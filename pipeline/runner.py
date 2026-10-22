@@ -15,6 +15,7 @@ from sqlite3 import Connection
 
 from omegaconf import DictConfig, OmegaConf
 
+from pipeline.db import DB_NAME, RUNS_LOCK, connect, now, reap
 from stages import (
     Context,
     Execution,
@@ -26,10 +27,8 @@ from stages import (
     regions,
     regress,
     render,
-    render_regress,
     split,
 )
-from stages.db import DB_NAME, RUNS_LOCK, connect, now, reap
 
 logger = logging.getLogger(__name__)
 
@@ -41,21 +40,28 @@ STAGES = {
     "classify": classify,
     "failures": failures,
     "baselines": baselines,
-    "render": render,
     "complexity": complexity,
     "regress": regress,
-    "render_regress": render_regress,
+    "render": render,
 }
 _MISSING = object()
 # The size of every output file, to notice a lost or cut one.
 _SIZES = "sizes.json"
 
 
-def plan(targets: Sequence[str]) -> list[str]:
+def _stage_inputs(name: str, cfg: DictConfig) -> tuple[str, ...]:
+    """Return the stages `name` reads under this config."""
+    module = STAGES[name]
+    return module.inputs(cfg) if hasattr(module, "inputs") else module.INPUTS
+
+
+def plan(targets: Sequence[str], cfg: DictConfig) -> list[str]:
     """Return `targets` and every stage they read, in execution order.
 
     Args:
         targets: The stages to run.
+        cfg: The validated config; what some stages read depends on
+            it.
 
     Returns:
         The stage names in execution order.
@@ -72,7 +78,7 @@ def plan(targets: Sequence[str]) -> list[str]:
     # Inputs always come earlier in STAGES.
     for name in reversed(STAGES):
         if name in needed:
-            needed.update(STAGES[name].INPUTS)
+            needed.update(_stage_inputs(name, cfg))
     return [name for name in STAGES if name in needed]
 
 
@@ -292,7 +298,7 @@ def run(targets: Sequence[str], cfg: DictConfig, *, force: bool) -> int:
         ValueError: There is no target, or one is not a stage.
         RuntimeError: A stage did not write its declared outputs.
     """
-    order = plan(targets)
+    order = plan(targets, cfg)
     root = Path(cfg.root)
     with closing(connect(root / DB_NAME)) as db:
         # Before our own run exists: only dead runs are `running`.
@@ -309,7 +315,7 @@ def run(targets: Sequence[str], cfg: DictConfig, *, force: bool) -> int:
             done: dict[str, Execution] = {}
             try:
                 for name in order:
-                    inputs = {stage: done[stage] for stage in STAGES[name].INPUTS}
+                    inputs = {stage: done[stage] for stage in _stage_inputs(name, cfg)}
                     done[name] = _execute(
                         db, run_id, name, cfg, inputs, force=force and name in targets
                     )

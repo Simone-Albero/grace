@@ -15,6 +15,7 @@ groups:                    # the option of each group, configs/<group>/<option>.
 seed: 42
 distance: euclidean        # euclidean | cosine — metric of the graph, the regions and the complexity measures
 figure_format: pdf         # figure file format: pdf (vector, lighter) | png
+regressor_figures: true    # render also draws the regressor's figures, so it reads complexity and regress; false leaves them out of a render run
 root: resources            # grace.db and artifacts/<stage>/<execution id>/ live here; verify uses resources/verify
 
 clustering:                # shared by every algorithm (configs/clustering/<name>.yaml: name and params)

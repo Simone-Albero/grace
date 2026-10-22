@@ -11,7 +11,7 @@ import uvicorn
 
 from dashboard import jobs
 from dashboard.app import create_app
-from stages.db import DB_NAME, explain
+from pipeline.db import DB_NAME, explain
 
 
 def main() -> None:

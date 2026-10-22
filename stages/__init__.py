@@ -43,7 +43,8 @@ class Context:
     Attributes:
         cfg: Only the stage's config keys (CONFIG or config_keys),
             read-only.
-        inputs: The executions of its INPUTS this run uses.
+        inputs: The executions of its INPUTS (or `inputs(cfg)`) this
+            run uses.
         out: Its own output folder, created empty.
         db: The DB connection.
         execution_id: The id of this execution.

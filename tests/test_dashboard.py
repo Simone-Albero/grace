@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 from dashboard import queries
 from dashboard.app import _num, create_app
-from stages.runner import run
+from pipeline.runner import run
 from tests.helpers import BASE_URL, fast_cfg, query
 
 
@@ -95,13 +95,12 @@ def test_compare(client: TestClient) -> None:
 
 
 def test_runs_and_run_detail(client: TestClient, run_id: int) -> None:
-    """Check that the run page shows all ten stages and figures."""
+    """Check that the run page shows every stage and figures."""
     assert f"/runs/{run_id}" in client.get("/runs").text
     page = client.get(f"/runs/{run_id}")
     assert page.status_code == 200
     stages = (
-        "split prepare regions classify failures baselines render "
-        "complexity regress render_regress"
+        "split prepare regions classify failures baselines complexity regress render"
     ).split()
     figures = ("baselines/predicted_vs_observed", "regress/predicted_vs_observed")
     for text in (*stages, *figures, "failures/rate_by_class", "class_1"):
@@ -112,28 +111,23 @@ def test_runs_and_run_detail(client: TestClient, run_id: int) -> None:
 
 
 def test_figures(client: TestClient, root: Path) -> None:
-    """Check that both render stages' figures are served as saved."""
-    ids = {stage: _execution(root, stage) for stage in ("render", "render_regress")}
-    for stage, execution in ids.items():
-        sql = f"SELECT name, file FROM figures WHERE execution_id = {execution}"
-        rows = query(root / "grace.db", sql)
-        assert rows
-        for name, file in rows:
-            response = client.get(f"/figures/{execution}/{name}")
-            assert response.status_code == 200
-            assert response.headers["content-type"] == "application/pdf"
-            saved = root / f"artifacts/{stage}/{execution}" / file
-            assert response.content == saved.read_bytes()
-    name, file = query(
-        root / "grace.db",
-        f"SELECT name, file FROM figures WHERE execution_id = {ids['render']}",
-    )[0]
-    assert client.get(f"/figures/{ids['render']}/nope").status_code == 404
-    assert client.get(f"/figures/{ids['render']}/{file}").status_code == 404
+    """Check that render's figures are served as saved."""
+    render = _execution(root, "render")
+    sql = f"SELECT name, file FROM figures WHERE execution_id = {render}"
+    rows = query(root / "grace.db", sql)
+    assert rows
+    for name, file in rows:
+        response = client.get(f"/figures/{render}/{name}")
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "application/pdf"
+        saved = root / f"artifacts/render/{render}" / file
+        assert response.content == saved.read_bytes()
+    name, file = rows[0]
+    assert client.get(f"/figures/{render}/nope").status_code == 404
+    assert client.get(f"/figures/{render}/{file}").status_code == 404
     assert (
         client.get(f"/figures/{_execution(root, 'regress')}/{name}").status_code == 404
     )
-    assert client.get(f"/figures/{ids['render_regress']}/{name}").status_code == 404
 
 
 def test_regions(client: TestClient, root: Path, run_id: int) -> None:
@@ -228,9 +222,9 @@ def test_fresh_root(tmp_path: Path) -> None:
     assert {"presets", "jobs"} <= tables
 
 
-def test_render_alone_then_regress(tmp_path: Path) -> None:
+def test_render_without_then_with_regressor(tmp_path: Path) -> None:
     """Check that a run without regress shows; regress joins it."""
-    run_id = run(["render"], fast_cfg(tmp_path), force=False)
+    run_id = run(["render"], fast_cfg(tmp_path, "regressor_figures=false"), force=False)
     linked = query(
         tmp_path / "grace.db", f"SELECT stage FROM run_stages WHERE run_id = {run_id}"
     )
@@ -268,7 +262,7 @@ def test_render_alone_then_regress(tmp_path: Path) -> None:
         ):
             assert client.get(url).status_code == 200, url
 
-        run(["render_regress"], fast_cfg(tmp_path), force=False)
+        run(["render"], fast_cfg(tmp_path), force=False)
         run(["failures"], fast_cfg(tmp_path), force=False)
         rows = client.get("/api/results").json()
         assert len(rows) == 1 and rows[0]["n_runs"] == 3

@@ -10,8 +10,8 @@ import numpy as np
 import pandas as pd
 from pandas.testing import assert_frame_equal
 
+from pipeline.runner import STAGES, _config_slice, run
 from stages import SPLITS
-from stages.runner import STAGES, _config_slice, run
 from tests.helpers import fast_cfg, query
 
 
@@ -119,24 +119,19 @@ def _check_regress(
 
 def _check_render(root: Path, ids: Mapping[str, int]) -> None:
     expected = {
-        "render": {
-            "classification/confusion_matrix",
-            "baselines/predicted_vs_observed",
-            "failures/rate_by_class",
-        },
-        "render_regress": {"regress/predicted_vs_observed", "regress/scores"},
+        "classification/confusion_matrix",
+        "baselines/predicted_vs_observed",
+        "failures/rate_by_class",
+        "regress/predicted_vs_observed",
+        "regress/scores",
     }
-    for stage, names in expected.items():
-        sql = f"SELECT name, file FROM figures WHERE execution_id = {ids[stage]}"
-        figures = dict(query(root / "grace.db", sql))
-        assert names <= figures.keys()
-        folder = root / f"artifacts/{stage}/{ids[stage]}"
-        assert all((folder / file).exists() for file in figures.values())
-    sql = f"SELECT name FROM figures WHERE execution_id = {ids['render']}"
-    render = [name for (name,) in query(root / "grace.db", sql)]
-    assert not any(name.startswith("regress/") for name in render)
+    sql = f"SELECT name, file FROM figures WHERE execution_id = {ids['render']}"
+    figures = dict(query(root / "grace.db", sql))
+    assert expected <= figures.keys()
+    folder = root / f"artifacts/render/{ids['render']}"
+    assert all((folder / file).exists() for file in figures.values())
     # Naive Bayes trains no epochs, so there is no loss history.
-    assert "classification/training_loss" not in render
+    assert "classification/training_loss" not in figures
 
 
 def test_second_run_is_cached(root: Path) -> None:
@@ -149,16 +144,14 @@ def test_second_run_is_cached(root: Path) -> None:
 
 
 def test_figure_format_reruns_render_only(root: Path) -> None:
-    """Check that a new figure_format reruns only the render stages."""
-    run_id = run(
-        ["render", "render_regress"], fast_cfg(root, "figure_format=png"), force=False
-    )
+    """Check that a new figure_format reruns only render."""
+    run_id = run(["render"], fast_cfg(root, "figure_format=png"), force=False)
     cached = query(
         root / "grace.db",
         f"SELECT stage, cached FROM run_stages WHERE run_id = {run_id}",
     )
     rerun = {stage for stage, was_cached in cached if not was_cached}
-    assert rerun == {"render", "render_regress"}
+    assert rerun == {"render"}
     files = query(
         root / "grace.db",
         "SELECT file FROM figures JOIN run_stages USING (execution_id) "

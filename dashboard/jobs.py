@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import TextIO
 
 from dashboard import store
-from stages.db import reap
+from pipeline.db import reap
 
 # Config paths are relative to the repo.
 REPO = Path(__file__).resolve().parents[1]
@@ -129,10 +129,9 @@ def check(preset: Mapping[str, object], root: Path) -> None:
             raise ValueError(f"Interpolation in {item!r} is not allowed in presets.")
     # Imported here: they import torch (seconds), which only a save or a
     # launch needs.
-    from stages.config import load_config, sweep
-    from stages.runner import plan
+    from pipeline.config import load_config, sweep
+    from pipeline.runner import plan
 
-    plan(preset["targets"])
     for combo in sweep(preset["sweeps"]):
         # `root` first: any later item that sets it, also as
         # `[root]=...`, which OmegaConf reads as the key `root`,
@@ -144,6 +143,8 @@ def check(preset: Mapping[str, object], root: Path) -> None:
                 f"root is the dashboard's ({root}); remove the override or "
                 "sweep that sets it."
             )
+        # What a target reads depends on the config, so plan on each.
+        plan(preset["targets"], cfg)
 
 
 def argv(preset: Mapping[str, object], root: Path) -> list[str]:

@@ -9,7 +9,7 @@ from pathlib import Path
 
 from omegaconf import DictConfig
 
-from stages.config import load_config
+from pipeline.config import load_config
 
 # The dashboard answers only to its own Host.
 BASE_URL = "http://127.0.0.1:8000"

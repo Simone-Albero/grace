@@ -29,13 +29,13 @@ format:
 
 ## smoke: every stage on synthetic_test into resources/verify (own DB), MODE=quick|full; the second pass must be fully cached
 smoke:
-	$(PYTHON) -m stages render render_regress $(VERIFY) $(SWEEP)
-	$(PYTHON) -m stages render render_regress $(VERIFY) $(SWEEP) 2> resources/verify/cached.log || { cat resources/verify/cached.log; exit 1; }
+	$(PYTHON) -m stages render $(VERIFY) $(SWEEP)
+	$(PYTHON) -m stages render $(VERIFY) $(SWEEP) 2> resources/verify/cached.log || { cat resources/verify/cached.log; exit 1; }
 	! grep "running execution" resources/verify/cached.log
 
 ## generate: the synthetic dataset (ROWS=<n> for a smaller one)
 generate:
-	$(PYTHON) -m stages.generate_synthetic $(if $(ROWS),--rows $(ROWS),)
+	$(PYTHON) -m pipeline.generate_synthetic $(if $(ROWS),--rows $(ROWS),)
 
 ## dashboard: dashboard (results, presets, jobs) of ROOT/grace.db (default resources), created if missing, on 127.0.0.1:PORT (default 8000); remote host: ssh -L PORT:127.0.0.1:PORT <host>
 dashboard:

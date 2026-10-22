@@ -12,10 +12,10 @@ import pytest
 from omegaconf import OmegaConf
 
 import stages.prepare
+from pipeline.config import CONFIGS, load_config, sweep, validate
+from pipeline.db import KILLED, RUNS_LOCK, connect, reap
+from pipeline.runner import STAGES, _config_slice, plan, run
 from stages import SPLITS, Context
-from stages.config import CONFIGS, load_config, sweep, validate
-from stages.db import KILLED, RUNS_LOCK, connect, reap
-from stages.runner import _config_slice, run
 from tests.helpers import fast_cfg, query
 
 
@@ -266,6 +266,7 @@ def test_config_errors(
         (["seed=-1"], "seed"),
         # The regressor's searches take seed + fold, below 2**32.
         ([f"seed={2**31}"], "seed"),
+        (["regressor_figures=maybe"], "regressor_figures"),
         (["data.num_cols=[num_1,num_1]"], "more than once"),
         (["loss.params.label_smoothing=1.0"], "label_smoothing"),
         (["loss=focal", "loss.params.gamma=-1"], "gamma"),
@@ -275,6 +276,17 @@ def test_config_errors_name_the_key(overrides: list[str], match: str) -> None:
     """Check that a config error names the offending key."""
     with pytest.raises(ValueError, match=re.escape(match)):
         load_config(["data=synthetic_test", *overrides])
+
+
+def test_render_reads_the_regressor_only_when_asked() -> None:
+    """Check that regressor_figures decides what render runs after."""
+    with_regressor = load_config(["data=synthetic_test"])
+    without_regressor = load_config(["data=synthetic_test", "regressor_figures=false"])
+    assert plan(["render"], with_regressor) == list(STAGES)
+    skipped = {"complexity", "regress"}
+    assert plan(["render"], without_regressor) == [
+        stage for stage in STAGES if stage not in skipped
+    ]
 
 
 def test_clustering_params_checked() -> None:

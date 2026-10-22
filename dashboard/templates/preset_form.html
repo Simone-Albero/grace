@@ -10,7 +10,7 @@
            required></label>
   <label>targets (stages, separated by spaces)
     <input name="targets" value="{{ preset.targets | join(' ') }}"
-           placeholder="render render_regress" size="40"></label>
+           placeholder="render" size="40"></label>
   <label>overrides (one key=value per line)
     <textarea name="overrides" rows="5"
       placeholder="data=synthetic_test&#10;classifier=mlp">{{ preset.overrides | join("\n") }}</textarea></label>

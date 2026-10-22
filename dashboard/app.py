@@ -34,7 +34,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from dashboard import charts, jobs, queries, store
 from dashboard.queries import CONFIG_KEYS, METRICS, REGION_COLUMNS, SCORES
-from stages.db import explain
+from pipeline.db import explain
 
 # The rendered rows of the region table; the scatter keeps all points.
 _MAX_ROWS = 500

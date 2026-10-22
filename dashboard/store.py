@@ -18,7 +18,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 
-from stages.db import connect, now, reap
+from pipeline.db import connect, now, reap
 
 RESTARTED = "dashboard restarted"
 # Its process may outlive a killed dashboard: the log and the run tell.

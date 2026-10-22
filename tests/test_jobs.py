@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 
 from dashboard import jobs, queries, store
 from dashboard.app import create_app
-from stages.db import KILLED
+from pipeline.db import KILLED
 from tests.helpers import BASE_URL, query
 
 SPLIT = {"name": "split", "targets": "split", "overrides": "data=synthetic_test"}
@@ -100,6 +100,7 @@ def test_preset_crud(client: TestClient, db_path: Path) -> None:
     ("changes", "message"),
     [
         ({"targets": "bogus"}, "Unknown stage 'bogus'"),
+        ({"targets": "render_regress"}, "Unknown stage 'render_regress'"),
         ({"targets": ""}, "No target given"),
         ({"targets": "data=x"}, "put it in the overrides"),
         ({"overrides": "nope=1"}, "Unknown config key in 'nope=1'"),

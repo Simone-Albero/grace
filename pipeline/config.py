@@ -143,6 +143,10 @@ def validate(cfg: DictConfig) -> None:
         f"figure_format {cfg.figure_format!r} invalid; valid: ['pdf', 'png'].",
     )
     _check(
+        isinstance(cfg.regressor_figures, bool),
+        f"regressor_figures {cfg.regressor_figures!r} must be true or false.",
+    )
+    _check(
         isinstance(cfg.root, str) and bool(cfg.root),
         f"root {cfg.root!r} must be a non-empty folder path.",
     )

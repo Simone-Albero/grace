@@ -18,7 +18,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 
 make generate                     # resources/raw_data/synthetic/synthetic_test.csv (ROWS=<n> for fewer rows)
-python -m stages render render_regress data=synthetic_test classifier=random_forest
+python -m stages render data=synthetic_test classifier=random_forest
 make dashboard                    # http://127.0.0.1:8000
 ```
 
@@ -28,14 +28,14 @@ The default `data` in [configs/config.yaml](configs/config.yaml) is `cic_2018_v2
 
 ## Stages and DAG
 
-`python -m stages <target…>` runs the targets and every stage they read. Each stage is one module in [stages/](stages/) that declares `CONFIG` (the config keys its outputs depend on; `config_keys(cfg)` instead when they depend on the config, as in `classify`: ML or DL), `INPUTS` (the stages it reads), `FILES` (raw files whose size and mtime count) and `OUTPUTS` (the files it must write), reads only its inputs' artifacts and DB rows, and writes only its own.
+`python -m stages <target…>` runs the targets and every stage they read. Each stage is one module in [stages/](stages/) that declares `CONFIG` (the config keys its outputs depend on; `config_keys(cfg)` instead when they depend on the config, as in `classify`: ML or DL), `INPUTS` (the stages it reads; `inputs(cfg)` instead when they depend on the config, as in `render`), `FILES` (raw files whose size and mtime count) and `OUTPUTS` (the files it must write), reads only its inputs' artifacts and DB rows, and writes only its own.
 
 ```
 split → prepare → regions → classify → failures → baselines → render
-                     └→ complexity → regress → render_regress
+                     └→ complexity → regress ───────────────────┘
 ```
 
-`render` needs no complexity and no regressor, so a run can stop after the baselines.
+`render` reads `complexity` and `regress` only to draw the regressor's figures, which `regressor_figures` (true by default) turns on. With `regressor_figures=false` it reads neither, so a run can stop after the baselines.
 
 | Stage | Reads | Config keys | Files written | DB tables written |
 |---|---|---|---|---|
@@ -45,10 +45,9 @@ split → prepare → regions → classify → failures → baselines → render
 | `classify` | split, prepare | `classifier`, `fit.balance`, `fit.n_samples`, `seed`, plus `grid_search` (ML) or `loss`, `optimizer`, `scheduler`, `fit.training`, `fit.validation`, `data.top_n`, `data.hash_buckets` (DL) | `predictions.parquet`, `model/` | `class_metrics`, `classifier_grid`, `history`, `metrics` |
 | `failures` | prepare, regions, classify | none | none | `failures`, `metrics` |
 | `baselines` | prepare, regions, classify, failures | `failure_regressor.min_eval_support` | none | `baselines`, `metrics` |
-| `render` | prepare, regions, classify, failures, baselines | `figure_format` | `figures/` | `figures`, `metrics` |
 | `complexity` | prepare, regions | `complexity`, `graph.k`, `distance`, `seed` | none | `complexity`, `metrics` |
 | `regress` | regions, complexity, failures, baselines | `failure_regressor`, `seed` | `model.joblib` | `estimates`, `regressor_folds`, `importances`, `metrics` |
-| `render_regress` | regions, complexity, failures, baselines, regress | `figure_format` | `figures/` | `figures`, `metrics` |
+| `render` | prepare, regions, classify, failures, baselines, plus complexity and regress when `regressor_figures` is true | `figure_format`, `regressor_figures` | `figures/` | `figures`, `metrics` |
 
 - **split** drops rows with missing or infinite values, drops the classes with fewer than `min_class_count` rows, and splits the rest stratified by class into train, validation and test.
 - **prepare** is preprocessing only. A signed log and a robust scaler for the numerical columns, a top-N plus hash encoder for the categorical ones, and the integer class labels are all fitted on train and applied to the three splits.
@@ -56,10 +55,9 @@ split → prepare → regions → classify → failures → baselines → render
 - **classify** trains one classifier on train (undersampled when `fit.balance` says so) and predicts validation and test. An ML classifier with a `grid` is tuned by cross-validated grid search and refit with the winner; the MLP trains with early stopping on validation.
 - **failures** counts the classifier's errors on the test rows routed to each region. Failure rates are measured on test only.
 - **baselines** predicts each region's failure rate from the classifier's probabilities alone: MCP (the mean of 1 minus the maximum class probability of the region's test rows) and ATC (the share of the region's test rows under a confidence threshold fitted on validation). It scores both against the observed rates on the regions with at least `failure_regressor.min_eval_support` test rows (the *used* regions, the ones the regressor is scored on too) and fails if there is none.
-- **render** draws the static figures of the classifier and the baselines: confusion matrix, F1 per class, the loss of a DL classifier, MCP and ATC against the observed rates, and the observed failure rate of the regions of each class (box and strip plot, a point's area is its test rows).
 - **complexity** describes every region and every class on its train rows (see [Method](#method)).
 - **regress** predicts each region's failure rate with a Random Forest on its descriptors and its class's, under nested cross-validation (a randomized search inside each outer fold) and refits the forest on all used regions. Its log sets the scores against those of the baselines, which it reads, not recomputes.
-- **render_regress** draws the regressor's figures: predicted against observed rates, the scores of the three predictors, the forest's feature importances and the distribution of the most important descriptors.
+- **render** draws the static figures of the classifier and the baselines: confusion matrix, F1 per class, the loss of a DL classifier, MCP and ATC against the observed rates, and the observed failure rate of the regions of each class (box and strip plot, a point's area is its test rows). With `regressor_figures` it also draws the regressor's: predicted against observed rates, the scores of the three predictors, the forest's feature importances and the distribution of the most important descriptors.
 
 ## CLI
 
@@ -76,21 +74,21 @@ python -m stages <target…> [key=value…] [--sweep key=v1,v2…] [--force]
 An execution is reused when a done execution of the same stage has the same key and all its output files exist with the size they were written with (`sizes.json` in its folder, without which the stage runs again; the content is not checked, so a same-size edit goes unnoticed: use `--force <stage>`). The key is the sha256 of the stage's config slice, the ids of the input executions it read, and the size and mtime of the raw CSV (`split`). `runtime` and `root` are in no key. Code changes are not detected: use `--force`.
 
 ```bash
-python -m stages render render_regress data=synthetic_test classifier=random_forest
-python -m stages render data=synthetic_test classifier=knn  # without the regressor
-python -m stages render render_regress data=synthetic_test --sweep classifier=knn,xgboost,mlp --sweep distance=euclidean,cosine
+python -m stages render data=synthetic_test classifier=random_forest
+python -m stages render data=synthetic_test classifier=knn regressor_figures=false  # without the regressor
+python -m stages render data=synthetic_test --sweep classifier=knn,xgboost,mlp --sweep distance=euclidean,cosine
 python -m stages regions data=synthetic_test clustering=hdbscan distance=cosine
 python -m stages regions data=synthetic_test clustering=hdbscan 'clustering.params.min_samples=[5,15]'
 python -m stages regions data=synthetic_test clustering=hdbscan --sweep 'clustering.params.min_samples=[1,5],[15,50]'
 python -m stages classify data=synthetic_test classifier=xgboost --force
-python -m stages render render_regress data=synthetic_test root=resources/other runtime.n_jobs=16
+python -m stages render data=synthetic_test root=resources/other runtime.n_jobs=16
 ```
 
 ## Configuration
 
-[configs/](configs/) holds one folder per group, one YAML per option: `data` (10), `classifier` (10), `clustering` (4), `space`, `graph`, `complexity`, `failure_regressor`, `fit`, `grid_search`, `loss`, `optimizer`, `scheduler`. [configs/config.yaml](configs/config.yaml) chooses the option of each group (`groups`) and holds `seed`, `distance` (`euclidean` or `cosine`), `figure_format` (`pdf` or `png`), `root`, `runtime.*` and the `clustering` keys every algorithm shares (`max_fit_samples`, `max_regions`, `min_cluster_floor`, `hardness_k`). `runtime` says how fast stages compute, never what: `n_jobs` (the classifier grid search, the failure regressor search, the k-NN searches of regions and complexity, and the fit of random_forest, knn and xgboost), `device`, `num_workers` and `pin_memory` (DL only).
+[configs/](configs/) holds one folder per group, one YAML per option: `data` (10), `classifier` (10), `clustering` (4), `space`, `graph`, `complexity`, `failure_regressor`, `fit`, `grid_search`, `loss`, `optimizer`, `scheduler`. [configs/config.yaml](configs/config.yaml) chooses the option of each group (`groups`) and holds `seed`, `distance` (`euclidean` or `cosine`), `figure_format` (`pdf` or `png`), `regressor_figures` (whether `render` also draws the regressor's figures), `root`, `runtime.*` and the `clustering` keys every algorithm shares (`max_fit_samples`, `max_regions`, `min_cluster_floor`, `hardness_k`). `runtime` says how fast stages compute, never what: `n_jobs` (the classifier grid search, the failure regressor search, the k-NN searches of regions and complexity, and the fit of random_forest, knn and xgboost), `device`, `num_workers` and `pin_memory` (DL only).
 
-`stages/config.py` loads the YAML files, applies the overrides and validates the whole config in one place, so a bad key, type or range of the pipeline's own settings fails before anything runs, with the valid values in the message. Values passed through to a library as they are (`classifier.params` and `grid` values, `optimizer.params`, `scheduler.params`, `clustering.params` values, `failure_regressor.params`) are checked by that library when their stage runs. So are the columns against the CSV (split) and the length of a `loss.params.class_weight` list (classify, which knows the classes). The config is strict: an unknown key fails. Add a new key (including `classifier.params.*`, `clustering.params.*` and `failure_regressor.params.*`, which cannot be introduced from the command line) to a YAML first.
+`pipeline/config.py` loads the YAML files, applies the overrides and validates the whole config in one place, so a bad key, type or range of the pipeline's own settings fails before anything runs, with the valid values in the message. Values passed through to a library as they are (`classifier.params` and `grid` values, `optimizer.params`, `scheduler.params`, `clustering.params` values, `failure_regressor.params`) are checked by that library when their stage runs. So are the columns against the CSV (split) and the length of a `loss.params.class_weight` list (classify, which knows the classes). The config is strict: an unknown key fails. Add a new key (including `classifier.params.*`, `clustering.params.*` and `failure_regressor.params.*`, which cannot be introduced from the command line) to a YAML first.
 
 ## Outputs
 
@@ -111,7 +109,7 @@ There are no migrations: after a schema change, delete the DB and its artifacts.
 | `class_metrics`, `classifier_grid`, `history` | per-class precision, recall and F1; the grid-search candidates; the loss of a DL classifier |
 | `failures`, `baselines`, `estimates` | per region, test rows, errors and failure rate; whether it is scored, its MCP and its ATC; the out-of-fold Random Forest prediction |
 | `regressor_folds`, `importances` | the outer folds (fold -1 is the refit); the mean feature importances |
-| `figures` | the figure files of a render or render_regress execution |
+| `figures` | the figure files of a render execution |
 | `presets`, `jobs` | dashboard presets and their background jobs |
 
 For example, the Spearman correlation of the three predictors with the observed failure rates, per run:
@@ -134,7 +132,7 @@ GROUP BY r.id;
 
 - **Results** (`/`, JSON at `/api/results`): one row per done failures execution, with the run that also holds a done regress (else a done baselines, else the latest) and that run's baselines and regress executions; the MCP and ATC columns are empty without baselines and the regressor's without regress. A sweep over `failure_regressor` keys shares one failures execution, so only its newest run is listed (see the Runs page for the others). Filterable by data, classifier, clustering, distance and seed, sortable.
 - **Comparisons** (`/compare`): interactive charts of any metric across configurations, and of the three predictors.
-- **Runs** and run detail: stage status and cache hits, metrics, the regressor's folds, per-class scores, the figures of both render stages. **Regions** and region detail: a sortable, filterable table, a scatter of any two columns, and the descriptors of one region.
+- **Runs** and run detail: stage status and cache hits, metrics, the regressor's folds, per-class scores, the run's figures. **Regions** and region detail: a sortable, filterable table, a scatter of any two columns, and the descriptors of one region.
 - **Presets**: one `python -m stages` call (targets, overrides, sweeps, force) without the root, validated when saved and again when launched.
 - **Jobs**: launching a preset queues a background job. Jobs run one at a time with a live log. Cancelling sends SIGTERM and, after 20 s, SIGKILL; jobs left open by a restart are closed (a job process may outlive a dashboard that was killed: see its log), and a job killed by the SIGKILL has its run and executions marked failed (at the first moment no other run is live; see the CLI section).
 
@@ -171,7 +169,7 @@ The regressor sees every key twice, as `region_<key>` and as `class_<key>` for t
 
 ### Inside the synthetic dataset
 
-Each class consists of a clean core together with a *difficulty ladder* running towards every class it is meant to overlap with (`_OVERLAPS` in [generate_synthetic.py](stages/generate_synthetic.py)). Every rung sits a fixed distance from the boundary between the two classes, and both sides face one another symmetrically, so the best error rate any classifier could reach on a rung is known in advance:
+Each class consists of a clean core together with a *difficulty ladder* running towards every class it is meant to overlap with (`_OVERLAPS` in [generate_synthetic.py](pipeline/generate_synthetic.py)). Every rung sits a fixed distance from the boundary between the two classes, and both sides face one another symmetrically, so the best error rate any classifier could reach on a rung is known in advance:
 
 | Sub-group | Distance from boundary | Best possible error | Rows |
 |---|---|---|---|
@@ -188,7 +186,7 @@ The file has 69,500 rows, 10 classes, 20 numerical and 2 categorical features; t
 
 To add a dataset, place the CSV under `resources/raw_data/`, copy a YAML from `configs/data/`, set `path` and the columns, and run with `data=<name>`.
 
-Every shipped configuration splits 40 % train, 5 % validation, 55 % test. The test split is kept large because it is the only one the regressor's target, every region's failure rate, is measured on. Measured on `unsw_nb15_v2` (2.39 million rows) with random_forest and `runtime.n_jobs=16`: about 6.5 minutes end to end, peak memory about 10 GB.
+Every shipped configuration splits 40 % train, 5 % validation, 55 % test. The test split is kept large because it is the only one the regressor's target, every region's failure rate, is measured on. Measured on `nb15_v2` (2.39 million rows) with random_forest and `runtime.n_jobs=16`: about 6.5 minutes end to end, peak memory about 10 GB.
 
 ## Extending
 
@@ -196,7 +194,7 @@ Every shipped configuration splits 40 % train, 5 % validation, 55 % test. The te
 - **A DL model**: an entry in `MODELS` in [src/dl.py](src/dl.py), a class whose constructor takes `num_classes`, `num_numerical_features`, `cardinalities` and the YAML `params`, and whose `forward(x_num, x_cat)` returns logits, each row's independent of the others in eval mode (prediction runs in chunks); and a YAML with `kind: dl`.
 - **A clustering**: a function `fit(X, *, …, max_fit_samples, random_state) -> labels` (-1 = noise) in `ALGORITHMS` in [src/clustering.py](src/clustering.py) and a `configs/clustering/<name>.yaml` with `name` and `params` (`{}` for none). If it takes `n_clusters`, the pipeline derives it per class from the data and sweeps it; it must not appear in the YAML. List-valued parameters are swept and the candidate of least loss kept.
 - **A descriptor**: return one more key from a family function in [src/complexity/](src/complexity/); it reaches the complexity table, the regressor (as `region_<key>` and `class_<key>`) and the dashboard by itself. A new family is one call, merged into the returned dict, in `src/complexity/measure.py` (and, optionally, a label in `src/plot/style.py`).
-- **A stage**: a module in `stages/` with `CONFIG` (or `config_keys`), `INPUTS`, `FILES`, `OUTPUTS` and `run(ctx)`; insert it into `STAGES` in [stages/runner.py](stages/runner.py) after its inputs and add its tables to `SCHEMA` in [stages/db.py](stages/db.py). Its tables start with `execution_id INTEGER NOT NULL REFERENCES executions (id)`, filled by the runner. Read upstream rows through `ctx.read`, `ctx.features`, `ctx.labels` and `ctx.split_rows`, and upstream files from `ctx.inputs[<stage>].dir`; write rows only through `ctx.write`, `ctx.save_metrics` and, for figures, `ctx.save_figures` (the stage must declare `figure_format` in `CONFIG`). Scalar results reach the Results and Compare pages through `METRICS` in [dashboard/queries.py](dashboard/queries.py).
+- **A stage**: a module in `stages/` with `CONFIG` (or `config_keys`), `INPUTS` (or `inputs`), `FILES`, `OUTPUTS` and `run(ctx)`; insert it into `STAGES` in [pipeline/runner.py](pipeline/runner.py) after its inputs and add its tables to `SCHEMA` in [pipeline/db.py](pipeline/db.py). Its tables start with `execution_id INTEGER NOT NULL REFERENCES executions (id)`, filled by the runner. Read upstream rows through `ctx.read`, `ctx.features`, `ctx.labels` and `ctx.split_rows`, and upstream files from `ctx.inputs[<stage>].dir`; write rows only through `ctx.write`, `ctx.save_metrics` and, for figures, `ctx.save_figures` (the stage must declare `figure_format` in `CONFIG`). Scalar results reach the Results and Compare pages through `METRICS` in [dashboard/queries.py](dashboard/queries.py).
 
 ## Development
 
@@ -214,10 +212,10 @@ make smoke MODE=quick        # every stage on synthetic_test into resources/veri
 configs/                 YAML groups and config.yaml
 src/                     pure topic modules: data, space, graph, clustering, complexity/,
                          ml, dl, regressor, baselines, scores, plot/ …
-stages/                  one module per stage, runner (DAG, cache), config, db, CLI
+stages/                  one module per stage, the stage contract (Context), CLI
+pipeline/                runner (DAG, cache), config, db, the synthetic dataset generator
 dashboard/               FastAPI app, queries, presets and jobs, templates
 tests/                   end-to-end, cache, DB, routing and dashboard tests, and src/
                          functions on toy data
-stages/generate_synthetic.py  the synthetic dataset
 Makefile                 shortcuts
 ```

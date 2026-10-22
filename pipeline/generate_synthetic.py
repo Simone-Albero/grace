@@ -1,6 +1,6 @@
 """Write the synthetic test dataset, a CSV of labelled rows.
 
-Run `python -m stages.generate_synthetic [--rows N]`. The CSV goes to
+Run `python -m pipeline.generate_synthetic [--rows N]`. The CSV goes to
 `resources/raw_data/synthetic/synthetic_test.csv`: 20 numerical and two
 categorical features, a `label` and the `true_subgroup` each row was
 drawn from. A difficulty ladder of sub-groups makes the classes

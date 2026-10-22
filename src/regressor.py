@@ -254,7 +254,8 @@ def fit_failure_regressor(
         raise ValueError(
             f"{n_used} usable region(s), failure-rate std {float(y.std()):.3g}: the "
             "failure regressor needs two regions whose rates differ. Lower "
-            "failure_regressor.min_eval_support or evaluate on more test rows."
+            "failure_regressor.min_eval_support or evaluate on more test rows; "
+            "regressor_figures=false draws the classifier's figures without it."
         )
 
     outer_cv, n_outer, strata = _outer_cv(y, n_outer_splits, random_state)

@@ -10,9 +10,9 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import NoReturn
 
-from stages.config import load_config, sweep
-from stages.db import DB_NAME, explain
-from stages.runner import run
+from pipeline.config import load_config, sweep
+from pipeline.db import DB_NAME, explain
+from pipeline.runner import run
 
 logger = logging.getLogger(__name__)
 
