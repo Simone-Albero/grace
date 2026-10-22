@@ -73,7 +73,7 @@ python -m stages <target…> [key=value…] [--sweep key=v1,v2…] [--force]
 - SIGTERM and Ctrl-C mark the run and the running execution `failed`. A run killed outright (SIGKILL, power loss) is marked `failed` at the first of these moments when no other run is live: the next run on the root, the dashboard's start, or the end of a dashboard job that was killed. A live run holds a shared lock on `runs.lock`, and rows still `running` while nobody holds it are dead. A SIGKILL of the CLI can leave joblib (loky) worker processes behind: they finish their queued fits, hold their memory for minutes and a few never exit; when no run is live, `pkill -f loky` removes them. A dashboard job has its own process group, which the dashboard kills whole after the cancel grace period.
 - A database error (locked, read-only, full disk, corrupted) ends with a message naming `<root>/grace.db` and, when it is known, what to do (restore a copy, or move it away together with `artifacts/` and `jobs/` to start a new one, wait for the process that locks it, make the root writable, free disk space). A full disk while a stage writes an artifact ends with the OS error.
 
-An execution is reused when a done execution of the same stage has the same key and all its output files exist with the size they were written with (`sizes.json` in its folder; the content is not checked, so a same-size edit goes unnoticed: use `--force <stage>`). The key is the sha256 of the stage's config slice, the ids of the input executions it read, and the size and mtime of the raw CSV (`split`). `runtime` and `root` are in no key. Code changes are not detected: use `--force`.
+An execution is reused when a done execution of the same stage has the same key and all its output files exist with the size they were written with (`sizes.json` in its folder, without which the stage runs again; the content is not checked, so a same-size edit goes unnoticed: use `--force <stage>`). The key is the sha256 of the stage's config slice, the ids of the input executions it read, and the size and mtime of the raw CSV (`split`). `runtime` and `root` are in no key. Code changes are not detected: use `--force`.
 
 ```bash
 python -m stages render render_regress data=synthetic_test classifier=random_forest
@@ -193,7 +193,7 @@ Every shipped configuration splits 40 % train, 5 % validation, 55 % test. The te
 ## Extending
 
 - **A classifier**: an entry in `CLASSIFIERS` in [src/ml.py](src/ml.py) (the estimator and the categorical strategy in front of it: a key of `_STRATEGIES`, or None to pass the prepared frame as it is) and a `configs/classifier/<name>.yaml` with `kind`, `name`, `params` and `grid`. If it takes `n_jobs`, add it to `PARALLEL` in the same file.
-- **A DL model**: an entry in `MODELS` in [src/dl.py](src/dl.py), a class whose constructor takes `num_classes`, `num_numerical_features`, `cardinalities` and the YAML `params`, and whose `forward(x_num, x_cat)` returns logits; and a YAML with `kind: dl`.
+- **A DL model**: an entry in `MODELS` in [src/dl.py](src/dl.py), a class whose constructor takes `num_classes`, `num_numerical_features`, `cardinalities` and the YAML `params`, and whose `forward(x_num, x_cat)` returns logits, each row's independent of the others in eval mode (prediction runs in chunks); and a YAML with `kind: dl`.
 - **A clustering**: a function `fit(X, *, …, max_fit_samples, random_state) -> labels` (-1 = noise) in `ALGORITHMS` in [src/clustering.py](src/clustering.py) and a `configs/clustering/<name>.yaml` with `name` and `params` (`{}` for none). If it takes `n_clusters`, the pipeline derives it per class from the data and sweeps it; it must not appear in the YAML. List-valued parameters are swept and the candidate of least loss kept.
 - **A descriptor**: return one more key from a family function in [src/complexity/](src/complexity/); it reaches the complexity table, the regressor (as `region_<key>` and `class_<key>`) and the dashboard by itself. A new family is one call, merged into the returned dict, in `src/complexity/measure.py` (and, optionally, a label in `src/plot/style.py`).
 - **A stage**: a module in `stages/` with `CONFIG` (or `config_keys`), `INPUTS`, `FILES`, `OUTPUTS` and `run(ctx)`; insert it into `STAGES` in [stages/runner.py](stages/runner.py) after its inputs and add its tables to `SCHEMA` in [stages/db.py](stages/db.py). Its tables start with `execution_id INTEGER NOT NULL REFERENCES executions (id)`, filled by the runner. Read upstream rows through `ctx.read`, `ctx.features`, `ctx.labels` and `ctx.split_rows`, and upstream files from `ctx.inputs[<stage>].dir`; write rows only through `ctx.write`, `ctx.save_metrics` and, for figures, `ctx.save_figures` (the stage must declare `figure_format` in `CONFIG`). Scalar results reach the Results and Compare pages through `METRICS` in [dashboard/queries.py](dashboard/queries.py).
@@ -216,7 +216,8 @@ src/                     pure topic modules: data, space, graph, clustering, com
                          ml, dl, regressor, baselines, scores, plot/ …
 stages/                  one module per stage, runner (DAG, cache), config, db, CLI
 dashboard/               FastAPI app, queries, presets and jobs, templates
-tests/                   end-to-end, cache, DB, routing and dashboard tests
+tests/                   end-to-end, cache, DB, routing and dashboard tests, and src/
+                         functions on toy data
 stages/generate_synthetic.py  the synthetic dataset
 Makefile                 shortcuts
 ```

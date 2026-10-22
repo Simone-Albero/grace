@@ -223,11 +223,19 @@ def _kill_group(pgid: int) -> None:
         pass
 
 
+def _kill_group_unless_reaped(process: subprocess.Popen) -> None:
+    """SIGKILL the job's group unless the job was already reaped."""
+    # Once reaped, its pgid may belong to an unrelated group; _run has
+    # already killed the workers it left.
+    if process.returncode is None:
+        _kill_group(process.pid)
+
+
 def _terminate(process: subprocess.Popen) -> None:
     """SIGTERM the job now, SIGKILL its group after the grace."""
     # Alone, so that the runner marks its run failed.
     process.terminate()
-    timer = threading.Timer(_GRACE_S, _kill_group, (process.pid,))
+    timer = threading.Timer(_GRACE_S, _kill_group_unless_reaped, (process,))
     timer.daemon = True
     timer.start()
 

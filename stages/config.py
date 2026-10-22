@@ -128,9 +128,11 @@ def validate(cfg: DictConfig) -> None:
         ValueError: A value is invalid; the message names the key, the
             value and, where a set exists, the valid ones.
     """
+    # The regressor seeds each search with seed + fold, which must stay
+    # below numpy's 2**32.
     _check(
-        _is_int(cfg.seed) and cfg.seed < 2**32,
-        f"seed {cfg.seed!r} must be an integer in [0, 2**32).",
+        _is_int(cfg.seed) and cfg.seed < 2**31,
+        f"seed {cfg.seed!r} must be an integer in [0, 2**31).",
     )
     _check(
         cfg.distance in ("euclidean", "cosine"),

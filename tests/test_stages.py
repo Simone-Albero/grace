@@ -1,5 +1,6 @@
 """End-to-end stage tests on the synthetic data."""
 
+import json
 import math
 from collections.abc import Mapping
 from pathlib import Path
@@ -191,13 +192,16 @@ def test_routing_is_label_free(tmp_path: Path) -> None:
     first = pd.read_parquet(tmp_path / "artifacts/regions/3/assignments.parquet")
 
     rng = np.random.default_rng(0)
+    prepared = tmp_path / "artifacts/prepare/2"
+    sizes = json.loads((prepared / "sizes.json").read_text())
     for split in ("val", "test"):
-        path = tmp_path / f"artifacts/prepare/2/{split}.parquet"
+        path = prepared / f"{split}.parquet"
         rows = pd.read_parquet(path)
         rows["label"] = rng.permutation(rows["label"].to_numpy())
         rows.to_parquet(path, index=False)
+        sizes[path.name] = path.stat().st_size
     # Else prepare would rerun, undoing the edit.
-    (tmp_path / "artifacts/prepare/2/sizes.json").unlink()
+    (prepared / "sizes.json").write_text(json.dumps(sizes))
     run(["regions"], cfg, force=True)
     second = pd.read_parquet(tmp_path / "artifacts/regions/4/assignments.parquet")
     assert_frame_equal(second, first)

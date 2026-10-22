@@ -22,6 +22,10 @@ from torch.utils.data import DataLoader, TensorDataset
 
 logger = logging.getLogger(__name__)
 
+# A test split of ~10M rows in one forward pass needs ~5 GB per hidden
+# layer on the device.
+_PREDICT_ROWS = 65_536
+
 
 class CrossEntropyLoss(nn.Module):
     """Cross-entropy with class weights and label smoothing.
@@ -415,12 +419,14 @@ def predict(
 
     Returns:
         The predicted class ids and the probabilities, shape
-        (n, n_classes), from one forward pass.
+        (n, n_classes).
     """
     model.eval()
+    logits = []
     with torch.no_grad():
-        logits = model(
-            *(tensor.to(device) for tensor in _tensors(rows, num_cols, cat_cols))
-        )
-    probabilities = F.softmax(logits.cpu(), dim=1)
+        for start in range(0, len(rows), _PREDICT_ROWS):
+            chunk = rows.iloc[start : start + _PREDICT_ROWS]
+            tensors = _tensors(chunk, num_cols, cat_cols)
+            logits.append(model(*(tensor.to(device) for tensor in tensors)).cpu())
+    probabilities = F.softmax(torch.cat(logits), dim=1)
     return probabilities.argmax(dim=1).numpy(), probabilities.numpy()

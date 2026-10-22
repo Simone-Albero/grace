@@ -215,6 +215,24 @@ def test_killed_job_fails_its_run(client: TestClient, db_path: Path) -> None:
     assert errors == [(KILLED,)]
 
 
+def test_late_kill_spares_a_reaped_job(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Check that the grace's SIGKILL skips a job already reaped."""
+    killed = []
+    monkeypatch.setattr(jobs, "_kill_group", killed.append)
+    done = subprocess.Popen(["true"], start_new_session=True)
+    done.wait()
+    jobs._kill_group_unless_reaped(done)
+    assert killed == []
+
+    running = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        jobs._kill_group_unless_reaped(running)
+        assert killed == [running.pid]
+    finally:
+        running.kill()
+        running.wait()
+
+
 def test_restart_closes_open_jobs(db_path: Path) -> None:
     """Check that a restart fails running and cancels queued jobs."""
     store.recover(db_path)

@@ -74,6 +74,12 @@ def test_lost_outputs_and_forced_downstream(tmp_path: Path) -> None:
         "split": (4, 1),
         "prepare": (6, 0),
     }
+    # Without its sizes.json an execution cannot be checked: lost too.
+    (tmp_path / "artifacts/prepare/6/sizes.json").unlink()
+    assert _links(tmp_path, run(["prepare"], cfg, force=False)) == {
+        "split": (4, 1),
+        "prepare": (7, 0),
+    }
 
 
 def test_killed_run_is_failed_by_the_next_run(tmp_path: Path) -> None:
@@ -258,6 +264,8 @@ def test_config_errors(
         (["groups.data=nb15_v2"], "pick it with <group>=<option>"),
         (["[groups][data]=nb15_v2"], "pick it with <group>=<option>"),
         (["seed=-1"], "seed"),
+        # The regressor's searches take seed + fold, below 2**32.
+        ([f"seed={2**31}"], "seed"),
         (["data.num_cols=[num_1,num_1]"], "more than once"),
         (["loss.params.label_smoothing=1.0"], "label_smoothing"),
         (["loss=focal", "loss.params.gamma=-1"], "gamma"),

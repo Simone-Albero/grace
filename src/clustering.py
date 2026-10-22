@@ -639,6 +639,7 @@ def cluster_class(
         max_clusters: The most clusters the class may keep.
         min_cluster_floor: The finest candidate is about the class size
             over this; also the merge floor for undersized clusters.
+            A refit keeps only the `max_clusters` largest clusters.
         hardness_k: The neighbours behind the kDN hardness.
         eval_rows_per_train_row: Evaluation rows per train row.
         metric: `euclidean` or `cosine`.
@@ -687,10 +688,19 @@ def cluster_class(
     if best_labels is not None:
         return best_labels, best["n_merged_clusters"], best["n_merged"], best["loss"]
     refit_labels = fit(X, **best["combo"])
+    # The refit labels rows the sweep never saw (hdbscan routes them by
+    # approximate_predict), so a cluster under the scaled floor there
+    # can clear the full one here. Only the `max_clusters` largest are
+    # kept, by rank, so that ties at the cut do not drop them all.
+    cluster_ids, cluster_sizes = np.unique(
+        refit_labels[refit_labels != -1], return_counts=True
+    )
+    over_cap = cluster_ids[np.argsort(-cluster_sizes, kind="stable")[max_clusters:]]
+    refit_labels = np.where(np.isin(refit_labels, over_cap), -1, refit_labels)
     # Refit on the full class: the sweep's merge counts described the
     # scored subsample, at a floor scaled down to match it, so they
     # don't describe this.
     final_labels, n_merged_clusters, n_merged = _merge_small_clusters(
         X, refit_labels, min_size=min_cluster_floor, metric=metric
     )
-    return final_labels, n_merged_clusters, n_merged, best["loss"]
+    return final_labels, n_merged_clusters + over_cap.size, n_merged, best["loss"]

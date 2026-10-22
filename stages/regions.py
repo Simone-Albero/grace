@@ -31,7 +31,7 @@ from stages import LABEL, SPLITS, Context
 logger = logging.getLogger(__name__)
 
 CONFIG = ("space", "graph", "clustering", "distance", "seed")
-# Split gives the feature kinds; prepare, the splits and class names.
+# Split gives the feature kinds; prepare, the splits.
 INPUTS = ("split", "prepare")
 FILES = ()
 OUTPUTS = ("space.joblib", "graph.npz", "centroids.parquet", "assignments.parquet")
@@ -52,7 +52,7 @@ def _cluster_per_class(
     train: pd.DataFrame,
     *,
     graph_rows: np.ndarray,
-    class_names: Mapping[int, str],
+    graph_points: np.ndarray,
     eval_rows_per_train_row: float,
 ) -> tuple[np.ndarray, dict[int, np.ndarray], list[dict[str, object]]]:
     """Cluster every class of train and number its regions.
@@ -77,7 +77,7 @@ def _cluster_per_class(
     report: list[dict[str, object]] = []
 
     nodes = KdnNodes(
-        X=_points(space, train.iloc[graph_rows], distance),
+        X=scale_for_metric(graph_points, distance),
         y=train_labels[graph_rows],
         row_ids=graph_rows,
     )
@@ -104,13 +104,6 @@ def _cluster_per_class(
         )
         cluster_ids = np.unique(raw_labels)
         n_class_clusters = int(cluster_ids.size)
-        if n_class_clusters > max_clusters_per_class:
-            raise ValueError(
-                f"class {class_names[class_id]!r}: {n_class_clusters} clusters "
-                "survive merging, over its share of clustering.max_regions "
-                f"({max_clusters_per_class}). Raise max_regions or tighten the "
-                "clustering grid."
-            )
 
         report.append(
             {
@@ -208,14 +201,11 @@ def run(ctx: Context) -> None:
         ctx: The stage context.
 
     Raises:
-        ValueError: A class has more clusters than its share of
-            `clustering.max_regions`, a train row has no region or a
-            centroid is not finite.
+        ValueError: A train row has no region or a centroid is not
+            finite.
     """
     cfg = ctx.cfg
     num_cols, cat_cols = ctx.features()
-    classes = ctx.read("classes", "prepare")
-    class_names = dict(zip(classes["class_id"], classes["name"]))
 
     prepared = ctx.inputs["prepare"].dir
     train = pd.read_parquet(prepared / "train.parquet")
@@ -238,8 +228,9 @@ def run(ctx: Context) -> None:
         top_k=cfg.space.top_k,
         cat_cost=cfg.space.cat_cost,
     )
+    graph_points = space.embed(train.iloc[graph_rows])
     train_graph = build_train_graph(
-        space.embed(train.iloc[graph_rows]),
+        graph_points,
         k=cfg.graph.k,
         metric=cfg.distance,
         n_jobs=ctx.runtime.n_jobs,
@@ -251,7 +242,7 @@ def run(ctx: Context) -> None:
         space,
         train,
         graph_rows=graph_rows,
-        class_names=class_names,
+        graph_points=graph_points,
         eval_rows_per_train_row=eval_rows_per_train_row,
     )
     if (labels < 0).any():

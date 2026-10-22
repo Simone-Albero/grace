@@ -109,17 +109,11 @@ def _file_stamps(name: str, cfg: DictConfig) -> dict[str, list[int] | None]:
 
 
 def _intact(directory: Path) -> bool:
-    """Return whether every file in sizes.json exists with its size.
-
-    An execution without the listing (older roots) is taken as intact.
-    """
-    listing = directory / _SIZES
-    if not listing.exists():
-        return True
+    """Return whether every file in sizes.json exists with its size."""
     try:
-        sizes = json.loads(listing.read_text())
+        sizes = json.loads((directory / _SIZES).read_text())
     except (OSError, ValueError):
-        # Cut by a crash: run the stage again.
+        # Missing, or cut by a crash: run the stage again.
         return False
     return all(
         (directory / name).is_file() and (directory / name).stat().st_size == size

@@ -17,7 +17,12 @@ from src.space import scale_for_metric
 
 logger = logging.getLogger(__name__)
 
-_KNN_BATCH_ROWS = 256
+# Distances per k-NN batch: each thread holds a float64 block and an
+# int64 argpartition of this size, so memory follows it, not n_nodes.
+_KNN_BATCH_CELLS = 2**21
+# csgraph reads a zero weight as no edge, so duplicate points would
+# fall apart into single nodes without a floor.
+_MIN_EDGE_WEIGHT = 1e-10
 
 
 def _thread_budget() -> int:
@@ -60,6 +65,7 @@ def nearest_neighbors(
     """
     n_points = points.shape[0]
     effective_k = min(k, nodes.shape[0] - 1)
+    rows_per_batch = max(1, _KNN_BATCH_CELLS // nodes.shape[0])
     scaled_nodes = scale_for_metric(nodes, metric)
     scaled_points = scale_for_metric(points, metric)
 
@@ -67,7 +73,7 @@ def nearest_neighbors(
     distances = np.empty((n_points, effective_k), dtype=np.float64)
 
     def fill_batch(start: int) -> None:
-        end = min(start + _KNN_BATCH_ROWS, n_points)
+        end = min(start + rows_per_batch, n_points)
         distances_to_nodes = cdist(
             scaled_points[start:end], scaled_nodes, metric="euclidean"
         )
@@ -82,7 +88,7 @@ def nearest_neighbors(
         indices[start:end] = np.take_along_axis(candidates, order, axis=1)
         distances[start:end] = np.take_along_axis(candidate_dist, order, axis=1)
 
-    starts = list(range(0, n_points, _KNN_BATCH_ROWS))
+    starts = list(range(0, n_points, rows_per_batch))
     # cdist and argpartition release the GIL, so threads overlap real
     # work; each fills its own slice of `indices` and `distances`, with
     # nothing to lock between them.
@@ -130,7 +136,7 @@ def _symmetrize_knn_graph(
 
     sym_rows = np.concatenate([rows, cols])
     sym_cols = np.concatenate([cols, rows])
-    sym_data = np.concatenate([data, data])
+    sym_data = np.maximum(np.concatenate([data, data]), _MIN_EDGE_WEIGHT)
 
     order = np.lexsort((sym_data, sym_cols, sym_rows))
     sym_rows = sym_rows[order]
@@ -169,7 +175,7 @@ def _bridge_disconnected(
     for component in range(1, n_components):
         component_nodes = np.where(component_of == component)[0]
         bridge_node = int(component_nodes[anchor_dist[component_nodes].argmin()])
-        bridge_dist = max(float(anchor_dist[bridge_node]), 1e-10)
+        bridge_dist = max(float(anchor_dist[bridge_node]), _MIN_EDGE_WEIGHT)
         adjacency[anchor, bridge_node] = bridge_dist
         adjacency[bridge_node, anchor] = bridge_dist
     return adjacency.tocsr()
