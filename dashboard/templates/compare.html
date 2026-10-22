@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Compare{% endblock %}
+{% block body %}
+<h1>Compare</h1>
+<form hx-get="/compare/charts" hx-target="#charts" hx-trigger="load, change"
+      autocomplete="off">
+  {% for key in config_keys %}
+  <label>{{ key }}
+    <select name="{{ key }}">
+      <option value="">all</option>
+      {% for value in options[key] %}<option>{{ value }}</option>{% endfor %}
+    </select>
+  </label>
+  {% endfor %}
+  <label>metric
+    <select name="metric">
+      {% for m in metrics %}
+      <option{% if m == "regressor_spearman" %} selected{% endif %}>{{ m }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>x
+    <select name="x">
+      {% for key in config_keys %}
+      <option{% if key == "classifier" %} selected{% endif %}>{{ key }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>color
+    <select name="color">
+      <option value="">none</option>
+      {% for key in config_keys %}
+      <option{% if key == "clustering" %} selected{% endif %}>{{ key }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>score (RF vs MCP vs ATC)
+    <select name="score">{% for s in scores %}<option>{{ s }}</option>{% endfor %}</select>
+  </label>
+</form>
+<div id="charts"></div>
+{% endblock %}

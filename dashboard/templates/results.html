@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Results{% endblock %}
+{% block body %}
+<h1>Results</h1>
+<form id="filters" hx-get="/" hx-target="#table" hx-trigger="change"
+      hx-include="#table" hx-push-url="true">
+  {% for key in config_keys %}
+  <label>{{ key }}
+    <select name="{{ key }}">
+      <option value="">all</option>
+      {% for value in options[key] %}
+      <option{% if selected[key] == value %} selected{% endif %}>{{ value }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  {% endfor %}
+</form>
+<div id="table">{% include "_results_table.html" %}</div>
+{% endblock %}

@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Runs{% endblock %}
+{% block body %}
+<h1>Runs</h1>
+{% if not runs %}<p class="muted">No run yet.</p>{% else %}
+<div class="scroll">
+<table>
+  <thead><tr>
+    <th>id</th><th>status</th><th>targets</th>
+    {% for key in config_keys %}<th>{{ key }}</th>{% endfor %}
+    <th>started_at</th><th>finished_at</th><th>error</th>
+  </tr></thead>
+  <tbody>
+  {% for r in runs %}
+  <tr>
+    <td><a href="/runs/{{ r.id }}">{{ r.id }}</a></td>
+    <td class="{{ r.status }}">{{ r.status }}</td>
+    <td>{{ r.targets | join(", ") }}</td>
+    {% for key in config_keys %}<td>{{ r[key] }}</td>{% endfor %}
+    <td>{{ r.started_at }}</td><td>{{ r.finished_at or "–" }}</td>
+    <td>{{ (r.error or "")[:120] }}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endif %}
+{% endblock %}

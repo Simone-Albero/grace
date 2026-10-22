@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% block title %}Run {{ run.id }}{% endblock %}
+{% block body %}
+<h1>Run {{ run.id }} <span class="{{ run.status }}">{{ run.status }}</span></h1>
+<p>
+  targets: {{ run.targets | join(", ") }} · started {{ run.started_at }}
+  · finished {{ run.finished_at or "–" }}<br>
+  {% for key in config_keys %}{{ key }}=<b>{{ run[key] }}</b> {% endfor %}
+  {% if has_regions %}· <a href="/runs/{{ run.id }}/regions">regions</a>{% endif %}
+</p>
+{% if run.error %}<pre class="failed">{{ run.error }}</pre>{% endif %}
+<details><summary>config</summary><pre>{{ config }}</pre></details>
+
+<h2>Stages</h2>
+<table>
+  <thead><tr>
+    <th>stage</th><th>execution</th><th>cached</th><th>status</th>
+    <th>started_at</th><th>duration_s</th><th>error</th>
+  </tr></thead>
+  <tbody>
+  {% for s in stages %}
+  <tr>
+    <td>{{ s.stage }}</td><td class="num">{{ s.execution_id }}</td>
+    <td>{{ "yes" if s.cached else "no" }}</td>
+    <td class="{{ s.status }}">{{ s.status }}</td>
+    <td>{{ s.started_at }}</td><td class="num">{{ s.duration_s | num }}</td>
+    <td>{{ (s.error or "")[:120] }}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<h2>Metrics</h2>
+<div class="cols">
+  {% for stage, rows in metrics.items() %}
+  <table>
+    <thead><tr><th colspan="2">{{ stage }}</th></tr></thead>
+    <tbody>
+    {% for name, value in rows %}
+    <tr><td>{{ name }}</td><td class="num">{{ value | num }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% endfor %}
+</div>
+
+{% if classes %}
+<h2>Classes</h2>
+<table>
+  <thead><tr>
+    <th>class</th><th>n_test</th><th>precision</th><th>recall</th><th>f1</th>
+  </tr></thead>
+  <tbody>
+  {% for c in classes %}
+  <tr>
+    <td>{{ c.name }}</td><td class="num">{{ c.n_test }}</td>
+    <td class="num">{{ c.precision | num }}</td><td class="num">{{ c.recall | num }}</td>
+    <td class="num">{{ c.f1 | num }}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+{% if folds %}
+<h2>Regressor folds <span class="muted">(-1 = refit)</span></h2>
+<table>
+  <thead><tr>
+    <th>fold</th><th>n_regions</th><th>spearman</th><th>r2</th><th>mae</th>
+    <th>best_score</th><th>params</th>
+  </tr></thead>
+  <tbody>
+  {% for f in folds %}
+  <tr>
+    <td class="num">{{ f.fold }}</td><td class="num">{{ f.n_regions }}</td>
+    <td class="num">{{ f.spearman | num }}</td><td class="num">{{ f.r2 | num }}</td>
+    <td class="num">{{ f.mae | num }}</td><td class="num">{{ f.best_score | num }}</td>
+    <td>{{ f.params }}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+{% if figures %}
+<h2>Figures</h2>
+<div class="cols">
+  {% for f in figures %}
+  {% set url = "/figures/%d/%s" % (f.execution_id, f.name | urlencode) %}
+  <figure class="figure">
+    {% if f.file.endswith(".pdf") %}
+    <object data="{{ url }}" type="application/pdf" width="100%" height="420">
+      <a href="{{ url }}">{{ f.name }}</a>
+    </object>
+    {% else %}
+    <img src="{{ url }}" alt="{{ f.name }}">
+    {% endif %}
+    <figcaption>{{ f.name }}</figcaption>
+  </figure>
+  {% endfor %}
+</div>
+{% endif %}
+{% endblock %}

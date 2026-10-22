@@ -1,0 +1,6 @@
+kind: ml
+name: naive_bayes
+params:
+  var_smoothing: 1e-9
+grid:
+  var_smoothing: [1e-11, 1e-9, 1e-7]

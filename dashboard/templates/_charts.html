@@ -1,0 +1,9 @@
+{% for figure in figures %}
+<div class="chart"></div>
+<script>
+  Plotly.newPlot(document.currentScript.previousElementSibling, {{ figure.data | tojson }},
+                 {{ figure.layout | tojson }}).then(el => {
+    el.on("plotly_click", e => { const u = e.points[0].customdata; if (u) location = u; });
+  });
+</script>
+{% endfor %}

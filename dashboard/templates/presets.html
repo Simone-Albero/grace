@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Presets{% endblock %}
+{% block body %}
+<h1>Presets</h1>
+<p><a href="/presets/new">New preset</a>
+  <span class="muted">· jobs run with <code>root={{ root }}</code></span></p>
+{% if not presets %}<p class="muted">No preset yet.</p>{% else %}
+<table>
+  <thead><tr><th>name</th><th>command</th><th>updated_at</th><th></th></tr></thead>
+  <tbody>
+  {% for p in presets %}
+  <tr>
+    <td><a href="/presets/{{ p.name }}">{{ p.name }}</a></td>
+    <td><code>{{ p.command }}</code></td>
+    <td>{{ p.updated_at }}</td>
+    <td>
+      <form class="inline" method="post" action="/presets/{{ p.name }}/launch">
+        <button>launch</button></form>
+      <form class="inline" method="post" action="/presets/{{ p.name }}/delete"
+            onsubmit="return confirm('Delete preset {{ p.name }}?')">
+        <button>delete</button></form>
+    </td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endblock %}

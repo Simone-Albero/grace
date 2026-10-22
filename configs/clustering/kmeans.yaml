@@ -1,0 +1,2 @@
+name: kmeans               # centroid-based; n_clusters derived per class
+params: {}

@@ -1,0 +1,6 @@
+kind: ml
+name: linear_svc
+params:
+  max_iter: 2000
+grid:
+  C: [0.01, 0.1, 1.0, 10.0]

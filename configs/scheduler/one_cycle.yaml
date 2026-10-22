@@ -1,0 +1,9 @@
+name: OneCycleLR
+
+params:
+  max_lr: 0.003
+  pct_start: 0.15
+  anneal_strategy: cos
+  epochs: ${fit.training.epochs}
+  steps_per_epoch: auto
+

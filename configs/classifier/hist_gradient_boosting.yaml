@@ -1,0 +1,9 @@
+kind: ml
+name: hist_gradient_boosting
+params:
+  max_iter: 200
+  learning_rate: 0.1
+grid:
+  max_iter: [100, 300, 500]
+  learning_rate: [0.05, 0.1, 0.2]
+  max_depth: [null, 6, 12]

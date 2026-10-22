@@ -1,0 +1,11 @@
+kind: ml
+name: xgboost
+params:
+  n_estimators: 200
+  learning_rate: 0.1
+  max_depth: 6
+  eval_metric: mlogloss
+grid:
+  n_estimators: [100, 300, 500]
+  learning_rate: [0.05, 0.1, 0.2]
+  max_depth: [4, 6, 10]

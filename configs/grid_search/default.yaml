@@ -1,0 +1,3 @@
+scoring: f1_macro
+cv: 5
+max_samples: 50000

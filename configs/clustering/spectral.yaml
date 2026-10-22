@@ -1,0 +1,3 @@
+name: spectral             # k-NN affinity graph, non-convex clusters; n_clusters derived per class; the priciest to sweep
+params:
+  n_neighbors: 10

@@ -1,0 +1,8 @@
+kind: ml
+name: random_forest
+params:
+  n_estimators: 200
+grid:
+  n_estimators: [100, 300, 500]
+  max_depth: [null, 10, 30]
+  min_samples_leaf: [1, 5, 20]

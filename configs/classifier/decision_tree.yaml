@@ -1,0 +1,6 @@
+kind: ml
+name: decision_tree
+params: {}
+grid:
+  max_depth: [null, 10, 20, 40]
+  min_samples_leaf: [1, 5, 20]

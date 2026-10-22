@@ -1,0 +1,5 @@
+top_k_clusters: 10                 # nearest rivals (populations of another class) each region and class is compared with
+max_sample_per_region: 200         # rows a region is measured on when train is larger than graph.max_samples; below that every row is measured
+max_sample_per_class: 2000         # the same for a class
+silhouette_max_samples: 10000      # size of the subsample behind the per-cluster silhouette tail (p5_silhouette, frac_at_risk), when the floor below needs fewer; the floor can exceed it, up to the rows measured
+silhouette_min_per_cluster: 50     # rows per cluster (all of a smaller one), kept even past silhouette_max_samples

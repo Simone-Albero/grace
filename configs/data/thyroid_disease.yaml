@@ -1,0 +1,36 @@
+path: resources/raw_data/thyroid_disease/thyroid_disease.csv
+
+label_col: class
+
+num_cols:
+  - age
+  - sex
+  - on_thyroxine
+  - query_on_thyroxine
+  - on_antithyroid_medication
+  - sick
+  - pregnant
+  - thyroid_surgery
+  - I131_treatment
+  - query_hypothyroid
+  - query_hyperthyroid
+  - lithium
+  - goitre
+  - tumor
+  - hypopituitary
+  - psych
+  - TSH
+  - T3
+  - TT4
+  - T4U
+  - FTI
+
+cat_cols: []
+
+train_frac: 0.4
+val_frac: 0.05    # DL early stopping and the ATC threshold; every failure rate is measured on test
+test_frac: 0.55
+
+min_class_count: 100
+top_n: 32
+hash_buckets: 64

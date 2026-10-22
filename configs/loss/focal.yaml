@@ -1,0 +1,6 @@
+name: focal
+
+params:
+  gamma: 2.0
+  class_weight: auto         # auto: log-damped inverse class frequency of train (none when train is rebalanced) | null: none | a list, one per class
+  label_smoothing: 0.1

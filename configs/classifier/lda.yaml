@@ -1,0 +1,6 @@
+kind: ml
+name: lda
+params:
+  solver: svd
+grid:
+  solver: [svd, lsqr, eigen]

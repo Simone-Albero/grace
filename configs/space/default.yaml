@@ -1,0 +1,2 @@
+top_k: 16          # most frequent codes of each categorical column that get their own one-hot slot; the rest share one
+cat_cost: 1.0      # squared distance a categorical mismatch adds; 1.0 weighs it like one IQR step on a numeric column

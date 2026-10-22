@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Preset{% endblock %}
+{% block body %}
+<h1>{{ "Edit preset " ~ original if original else "New preset" }}</h1>
+{% if error %}<pre class="failed">{{ error }}</pre>{% endif %}
+<form method="post" action="/presets">
+  <input type="hidden" name="original" value="{{ original }}">
+  <label>name
+    <input name="name" value="{{ preset.name }}" pattern="[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}"
+           required></label>
+  <label>targets (stages, separated by spaces)
+    <input name="targets" value="{{ preset.targets | join(' ') }}"
+           placeholder="render render_regress" size="40"></label>
+  <label>overrides (one key=value per line)
+    <textarea name="overrides" rows="5"
+      placeholder="data=synthetic_test&#10;classifier=mlp">{{ preset.overrides | join("\n") }}</textarea></label>
+  <label>sweeps (one key=v1,v2 per line)
+    <textarea name="sweeps" rows="3"
+      placeholder="distance=euclidean,cosine">{{ preset.sweeps | join("\n") }}</textarea></label>
+  <label><span><input type="checkbox" name="force"
+    {% if preset.force %}checked{% endif %}> --force: re-run the targets even when
+    cached</span></label>
+  <div><button>Save</button> <a href="/presets">Cancel</a></div>
+</form>
+<p class="muted">Saving loads every sweep combination (the first save takes a few
+  seconds). <code>root</code> is the dashboard's.</p>
+{% endblock %}

@@ -1,0 +1,7 @@
+kind: ml
+name: knn
+params:
+  n_neighbors: 5
+grid:
+  n_neighbors: [3, 5, 10, 20]
+  weights: [uniform, distance]

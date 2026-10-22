@@ -1,0 +1,30 @@
+groups:                    # the option of each group, configs/<group>/<option>.yaml; `data=nb15_v2` picks another
+  data: cic_2018_v2
+  classifier: mlp
+  space: default
+  graph: default
+  clustering: kmeans
+  loss: focal              # consumed only by DL classifiers
+  optimizer: adamw         # consumed only by DL classifiers
+  scheduler: one_cycle     # consumed only by DL classifiers
+  fit: default             # how the classifier is trained: balancing, epochs, early stopping
+  complexity: default
+  failure_regressor: default
+  grid_search: default
+
+seed: 42
+distance: euclidean        # euclidean | cosine — metric of the graph, the regions and the complexity measures
+figure_format: pdf         # figure file format: pdf (vector, lighter) | png
+root: resources            # grace.db and artifacts/<stage>/<execution id>/ live here; verify uses resources/verify
+
+clustering:                # shared by every algorithm (configs/clustering/<name>.yaml: name and params)
+  max_fit_samples: 20000   # rows a candidate is fitted and scored on; a larger class is subsampled, then refit whole
+  max_regions: 2500        # regions over all classes, shared equally between them
+  min_cluster_floor: 20    # finest n_clusters candidate ≈ class size / this; also the merge floor for undersized clusters and noise, scaled by the scored sample fraction while sweeping
+  hardness_k: 30           # neighbours behind the kDN hardness a candidate's loss is judged on
+
+runtime:                   # where and how fast stages compute, never what: in no cache key
+  device: cpu              # DL classifiers: cpu | cuda | mps
+  n_jobs: -1               # n_jobs of the searches (classifier grid, failure regressor) and of random_forest, knn and xgboost
+  num_workers: 0           # DL dataloader workers; the dataset is in-memory tensors, workers also segfault on macOS
+  pin_memory: false        # DL dataloaders

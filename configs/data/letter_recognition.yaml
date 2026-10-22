@@ -1,0 +1,32 @@
+path: resources/raw_data/letter_recognition/letter_recognition.csv
+
+label_col: lettr
+
+num_cols:
+  - x_box
+  - y_box
+  - width
+  - high
+  - onpix
+  - x_bar
+  - y_bar
+  - x2bar
+  - y2bar
+  - xybar
+  - x2ybr
+  - xy2br
+  - x_ege
+  - xegvy
+  - y_ege
+  - yegvx
+
+cat_cols: []
+
+train_frac: 0.4
+val_frac: 0.05    # DL early stopping and the ATC threshold; every failure rate is measured on test
+test_frac: 0.55
+
+# All 26 classes have 734–813 instances
+min_class_count: 100
+top_n: 32
+hash_buckets: 64

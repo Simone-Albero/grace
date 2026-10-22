@@ -1,0 +1,22 @@
+<div id="job" {% if active %}hx-get="/jobs/{{ job.id }}" hx-trigger="every 2s" hx-swap="outerHTML"{% endif %}>
+<p>status <b class="{{ job.status }}">{{ job.status }}</b>
+  · created {{ job.created_at }} · started {{ job.started_at or "–" }}
+  · finished {{ job.finished_at or "–" }}
+  · returncode {{ "–" if job.returncode is none else job.returncode }}
+  {% if active %}
+  <form class="inline" method="post" action="/jobs/{{ job.id }}/cancel">
+    <button>cancel</button></form>{% endif %}</p>
+{% if job.error %}<pre class="failed">{{ job.error }}</pre>{% endif %}
+<h2>Runs started while it ran</h2>
+{% if not runs %}<p class="muted">None yet.</p>{% else %}
+<ul>
+  {% for r in runs %}
+  <li><a href="/runs/{{ r.id }}">run {{ r.id }}</a>
+    <span class="{{ r.status }}">{{ r.status }}</span>
+    · {{ r.targets | join(", ") }}</li>
+  {% endfor %}
+</ul>
+{% endif %}
+<h2>Log <a href="/jobs/{{ job.id }}/log">full log</a></h2>
+<pre class="log">{{ log }}</pre>
+</div>

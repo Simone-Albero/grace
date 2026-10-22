@@ -1,0 +1,37 @@
+path: resources/raw_data/synthetic/synthetic_test.csv
+
+label_col: label
+
+num_cols:
+  - num_1
+  - num_2
+  - num_3
+  - num_4
+  - num_5
+  - num_6
+  - num_7
+  - num_8
+  - num_9
+  - num_10
+  - num_11
+  - num_12
+  - num_13
+  - num_14
+  - num_15
+  - num_16
+  - num_17
+  - num_18
+  - num_19
+  - num_20
+
+cat_cols:
+  - cat_1
+  - cat_2
+
+train_frac: 0.4
+val_frac: 0.05    # DL early stopping and the ATC threshold; every failure rate is measured on test
+test_frac: 0.55
+
+min_class_count: 3000
+top_n: 128
+hash_buckets: 256

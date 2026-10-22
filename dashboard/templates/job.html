@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block title %}Job {{ job.id }}{% endblock %}
+{% block body %}
+<h1>Job {{ job.id }} <span class="muted">· preset {{ job.preset }}</span></h1>
+<pre>{{ command }}</pre>
+{% include "_job.html" %}
+{% endblock %}

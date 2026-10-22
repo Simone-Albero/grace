@@ -1,0 +1,35 @@
+path: resources/raw_data/bank_marketing/bank_marketing.csv
+
+label_col: y
+
+num_cols:
+  - age
+  - duration
+  - campaign
+  - pdays
+  - previous
+  - emp.var.rate
+  - cons.price.idx
+  - cons.conf.idx
+  - euribor3m
+  - nr.employed
+
+cat_cols:
+  - job
+  - marital
+  - education
+  - default
+  - housing
+  - loan
+  - contact
+  - month
+  - day_of_week
+  - poutcome
+
+train_frac: 0.4
+val_frac: 0.05    # DL early stopping and the ATC threshold; every failure rate is measured on test
+test_frac: 0.55
+
+min_class_count: 100
+top_n: 32
+hash_buckets: 64

@@ -1,0 +1,6 @@
+kind: dl
+name: mlp
+params:
+  max_emb_dim: 64
+  hidden_dims: [128, 64, 32, 16]
+  dropout: 0.1
