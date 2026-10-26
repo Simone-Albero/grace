@@ -1,10 +1,44 @@
 """The pure functions of src/ on toy data."""
 
+import math
+
 import numpy as np
+import pandas as pd
 import pytest
+from pandas.testing import assert_frame_equal
 
 from src import clustering
+from src.data import stratified_holdout
 from src.graph import build_train_graph
+
+
+def test_stratified_holdout_is_stratified_and_deterministic() -> None:
+    """Check the holdout's size, its per-class split and its seed."""
+    rows = pd.DataFrame({"label": np.repeat([0, 1], [80, 20]), "x": np.arange(100)})
+    fit, holdout = stratified_holdout(
+        rows, holdout_frac=0.1, label_col="label", random_state=0
+    )
+    assert len(holdout) == math.ceil(0.1 * len(rows))
+    assert len(fit) + len(holdout) == len(rows)
+    assert holdout["label"].value_counts().to_dict() == {0: 8, 1: 2}
+    fit_again, holdout_again = stratified_holdout(
+        rows, holdout_frac=0.1, label_col="label", random_state=0
+    )
+    assert_frame_equal(holdout, holdout_again)
+    assert_frame_equal(fit, fit_again)
+    # A different seed must draw different rows, not just give the
+    # same result independently of random_state.
+    _, holdout_other_seed = stratified_holdout(
+        rows, holdout_frac=0.1, label_col="label", random_state=1
+    )
+    assert not holdout_other_seed["x"].equals(holdout["x"])
+
+
+def test_stratified_holdout_rejects_a_split_too_small_for_its_classes() -> None:
+    """Check it names the condition, not sklearn's own opaque error."""
+    rows = pd.DataFrame({"label": np.repeat([0, 1, 2], 10), "x": np.arange(30)})
+    with pytest.raises(ValueError, match="holdout_frac"):
+        stratified_holdout(rows, holdout_frac=0.05, label_col="label", random_state=0)
 
 
 def test_duplicate_points_join_inside_the_mst() -> None:

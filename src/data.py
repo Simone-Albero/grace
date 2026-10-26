@@ -7,11 +7,13 @@ __all__ = [
     "drop_nans",
     "drop_rare_classes",
     "ml_split",
+    "stratified_holdout",
     "subsample_per_class",
     "undersample_classes",
 ]
 
 import hashlib
+import math
 
 import numpy as np
 import pandas as pd
@@ -134,6 +136,44 @@ def ml_split(
         stratify=rest[label_col],
     )
     return train, val, test
+
+
+def stratified_holdout(
+    rows: pd.DataFrame, *, holdout_frac: float, label_col: str, random_state: int
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Split a table into a fit part and a stratified holdout.
+
+    Args:
+        rows: The table to split.
+        holdout_frac: The share of rows held out.
+        label_col: The label column, which stratifies the split.
+        random_state: The seed of the split.
+
+    Returns:
+        The fit rows and the holdout rows.
+
+    Raises:
+        ValueError: A class has fewer than two rows, or either side of
+            the split would hold fewer rows than there are classes, so
+            stratification could not keep every class on both sides.
+    """
+    counts = rows[label_col].value_counts()
+    n_holdout = math.ceil(holdout_frac * len(rows))
+    n_fit = len(rows) - n_holdout
+    if counts.min() < 2 or n_fit < len(counts) or n_holdout < len(counts):
+        raise ValueError(
+            f"{len(rows)} rows of {len(counts)} classes (smallest {counts.min()}) "
+            f"split by holdout_frac={holdout_frac} into {n_fit} fit and {n_holdout} "
+            "holdout row(s) cannot keep every class on both sides: lower holdout_frac "
+            "or give it more rows."
+        )
+    fit, holdout = train_test_split(
+        rows,
+        test_size=holdout_frac,
+        random_state=random_state,
+        stratify=rows[label_col],
+    )
+    return fit, holdout
 
 
 class LogTransformer(BaseEstimator, TransformerMixin):

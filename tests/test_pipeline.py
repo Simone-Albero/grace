@@ -220,6 +220,8 @@ def test_failed_stage_rolls_back(
         (["loss.name=nope"], ["prepare"]),
         (["fit.training.epochs=0"], ["prepare"]),
         (["fit.training.early_stopping.min_delta=-1"], ["prepare"]),
+        (["fit.training.early_stopping.holdout=0"], ["prepare"]),
+        (["fit.training.early_stopping.holdout=1"], ["prepare"]),
         (["fit.training.max_grad_norm=0"], ["prepare"]),
         (["fit.balance=oversample"], ["prepare"]),
         (["runtime.num_workers=-1"], ["prepare"]),
@@ -251,7 +253,7 @@ def test_config_errors(
         (["scheduler.name=Nope"], "scheduler.name"),
         (["scheduler.name=LRScheduler"], "scheduler.name"),
         (["fit.training.dataloader.batch_size=1"], "batch_size"),
-        (["fit.validation.dataloader.batch_size=0"], "batch_size"),
+        (["fit.training.early_stopping.dataloader.batch_size=0"], "batch_size"),
         (["runtime.device=cuda:x"], "runtime.device"),
         (["clustering.params=5"], "must be a mapping"),
         (

@@ -42,7 +42,7 @@ split → prepare → regions → classify → failures → baselines → render
 | `split` | | `data.{path,label_col,num_cols,cat_cols,min_class_count,train_frac,val_frac,test_frac}`, `seed` | `{train,val,test}.parquet` | `features`, `metrics` |
 | `prepare` | split | `data.top_n`, `data.hash_buckets` | `{train,val,test}.parquet`, `preprocessor.joblib` | `classes` |
 | `regions` | split, prepare | `space`, `graph`, `clustering`, `distance`, `seed` | `space.joblib`, `graph.npz`, `centroids.parquet`, `assignments.parquet` | `regions`, `class_clusterings`, `metrics` |
-| `classify` | split, prepare | `classifier`, `fit.balance`, `fit.n_samples`, `seed`, plus `grid_search` (ML) or `loss`, `optimizer`, `scheduler`, `fit.training`, `fit.validation`, `data.top_n`, `data.hash_buckets` (DL) | `predictions.parquet`, `model/` | `class_metrics`, `classifier_grid`, `history`, `metrics` |
+| `classify` | split, prepare | `classifier`, `fit.balance`, `fit.n_samples`, `seed`, plus `grid_search` (ML) or `loss`, `optimizer`, `scheduler`, `fit.training`, `data.top_n`, `data.hash_buckets` (DL) | `predictions.parquet`, `model/` | `class_metrics`, `classifier_grid`, `history`, `metrics` |
 | `failures` | prepare, regions, classify | none | none | `failures`, `metrics` |
 | `baselines` | prepare, regions, classify, failures | `failure_regressor.min_eval_support` | none | `baselines`, `metrics` |
 | `complexity` | prepare, regions | `complexity`, `graph.k`, `distance`, `seed` | none | `complexity`, `metrics` |
@@ -52,7 +52,7 @@ split → prepare → regions → classify → failures → baselines → render
 - **split** drops rows with missing or infinite values, drops the classes with fewer than `min_class_count` rows, and splits the rest stratified by class into train, validation and test.
 - **prepare** is preprocessing only. A signed log and a robust scaler for the numerical columns, a top-N plus hash encoder for the categorical ones, and the integer class labels are all fitted on train and applied to the three splits.
 - **regions** builds the euclidean space regions live in (the prepared numerical features plus a one-hot block for the `space.top_k` most frequent codes of each categorical feature), a k-nearest-neighbour graph of a uniform sample of train, and clusters each class of train on its own. The granularity (number of clusters, or the density-based parameters) is the candidate of the clustering grid with the least loss: the hardness spread a region's mean hides plus the sampling noise of its test failure rate (see [Method](#method)); the hardness of a row being the share of its `clustering.hardness_k` nearest training neighbours that belong to another class (kDN). Undersized clusters and noise points merge into the nearest region of the same class. Validation and test rows are then routed to the nearest region centre **without their labels**.
-- **classify** trains one classifier on train (undersampled when `fit.balance` says so) and predicts validation and test. An ML classifier with a `grid` is tuned by cross-validated grid search and refit with the winner; the MLP trains with early stopping on validation.
+- **classify** trains one classifier on train (undersampled when `fit.balance` says so) and predicts validation and test. An ML classifier with a `grid` is tuned by cross-validated grid search and refit with the winner; the MLP stops early on a holdout of its training rows, stratified by class (`fit.training.early_stopping.holdout`), so no classifier learns from a validation label.
 - **failures** counts the classifier's errors on the test rows routed to each region. Failure rates are measured on test only.
 - **baselines** predicts each region's failure rate from the classifier's probabilities alone: MCP (the mean of 1 minus the maximum class probability of the region's test rows) and ATC (the share of the region's test rows under a confidence threshold fitted on validation). It scores both against the observed rates on the regions with at least `failure_regressor.min_eval_support` test rows (the *used* regions, the ones the regressor is scored on too) and fails if there is none.
 - **complexity** describes every region and every class on its train rows (see [Method](#method)).
@@ -186,7 +186,7 @@ The file has 69,500 rows, 10 classes, 20 numerical and 2 categorical features; t
 
 To add a dataset, place the CSV under `resources/raw_data/`, copy a YAML from `configs/data/`, set `path` and the columns, and run with `data=<name>`.
 
-Every shipped configuration splits 40 % train, 5 % validation, 55 % test. The test split is kept large because it is the only one the regressor's target, every region's failure rate, is measured on. Measured on `nb15_v2` (2.39 million rows) with random_forest and `runtime.n_jobs=16`: about 6.5 minutes end to end, peak memory about 10 GB.
+Every shipped configuration splits 40 % train, 15 % validation, 45 % test. No classifier trains on validation; its labels fit the ATC threshold. The test split is kept large because it is the only one the regressor's target, every region's failure rate, is measured on. Measured on `nb15_v2` (2.39 million rows) with random_forest and `runtime.n_jobs=16`: about 6.5 minutes end to end, peak memory about 10 GB.
 
 ## Extending
 

@@ -200,6 +200,32 @@ def test_routing_is_label_free(tmp_path: Path) -> None:
     assert_frame_equal(second, first)
 
 
+def test_classify_never_trains_on_val_labels(tmp_path: Path) -> None:
+    """Check that every classify prediction ignores val's labels."""
+    cfg = fast_cfg(
+        tmp_path,
+        "classifier=mlp",
+        "fit.training.epochs=4",
+        "fit.training.early_stopping.patience=1",
+    )
+    run(["classify"], cfg, force=False)
+    first = pd.read_parquet(tmp_path / "artifacts/classify/3/predictions.parquet")
+
+    rng = np.random.default_rng(0)
+    prepared = tmp_path / "artifacts/prepare/2"
+    sizes = json.loads((prepared / "sizes.json").read_text())
+    path = prepared / "val.parquet"
+    rows = pd.read_parquet(path)
+    rows["label"] = rng.permutation(rows["label"].to_numpy())
+    rows.to_parquet(path, index=False)
+    sizes[path.name] = path.stat().st_size
+    # Else prepare would rerun, undoing the edit.
+    (prepared / "sizes.json").write_text(json.dumps(sizes))
+    run(["classify"], cfg, force=True)
+    second = pd.read_parquet(tmp_path / "artifacts/classify/4/predictions.parquet")
+    assert_frame_equal(second, first)
+
+
 def test_mlp_trains_and_saves_only_model_pt(root: Path) -> None:
     """Check that an MLP trains its epochs and saves only model.pt."""
     run(
@@ -214,7 +240,8 @@ def test_mlp_trains_and_saves_only_model_pt(root: Path) -> None:
             f"SELECT name, value FROM metrics WHERE execution_id = {execution}",
         )
     )
-    # Patience 5 cannot stop it within 2 epochs.
+    # n_fit is the rows the model actually trained on: for DL, the
+    # holdout is already out. Patience 5 cannot stop it within 2 epochs.
     steps = 2 * math.ceil(metrics["n_fit"] / 512)
     history = f"SELECT COUNT(*) FROM history WHERE execution_id = {execution}"
     assert _scalar(root, history) == steps
@@ -231,8 +258,23 @@ def test_mlp_trains_on_a_one_row_last_batch(root: Path) -> None:
         "SELECT value FROM metrics JOIN executions ON executions.id = execution_id "
         "WHERE stage = 'classify' AND name = 'n_fit' ORDER BY executions.id LIMIT 1",
     )
-    # As n_fit % (n_fit - 1) == 1, the last batch of every epoch has
-    # one row.
-    batch_size = f"fit.training.dataloader.batch_size={int(n_fit) - 1}"
-    cfg = fast_cfg(root, "classifier=mlp", "fit.training.epochs=1", batch_size)
+    holdout_frac = fast_cfg(root).fit.training.early_stopping.holdout
+    # A guess at the post-holdout row count, matching
+    # train_test_split's own ceil rounding of the held-out share, sized
+    # so n_train % batch_size == 1; checked against the real count
+    # below instead of trusted, so a rounding drift fails loudly.
+    batch_size = int(n_fit) - math.ceil(holdout_frac * n_fit) - 1
+    cfg = fast_cfg(
+        root,
+        "classifier=mlp",
+        "fit.training.epochs=1",
+        f"fit.training.dataloader.batch_size={batch_size}",
+    )
     run(["classify"], cfg, force=False)
+    execution = _scalar(root, "SELECT MAX(id) FROM executions WHERE stage = 'classify'")
+    n_train = _scalar(
+        root,
+        f"SELECT value FROM metrics WHERE execution_id = {execution} "
+        "AND name = 'n_fit'",
+    )
+    assert n_train % batch_size == 1

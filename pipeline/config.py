@@ -263,6 +263,11 @@ def _validate_fit(fit: DictConfig) -> None:
         _is_number(min_delta) and min_delta >= 0,
         f"fit.training.early_stopping.min_delta {min_delta!r} must be a number >= 0.",
     )
+    holdout = training.early_stopping.holdout
+    _check(
+        _is_number(holdout) and 0 < holdout < 1,
+        f"fit.training.early_stopping.holdout {holdout!r} must be a number in (0, 1).",
+    )
     max_grad_norm = training.max_grad_norm
     _check(
         _is_number(max_grad_norm) and max_grad_norm > 0,
@@ -274,11 +279,11 @@ def _validate_fit(fit: DictConfig) -> None:
         f"fit.training.dataloader.batch_size {batch_size!r} must be an integer >= 2 "
         "(BatchNorm needs 2 rows per batch).",
     )
-    val_batch_size = fit.validation.dataloader.batch_size
+    holdout_batch_size = training.early_stopping.dataloader.batch_size
     _check(
-        _is_int(val_batch_size, 1),
-        f"fit.validation.dataloader.batch_size {val_batch_size!r} must be an "
-        "integer > 0.",
+        _is_int(holdout_batch_size, 1),
+        f"fit.training.early_stopping.dataloader.batch_size {holdout_batch_size!r} "
+        "must be an integer > 0.",
     )
 
 

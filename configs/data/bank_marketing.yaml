@@ -27,8 +27,8 @@ cat_cols:
   - poutcome
 
 train_frac: 0.4
-val_frac: 0.05    # DL early stopping and the ATC threshold; every failure rate is measured on test
-test_frac: 0.55
+val_frac: 0.15     # the label budget: the ATC threshold is fitted here, and no classifier trains on it
+test_frac: 0.45    # the only split the regressor and the baselines are judged against
 
 min_class_count: 100
 top_n: 32

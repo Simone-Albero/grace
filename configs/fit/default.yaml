@@ -12,8 +12,7 @@ training:                # DL classifiers only
   early_stopping:
     patience: 5
     min_delta: 0.001
-
-validation:              # DL classifiers only
-  dataloader:
-    batch_size: 512
-    shuffle: false
+    holdout: 0.1         # share of the (balanced) train split held out to stop on, stratified by class
+    dataloader:
+      batch_size: 512
+      shuffle: false

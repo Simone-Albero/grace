@@ -303,7 +303,7 @@ def _train_epoch(
     return losses
 
 
-def _val_loss(
+def _holdout_loss(
     model: nn.Module,
     loader: DataLoader,
     *,
@@ -323,7 +323,7 @@ def _val_loss(
 def train(
     model: nn.Module,
     train_loader: DataLoader,
-    val_loader: DataLoader,
+    holdout_loader: DataLoader,
     *,
     loss_fn: nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -334,21 +334,22 @@ def train(
     min_delta: float,
     device: torch.device,
 ) -> list[float]:
-    """Train with early stopping on val loss, keeping the best epoch.
+    """Train with early stopping on the holdout's loss, best epoch kept.
 
     Args:
         model: The model, trained in place; it ends with the weights of
-            the first epoch of least val loss.
+            the first epoch of least holdout loss.
         train_loader: The train batches.
-        val_loader: The validation batches.
-        loss_fn: The loss, for both splits.
+        holdout_loader: The early-stopping holdout's batches.
+        loss_fn: The loss, for both loaders.
         optimizer: The optimizer, stepped once per batch.
         scheduler: The learning-rate schedule, stepped once per batch.
         epochs: The most epochs to run.
         max_grad_norm: The gradient norm clipped to.
-        patience: The epochs without a val-loss gain of `min_delta`
+        patience: The epochs without a holdout-loss gain of `min_delta`
             that stop the training.
-        min_delta: The smallest val-loss gain that resets the patience.
+        min_delta: The smallest holdout-loss gain that resets the
+            patience.
         device: The device of the batches.
 
     Returns:
@@ -372,18 +373,20 @@ def train(
             device=device,
         )
         history += losses
-        val_loss = _val_loss(model, val_loader, loss_fn=loss_fn, device=device)
+        holdout_loss = _holdout_loss(
+            model, holdout_loader, loss_fn=loss_fn, device=device
+        )
         logger.info("Epoch [%d] Train Loss: %.6f", epoch, _mean(losses))
-        logger.info("Epoch [%d] Val Loss: %.6f", epoch, val_loss)
+        logger.info("Epoch [%d] Holdout Loss: %.6f", epoch, holdout_loss)
 
         # Strict < keeps the earliest of tied best epochs.
-        if best_state is None or val_loss < best_loss:
-            best_loss, best_epoch = val_loss, epoch
+        if best_state is None or holdout_loss < best_loss:
+            best_loss, best_epoch = holdout_loss, epoch
             best_state = {
                 name: tensor.detach().clone()
                 for name, tensor in model.state_dict().items()
             }
-        score = -val_loss
+        score = -holdout_loss
         if stop_score is None:
             stop_score = score
         elif score <= stop_score + min_delta:
@@ -396,7 +399,7 @@ def train(
             stop_score, stale = score, 0
 
     model.load_state_dict(best_state)
-    logger.info("Best epoch %d (val loss %.6f) restored.", best_epoch, best_loss)
+    logger.info("Best epoch %d (holdout loss %.6f) restored.", best_epoch, best_loss)
     return history
 
 

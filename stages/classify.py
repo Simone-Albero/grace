@@ -3,7 +3,8 @@
 Artifacts: predictions (val and test) and the model. DB rows written:
 `class_metrics`, `classifier_grid` (ML grid search), `history` (DL
 train loss) and metrics from the test predictions (accuracy,
-macro/weighted precision, recall, f1), n_fit and, after a grid search,
+macro/weighted precision, recall, f1), n_fit (the rows the model fit
+on, the DL early-stopping holdout excluded) and, after a grid search,
 best_score.
 """
 
@@ -22,7 +23,7 @@ from sklearn.pipeline import Pipeline
 from torch import nn
 
 from src import dl, ml
-from src.data import subsample_per_class, undersample_classes
+from src.data import stratified_holdout, subsample_per_class, undersample_classes
 from src.scores import compute_classification_metrics
 from stages import LABEL, SPLITS, Context
 
@@ -36,7 +37,6 @@ _DL_ONLY = (
     "optimizer",
     "scheduler",
     "fit.training",
-    "fit.validation",
     # The embedding cardinalities are top_n + hash_buckets.
     "data.top_n",
     "data.hash_buckets",
@@ -139,28 +139,38 @@ def _fit_ml(
 def _fit_dl(
     ctx: Context,
     fit_rows: pd.DataFrame,
-    val: pd.DataFrame,
     *,
     num_cols: list[str],
     cat_cols: list[str],
     n_classes: int,
     params: Mapping[str, object],
-) -> tuple[nn.Module, list[float]]:
-    """Train the DL classifier with early stopping on val.
+) -> tuple[nn.Module, list[float], int]:
+    """Train the DL classifier, early stopping on a holdout of train.
+
+    Stopping on val would pick the epoch that suits val best and bias
+    every estimate made from val's labels.
 
     Returns:
-        The model at its best epoch and the loss of every step.
+        The model at its best epoch, the loss of every step and the
+        number of rows it actually trained on (`fit_rows` less the
+        holdout).
     """
     cfg, runtime = ctx.cfg, ctx.runtime
     device = torch.device(runtime.device)
     logger.info("Training %s ...", cfg.classifier.name)
+    train_rows, holdout_rows = stratified_holdout(
+        fit_rows,
+        holdout_frac=cfg.fit.training.early_stopping.holdout,
+        label_col=LABEL,
+        random_state=cfg.seed,
+    )
 
     loss_params = OmegaConf.to_container(cfg.loss.params, resolve=True)
     if loss_params.get("class_weight") == "auto":
-        # A rebalanced split trains unweighted; otherwise `fit_rows` is
-        # the train split.
+        # A rebalanced split trains unweighted; otherwise `train_rows`
+        # keeps the class shares of the train split.
         if cfg.fit.balance == "none" and cfg.fit.n_samples is None:
-            weight_by_class = dl.class_weights(fit_rows[LABEL])
+            weight_by_class = dl.class_weights(train_rows[LABEL])
             loss_params["class_weight"] = [
                 weight_by_class[class_id] for class_id in range(n_classes)
             ]
@@ -197,15 +207,15 @@ def _fit_dl(
         isinstance(module, nn.BatchNorm1d) for module in model.modules()
     )
     train_batching["drop_last"] = (
-        has_batch_norm and len(fit_rows) % train_batching["batch_size"] == 1
+        has_batch_norm and len(train_rows) % train_batching["batch_size"] == 1
     )
     train_loader = dl.build_loader(
-        fit_rows, **column_options, **train_batching, **loader_options
+        train_rows, **column_options, **train_batching, **loader_options
     )
-    val_loader = dl.build_loader(
-        val,
+    holdout_loader = dl.build_loader(
+        holdout_rows,
         **column_options,
-        **OmegaConf.to_container(cfg.fit.validation.dataloader),
+        **OmegaConf.to_container(cfg.fit.training.early_stopping.dataloader),
         **loader_options,
     )
 
@@ -223,7 +233,7 @@ def _fit_dl(
     history = dl.train(
         model,
         train_loader,
-        val_loader,
+        holdout_loader,
         loss_fn=loss_fn,
         optimizer=optimizer,
         scheduler=scheduler,
@@ -233,7 +243,7 @@ def _fit_dl(
         min_delta=training.early_stopping.min_delta,
         device=device,
     )
-    return model, history
+    return model, history, len(train_rows)
 
 
 def _predict(
@@ -346,12 +356,12 @@ def run(ctx: Context) -> None:
             ctx, fit_rows, num_cols=num_cols, cat_cols=cat_cols, params=params
         )
         losses = []
+        n_fit = len(fit_rows)
         joblib.dump(model, model_dir / "model.joblib")
     else:
-        model, losses = _fit_dl(
+        model, losses, n_fit = _fit_dl(
             ctx,
             fit_rows,
-            val,
             num_cols=num_cols,
             cat_cols=cat_cols,
             n_classes=n_classes,
@@ -387,7 +397,7 @@ def run(ctx: Context) -> None:
     metrics = compute_classification_metrics(y_true, predicted["test"][0])
     per_class = pd.DataFrame(metrics.pop("classes"))
     ctx.write("class_metrics", per_class)
-    metrics["n_fit"] = len(fit_rows)
+    metrics["n_fit"] = n_fit
     if summary is not None:
         metrics["best_score"] = summary["best_score"]
         ctx.write("classifier_grid", _grid_table(summary))
