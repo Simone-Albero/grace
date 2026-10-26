@@ -175,6 +175,41 @@ def test_class_missing_from_edges_gets_its_own_group() -> None:
     assert bins[2] not in bins[:2]
 
 
+def test_class_bins_stay_consistent_across_a_split_call() -> None:
+    """Check one call on two row sets' union, then split, numbers alike.
+
+    `assign_class_bins` numbers a call's groups from the classes that
+    call is given, so calling it separately on two row sets that
+    predict different classes is not guaranteed to agree on an id; a
+    caller with two sets to route (such as val and test) must instead
+    call it once on their union and split the result.
+    """
+    first_confidence = np.array([0.6, 0.65, 0.3, 0.35])
+    first_predicted = np.array([0, 0, 2, 2])
+    second_confidence = np.array([0.62, 0.5, 0.32, 0.4])
+    second_predicted = np.array([0, 1, 2, 2])  # class 1 only here.
+    edges = partitions.class_confidence_edges(
+        first_confidence, first_predicted, n_bins=2
+    )
+
+    confidence = np.concatenate([first_confidence, second_confidence])
+    predicted = np.concatenate([first_predicted, second_predicted])
+    group = partitions.assign_class_bins(confidence, predicted, edges)
+    first_group, second_group = np.split(group, [len(first_confidence)])
+
+    for class_id in (0, 1, 2):
+        ids = np.concatenate(
+            [
+                first_group[first_predicted == class_id],
+                second_group[second_predicted == class_id],
+            ]
+        )
+        # Every row of a class gets the same id, wherever it came from.
+        assert (ids == ids[0]).all()
+    own_ids = {class_id: group[predicted == class_id][0] for class_id in (0, 1, 2)}
+    assert len(set(own_ids.values())) == len(own_ids)
+
+
 def test_apportion_sums_to_the_total() -> None:
     """Check the largest-remainder shares always sum to the total."""
     cases = [

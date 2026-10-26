@@ -32,10 +32,11 @@ The default `data` in [configs/config.yaml](configs/config.yaml) is `cic_2018_v2
 
 ```
 split → prepare → regions → classify → failures → baselines → render
+                     │         └→ partitions                    │
                      └→ complexity → regress ───────────────────┘
 ```
 
-`render` reads `complexity` and `regress` only to draw the regressor's figures, which `regressor_figures` (true by default) turns on. With `regressor_figures=false` it reads neither, so a run can stop after the baselines.
+`render` reads `complexity` and `regress` only to draw the regressor's figures, which `regressor_figures` (true by default) turns on. With `regressor_figures=false` it reads neither, so a run can stop after the baselines. `partitions` reads prepare, regions and classify, and no stage reads it, so `render` does not run it: name it as a target of its own, as in `python -m stages render partitions data=synthetic_test`.
 
 | Stage | Reads | Config keys | Files written | DB tables written |
 |---|---|---|---|---|
@@ -48,6 +49,7 @@ split → prepare → regions → classify → failures → baselines → render
 | `complexity` | prepare, regions | `complexity`, `graph.k`, `distance`, `seed` | none | `complexity`, `metrics` |
 | `regress` | regions, complexity, failures, baselines | `failure_regressor`, `seed` | `model.joblib` | `estimates`, `regressor_folds`, `importances`, `metrics` |
 | `render` | prepare, regions, classify, failures, baselines, plus complexity and regress when `regressor_figures` is true | `figure_format`, `regressor_figures` | `figures/` | `figures`, `metrics` |
+| `partitions` | prepare, regions, classify | `clustering.{min_cluster_floor,hardness_k,max_fit_samples}`, `distance`, `seed`, `partitions` | none | `partitions`, `partition_class_levels`, `partition_groups`, `metrics` |
 
 - **split** drops rows with missing or infinite values, drops the classes with fewer than `min_class_count` rows, and splits the rest stratified by class into train, validation and test.
 - **prepare** is preprocessing only. A signed log and a robust scaler for the numerical columns, a top-N plus hash encoder for the categorical ones, and the integer class labels are all fitted on train and applied to the three splits.
@@ -58,6 +60,7 @@ split → prepare → regions → classify → failures → baselines → render
 - **complexity** describes every region and every class on its train rows (see [Method](#method)).
 - **regress** learns each region's validation rate with a Random Forest on its descriptors and its class's, on every region with a validation row, each weighted by how many it has, under nested cross-validation (a randomized search inside each outer fold), and refits the forest on all of them. Those regions are predicted out of fold; a used region with no validation row is predicted by the refit, which never saw it. The predictions are scored against the test rates of the used regions, and the log sets the scores against those of the baselines, which it reads, not recomputes.
 - **render** draws the static figures of the classifier and the baselines: confusion matrix, F1 per class, the loss of a DL classifier, the val rate, MCP and ATC against the test rates, and the test rate of the regions of each class (box and strip plot, a point's area is its test rows). With `regressor_figures` it also draws the regressor's: predicted against test rates, the scores of the four predictors, the forest's feature importances and the distribution of the most important descriptors.
+- **partitions** compares five ways of grouping the validation and test rows that read none of their labels. Each group's failure rate is estimated on its validation rows (the global validation error rate for a group with none) and scored against the failures of its test rows. `intra` clusters each class of train with k-means, whatever the `clustering` option, and `inter` all of train, each at seven levels: the finest aims at `clustering.min_cluster_floor` rows per group, each next one at twice as many, and undersized groups merge. Both also keep the grouping of least loss, the loss that regions minimizes (see [Method](#method)): `inter` its best level, `intra` each class at its own best level. `null`, the floor of both, splits train into the Voronoi cells of randomly drawn train rows at `inter`'s group counts, `partitions.null_draws` times, and keeps its best level per draw. In these three arms validation and test rows are routed to the nearest group centre, as in regions. `confidence` bins the classifier's top class probability at equal validation mass over all rows, and `predicted_class` within each predicted class (at least one bin each, shared out by their validation rows), each with 15 bins (`fixed15`), the cube root of the validation rows (`cbrt`) or one per 150 of them (`per150`). Every grouping gets its Brier score on test, split into uncertainty, resolution and reliability, its skill (the share of the Brier score of the global validation error rate it avoids) and its AUROC; the three geometric arms also their loss and the Spearman correlation of each group's mean training kDN with its test rate.
 
 ## CLI
 
@@ -86,7 +89,7 @@ python -m stages render data=synthetic_test root=resources/other runtime.n_jobs=
 
 ## Configuration
 
-[configs/](configs/) holds one folder per group, one YAML per option: `data` (10), `classifier` (10), `clustering` (4), `space`, `graph`, `complexity`, `failure_regressor`, `fit`, `grid_search`, `loss`, `optimizer`, `scheduler`. [configs/config.yaml](configs/config.yaml) chooses the option of each group (`groups`) and holds `seed`, `distance` (`euclidean` or `cosine`), `figure_format` (`pdf` or `png`), `regressor_figures` (whether `render` also draws the regressor's figures), `root`, `runtime.*` and the `clustering` keys every algorithm shares (`max_fit_samples`, `max_regions`, `min_cluster_floor`, `hardness_k`). `runtime` says how fast stages compute, never what: `n_jobs` (the classifier grid search, the failure regressor search, the k-NN searches of regions and complexity, and the fit of random_forest, knn and xgboost), `device`, `num_workers` and `pin_memory` (DL only).
+[configs/](configs/) holds one folder per group, one YAML per option: `data` (10), `classifier` (10), `clustering` (4), `space`, `graph`, `complexity`, `failure_regressor`, `fit`, `grid_search`, `loss`, `optimizer`, `scheduler`, `partitions`. [configs/config.yaml](configs/config.yaml) chooses the option of each group (`groups`) and holds `seed`, `distance` (`euclidean` or `cosine`), `figure_format` (`pdf` or `png`), `regressor_figures` (whether `render` also draws the regressor's figures), `root`, `runtime.*` and the `clustering` keys every algorithm shares (`max_fit_samples`, `max_regions`, `min_cluster_floor`, `hardness_k`). `runtime` says how fast stages compute, never what: `n_jobs` (the classifier grid search, the failure regressor search, the k-NN searches of regions and complexity, and the fit of random_forest, knn and xgboost), `device`, `num_workers` and `pin_memory` (DL only).
 
 `pipeline/config.py` loads the YAML files, applies the overrides and validates the whole config in one place, so a bad key, type or range of the pipeline's own settings fails before anything runs, with the valid values in the message. Values passed through to a library as they are (`classifier.params` and `grid` values, `optimizer.params`, `scheduler.params`, `clustering.params` values, `failure_regressor.params`) are checked by that library when their stage runs. So are the columns against the CSV (split) and the length of a `loss.params.class_weight` list (classify, which knows the classes). The config is strict: an unknown key fails. Add a new key (including `classifier.params.*`, `clustering.params.*` and `failure_regressor.params.*`, which cannot be introduced from the command line) to a YAML first.
 
@@ -110,6 +113,7 @@ There are no migrations: after a schema change, delete the DB and its artifacts.
 | `failures`, `baselines`, `estimates` | per region, validation and test rows, errors and failure rates; whether it is scored, its val rate, MCP and ATC; the Random Forest prediction and the outer fold that held the region out (empty when the refit predicted it) |
 | `regressor_folds`, `importances` | the outer folds (fold -1 is the refit); the mean feature importances |
 | `figures` | the figure files of a render execution |
+| `partitions`, `partition_class_levels`, `partition_groups` | per arm, rule, level and draw of the partitions stage: the groups asked for and realized, the loss, the 10th, 50th and 90th percentiles of the groups' validation rates, the share of test rows in a group with no validation row and the scores on test; per class and level of `intra`, its clusters, its loss and whether it was selected; per group of each arm's selected grouping and of each bin rule (of `null`, the first draw only), its rows per split, validation and test rates and mean kDN |
 | `presets`, `jobs` | dashboard presets and their background jobs |
 
 For example, the Spearman correlation of the four predictors with the test failure rates, per run:

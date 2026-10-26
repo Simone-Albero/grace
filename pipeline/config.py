@@ -158,6 +158,7 @@ def validate(cfg: DictConfig) -> None:
     _validate_regions(cfg)
     _validate_regressor(cfg.failure_regressor)
     _validate_runtime(cfg.runtime)
+    _validate_partitions(cfg.partitions)
 
 
 def _validate_data(data: DictConfig) -> None:
@@ -472,6 +473,14 @@ def _validate_runtime(runtime: DictConfig) -> None:
     _check(
         isinstance(runtime.pin_memory, bool),
         f"runtime.pin_memory {runtime.pin_memory!r} must be true or false.",
+    )
+
+
+def _validate_partitions(partitions: DictConfig) -> None:
+    """Check the `partitions` section."""
+    _check(
+        _is_int(partitions.null_draws, 1),
+        f"partitions.null_draws {partitions.null_draws!r} must be an integer > 0.",
     )
 
 

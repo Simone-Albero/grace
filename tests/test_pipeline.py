@@ -229,6 +229,7 @@ def test_failed_stage_rolls_back(
         (["failure_regressor.n_outer_splits=1"], ["prepare"]),
         (["failure_regressor.param_grid.max_depth=5"], ["prepare"]),
         (["failure_regressor.n_iter=0"], ["prepare"]),
+        (["partitions.null_draws=0"], ["prepare"]),
         ([], ["bogus"]),
     ],
 )
@@ -284,10 +285,24 @@ def test_render_reads_the_regressor_only_when_asked() -> None:
     """Check that regressor_figures decides what render runs after."""
     with_regressor = load_config(["data=synthetic_test"])
     without_regressor = load_config(["data=synthetic_test", "regressor_figures=false"])
-    assert plan(["render"], with_regressor) == list(STAGES)
+    # render never reads partitions: it is its own, independent target.
+    non_partition_stages = [stage for stage in STAGES if stage != "partitions"]
+    assert plan(["render"], with_regressor) == non_partition_stages
     skipped = {"complexity", "regress"}
     assert plan(["render"], without_regressor) == [
-        stage for stage in STAGES if stage not in skipped
+        stage for stage in non_partition_stages if stage not in skipped
+    ]
+
+
+def test_plan_partitions_skips_the_regressor_chain() -> None:
+    """Check that partitions plans only the chain it reads."""
+    cfg = load_config(["data=synthetic_test"])
+    assert plan(["partitions"], cfg) == [
+        "split",
+        "prepare",
+        "regions",
+        "classify",
+        "partitions",
     ]
 
 

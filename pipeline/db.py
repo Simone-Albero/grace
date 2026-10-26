@@ -188,6 +188,57 @@ CREATE TABLE IF NOT EXISTS figures (
     file TEXT NOT NULL,  -- relative to the execution dir
     PRIMARY KEY (execution_id, name)
 );
+CREATE TABLE IF NOT EXISTS partitions (
+    execution_id INTEGER NOT NULL REFERENCES executions (id),
+    arm TEXT NOT NULL
+        CHECK (arm IN ('intra', 'inter', 'null', 'confidence', 'predicted_class')),
+    rule TEXT NOT NULL
+        CHECK (rule IN ('level', 'selected', 'fixed15', 'cbrt', 'per150')),
+    level INTEGER NOT NULL,  -- -1: the rule has no level (selected or a bin rule)
+    draw INTEGER NOT NULL,  -- the null arm's draw; 0 elsewhere
+    n_target INTEGER NOT NULL,  -- groups asked for, before merging or binning ties
+    n_groups INTEGER NOT NULL,  -- groups realized; at most n_target
+    loss REAL,  -- NULL for a bin arm, which has no geometric loss
+    routed_loss REAL,  -- NULL for a bin arm
+    val_p10 REAL NOT NULL,
+    val_median REAL NOT NULL,
+    val_p90 REAL NOT NULL,
+    share_no_val REAL NOT NULL,  -- test rows in a group with no val row
+    brier REAL NOT NULL,
+    skill REAL,  -- NULL when the reference model already scores zero Brier
+    uncertainty REAL NOT NULL,
+    resolution REAL NOT NULL,
+    reliability REAL NOT NULL,
+    auroc REAL,  -- NULL when every scored test row failed, or none did
+    kdn_spearman REAL,  -- always NULL for a bin arm; a geometric arm can
+        -- also be NULL, with too few groups holding a test row or a
+        -- constant mean kDN or test rate among them
+    PRIMARY KEY (execution_id, arm, rule, level, draw)
+);
+CREATE TABLE IF NOT EXISTS partition_class_levels (
+    execution_id INTEGER NOT NULL REFERENCES executions (id),
+    class_id INTEGER NOT NULL,
+    level INTEGER NOT NULL,
+    n_clusters INTEGER NOT NULL,
+    loss REAL NOT NULL,
+    selected INTEGER NOT NULL CHECK (selected IN (0, 1)),
+    PRIMARY KEY (execution_id, class_id, level)
+);
+CREATE TABLE IF NOT EXISTS partition_groups (
+    execution_id INTEGER NOT NULL REFERENCES executions (id),
+    arm TEXT NOT NULL
+        CHECK (arm IN ('intra', 'inter', 'null', 'confidence', 'predicted_class')),
+    rule TEXT NOT NULL
+        CHECK (rule IN ('selected', 'fixed15', 'cbrt', 'per150')),  -- no 'level' row
+    group_id INTEGER NOT NULL,
+    n_train INTEGER NOT NULL,  -- 0 for a bin arm, which routes no train row
+    n_val INTEGER NOT NULL,
+    n_test INTEGER NOT NULL,
+    val_rate REAL,  -- NULL when n_val = 0
+    test_rate REAL,  -- NULL when n_test = 0
+    mean_kdn REAL,  -- NULL for a bin arm
+    PRIMARY KEY (execution_id, arm, rule, group_id)
+);
 CREATE TABLE IF NOT EXISTS presets (  -- dashboard: one python -m stages call
     name TEXT PRIMARY KEY,
     targets TEXT NOT NULL,  -- JSON list of stage names

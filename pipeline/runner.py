@@ -23,6 +23,7 @@ from stages import (
     classify,
     complexity,
     failures,
+    partitions,
     prepare,
     regions,
     regress,
@@ -43,6 +44,7 @@ STAGES = {
     "complexity": complexity,
     "regress": regress,
     "render": render,
+    "partitions": partitions,
 }
 _MISSING = object()
 # The size of every output file, to notice a lost or cut one.

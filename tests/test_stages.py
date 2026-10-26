@@ -13,6 +13,7 @@ from omegaconf import DictConfig, OmegaConf
 from pandas.testing import assert_frame_equal
 
 import stages.baselines as baselines_stage
+import stages.partitions as partitions_stage
 import stages.regress as regress_stage
 from pipeline.runner import STAGES, _config_slice, run
 from src.regressor import region_descriptors
@@ -71,6 +72,7 @@ def test_outputs(root: Path) -> None:
     _check_baselines(root, metrics)
     _check_regress(root, metrics, ids)
     _check_render(root, ids)
+    _check_partitions(root, metrics)
 
 
 def _check_complexity(
@@ -159,6 +161,53 @@ def _check_render(root: Path, ids: Mapping[str, int]) -> None:
     assert all((folder / file).exists() for file in figures.values())
     # Naive Bayes trains no epochs, so there is no loss history.
     assert "classification/training_loss" not in figures
+
+
+def _check_partitions(root: Path, metrics: Mapping[tuple[str, str], float]) -> None:
+    db_path = root / "grace.db"
+    brier_identity = "ABS(brier - (uncertainty - resolution + reliability)) > 1e-6"
+    assert _scalar(root, f"SELECT COUNT(*) FROM partitions WHERE {brier_identity}") == 0
+    assert (
+        _scalar(root, "SELECT COUNT(*) FROM partitions WHERE n_groups > n_target") == 0
+    )
+
+    bin_arms = "arm IN ('confidence', 'predicted_class')"
+    bins_have_a_spearman = (
+        f"SELECT COUNT(*) FROM partitions WHERE {bin_arms} AND kdn_spearman IS NOT NULL"
+    )
+    assert _scalar(root, bins_have_a_spearman) == 0
+    others_lack_one = (
+        "SELECT COUNT(*) FROM partitions "
+        f"WHERE NOT ({bin_arms}) AND kdn_spearman IS NULL"
+    )
+    assert _scalar(root, others_lack_one) == 0
+
+    # A selected row's loss is at most the least loss of its arm's own
+    # level sweep (intra's per-class pick can do strictly better).
+    selected_rows = query(
+        db_path,
+        "SELECT arm, draw, loss FROM partitions WHERE rule = 'selected' "
+        "AND arm IN ('intra', 'inter', 'null')",
+    )
+    for arm, draw, loss in selected_rows:
+        least_level_loss = query(
+            db_path,
+            "SELECT MIN(loss) FROM partitions "
+            f"WHERE arm = '{arm}' AND rule = 'level' AND draw = {draw}",
+        )[0][0]
+        assert loss <= least_level_loss + 1e-9
+
+    n_val = int(metrics["split", "n_val"])
+    n_test = int(metrics["split", "n_test"])
+    group_counts = query(
+        db_path,
+        "SELECT arm, rule, SUM(n_val), SUM(n_test) FROM partition_groups "
+        "GROUP BY arm, rule",
+    )
+    assert group_counts
+    for _, _, total_val, total_test in group_counts:
+        assert total_val == n_val
+        assert total_test == n_test
 
 
 def test_second_run_is_cached(root: Path) -> None:
@@ -468,3 +517,33 @@ def test_regress_predicts_a_used_region_without_a_val_row(tmp_path: Path) -> Non
 
     metrics = next(values for name, values in ctx.pending if name == "metrics")
     assert np.isfinite(metrics["regressor_mae"])
+
+
+def test_predicted_class_n_target_counts_a_class_missing_from_val() -> None:
+    """Check n_target widens for a class seen on test but not val.
+
+    Without the widening, `n_groups <= n_target` (the invariant
+    `_check_partitions` relies on) would fail whenever a class is
+    predicted on test but not on val: `assign_class_bins` still gives
+    it a group, uncounted by the bin rule's own `n_bins`.
+    """
+    val = partitions_stage._Predictions(
+        predicted=np.array([0, 0, 2, 2]),
+        confidence=np.array([0.6, 0.65, 0.3, 0.35]),
+        error=np.array([0.0, 1.0, 0.0, 1.0]),
+    )
+    test = partitions_stage._Predictions(
+        predicted=np.array([0, 1, 2, 2]),
+        confidence=np.array([0.62, 0.5, 0.32, 0.4]),
+        error=np.array([0.0, 1.0, 1.0, 0.0]),
+    )
+
+    rows, _ = partitions_stage._score_bins("predicted_class", val, test, reference=0.5)
+
+    for row in rows:
+        assert row["n_groups"] <= row["n_target"]
+        # The one test row of the class val never predicts is the only
+        # one in a group with no val row. Routing val and test through
+        # two separate calls (the id-aliasing bug) instead aliases a
+        # val-only class's rows onto it too, raising this to 0.5.
+        assert row["share_no_val"] == pytest.approx(0.25)

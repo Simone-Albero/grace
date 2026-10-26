@@ -11,6 +11,7 @@ groups:                    # the option of each group, configs/<group>/<option>.
   complexity: default
   failure_regressor: default
   grid_search: default
+  partitions: default
 
 seed: 42
 distance: euclidean        # euclidean | cosine — metric of the graph, the regions and the complexity measures
