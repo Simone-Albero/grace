@@ -155,6 +155,19 @@ def test_regions(client: TestClient, root: Path, run_id: int) -> None:
     assert client.get(f"{url}/999999").status_code == 404
 
 
+def test_partitions_panel(client: TestClient, run_id: int) -> None:
+    """Check that the panel appears and the charts draw."""
+    assert "Partitions" in client.get(f"/runs/{run_id}/regions").text
+    charts = client.get(f"/runs/{run_id}/partitions")
+    assert charts.status_code == 200
+    assert charts.text.count("Plotly.newPlot") == 4
+    for arm in ("intra", "inter", "null", "confidence", "predicted_class"):
+        assert arm in charts.text
+    assert client.get(f"/runs/{run_id}/partitions?metric=bogus").status_code == 400
+    assert client.get(f"/runs/{run_id}/partitions?x=bogus").status_code == 400
+    assert client.get("/runs/999999/partitions").status_code == 404
+
+
 def test_read_routes_never_write(client: TestClient, root: Path, run_id: int) -> None:
     """Check that GET routes never write; connections are read-only."""
     path = root / "grace.db"
@@ -178,6 +191,7 @@ def test_read_routes_never_write(client: TestClient, root: Path, run_id: int) ->
         f"/runs/{run_id}",
         f"/runs/{run_id}/regions",
         f"/runs/{run_id}/regions/0",
+        f"/runs/{run_id}/partitions",
         f"/figures/{render}/{name}",
     ):
         assert client.get(url).status_code == 200, url

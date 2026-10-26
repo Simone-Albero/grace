@@ -3,6 +3,8 @@
 __all__ = [
     "CONFIG_KEYS",
     "METRICS",
+    "PARTITION_AXES",
+    "PARTITION_METRICS",
     "PREDICTORS",
     "REGION_COLUMNS",
     "SCORES",
@@ -14,6 +16,9 @@ __all__ = [
     "job",
     "job_runs",
     "jobs",
+    "partition_class_levels",
+    "partition_groups",
+    "partitions",
     "preset",
     "presets",
     "regions",
@@ -66,6 +71,9 @@ REGION_COLUMNS = (
     "n_train n_val n_test n_val_error val_rate n_test_error test_rate used fold "
     "regressor val mcp atc abs_error"
 ).split()
+# The partitions columns the panel plots: its metrics and its x axes.
+PARTITION_METRICS = ("skill", "brier", "auroc", "kdn_spearman", "share_no_val")
+PARTITION_AXES = ("n_groups", "val_median")
 _CONFIG_COLUMNS = ", ".join(
     f"json_extract(r.config, '{path}') AS {name}" for name, path in CONFIG_KEYS.items()
 )
@@ -428,6 +436,64 @@ def descriptors(
         ORDER BY r.rowid
         """,
         (class_id, complexity_id, region_id),
+    )
+
+
+def partitions(db: sqlite3.Connection, partitions_id: int) -> list[dict[str, object]]:
+    """List the rows of a partitions execution.
+
+    Args:
+        db: A connection to grace.db.
+        partitions_id: The execution id of partitions.
+
+    Returns:
+        One row per arm, rule, level and draw, in that order.
+    """
+    return _all(
+        db,
+        "SELECT * FROM partitions WHERE execution_id = ? "
+        "ORDER BY arm, rule, level, draw",
+        (partitions_id,),
+    )
+
+
+def partition_class_levels(
+    db: sqlite3.Connection, partitions_id: int
+) -> list[dict[str, object]]:
+    """List the intra arm's per-class loss curve.
+
+    Args:
+        db: A connection to grace.db.
+        partitions_id: The execution id of partitions.
+
+    Returns:
+        The rows, ordered by class and level.
+    """
+    return _all(
+        db,
+        "SELECT * FROM partition_class_levels WHERE execution_id = ? "
+        "ORDER BY class_id, level",
+        (partitions_id,),
+    )
+
+
+def partition_groups(
+    db: sqlite3.Connection, partitions_id: int
+) -> list[dict[str, object]]:
+    """List the groups of a partitions execution's operating points.
+
+    Args:
+        db: A connection to grace.db.
+        partitions_id: The execution id of partitions.
+
+    Returns:
+        The rows, ordered by arm, rule and group.
+    """
+    return _all(
+        db,
+        "SELECT * FROM partition_groups WHERE execution_id = ? "
+        "ORDER BY arm, rule, group_id",
+        (partitions_id,),
     )
 
 

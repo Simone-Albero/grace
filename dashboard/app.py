@@ -33,7 +33,14 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from dashboard import charts, jobs, queries, store
-from dashboard.queries import CONFIG_KEYS, METRICS, REGION_COLUMNS, SCORES
+from dashboard.queries import (
+    CONFIG_KEYS,
+    METRICS,
+    PARTITION_AXES,
+    PARTITION_METRICS,
+    REGION_COLUMNS,
+    SCORES,
+)
 from pipeline.db import explain
 
 # The rendered rows of the region table; the scatter keeps all points.
@@ -122,14 +129,22 @@ def _found(row: dict | None, detail: str) -> dict:
     return row
 
 
+def _stage_ids_with(
+    connection: sqlite3.Connection, run_id: int, stage: str
+) -> dict[str, int]:
+    """Return a run's stage ids, or raise a 404 if it lacks `stage`."""
+    _found(queries.run(connection, run_id), f"No run {run_id}")
+    ids = queries.stage_ids(connection, run_id)
+    if stage not in ids:
+        raise HTTPException(404, f"Run {run_id} has no {stage} stage")
+    return ids
+
+
 def _region_rows(
     connection: sqlite3.Connection, run_id: int
 ) -> tuple[dict[str, int], list[str], list[dict]]:
     """Return the stage ids, measures and region rows of a run."""
-    _found(queries.run(connection, run_id), f"No run {run_id}")
-    ids = queries.stage_ids(connection, run_id)
-    if "regions" not in ids:
-        raise HTTPException(404, f"Run {run_id} has no regions stage")
+    ids = _stage_ids_with(connection, run_id, "regions")
     measures, rows = queries.regions(connection, ids)
     return ids, measures, rows
 
@@ -336,7 +351,7 @@ def create_app(db_path: Path) -> FastAPI:
         x: str = "regressor",
         y: str = "test_rate",
     ) -> HTMLResponse:
-        _, measures, rows = _region_rows(connection, run_id)
+        ids, measures, rows = _region_rows(connection, run_id)
         sortable = ["region_id", "class", *REGION_COLUMNS, *measures]
         _choice("sort", sort, sortable)
         axes = [*REGION_COLUMNS, *measures]
@@ -361,8 +376,43 @@ def create_app(db_path: Path) -> FastAPI:
             "desc": desc,
             "x": x,
             "y": y,
+            "has_partitions": "partitions" in ids,
+            "partition_metrics": PARTITION_METRICS,
+            "partition_axes": PARTITION_AXES,
         }
         return render(request, "regions.html", context, fragment="_regions.html")
+
+    @app.get("/runs/{run_id}/partitions", response_class=HTMLResponse)
+    def partitions_panel(
+        request: Request,
+        run_id: _Id,
+        connection: sqlite3.Connection = Depends(db),
+        metric: str = "skill",
+        x: str = "n_groups",
+    ) -> HTMLResponse:
+        _choice("metric", metric, PARTITION_METRICS)
+        _choice("x", x, PARTITION_AXES)
+        ids = _stage_ids_with(connection, run_id, "partitions")
+        partitions_id = ids["partitions"]
+        group_rows = queries.partition_groups(connection, partitions_id)
+        class_names = {
+            row["class_id"]: row["name"]
+            for row in queries.class_metrics(
+                connection, ids["prepare"], ids["classify"]
+            )
+        }
+        figures = [
+            charts.partition_curves(
+                queries.partitions(connection, partitions_id), metric=metric, x=x
+            ),
+            charts.partition_class_curves(
+                queries.partition_class_levels(connection, partitions_id),
+                class_names=class_names,
+            ),
+            charts.partition_val_rates(group_rows),
+            charts.partition_val_test_scatter(group_rows),
+        ]
+        return render(request, "_charts.html", {"figures": figures})
 
     @app.get("/runs/{run_id}/regions/{region_id}", response_class=HTMLResponse)
     def region_page(

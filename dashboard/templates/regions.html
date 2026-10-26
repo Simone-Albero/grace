@@ -30,4 +30,25 @@
   {% endfor %}
 </form>
 <div id="regions">{% include "_regions.html" %}</div>
+{% if has_partitions %}
+<h2>Partitions</h2>
+<form hx-get="/runs/{{ run_id }}/partitions" hx-target="#partitions"
+      hx-trigger="load, change" autocomplete="off">
+  <label>metric
+    <select name="metric">
+      {% for metric in partition_metrics %}
+      <option{% if metric == "skill" %} selected{% endif %}>{{ metric }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>x
+    <select name="x">
+      {% for axis in partition_axes %}
+      <option{% if axis == "n_groups" %} selected{% endif %}>{{ axis }}</option>
+      {% endfor %}
+    </select>
+  </label>
+</form>
+<div id="partitions"></div>
+{% endif %}
 {% endblock %}
