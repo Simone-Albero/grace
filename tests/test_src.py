@@ -6,10 +6,12 @@ import numpy as np
 import pandas as pd
 import pytest
 from pandas.testing import assert_frame_equal
+from sklearn.ensemble import RandomForestRegressor
 
 from src import clustering
 from src.data import stratified_holdout
 from src.graph import build_train_graph
+from src.regressor import fit_failure_regressor
 
 
 def test_stratified_holdout_is_stratified_and_deterministic() -> None:
@@ -90,3 +92,47 @@ def test_refit_keeps_at_most_max_clusters(
     # at the cut must still keep `max_clusters` of them.
     assert np.unique(labels).size == min(max_clusters, 3)
     assert n_merged_clusters == 3 - min(max_clusters, 3)
+
+
+def test_fit_failure_regressor_passes_sample_weight_to_the_forest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Check every forest fit, in the inner search too, is weighted."""
+    calls: list[np.ndarray | None] = []
+    original_fit = RandomForestRegressor.fit
+
+    def spy_fit(
+        self: RandomForestRegressor,
+        X: pd.DataFrame,
+        y: pd.Series,
+        sample_weight: pd.Series | None = None,
+    ) -> RandomForestRegressor:
+        calls.append(sample_weight)
+        return original_fit(self, X, y, sample_weight=sample_weight)
+
+    monkeypatch.setattr(RandomForestRegressor, "fit", spy_fit)
+
+    # 8 regions and 2 inner splits: enough for the inner search to run,
+    # not just the no-search branch of `_fit_model`.
+    X = pd.DataFrame({"a": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]})
+    y = pd.Series([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8])
+    weight = pd.Series([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 50.0])
+
+    fit_failure_regressor(
+        X,
+        y,
+        sample_weight=weight,
+        params={},
+        param_grid={"n_estimators": [5, 10]},
+        n_outer_splits=2,
+        n_inner_splits=2,
+        n_iter=1,
+        n_jobs=1,
+        random_state=0,
+    )
+
+    # Every candidate's fit, in every inner and outer fold, plus the
+    # refit: none silently dropped the weight.
+    assert len(calls) > 3
+    assert all(call is not None for call in calls)
+    assert any(call.max() == pytest.approx(50.0) for call in calls)

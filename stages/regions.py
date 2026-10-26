@@ -214,7 +214,7 @@ def run(ctx: Context) -> None:
         name: pd.read_parquet(prepared / f"{name}.parquet", columns=num_cols + cat_cols)
         for name in SPLITS[1:]
     }
-    eval_rows_per_train_row = len(eval_rows["test"]) / len(train)
+    eval_rows_per_train_row = len(eval_rows["val"]) / len(train)
 
     graph_rows = np.sort(
         subsample_indices(

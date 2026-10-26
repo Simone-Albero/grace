@@ -19,8 +19,6 @@ from sklearn.model_selection import (
     StratifiedKFold,
 )
 
-from src.scores import rate_scores
-
 logger = logging.getLogger(__name__)
 
 
@@ -32,9 +30,8 @@ class FailureRegressor:
         predicted: The out-of-fold rate by region, indexed like `X`.
         fold: The outer fold holding each region out, indexed like
             `X`.
-        folds: One dict per outer fold, with "fold", "n_regions", the
-            "spearman", "r2" and "mae" scores, "best_score" and
-            "params".
+        folds: One dict per outer fold, with "fold", "n_regions",
+            "best_score" and "params".
         importances: The mean `feature_importances_` over the outer
             folds, by descriptor.
         model: The forest refit on every region.
@@ -114,6 +111,7 @@ def _fit_model(
     X: pd.DataFrame,
     y: pd.Series,
     *,
+    sample_weight: pd.Series,
     params: Mapping[str, object],
     param_grid: Mapping[str, Sequence[object]],
     inner_cv: KFold | None,
@@ -125,7 +123,7 @@ def _fit_model(
     """Fit one forest; without `inner_cv`, keep defaults, no search."""
     forest = RandomForestRegressor(**{**params, "random_state": random_state})
     if inner_cv is None:
-        forest.fit(X, y)
+        forest.fit(X, y, sample_weight=sample_weight)
         fitted = forest.get_params()
         return forest, {key: fitted[key] for key in param_grid}, None
 
@@ -148,7 +146,7 @@ def _fit_model(
         # to search its own slice.
         random_state=search_seed,
     )
-    search.fit(X, y)
+    search.fit(X, y, sample_weight=sample_weight)
     return search.best_estimator_, dict(search.best_params_), float(search.best_score_)
 
 
@@ -218,6 +216,7 @@ def fit_failure_regressor(
     X: pd.DataFrame,
     y: pd.Series,
     *,
+    sample_weight: pd.Series,
     params: Mapping[str, object],
     param_grid: Mapping[str, Sequence[object]],
     n_outer_splits: int,
@@ -231,6 +230,8 @@ def fit_failure_regressor(
     Args:
         X: The descriptors, one row per region.
         y: The observed failure rate of each region, indexed like `X`.
+        sample_weight: Each region's weight, indexed like `X`; passed
+            to the forest's fit, not to the inner search's own scorer.
         params: The forest's own parameters.
         param_grid: The values the inner search draws from, by forest
             parameter.
@@ -243,8 +244,8 @@ def fit_failure_regressor(
             searches.
 
     Returns:
-        The out-of-fold rates, the scores and importances per fold and
-        the forest refit on every region.
+        The out-of-fold rates, each outer fold's search result, the mean
+        importances and the forest refit on every region.
 
     Raises:
         ValueError: If fewer than two regions have rates that differ.
@@ -253,9 +254,9 @@ def fit_failure_regressor(
     if n_used < 2 or float(y.std()) < 1e-9:
         raise ValueError(
             f"{n_used} usable region(s), failure-rate std {float(y.std()):.3g}: the "
-            "failure regressor needs two regions whose rates differ. Lower "
-            "failure_regressor.min_eval_support or evaluate on more test rows; "
-            "regressor_figures=false draws the classifier's figures without it."
+            "failure regressor needs two regions whose rates differ. Raise "
+            "data.val_frac for more val-labelled regions; regressor_figures=false "
+            "draws the classifier's figures without it."
         )
 
     outer_cv, n_outer, strata = _outer_cv(y, n_outer_splits, random_state)
@@ -282,36 +283,30 @@ def fit_failure_regressor(
         forest, best_params, best_score = _fit_model(
             X.iloc[fit_idx],
             y.iloc[fit_idx],
+            sample_weight=sample_weight.iloc[fit_idx],
             search_seed=random_state + fold,
             **fit_args,
         )
-        # Clip as the inner scorer does, so fold scores match the tuned
-        # ones.
+        # Clip as the inner scorer does, so held-out predictions match
+        # the tuned ones.
         predicted[held_idx] = np.clip(forest.predict(X.iloc[held_idx]), 0.0, 1.0)
         fold_of[held_idx] = fold
         importances.append(forest.feature_importances_)
-        scores = rate_scores(predicted[held_idx], y.iloc[held_idx])
         folds.append(
             {
                 "fold": fold,
                 "n_regions": len(held_idx),
-                **{name: scores[name] for name in ("spearman", "r2", "mae")},
                 "best_score": best_score,
                 "params": best_params,
             }
         )
-        logger.info(
-            "outer fold %d/%d: rho=%.4f mae=%.4f",
-            fold + 1,
-            n_outer,
-            scores["spearman"],
-            scores["mae"],
-        )
+        logger.info("outer fold %d/%d: n_held_out=%d", fold + 1, n_outer, len(held_idx))
 
     logger.info("Refitting the forest on the %d usable regions", n_used)
     model, refit_params, refit_score = _fit_model(
         X,
         y,
+        sample_weight=sample_weight,
         # The seed after the outer folds' own, so the refit searches a
         # slice of its own.
         search_seed=random_state + n_outer,

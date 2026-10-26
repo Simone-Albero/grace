@@ -80,7 +80,7 @@ def metric_bars(
 
 
 def predictor_bars(rows: Sequence[dict], *, score: str, x: str) -> dict[str, object]:
-    """Draw the mean RF regressor, MCP and ATC `score` per value of `x`.
+    """Draw the mean RF regressor, val, MCP and ATC `score` per `x`.
 
     Args:
         rows: The results rows.

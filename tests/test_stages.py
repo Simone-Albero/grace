@@ -8,9 +8,14 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
+import pytest
+from omegaconf import DictConfig, OmegaConf
 from pandas.testing import assert_frame_equal
 
+import stages.baselines as baselines_stage
+import stages.regress as regress_stage
 from pipeline.runner import STAGES, _config_slice, run
+from src.regressor import region_descriptors
 from stages import SPLITS
 from tests.helpers import fast_cfg, query
 
@@ -50,9 +55,16 @@ def test_outputs(root: Path) -> None:
 
     _check_complexity(root, metrics, n_regions)
 
+    n_val = int(metrics["split", "n_val"])
+    n_train = int(metrics["split", "n_train"])
+    # The granularity noise term reads the val budget, not the test one.
+    assert metrics["regions", "eval_rows_per_train_row"] == pytest.approx(
+        n_val / n_train
+    )
     assert _scalar(root, "SELECT COUNT(*) FROM failures") == n_regions
-    assert _scalar(root, "SELECT SUM(n_eval) FROM failures") == n_test
-    out_of_range = "failure_rate < 0 OR failure_rate > 1"
+    assert _scalar(root, "SELECT SUM(n_val) FROM failures") == n_val
+    assert _scalar(root, "SELECT SUM(n_test) FROM failures") == n_test
+    out_of_range = "val_rate NOT BETWEEN 0 AND 1 OR test_rate NOT BETWEEN 0 AND 1"
     assert _scalar(root, f"SELECT COUNT(*) FROM failures WHERE {out_of_range}") == 0
     assert _scalar(root, "SELECT COUNT(*) FROM class_metrics") == 9
     assert ("classify", "accuracy") in metrics
@@ -84,9 +96,13 @@ def _check_baselines(root: Path, metrics: Mapping[tuple[str, str], float]) -> No
     assert _scalar(root, "SELECT COUNT(*) FROM baselines") == n_regions
     n_used = int(metrics["baselines", "n_regions_used"])
     assert _scalar(root, "SELECT SUM(used) FROM baselines") == n_used
-    outside = "mcp NOT BETWEEN 0 AND 1 OR atc NOT BETWEEN 0 AND 1"
+    outside = (
+        "val NOT BETWEEN 0 AND 1 OR mcp NOT BETWEEN 0 AND 1 OR "
+        "atc NOT BETWEEN 0 AND 1"
+    )
     assert _scalar(root, f"SELECT COUNT(*) FROM baselines WHERE {outside}") == 0
-    for predictor in ("mcp", "atc"):
+    assert _scalar(root, "SELECT COUNT(*) FROM baselines WHERE val IS NULL") == 0
+    for predictor in ("val", "mcp", "atc"):
         for score in ("spearman", "r2", "mae", "mse"):
             assert ("baselines", f"{predictor}_{score}") in metrics
     assert ("baselines", "atc_threshold") in metrics
@@ -97,13 +113,24 @@ def _check_regress(
 ) -> None:
     n_regions = int(metrics["regions", "n_regions"])
     assert _scalar(root, "SELECT COUNT(*) FROM estimates") == n_regions
-    unused = (
-        "SELECT COUNT(*) FROM estimates JOIN baselines USING (region_id) "
+    # A region is predicted iff it is used, has a val row, or both.
+    unpredicted = (
+        "SELECT COUNT(*) FROM estimates "
+        "JOIN baselines USING (region_id) JOIN failures USING (region_id) "
         f"WHERE estimates.execution_id = {ids['regress']} "
         f"AND baselines.execution_id = {ids['baselines']} "
-        "AND (regressor IS NULL) != (used = 0)"
+        f"AND failures.execution_id = {ids['failures']} "
+        "AND (regressor IS NULL) != (used = 0 AND n_val = 0)"
     )
-    assert _scalar(root, unused) == 0
+    assert _scalar(root, unpredicted) == 0
+    # The folds cover exactly the regions with a val row.
+    fold_coverage = (
+        "SELECT COUNT(*) FROM estimates JOIN failures USING (region_id) "
+        f"WHERE estimates.execution_id = {ids['regress']} "
+        f"AND failures.execution_id = {ids['failures']} "
+        "AND (fold IS NULL) != (n_val = 0)"
+    )
+    assert _scalar(root, fold_coverage) == 0
     for score in ("spearman", "r2", "mae", "mse"):
         assert ("regress", f"regressor_{score}") in metrics
     folds = int(metrics["regress", "n_outer_splits"]) + 1
@@ -278,3 +305,166 @@ def test_mlp_trains_on_a_one_row_last_batch(root: Path) -> None:
         "AND name = 'n_fit'",
     )
     assert n_train % batch_size == 1
+
+
+class _FakeContext:
+    """A minimal stage Context double: DB tables, an output folder."""
+
+    def __init__(
+        self,
+        tables: Mapping[tuple[str, str], pd.DataFrame],
+        cfg: DictConfig,
+        out: Path,
+    ) -> None:
+        self.cfg = cfg
+        self.runtime = OmegaConf.create({"n_jobs": 1})
+        self.out = out
+        self._tables = tables
+        self.pending: list[tuple[str, object]] = []
+
+    def read(self, table: str, stage: str) -> pd.DataFrame:
+        return self._tables[(stage, table)].copy()
+
+    def write(self, table: str, frame: pd.DataFrame) -> None:
+        self.pending.append((table, frame))
+
+    def save_metrics(self, values: Mapping[str, float]) -> None:
+        self.pending.append(("metrics", dict(values)))
+
+
+def test_baseline_val_rate_falls_back_to_the_global_rate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Check a region with no val row takes the global val rate."""
+    failures = pd.DataFrame(
+        {
+            "region_id": [1, 2, 3],
+            "n_val": [10, 0, 20],
+            "n_val_error": [1, 0, 6],
+            "val_rate": [0.1, None, 0.3],
+            "n_test": [50, 50, 50],
+            "n_test_error": [5, 5, 5],
+            "test_rate": [0.1, 0.1, 0.1],
+        }
+    )
+    monkeypatch.setattr(
+        baselines_stage,
+        "_rates",
+        lambda ctx: (
+            0.5,
+            pd.Series([0.3, 0.3, 0.3], index=[1, 2, 3]),
+            pd.Series([0.4, 0.4, 0.4], index=[1, 2, 3]),
+        ),
+    )
+    cfg = OmegaConf.create({"failure_regressor": {"min_eval_support": 1}})
+    ctx = _FakeContext({("failures", "failures"): failures}, cfg, tmp_path)
+
+    baselines_stage.run(ctx)
+
+    table = next(frame for name, frame in ctx.pending if name == "baselines").set_index(
+        "region_id"
+    )
+    # The global rate is (1 + 0 + 6) / (10 + 0 + 20) = 7/30.
+    assert table.loc[1, "val"] == pytest.approx(0.1)
+    assert table.loc[3, "val"] == pytest.approx(0.3)
+    assert table.loc[2, "val"] == pytest.approx(7 / 30)
+
+
+def _regress_tables() -> dict[tuple[str, str], pd.DataFrame]:
+    """Build a four-region toy input for `stages.regress`.
+
+    Region 1: used, has a val row. Region 2: used, no val row (the
+    refit-only case). Region 3: has a val row, not used (too few test
+    rows). Region 4: used, has a val row.
+    """
+    regions = pd.DataFrame({"region_id": [1, 2, 3, 4], "class_id": [10, 10, 20, 20]})
+    complexity = pd.DataFrame(
+        [
+            {"scope": "region", "scope_id": 1, "measure": "m1", "value": 1.0},
+            {"scope": "region", "scope_id": 2, "measure": "m1", "value": 2.0},
+            {"scope": "region", "scope_id": 3, "measure": "m1", "value": 3.0},
+            {"scope": "region", "scope_id": 4, "measure": "m1", "value": 4.0},
+            {"scope": "class", "scope_id": 10, "measure": "m1", "value": 1.5},
+            {"scope": "class", "scope_id": 20, "measure": "m1", "value": 3.5},
+        ]
+    )
+    failures = pd.DataFrame(
+        {
+            "region_id": [1, 2, 3, 4],
+            "n_val": [20, 0, 15, 10],
+            "n_val_error": [2, 0, 6, 1],
+            "val_rate": [0.1, None, 0.4, 0.1],
+            "n_test": [30, 25, 2, 40],
+            "n_test_error": [9, 5, 1, 4],
+            "test_rate": [0.3, 0.2, 0.5, 0.1],
+        }
+    )
+    baselines = pd.DataFrame({"region_id": [1, 2, 3, 4], "used": [1, 1, 0, 1]})
+    metrics = pd.DataFrame(
+        {
+            "name": [
+                f"{predictor}_{score}"
+                for predictor in ("val", "mcp", "atc")
+                for score in ("spearman", "r2", "mae", "mse")
+            ],
+            "value": [0.0] * 12,
+        }
+    )
+    return {
+        ("regions", "regions"): regions,
+        ("complexity", "complexity"): complexity,
+        ("failures", "failures"): failures,
+        ("baselines", "baselines"): baselines,
+        ("baselines", "metrics"): metrics,
+    }
+
+
+def test_regress_predicts_a_used_region_without_a_val_row(tmp_path: Path) -> None:
+    """Check the refit, not the CV, predicts a used, val-less region."""
+    cfg = OmegaConf.create(
+        {
+            "failure_regressor": {
+                "params": {},
+                "param_grid": {"n_estimators": [5]},
+                "n_outer_splits": 2,
+                "n_inner_splits": 0,
+                "n_iter": 1,
+            },
+            "seed": 0,
+        }
+    )
+    ctx = _FakeContext(_regress_tables(), cfg, tmp_path)
+
+    regress_stage.run(ctx)
+
+    estimates = next(
+        frame for name, frame in ctx.pending if name == "estimates"
+    ).set_index("region_id")
+
+    # Region 2: used, no val row -> predicted by the refit, fold is NA,
+    # and its value is exactly the refit model's own prediction (not,
+    # say, a coincidental fallback to some other rate).
+    assert pd.isna(estimates.loc[2, "fold"])
+    model = joblib.load(tmp_path / "model.joblib")
+    tables = _regress_tables()
+    regions = tables[("regions", "regions")].set_index("region_id")
+    descriptors = region_descriptors(
+        tables[("complexity", "complexity")], regions["class_id"]
+    )
+    expected = np.clip(
+        model.predict(descriptors.loc[[2], model.feature_names_in_]), 0.0, 1.0
+    )[0]
+    assert estimates.loc[2, "regressor"] == pytest.approx(expected)
+
+    # Regions 1 and 4: used, out-of-fold predicted, a real fold index.
+    for region in (1, 4):
+        assert not pd.isna(estimates.loc[region, "fold"])
+        assert 0.0 <= estimates.loc[region, "regressor"] <= 1.0
+
+    # Region 3: has a val row (trained) but is not used: it still gets
+    # an out-of-fold estimate, just never scored against test.
+    assert not pd.isna(estimates.loc[3, "fold"])
+    assert 0.0 <= estimates.loc[3, "regressor"] <= 1.0
+
+    metrics = next(values for name, values in ctx.pending if name == "metrics")
+    assert np.isfinite(metrics["regressor_mae"])

@@ -33,7 +33,7 @@ OUTPUTS = ("figures",)
 _BASE_INPUTS = ("prepare", "regions", "classify", "failures", "baselines")
 # The number of most important features that get a descriptor violin.
 _TOP_DESCRIPTORS = 4
-_BASELINES = (("mcp", "MCP"), ("atc", "ATC"))
+_BASELINES = (("val", "Val rate"), ("mcp", "MCP"), ("atc", "ATC"))
 _PREDICTORS = (("regressor", "RF regressor"), *_BASELINES)
 
 
@@ -53,14 +53,14 @@ def inputs(cfg: DictConfig) -> tuple[str, ...]:
 
 
 def _used_rates(ctx: Context) -> tuple[pd.DataFrame, pd.Series]:
-    """Return the baselines table and the used regions' failure rates.
+    """Return the baselines table and the used regions' test rates.
 
     Returns:
-        The `baselines` table by region, and the failure rate of each
-        region that the predictors are scored on.
+        The `baselines` table by region, and the test failure rate of
+        each region that the predictors are scored on.
     """
     table = ctx.read("baselines", "baselines").set_index("region_id")
-    observed = ctx.read("failures", "failures").set_index("region_id")["failure_rate"]
+    observed = ctx.read("failures", "failures").set_index("region_id")["test_rate"]
     return table, observed.loc[table.index[table["used"] == 1]]
 
 
@@ -93,7 +93,7 @@ def _classification_figures(ctx: Context) -> dict[str, Figure]:
 
 
 def _baseline_figures(ctx: Context) -> dict[str, Figure]:
-    """Draw the MCP and ATC rates against the observed failure rates."""
+    """Draw the val, MCP and ATC rates against the observed ones."""
     metrics = ctx.read("metrics", "baselines").set_index("name")["value"]
     table, rate = _used_rates(ctx)
 
@@ -103,7 +103,7 @@ def _baseline_figures(ctx: Context) -> dict[str, Figure]:
         predicted[label] = (table.loc[rate.index, key].to_numpy(dtype=float), notes)
     return {
         "baselines/predicted_vs_observed": predicted_vs_observed_plot(
-            rate.to_numpy(), predicted, figsize=(9.0, 4.2)
+            rate.to_numpy(), predicted, figsize=(3.0 * len(_BASELINES) + 3.0, 4.2)
         )
     }
 
@@ -113,15 +113,15 @@ def _failure_figure(ctx: Context) -> Figure:
     names = ctx.read("classes", "prepare").set_index("class_id")["name"]
     class_of = ctx.read("regions", "regions").set_index("region_id")["class_id"]
     failures = ctx.read("failures", "failures").set_index("region_id")
-    failures = failures[failures["n_eval"] > 0]
+    failures = failures[failures["n_test"] > 0]
     class_ids = sorted(class_of.loc[failures.index].unique())
     per_class = [
         failures[class_of.loc[failures.index] == class_id] for class_id in class_ids
     ]
     return strip_box_plot(
         [names.loc[class_id] for class_id in class_ids],
-        [frame["failure_rate"].to_numpy(dtype=float) for frame in per_class],
-        [frame["n_eval"].to_numpy(dtype=float) for frame in per_class],
+        [frame["test_rate"].to_numpy(dtype=float) for frame in per_class],
+        [frame["n_test"].to_numpy(dtype=float) for frame in per_class],
         x_label="Class",
         y_label="Observed failure rate",
         size_label="Test rows",

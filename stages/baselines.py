@@ -1,11 +1,13 @@
-"""MCP and ATC failure-rate baselines of every region, scored on test.
+"""Val, MCP and ATC failure-rate baselines, every region, on test.
 
-Both predict a region's failure rate from the classifier's
+`val` is a region's own validation failure rate, falling back to the
+global validation rate when the region has no validation row. MCP and
+ATC predict a region's failure rate from the classifier's
 probabilities on the test rows routed to it, the ATC threshold fit on
 val. A region is scored (`used`) when at least
 `failure_regressor.min_eval_support` test rows fell in it: the regressor
 is scored on the same regions. DB rows written: `baselines` (every
-region) and the scores of MCP and ATC in metrics.
+region) and the scores of val, MCP and ATC in metrics.
 """
 
 __all__ = ["CONFIG", "INPUTS", "FILES", "OUTPUTS", "run"]
@@ -68,10 +70,10 @@ def _used_regions(
         ValueError: No region has enough test rows.
     """
     # A region can end up with no test row, e.g. a small one.
-    no_eval = failures["n_eval"] == 0
-    low_support = ~no_eval & (failures["n_eval"] < min_eval_support)
-    used = failures.index[~no_eval & ~low_support]
-    n_excluded = int(no_eval.sum() + low_support.sum())
+    no_test_mask = failures["n_test"] == 0
+    low_support_mask = ~no_test_mask & (failures["n_test"] < min_eval_support)
+    used = failures.index[~no_test_mask & ~low_support_mask]
+    n_excluded = int(no_test_mask.sum() + low_support_mask.sum())
     # Losing over a fifth of the regions earns a warning: routine on a
     # small test split, whose rows starve per-region support.
     log = logger.warning if n_excluded > 0.2 * len(failures) else logger.info
@@ -79,9 +81,9 @@ def _used_regions(
         "%d/%d regions used (no test row: %d, fewer than %d: %d)",
         len(used),
         len(failures),
-        no_eval.sum(),
+        no_test_mask.sum(),
         min_eval_support,
-        low_support.sum(),
+        low_support_mask.sum(),
     )
     if used.empty:
         raise ValueError(
@@ -89,11 +91,11 @@ def _used_regions(
             "(failure_regressor.min_eval_support). Lower it or evaluate on more "
             "test rows."
         )
-    return used, no_eval, low_support
+    return used, no_test_mask, low_support_mask
 
 
 def run(ctx: Context) -> None:
-    """Compute the MCP and ATC rate of each region and score them.
+    """Compute the val, MCP and ATC rate of each region and score them.
 
     Args:
         ctx: The stage context.
@@ -103,22 +105,24 @@ def run(ctx: Context) -> None:
             prepare disagree, or if no region has enough test rows.
     """
     failures = ctx.read("failures", "failures").set_index("region_id")
-    used, no_eval, low_support = _used_regions(
+    used, no_test_mask, low_support_mask = _used_regions(
         failures, ctx.cfg.failure_regressor.min_eval_support
     )
 
     threshold, mcp, atc = _rates(ctx)
+    global_val_rate = failures["n_val_error"].sum() / failures["n_val"].sum()
     table = pd.DataFrame(
         {"used": failures.index.isin(used).astype(int)}, index=failures.index
     )
+    table["val"] = failures["val_rate"].fillna(global_val_rate)
     table["mcp"] = mcp.reindex(failures.index)
     table["atc"] = atc.reindex(failures.index)
     ctx.write("baselines", table.reset_index())
 
-    y = failures.loc[used, "failure_rate"].astype(float)
+    test_rate = failures.loc[used, "test_rate"].astype(float)
     scores = {
-        name: rate_scores(rate.loc[used], y)
-        for name, rate in (("mcp", mcp), ("atc", atc))
+        name: rate_scores(rate.loc[used], test_rate)
+        for name, rate in (("val", table["val"]), ("mcp", mcp), ("atc", atc))
     }
     for name, score in scores.items():
         log_scores(name, score)
@@ -126,15 +130,15 @@ def run(ctx: Context) -> None:
     metrics = {}
     for predictor, score in scores.items():
         metrics.update({f"{predictor}_{name}": value for name, value in score.items()})
-    n_eval = failures.loc[used, "n_eval"].sum()
+    n_test = failures.loc[used, "n_test"].sum()
     ctx.save_metrics(
         {
             **metrics,
             "atc_threshold": threshold,
             "n_regions": len(failures),
             "n_regions_used": len(used),
-            "n_excluded_no_eval": no_eval.sum(),
-            "n_excluded_low_support": low_support.sum(),
-            "error_rate_used": failures.loc[used, "n_error"].sum() / n_eval,
+            "n_excluded_no_test": no_test_mask.sum(),
+            "n_excluded_low_support": low_support_mask.sum(),
+            "error_rate_used": failures.loc[used, "n_test_error"].sum() / n_test,
         }
     )

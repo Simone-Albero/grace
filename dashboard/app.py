@@ -334,7 +334,7 @@ def create_app(db_path: Path) -> FastAPI:
         sort: str = "region_id",
         desc: bool = False,
         x: str = "regressor",
-        y: str = "failure_rate",
+        y: str = "test_rate",
     ) -> HTMLResponse:
         _, measures, rows = _region_rows(connection, run_id)
         sortable = ["region_id", "class", *REGION_COLUMNS, *measures]

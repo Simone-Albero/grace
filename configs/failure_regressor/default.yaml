@@ -1,4 +1,4 @@
-min_eval_support: 5        # regions with fewer test rows are scored by no predictor (MCP, ATC, RF)
+min_eval_support: 5        # regions with fewer test rows are scored by no predictor (val, MCP, ATC, RF)
 n_outer_splits: 5          # outer CV folds: each region's rate is predicted by a fit that never saw it
 n_inner_splits: 5          # inner CV folds of the hyper-parameter search
 n_iter: 40                 # RandomizedSearchCV draws per fit; a grid smaller than this is searched whole

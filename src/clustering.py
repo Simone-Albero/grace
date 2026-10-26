@@ -426,7 +426,7 @@ def _granularity_loss(
 
     The loss is the sum of two terms: `within` is the hardness variance
     a region's mean hides, `noise` the sampling noise of a rate
-    measured on the test rows the region will receive, at its
+    measured on the val rows the region will receive, at its
     full-class size. A finer partition lowers the first and raises the
     second.
     """

@@ -44,6 +44,7 @@ CONFIG_KEYS = {
 # execution holds its scores; the `regions` columns carry its rates.
 PREDICTORS = {
     "regressor": ("RF regressor", "regress"),
+    "val": ("Val rate", "baselines"),
     "mcp": ("MCP", "baselines"),
     "atc": ("ATC", "baselines"),
 }
@@ -62,8 +63,8 @@ METRICS = {
 # The numeric columns of `regions` other than the complexity measures;
 # they follow the SELECT there and its abs_error.
 REGION_COLUMNS = (
-    "n_train n_val n_test n_eval n_error failure_rate used fold "
-    "regressor mcp atc abs_error"
+    "n_train n_val n_test n_val_error val_rate n_test_error test_rate used fold "
+    "regressor val mcp atc abs_error"
 ).split()
 _CONFIG_COLUMNS = ", ".join(
     f"json_extract(r.config, '{path}') AS {name}" for name, path in CONFIG_KEYS.items()
@@ -364,8 +365,8 @@ def regions(
         """
         SELECT g.region_id, g.class_id, k.name AS class,
                g.n_train, g.n_val, g.n_test,
-               f.n_eval, f.n_error, f.failure_rate,
-               b.used, e.fold, e.regressor, b.mcp, b.atc
+               f.n_val_error, f.val_rate, f.n_test_error, f.test_rate,
+               b.used, e.fold, e.regressor, b.val, b.mcp, b.atc
         FROM regions g
         JOIN classes k ON k.execution_id = :prepare AND k.class_id = g.class_id
         LEFT JOIN failures f
@@ -393,8 +394,12 @@ def regions(
         if region_id in by_id:
             by_id[region_id][measure] = value
     for row in rows:
-        both = row["regressor"] is not None and row["failure_rate"] is not None
-        row["abs_error"] = abs(row["regressor"] - row["failure_rate"]) if both else None
+        scored = (
+            row["used"] == 1
+            and row["regressor"] is not None
+            and row["test_rate"] is not None
+        )
+        row["abs_error"] = abs(row["regressor"] - row["test_rate"]) if scored else None
     return measures, rows
 
 

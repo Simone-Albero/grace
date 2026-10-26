@@ -138,7 +138,7 @@ def test_regions(client: TestClient, root: Path, run_id: int) -> None:
     failures = _execution(root, "failures")
     region_id, rate = query(
         root / "grace.db",
-        "SELECT region_id, failure_rate FROM failures "
+        "SELECT region_id, test_rate FROM failures "
         f"WHERE execution_id = {failures} ORDER BY region_id DESC",
     )[0]
     link = f"{url}/{region_id}"

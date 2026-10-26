@@ -141,15 +141,19 @@ CREATE TABLE IF NOT EXISTS history (
 CREATE TABLE IF NOT EXISTS failures (
     execution_id INTEGER NOT NULL REFERENCES executions (id),
     region_id INTEGER NOT NULL,
-    n_eval INTEGER NOT NULL,
-    n_error INTEGER NOT NULL,
-    failure_rate REAL,  -- NULL when n_eval = 0
+    n_val INTEGER NOT NULL,
+    n_val_error INTEGER NOT NULL,
+    val_rate REAL,  -- NULL when n_val = 0
+    n_test INTEGER NOT NULL,
+    n_test_error INTEGER NOT NULL,
+    test_rate REAL,  -- NULL when n_test = 0
     PRIMARY KEY (execution_id, region_id)
 );
 CREATE TABLE IF NOT EXISTS baselines (
     execution_id INTEGER NOT NULL REFERENCES executions (id),
     region_id INTEGER NOT NULL,
     used INTEGER NOT NULL CHECK (used IN (0, 1)),  -- scored: enough test rows
+    val REAL,  -- the region's own val rate; the global val rate without one
     mcp REAL,  -- mean 1 - max probability of its test rows; NULL without any
     atc REAL,  -- share of its test rows under the ATC threshold; NULL without any
     PRIMARY KEY (execution_id, region_id)
@@ -157,15 +161,15 @@ CREATE TABLE IF NOT EXISTS baselines (
 CREATE TABLE IF NOT EXISTS estimates (
     execution_id INTEGER NOT NULL REFERENCES executions (id),
     region_id INTEGER NOT NULL,
-    fold INTEGER,  -- outer fold that held it out; NULL when unused
-    regressor REAL,  -- out-of-fold RF failure rate; NULL when unused
+    fold INTEGER,  -- outer fold that held it out; NULL for the refit or unpredicted
+    regressor REAL,  -- predicted rate; NULL without a val row and unused
     PRIMARY KEY (execution_id, region_id)
 );
 CREATE TABLE IF NOT EXISTS regressor_folds (
     execution_id INTEGER NOT NULL REFERENCES executions (id),
-    fold INTEGER NOT NULL,  -- -1: the refit on every used region
-    n_regions INTEGER NOT NULL,  -- held out (fold) or fitted (refit)
-    spearman REAL,  -- held-out scores; NULL for the refit
+    fold INTEGER NOT NULL,  -- -1: the refit on every val-labelled region
+    n_regions INTEGER NOT NULL,  -- held out (fold) or trained on (refit)
+    spearman REAL,  -- scored on its held-out, used regions; NULL for the refit
     r2 REAL,
     mae REAL,
     best_score REAL,  -- inner-CV clipped R²; NULL without a search
