@@ -8,7 +8,7 @@ import pytest
 from pandas.testing import assert_frame_equal
 from sklearn.ensemble import RandomForestRegressor
 
-from src import clustering
+from src import clustering, partitions, scores
 from src.data import stratified_holdout
 from src.graph import build_train_graph
 from src.regressor import fit_failure_regressor
@@ -136,3 +136,227 @@ def test_fit_failure_regressor_passes_sample_weight_to_the_forest(
     assert len(calls) > 3
     assert all(call is not None for call in calls)
     assert any(call.max() == pytest.approx(50.0) for call in calls)
+
+
+def test_tied_confidences_share_a_bin() -> None:
+    """Check that a tie on every confidence leaves one bin, index 0."""
+    confidence = np.full(10, 0.5)
+    edges = partitions.confidence_edges(confidence, n_bins=4)
+    assert edges.size == 1
+    assert (partitions.assign_bins(confidence, edges) == 0).all()
+
+
+def test_class_bins_cover_every_class() -> None:
+    """Check each predicted class gets bins, a tiny minority one too."""
+    rng = np.random.default_rng(1)
+    confidence = rng.uniform(size=101)
+    predicted_class = np.array([0] * 95 + [1] * 5 + [2])
+    edges = partitions.class_confidence_edges(confidence, predicted_class, n_bins=4)
+    assert set(edges) == {0, 1, 2}
+    assert len(edges[0]) >= 2 and len(edges[1]) >= 2
+    bins = partitions.assign_class_bins(confidence, predicted_class, edges)
+    # Every group id belongs to exactly one predicted class: none is
+    # shared across classes, unlike a plain within-class bin index.
+    for class_id in (0, 1, 2):
+        own_ids = set(bins[predicted_class == class_id])
+        other_ids = set(bins[predicted_class != class_id])
+        assert not own_ids & other_ids
+
+
+def test_class_missing_from_edges_gets_its_own_group() -> None:
+    """Check a class edges never saw gets one id, not a KeyError."""
+    confidence = np.array([0.1, 0.9, 0.5])
+    predicted_class = np.array([0, 0, 2])
+    edges = partitions.class_confidence_edges(
+        confidence[:2], predicted_class[:2], n_bins=2
+    )
+    assert set(edges) == {0}
+    bins = partitions.assign_class_bins(confidence, predicted_class, edges)
+    assert bins[2] not in bins[:2]
+
+
+def test_apportion_sums_to_the_total() -> None:
+    """Check the largest-remainder shares always sum to the total."""
+    cases = [
+        (15, [90, 5, 5]),  # np.round over-allocated this to 16.
+        (15, [1] * 10),  # np.round over-allocated this to 20.
+        (10, [1, 1, 1]),  # np.round under-allocated this to 9.
+        (3, [998, 1, 1]),  # flooring every share to 1 overshoots 3.
+    ]
+    for total, weights in cases:
+        allocated = partitions._apportion(total, np.array(weights))
+        assert int(allocated.sum()) == total
+        assert (allocated >= 1).all()
+
+
+def test_empty_group_takes_global_rate() -> None:
+    """Check a group id with no rows gets the global rate, not NaN."""
+    group = np.array([0, 0, 1, 1, 1])
+    observed = np.array([1, 0, 0, 1, 1])
+    rates = partitions.estimate_group_rates(group, observed, [0, 1, 2])
+    assert rates.loc[0] == pytest.approx(0.5)
+    assert rates.loc[1] == pytest.approx(2 / 3)
+    assert rates.loc[2] == pytest.approx(observed.mean())
+
+
+def test_kdn_per_row_labels_match_one_class() -> None:
+    """Check per-row labels reproduce separate single-class calls."""
+    rng = np.random.default_rng(3)
+    nodes = clustering.KdnNodes(
+        X=rng.normal(size=(60, 2)),
+        y=np.repeat([0, 1], 30),
+        row_ids=np.arange(1000, 1060),
+    )
+    X = rng.normal(size=(20, 2))
+    row_ids = np.arange(2000, 2020)
+    labels = np.repeat([0, 1], 10)
+
+    mixed = clustering.compute_kdn(X, row_ids=row_ids, labels=labels, nodes=nodes, k=5)
+    for label in (0, 1):
+        in_class = labels == label
+        per_class = clustering.compute_kdn(
+            X[in_class],
+            row_ids=row_ids[in_class],
+            labels=np.full(in_class.sum(), label),
+            nodes=nodes,
+            k=5,
+        )
+        assert np.allclose(mixed[in_class], per_class)
+
+
+def test_level_pick_matches_cluster_class() -> None:
+    """Check the level kmeans_levels scores best is cluster_class's."""
+    rng = np.random.default_rng(6)
+    X = np.vstack(
+        [
+            rng.normal(loc=loc, scale=0.3, size=(60, 2))
+            for loc in ([0, 0], [5, 5], [0, 5], [5, 0], [2.5, 2.5])
+        ]
+    )
+    row_ids = np.arange(len(X))
+    nodes = clustering.KdnNodes(X=X, y=np.zeros(len(X), dtype=int), row_ids=row_ids)
+    min_cluster_floor = 20
+    hardness_k = 5
+    eval_rows_per_train_row = 0.4
+
+    best_labels, _, _, best_loss = clustering.cluster_class(
+        X,
+        row_ids=row_ids,
+        label=0,
+        algorithm="kmeans",
+        params={},
+        nodes=nodes,
+        max_fit_samples=10000,
+        max_clusters=1000,
+        min_cluster_floor=min_cluster_floor,
+        hardness_k=hardness_k,
+        eval_rows_per_train_row=eval_rows_per_train_row,
+        metric="euclidean",
+        random_state=7,
+    )
+
+    levels = clustering.kmeans_levels(
+        X,
+        min_cluster_floor=min_cluster_floor,
+        max_fit_samples=10000,
+        metric="euclidean",
+        random_state=7,
+    )
+    hardness = clustering.compute_kdn(
+        X,
+        row_ids=row_ids,
+        labels=np.zeros(len(X), dtype=int),
+        nodes=nodes,
+        k=hardness_k,
+    )
+    losses = [
+        clustering.granularity_loss(
+            level_labels,
+            hardness,
+            n_class=len(X),
+            eval_rows_per_train_row=eval_rows_per_train_row,
+        )
+        for level_labels in levels
+    ]
+    best_level = int(np.argmin(losses))
+    assert losses[best_level] == pytest.approx(best_loss)
+    assert np.array_equal(levels[best_level], best_labels)
+
+
+def test_null_draw_is_seeded() -> None:
+    """Check random_voronoi is reproducible from its own rng seed."""
+    X = np.random.default_rng(8).normal(size=(100, 2))
+    draw_args = dict(min_cluster_floor=2, metric="euclidean")
+    first = clustering.random_voronoi(X, 10, rng=np.random.default_rng(0), **draw_args)
+    again = clustering.random_voronoi(X, 10, rng=np.random.default_rng(0), **draw_args)
+    different = clustering.random_voronoi(
+        X, 10, rng=np.random.default_rng(1), **draw_args
+    )
+    assert np.array_equal(first, again)
+    assert not np.array_equal(first, different)
+
+
+def test_brier_decomposition_is_exact() -> None:
+    """Check brier decomposes exactly into its three terms."""
+    rng = np.random.default_rng(2)
+    group = rng.integers(0, 6, size=500)
+    observed = rng.binomial(1, 0.3, size=500).astype(float)
+    group_rate = pd.Series(observed).groupby(group).transform("mean")
+    predicted = np.clip(group_rate.to_numpy() + rng.normal(scale=0.05, size=1), 0, 1)
+    score = scores.group_scores(predicted, observed, group, reference=0.3)
+    assert score["brier"] == pytest.approx(
+        score["uncertainty"] - score["resolution"] + score["reliability"], abs=1e-12
+    )
+
+
+def test_kmeans_levels_leave_no_undersized_group() -> None:
+    """Check every level clears the floor, or merges to one group."""
+    rng = np.random.default_rng(4)
+    X = np.vstack([rng.normal(size=(300, 2)), rng.normal(loc=8, size=(7, 2))])
+    levels = clustering.kmeans_levels(
+        X,
+        min_cluster_floor=20,
+        max_fit_samples=10000,
+        metric="euclidean",
+        random_state=0,
+    )
+    assert len(levels) == len(clustering.level_counts(len(X), 20))
+    for labels in levels:
+        _, counts = np.unique(labels, return_counts=True)
+        assert counts.min() >= 20 or counts.size == 1
+    # The finest level must actually survive as more than one group,
+    # not merge everything away: a mutant that always collapses to one
+    # group would otherwise still pass.
+    _, finest_counts = np.unique(levels[0], return_counts=True)
+    assert finest_counts.size > 1
+
+
+def test_random_voronoi_leaves_no_undersized_cell() -> None:
+    """Check cells under the floor merge, more than one group left."""
+    X = np.random.default_rng(5).normal(size=(200, 2))
+    labels = clustering.random_voronoi(
+        X,
+        20,
+        min_cluster_floor=8,
+        metric="euclidean",
+        rng=np.random.default_rng(0),
+    )
+    assert labels.shape == (200,)
+    _, counts = np.unique(labels, return_counts=True)
+    assert counts.min() >= 8
+    assert counts.size > 1
+
+
+def test_random_voronoi_caps_n_cells_at_the_row_count() -> None:
+    """Check asking for more cells than rows draws at most one each."""
+    X = np.random.default_rng(5).normal(size=(40, 2))
+    labels = clustering.random_voronoi(
+        X,
+        1000,
+        min_cluster_floor=4,
+        metric="euclidean",
+        rng=np.random.default_rng(0),
+    )
+    assert labels.shape == (40,)
+    _, counts = np.unique(labels, return_counts=True)
+    assert counts.min() >= 4 or counts.size == 1

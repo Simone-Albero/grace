@@ -7,6 +7,11 @@ __all__ = [
     "cluster_class",
     "cluster_size_balance",
     "compute_centroids",
+    "compute_kdn",
+    "granularity_loss",
+    "kmeans_levels",
+    "level_counts",
+    "random_voronoi",
     "subsample_indices",
 ]
 
@@ -51,17 +56,33 @@ class KdnNodes:
     row_ids: np.ndarray
 
 
-def _compute_kdn(
-    X: np.ndarray, *, row_ids: np.ndarray, label: object, nodes: KdnNodes, k: int
+def compute_kdn(
+    X: np.ndarray, *, row_ids: np.ndarray, labels: np.ndarray, nodes: KdnNodes, k: int
 ) -> np.ndarray:
     """Return the share of each row's k nearest nodes of another class.
 
     The row's own node is excluded.
+
+    Args:
+        X: The rows to score, shape (n, d).
+        row_ids: Each row's id in the numbering of `nodes.row_ids`, so
+            a row that is itself a node skips that node.
+        labels: Each row's own class.
+        nodes: The graph nodes the neighbours are drawn from.
+        k: The neighbours counted, capped at the node count minus one.
+
+    Returns:
+        Each row's kDN, in [0, 1].
+
+    Raises:
+        ValueError: Fewer than two nodes, so none is left once a row's
+            own copy is excluded.
     """
+    labels = np.asarray(labels)
     effective_k = min(k, nodes.X.shape[0] - 1)
     if effective_k < 1:
         raise ValueError(
-            f"_compute_kdn: {nodes.X.shape[0]} node(s) leave no "
+            f"compute_kdn: {nodes.X.shape[0]} node(s) leave no "
             "neighbour once a row's own copy is excluded."
         )
     index = NearestNeighbors(n_neighbors=effective_k + 1).fit(nodes.X)
@@ -78,7 +99,7 @@ def _compute_kdn(
     keep[np.arange(len(X)), drop] = False
 
     kept_labels = neighbor_labels[keep].reshape(len(X), effective_k)
-    return (kept_labels != label).sum(axis=1) / effective_k
+    return (kept_labels != labels[:, np.newaxis]).sum(axis=1) / effective_k
 
 
 def cluster_size_balance(labels: np.ndarray) -> float:
@@ -415,7 +436,7 @@ ALGORITHMS: dict[str, Callable[..., np.ndarray]] = {
 }
 
 
-def _granularity_loss(
+def granularity_loss(
     labels: np.ndarray,
     hardness: np.ndarray,
     *,
@@ -425,10 +446,18 @@ def _granularity_loss(
     """Return the squared error of reading hardness off region rates.
 
     The loss is the sum of two terms: `within` is the hardness variance
-    a region's mean hides, `noise` the sampling noise of a rate
-    measured on the val rows the region will receive, at its
-    full-class size. A finer partition lowers the first and raises the
-    second.
+    a group's mean hides, `noise` the sampling noise of a rate measured
+    on the val rows the group will receive, at its full-population
+    size. A finer partition lowers the first and raises the second.
+
+    Args:
+        labels: The group label of every row.
+        hardness: Each row's hardness, such as its kDN.
+        n_class: The full population size the groups are scaled to.
+        eval_rows_per_train_row: Evaluation rows per train row.
+
+    Returns:
+        The loss, `within` plus `noise`.
     """
     ids, counts = np.unique(labels, return_counts=True)
     scale = n_class / labels.shape[0]
@@ -499,7 +528,7 @@ def _score_candidates(
         labels, n_merged_clusters, n_merged = _merge_small_clusters(
             X_sub, labels, min_size=scaled_floor, metric=metric
         )
-        loss = _granularity_loss(
+        loss = granularity_loss(
             labels,
             hardness,
             n_class=n_class,
@@ -561,8 +590,12 @@ def _select_granularity(
     n_class = X.shape[0]
     scale = n_class / X_sub.shape[0]
     scaled_floor = min_cluster_floor / scale
-    hardness = _compute_kdn(
-        X_sub, row_ids=row_ids[scored_rows], label=label, nodes=nodes, k=hardness_k
+    hardness = compute_kdn(
+        X_sub,
+        row_ids=row_ids[scored_rows],
+        labels=np.full(X_sub.shape[0], label),
+        nodes=nodes,
+        k=hardness_k,
     )
 
     scored = _score_candidates(
@@ -596,15 +629,99 @@ def _select_granularity(
     return best_entry, None if subsampled else best_labels
 
 
-def _n_clusters_grid(n_class: int, target_size: int, max_n_clusters: int) -> list[int]:
-    """Return `n_clusters` candidates, from a geometric band of sizes.
+def level_counts(n_rows: int, min_cluster_floor: int) -> list[int]:
+    """Return the group count of each granularity level.
 
-    The band starts at `target_size` rows per cluster and doubles at
-    each level.
+    Level 0 targets `min_cluster_floor` rows per group, and each
+    further level doubles that target, coarsening the partition.
+
+    Args:
+        n_rows: The rows the groups partition.
+        min_cluster_floor: The target group size of the finest level.
+
+    Returns:
+        One count per level, finest first, each at least 2.
     """
-    sizes = (target_size * (2**level) for level in range(_GRANULARITY_LEVELS))
-    candidates = {min(max_n_clusters, max(2, round(n_class / size))) for size in sizes}
-    return sorted(candidates)
+    return [
+        max(2, round(n_rows / (min_cluster_floor * 2**level)))
+        for level in range(_GRANULARITY_LEVELS)
+    ]
+
+
+def _n_clusters_grid(
+    n_class: int, min_cluster_floor: int, max_n_clusters: int
+) -> list[int]:
+    """Return the distinct level counts, capped at `max_n_clusters`."""
+    counts = {
+        min(max_n_clusters, count) for count in level_counts(n_class, min_cluster_floor)
+    }
+    return sorted(counts)
+
+
+def kmeans_levels(
+    X: np.ndarray,
+    *,
+    min_cluster_floor: int,
+    max_fit_samples: int,
+    metric: str,
+    random_state: int,
+) -> list[np.ndarray]:
+    """Cluster X at every granularity level, merging undersized groups.
+
+    Args:
+        X: The points, shape (n, d).
+        min_cluster_floor: The finest level's target group size; also
+            the merge floor for undersized clusters.
+        max_fit_samples: The most rows K-means is fitted on.
+        metric: `euclidean` or `cosine`, the merge's nearest-centroid
+            metric.
+        random_state: The seed of K-means and its subsample.
+
+    Returns:
+        The merged labels of every level, finest first.
+    """
+    level_labels = []
+    for n_clusters in level_counts(X.shape[0], min_cluster_floor):
+        labels = _fit_kmeans(
+            X,
+            n_clusters=n_clusters,
+            max_fit_samples=max_fit_samples,
+            random_state=random_state,
+        )
+        merged, _, _ = _merge_small_clusters(
+            X, labels, min_size=min_cluster_floor, metric=metric
+        )
+        level_labels.append(merged)
+    return level_labels
+
+
+def random_voronoi(
+    X: np.ndarray,
+    n_cells: int,
+    *,
+    min_cluster_floor: int,
+    metric: str,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Partition X into Voronoi cells of random rows, small ones merged.
+
+    Args:
+        X: The points, shape (n, d).
+        n_cells: The cells before merging, capped at the row count.
+        min_cluster_floor: The merge floor for undersized cells.
+        metric: `euclidean` or `cosine`.
+        rng: The generator drawing the rows that centre the cells.
+
+    Returns:
+        The merged cell label of every row.
+    """
+    center_rows = rng.choice(X.shape[0], size=min(n_cells, X.shape[0]), replace=False)
+    centroids = dict(enumerate(X[center_rows]))
+    labels = assign_nearest_centroid(X, centroids, metric=metric)
+    merged, _, _ = _merge_small_clusters(
+        X, labels, min_size=min_cluster_floor, metric=metric
+    )
+    return merged
 
 
 def cluster_class(
