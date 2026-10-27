@@ -13,10 +13,12 @@ __all__ = [
     "SERIES",
     "arm_bars",
     "class_rate_bars",
+    "class_rate_gap",
     "class_score_bars",
     "confusion_heatmap",
     "grid_search",
     "group_bars",
+    "group_rate_bins",
     "importance_bars",
     "loss_curve",
     "partition_class_curves",
@@ -26,6 +28,7 @@ __all__ = [
     "predicted_vs_observed",
     "predictor_bars",
     "rate_ecdf",
+    "region_rate_bins",
     "region_scatter",
     "region_size_box",
     "regions_per_class",
@@ -34,6 +37,7 @@ __all__ = [
     "val_test_scatter",
 ]
 
+import bisect
 import math
 import statistics
 from collections.abc import Mapping, Sequence
@@ -87,6 +91,10 @@ OPERATING_RULES = {
     "confidence": "cbrt",
     "predicted_class": "cbrt",
 }
+# The upper edges of the failure-rate bins, after a bin of its own for a
+# rate of exactly 0: a good classifier leaves most regions error-free.
+_RATE_EDGES = [0.05, 0.1, 0.2, 0.3, 0.5]
+_RATE_BINS = ["0", "0–5%", "5–10%", "10–20%", "20–30%", "30–50%", "50–100%"]
 # Most classes that get a numbered cell or their own color.
 _MAX_LABELLED = 15
 _MAX_COLORED = len(SERIES)
@@ -499,6 +507,174 @@ def rate_ecdf(rows: Sequence[Mapping]) -> dict[str, object]:
         "yaxis": {"title": "share of regions", "range": [0, 1.02]},
     }
     return {"data": traces, "layout": layout}
+
+
+def _rate_bin(rate: float) -> str:
+    """Return the label of the failure-rate bin of `rate`."""
+    if rate == 0:
+        return _RATE_BINS[0]
+    return _RATE_BINS[1 + bisect.bisect_left(_RATE_EDGES, rate)]
+
+
+def _rate_bin_bars(
+    traces: Sequence[tuple[str, str, Sequence[tuple[float | None, int]]]],
+    *,
+    measure: str,
+) -> dict[str, object]:
+    """Draw how a set of clusters spreads over the failure-rate bins.
+
+    Args:
+        traces: One `(name, color, clusters)` per trace, a cluster being
+            its `(failure rate, rows)`; a cluster without a rate is left
+            out.
+        measure: "count" for the clusters in each bin, "size" for their
+            mean rows.
+
+    Returns:
+        A grouped-bar figure with every bin on the x axis, empty ones
+        included; the hover shows both measures.
+    """
+    data = []
+    for name, color, clusters in traces:
+        sizes: dict[str, list[int]] = {label: [] for label in _RATE_BINS}
+        for rate, n_rows in clusters:
+            if rate is not None and not math.isnan(rate):
+                sizes[_rate_bin(rate)].append(n_rows)
+        counts = [len(sizes[label]) for label in _RATE_BINS]
+        means = [
+            statistics.mean(sizes[label]) if sizes[label] else None
+            for label in _RATE_BINS
+        ]
+        data.append(
+            {
+                "type": "bar",
+                "name": name,
+                "x": _RATE_BINS,
+                "y": counts if measure == "count" else means,
+                "customdata": [[count, mean] for count, mean in zip(counts, means)],
+                "marker": {"color": color},
+                "hovertemplate": (
+                    "%{x}<br>%{customdata[0]} in the bin · mean "
+                    f"%{{customdata[1]:,.1f}} rows<extra>{name}</extra>"
+                ),
+            }
+        )
+    layout = {
+        "barmode": "group",
+        "height": _HEIGHT,
+        "xaxis": {
+            "title": "failure rate",
+            "type": "category",
+            "categoryorder": "array",
+            "categoryarray": _RATE_BINS,
+        },
+        "yaxis": {
+            "title": "clusters" if measure == "count" else "mean rows per cluster"
+        },
+    }
+    return {"data": data, "layout": layout}
+
+
+def region_rate_bins(rows: Sequence[Mapping], *, measure: str) -> dict[str, object]:
+    """Bin the regions by failure rate, on val and on test.
+
+    Args:
+        rows: The region rows.
+        measure: "count" or "size", as `_rate_bin_bars` takes it; a
+            region's size is its rows in the split of the rate.
+
+    Returns:
+        A grouped-bar figure with a trace per split.
+    """
+    traces = [
+        (
+            split,
+            _SPLIT_COLORS[split],
+            [(row[f"{split}_rate"], row[f"n_{split}"]) for row in rows],
+        )
+        for split in ("val", "test")
+    ]
+    return _rate_bin_bars(traces, measure=measure)
+
+
+def group_rate_bins(rows: Sequence[Mapping], *, measure: str) -> dict[str, object]:
+    """Bin each arm's groups by val failure rate.
+
+    Args:
+        rows: The partition_groups rows of one execution.
+        measure: "count" or "size", as `_rate_bin_bars` takes it; a
+            group's size is its val rows.
+
+    Returns:
+        A grouped-bar figure with a trace per arm but `null`, at the
+        rule `OPERATING_RULES` gives it; the table keeps one draw of
+        `null`, with far more groups than any other arm.
+    """
+    traces = [
+        (
+            arm,
+            color,
+            [
+                (row["val_rate"], row["n_val"])
+                for row in rows
+                if row["arm"] == arm and row["rule"] == OPERATING_RULES[arm]
+            ],
+        )
+        for arm, color in ARM_COLORS.items()
+        if arm != "null"
+    ]
+    return _rate_bin_bars(traces, measure=measure)
+
+
+def class_rate_gap(rows: Sequence[Mapping], *, run_id: int) -> dict[str, object]:
+    """Box each class's gap between the val and the test failure rate.
+
+    Args:
+        rows: The region rows.
+        run_id: The run, for the link of each marker to its region.
+
+    Returns:
+        A box figure of `val_rate - test_rate`, every region a point,
+        with a line at 0: a point above it is a region whose val rate
+        overshot the test one.
+    """
+    points = _rate_points(rows)
+    trace = {
+        "type": "box",
+        "x": [row["class"] for row in points],
+        "y": [row["val_rate"] - row["test_rate"] for row in points],
+        "text": [
+            f"region {row['region_id']}<br>"
+            f"n_val {row['n_val']:,} · n_test {row['n_test']:,}"
+            for row in points
+        ],
+        "customdata": [f"/runs/{run_id}/regions/{row['region_id']}" for row in points],
+        "boxpoints": "all",
+        "jitter": 0.5,
+        "pointpos": 0,
+        "marker": {"color": SERIES[0], "size": 4, "opacity": 0.6},
+        "line": {"width": 1.5},
+        "fillcolor": "rgba(0,0,0,0)",
+        "hovertemplate": "%{text}<br>val − test %{y:.3f}<extra></extra>",
+    }
+    layout = {
+        "height": _HEIGHT,
+        "xaxis": {"type": "category"},
+        "yaxis": {"title": "val − test failure rate", "zeroline": False},
+        "shapes": [
+            {
+                "type": "line",
+                "xref": "paper",
+                "x0": 0,
+                "x1": 1,
+                "y0": 0,
+                "y1": 0,
+                "line": {"dash": "dot", "color": NEUTRAL},
+            }
+        ],
+        "showlegend": False,
+    }
+    return {"data": [trace], "layout": layout}
 
 
 def predictor_bars(

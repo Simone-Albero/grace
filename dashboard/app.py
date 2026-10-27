@@ -19,7 +19,12 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from dashboard import charts, experiments, queries, summary, tabs
 from dashboard.experiments import MAIN_KEYS, Experiment
-from dashboard.queries import PARTITION_AXES, PARTITION_METRICS, REGION_COLUMNS
+from dashboard.queries import (
+    ARM_METRICS,
+    PARTITION_AXES,
+    PARTITION_METRICS,
+    REGION_COLUMNS,
+)
 from pipeline.db import explain, reap
 
 # The rendered rows of the region table; the scatter keeps all points.
@@ -32,7 +37,6 @@ _SORTS = ["latest", "n_seeds", *MAIN_KEYS, *summary.HEADLINE]
 # What the pages poll for while a run is going, in seconds.
 _REFRESH_SECONDS = 5
 _BIN_RULES = ("selected", "fixed15", "cbrt", "per150")
-_ARM_METRICS = ("skill", "brier", "auroc", "kdn_spearman")
 # The trace of a grouped-bar chart: name, color, values by x.
 _Trace = tuple[str, str, dict[str, list[float]]]
 
@@ -434,7 +438,7 @@ def create_app(db_path: Path) -> FastAPI:
             "metrics": names,
             "labels": {name: summary.metric_label(name) for name in names},
             "scores": queries.SCORES,
-            "arm_metrics": _ARM_METRICS,
+            "arm_metrics": ARM_METRICS,
             "rules": _BIN_RULES,
         }
         return render(request, "compare.html", context)
@@ -454,7 +458,7 @@ def create_app(db_path: Path) -> FastAPI:
         _check_choice("x", x, MAIN_KEYS)
         _check_choice("color", color, ["", *MAIN_KEYS])
         _check_choice("score", score, queries.SCORES)
-        _check_choice("arm_metric", arm_metric, _ARM_METRICS)
+        _check_choice("arm_metric", arm_metric, ARM_METRICS)
         _check_choice("rule", rule, _BIN_RULES)
         all_rows = experiments.compare_rows(_load_experiments(connection))
         # A metric of a stage no run has finished is an empty chart, not

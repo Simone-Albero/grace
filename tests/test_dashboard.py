@@ -104,9 +104,16 @@ def test_run_overview_and_tabs(client: TestClient, run_id: int) -> None:
         "data": ("Preprocessing", "class_1", "num_1", "train"),
         "classifier": ("Confusion matrix", "precision", "accuracy"),
         "regions": ("Clustering of each class", "size balance", "n1_mean"),
-        "failures": ("Test against val failure rate", "Distribution"),
+        "failures": ("Test against val failure rate", "Distribution", "Val − test"),
         "predictors": ("RF regressor", "Val rate", "MCP", "ATC", "MSE", "Outer folds"),
-        "partitions": ("Operating points", "intra", "predicted_class", "Brier"),
+        "partitions": (
+            "Operating points",
+            "intra",
+            "predicted_class",
+            "Brier",
+            ">reliability</th>",
+            "Groups per val",
+        ),
     }
     for tab in _TABS:
         page = client.get(f"/runs/{run_id}/{tab}")

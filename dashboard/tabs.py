@@ -180,8 +180,10 @@ def _classifier(
         )
         if counts is None:
             confusion_note = (
-                "The confusion matrix needs the prepare and classify files "
-                "under artifacts/, and they are missing or disagree in length."
+                "The confusion matrix needs "
+                f"{root / dirs['prepare'] / 'test.parquet'} and "
+                f"{root / dirs['classify'] / 'predictions.parquet'}, and they "
+                "are missing or disagree in length."
             )
         else:
             figures["confusion"] = charts.confusion_heatmap(
@@ -231,6 +233,9 @@ def _failures(
         "scatter": charts.val_test_scatter(rows, run_id=run_id),
         "classes": charts.class_rate_bars(rows),
         "ecdf": charts.rate_ecdf(rows),
+        "bin_counts": charts.region_rate_bins(rows, measure="count"),
+        "bin_sizes": charts.region_rate_bins(rows, measure="size"),
+        "gap": charts.class_rate_gap(rows, run_id=run_id),
     }
     return {
         "tiles": _tiles(metrics, _TILES["failures"]),
@@ -291,12 +296,17 @@ def _predictors(
     }
 
 
-def _partitions(db: sqlite3.Connection, metrics: _Metrics, run_id: int) -> dict:
-    """Operating points of every arm, and the sweep charts' inputs."""
+def _partitions(
+    db: sqlite3.Connection, ids: Mapping[str, int], metrics: _Metrics, run_id: int
+) -> dict:
+    """Each arm's operating points and groups; the sweeps' inputs."""
     points = queries.operating_points(db, run_id)
     figures = {
-        metric: charts.arm_bars(points, metric) for metric in ("brier", "kdn_spearman")
+        metric: charts.arm_bars(points, metric) for metric in queries.ARM_METRICS
     }
+    groups = queries.partition_groups(db, ids["partitions"])
+    figures["bin_counts"] = charts.group_rate_bins(groups, measure="count")
+    figures["bin_sizes"] = charts.group_rate_bins(groups, measure="size")
     return {
         "tiles": _tiles(metrics, _TILES["partitions"]),
         "points": points,
@@ -360,5 +370,5 @@ def build(
         case "predictors":
             context.update(_predictors(db, ids, metrics, run["id"]))
         case "partitions":
-            context.update(_partitions(db, metrics, run["id"]))
+            context.update(_partitions(db, ids, metrics, run["id"]))
     return context

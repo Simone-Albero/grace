@@ -8,6 +8,15 @@
 </div>
 <p class="muted">A marker is a region, its area grows with its test rows. The empirical
   rates are errors over rows of the region in that split.</p>
+<div class="grid">
+  {{ m.chart(figures.bin_counts, "Regions per failure-rate bin") }}
+  {{ m.chart(figures.bin_sizes, "Mean rows per region, per failure-rate bin") }}
+  {{ m.chart(figures.gap, "Val − test failure rate of each region, per class", wide=True) }}
+</div>
+<p class="muted">A region's size is its rows in the split of the rate. Both rates are
+  empirical, and the real one is not observable; test usually has more rows than val, so its
+  rate is the less noisy. A gap far from 0 is noise or drift between the two, and small
+  regions show most of it, since a few rows make a noisy rate.</p>
 <h2>Regions with the highest test failure rate</h2>
 <div class="scroll"><table>
   <thead><tr>

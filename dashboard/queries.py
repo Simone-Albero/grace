@@ -1,6 +1,7 @@
 """Read-only queries of the dashboard on grace.db."""
 
 __all__ = [
+    "ARM_METRICS",
     "OPERATING_COLUMNS",
     "PARTITION_AXES",
     "PARTITION_METRICS",
@@ -61,11 +62,29 @@ REGION_COLUMNS = (
     "regressor val mcp atc abs_error"
 ).split()
 # The partitions columns the panel plots: its metrics and its x axes.
-PARTITION_METRICS = ("skill", "brier", "auroc", "kdn_spearman", "share_no_val")
+PARTITION_METRICS = (
+    "skill",
+    "brier",
+    "resolution",
+    "reliability",
+    "auroc",
+    "kdn_spearman",
+    "share_no_val",
+)
+# The scores drawn at each arm's operating point, in reading order.
+ARM_METRICS = (
+    "skill",
+    "brier",
+    "resolution",
+    "reliability",
+    "auroc",
+    "kdn_spearman",
+)
 PARTITION_AXES = ("n_groups", "val_median")
 # The partitions columns averaged into an operating point.
 OPERATING_COLUMNS = (
-    "n_groups val_median share_no_val brier skill auroc kdn_spearman"
+    "n_groups val_median share_no_val brier skill resolution reliability "
+    "auroc kdn_spearman"
 ).split()
 
 

@@ -1,17 +1,55 @@
 {% extends "run_base.html" %}
 {% block content %}
 {{ m.tiles(tiles) }}
+<details class="settings" open>
+  <summary>How to read this tab</summary>
+  <p>Every arm splits the val and test rows into groups, reading none of their labels. A group
+    predicts, for each of its test rows, the failure rate of its own val rows (the global val
+    rate if it has none); the scores say how well those predictions match the test failures.</p>
+  <h4>Arms</h4>
+  <dl class="facts">
+    <dt>intra</dt><dd>k-means inside each class of train; each val and test row joins the nearest centre.</dd>
+    <dt>inter</dt><dd>k-means over all of train, routed the same way.</dd>
+    <dt>null</dt><dd>random cells instead of k-means, the mean of its draws: the floor, since an arm that does not beat it at a similar group count learns nothing from the geometry. It picks its own level, so its group count is not inter's.</dd>
+    <dt>confidence</dt><dd>equal-val-mass bins of the classifier's top probability, over all rows.</dd>
+    <dt>predicted_class</dt><dd>the same bins, inside each predicted class.</dd>
+    <dt>rule</dt><dd><code>selected</code> is the grouping of least loss; <code>fixed15</code>, <code>cbrt</code> and <code>per150</code> are 15 bins, the cube root of the val rows, and one bin per 150 of them.</dd>
+  </dl>
+  <h4>Scores, on test</h4>
+  <dl class="facts">
+    <dt>Brier</dt><dd>mean squared gap between the predicted rate and each row's failure (0 or 1); lower is better.</dd>
+    <dt>reference Brier</dt><dd>the same for one global val rate on every row, the group-blind answer.</dd>
+    <dt>skill</dt><dd>1 − Brier / reference Brier: 0 is no better than the global rate, 1 is perfect, below 0 is worse.</dd>
+    <dt>resolution</dt><dd>how far the groups' test rates sit from the overall one, i.e. how well they separate failing from correct rows; higher is better. It grows with the group count even for random groups, so compare arms at similar counts.</dd>
+    <dt>reliability</dt><dd>how far each group's val estimate sits from its test rate, i.e. how little the estimate transfers; lower is better.</dd>
+    <dt>identity</dt><dd>Brier = uncertainty − resolution + reliability; uncertainty is the same for every arm, so the arms differ in resolution and reliability only.</dd>
+    <dt>AUROC</dt><dd>the chance that a failing test row gets a higher predicted rate than a correct one; 0.5 is chance.</dd>
+    <dt>kDN Spearman</dt><dd>geometric arms only: the rank correlation of each group's mean train hardness with its test rate.</dd>
+    <dt>no val</dt><dd>the share of test rows in a group with no val row.</dd>
+  </dl>
+</details>
 <div class="grid">
-  {{ m.chart(figures.brier, "Brier score at each arm's operating point") }}
+  {{ m.chart(figures.skill, "Skill at each arm's operating point (higher is better)") }}
+  {{ m.chart(figures.brier, "Brier score at each arm's operating point (lower is better)") }}
+  {{ m.chart(figures.resolution, "Resolution: how well the groups separate failures (higher is better)") }}
+  {{ m.chart(figures.reliability, "Reliability: how far val estimates miss test (lower is better)") }}
+  {{ m.chart(figures.auroc, "AUROC at each arm's operating point (0.5 is chance)") }}
   {{ m.chart(figures.kdn_spearman, "kDN Spearman at each arm's operating point") }}
 </div>
 <p class="muted">An arm's operating point is its selected grouping, or for a bin arm the
   cube-root rule; <code>null</code> is the mean of its draws.</p>
+<h2>Groups by failure rate</h2>
+<div class="grid">
+  {{ m.chart(figures.bin_counts, "Groups per val failure-rate bin") }}
+  {{ m.chart(figures.bin_sizes, "Mean val rows per group, per bin") }}
+</div>
+<p class="muted">Each arm's groups at its operating point, <code>null</code> left out (the table keeps only its first draw's groups, and it has many more); a group's size is its val rows.</p>
 <h2>Operating points</h2>
 <div class="scroll"><table>
   <thead><tr>
     <th>arm</th><th>rule</th><th class="num">groups</th><th class="num">val median</th>
     <th class="num">no val</th><th class="num">Brier</th><th class="num">skill</th>
+    <th class="num">resolution</th><th class="num">reliability</th>
     <th class="num">AUROC</th><th class="num">kDN Spearman</th>
   </tr></thead>
   <tbody>
@@ -19,6 +57,7 @@
   <tr><td>{{ p.arm }}</td><td>{{ p.rule }}</td><td class="num">{{ p.n_groups | num }}</td>
     <td class="num">{{ p.val_median | num }}</td><td class="num">{{ p.share_no_val | num }}</td>
     <td class="num">{{ p.brier | num }}</td><td class="num">{{ p.skill | num }}</td>
+    <td class="num">{{ p.resolution | num }}</td><td class="num">{{ p.reliability | num }}</td>
     <td class="num">{{ p.auroc | num }}</td><td class="num">{{ p.kdn_spearman | num }}</td></tr>
   {% endfor %}
   </tbody>

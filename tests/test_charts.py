@@ -6,14 +6,17 @@ import pytest
 from dashboard.charts import (
     _mean_points,
     class_rate_bars,
+    class_rate_gap,
     confusion_heatmap,
     group_bars,
+    group_rate_bins,
     partition_class_curves,
     partition_curves,
     partition_val_rates,
     partition_val_test_scatter,
     predicted_vs_observed,
     rate_ecdf,
+    region_rate_bins,
     val_test_scatter,
 )
 
@@ -276,3 +279,66 @@ def test_group_bars_use_a_sample_std_and_hover_the_count() -> None:
     assert trace["y"] == [2.0, 5.0]
     assert trace["error_y"]["array"] == [pytest.approx(2**0.5), 0.0]
     assert trace["text"] == ["n = 2", "n = 1"]
+
+
+def test_region_rate_bins_give_zero_a_bin_and_keep_empty_bins() -> None:
+    """Check the bin edges, counts, mean sizes and empty bins.
+
+    A rate of exactly 0 has its own bin, a rate on an edge falls in the
+    bin it closes, a region with no rate is left out, and a bin nobody
+    reaches stays on the axis with no mean.
+    """
+    rows = [
+        {"val_rate": 0.0, "n_val": 10, "test_rate": 1.0, "n_test": 4},
+        {"val_rate": 0.05, "n_val": 20, "test_rate": None, "n_test": 0},
+        {"val_rate": 0.04, "n_val": 40, "test_rate": 0.5, "n_test": 6},
+        {"val_rate": None, "n_val": 0, "test_rate": 0.3, "n_test": 8},
+    ]
+    val_counts, test_counts = region_rate_bins(rows, measure="count")["data"]
+    assert val_counts["x"][:3] == ["0", "0–5%", "5–10%"]
+    assert val_counts["y"] == [1, 2, 0, 0, 0, 0, 0]
+    val_sizes = region_rate_bins(rows, measure="size")["data"][0]
+    assert val_sizes["y"] == [10, 30, None, None, None, None, None]
+    # 0.3 closes 20–30%, 0.5 closes 30–50%, 1.0 falls in 50–100%.
+    assert test_counts["y"] == [0, 0, 0, 0, 1, 1, 1]
+
+
+def test_group_rate_bins_read_each_arm_at_its_operating_rule() -> None:
+    """Check a bin arm at `cbrt` and a geometric arm at `selected`."""
+    rows = [
+        {"arm": "intra", "rule": "selected", "val_rate": 0.0, "n_val": 5},
+        {"arm": "intra", "rule": "level", "val_rate": 0.9, "n_val": 5},
+        {"arm": "confidence", "rule": "cbrt", "val_rate": 0.6, "n_val": 7},
+        {"arm": "confidence", "rule": "fixed15", "val_rate": 0.0, "n_val": 7},
+    ]
+    traces = group_rate_bins(rows, measure="count")["data"]
+    counts_by_arm = {trace["name"]: trace["y"] for trace in traces}
+    assert counts_by_arm["intra"] == [1, 0, 0, 0, 0, 0, 0]
+    assert counts_by_arm["confidence"] == [0, 0, 0, 0, 0, 0, 1]
+    assert "null" not in counts_by_arm
+
+
+def test_class_rate_gap_is_val_minus_test_and_skips_a_region_without_both() -> None:
+    """Check the gap's sign, and that a region missing a rate is out."""
+    rows = [
+        {
+            "class": "a",
+            "region_id": 1,
+            "val_rate": 0.5,
+            "test_rate": 0.25,
+            "n_val": 4,
+            "n_test": 4,
+        },
+        {
+            "class": "a",
+            "region_id": 2,
+            "val_rate": None,
+            "test_rate": 0.1,
+            "n_val": 0,
+            "n_test": 3,
+        },
+    ]
+    trace = class_rate_gap(rows, run_id=7)["data"][0]
+    assert trace["x"] == ["a"]
+    assert trace["y"] == [0.25]
+    assert trace["customdata"] == ["/runs/7/regions/1"]
