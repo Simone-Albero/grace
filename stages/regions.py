@@ -1,8 +1,8 @@
-"""Regions per class in a fitted space, with val and test routed.
+"""Regions per class in the fitted space, with val and test routed.
 
-Artifacts: the fitted space, the graph arrays, region centroids and
-assignments. DB rows written: `regions`, `class_clusterings` and
-metrics n_regions, n_graph_rows and eval_rows_per_train_row.
+Artifacts: region centroids and assignments. DB rows written:
+`regions`, `class_clusterings` and metrics n_regions and
+eval_rows_per_train_row.
 """
 
 __all__ = ["CONFIG", "INPUTS", "FILES", "OUTPUTS", "run"]
@@ -22,19 +22,18 @@ from src.clustering import (
     cluster_class,
     cluster_size_balance,
     compute_centroids,
-    subsample_indices,
 )
-from src.graph import build_train_graph
 from src.space import Space, scale_for_metric
 from stages import LABEL, SPLITS, Context
 
 logger = logging.getLogger(__name__)
 
-CONFIG = ("space", "graph", "clustering", "distance", "seed")
-# Split gives the feature kinds; prepare, the splits.
-INPUTS = ("split", "prepare")
+CONFIG = ("clustering", "distance", "seed")
+# Split gives the feature kinds; prepare, the splits; space, the fitted
+# space and the graph rows.
+INPUTS = ("split", "prepare", "space")
 FILES = ()
-OUTPUTS = ("space.joblib", "graph.npz", "centroids.parquet", "assignments.parquet")
+OUTPUTS = ("centroids.parquet", "assignments.parquet")
 _ROUTE_ROWS = 500_000
 
 
@@ -216,25 +215,10 @@ def run(ctx: Context) -> None:
     }
     eval_rows_per_train_row = len(eval_rows["val"]) / len(train)
 
-    graph_rows = np.sort(
-        subsample_indices(
-            len(train), max_samples=cfg.graph.max_samples, random_state=cfg.seed
-        )
-    )
-    space = Space.fit(
-        train,
-        num_cols=num_cols,
-        cat_cols=cat_cols,
-        top_k=cfg.space.top_k,
-        cat_cost=cfg.space.cat_cost,
-    )
+    space: Space = joblib.load(ctx.inputs["space"].dir / "space.joblib")
+    with np.load(ctx.inputs["space"].dir / "graph.npz") as stored:
+        graph_rows = stored["rows"]
     graph_points = space.embed(train.iloc[graph_rows])
-    train_graph = build_train_graph(
-        graph_points,
-        k=cfg.graph.k,
-        metric=cfg.distance,
-        n_jobs=ctx.runtime.n_jobs,
-    )
 
     logger.info("Running per-class clustering on train (n=%d)...", len(train))
     labels, centroids, report = _cluster_per_class(
@@ -258,14 +242,6 @@ def run(ctx: Context) -> None:
     }
     assignments = _assignments(assigned)
 
-    joblib.dump(space, ctx.out / "space.joblib")
-    np.savez(
-        ctx.out / "graph.npz",
-        rows=graph_rows,
-        knn_idx=train_graph.knn_idx,
-        knn_dist=train_graph.knn_dist,
-        mst=train_graph.mst_edges,
-    )
     centroid_table.to_parquet(ctx.out / "centroids.parquet", index=False)
     assignments.to_parquet(ctx.out / "assignments.parquet", index=False)
 
@@ -285,7 +261,6 @@ def run(ctx: Context) -> None:
     ctx.save_metrics(
         {
             "n_regions": len(region_ids),
-            "n_graph_rows": len(graph_rows),
             "eval_rows_per_train_row": eval_rows_per_train_row,
         }
     )

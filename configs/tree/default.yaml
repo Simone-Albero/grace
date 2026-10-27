@@ -1,0 +1,2 @@
+n_min: 30         # fewest train rows of a tree node: a split that would leave fewer is not made
+k_neighbours: 30  # nearest train rows behind a row's disagreement with its predicted class

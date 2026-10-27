@@ -26,7 +26,7 @@
   <tbody>
   {% for r in worst %}
   <tr>
-    <td><a href="/runs/{{ run.id }}/regions/{{ r.region_id }}">{{ r.region_id }}</a></td><td>{{ r["class"] }}</td>
+    <td>{{ r.region_id }}</td><td>{{ r["class"] }}</td>
     <td class="num">{{ r.n_val | num }}</td><td class="num">{{ r.n_val_error | num }}</td><td class="num">{{ r.val_rate | num }}</td>
     <td class="num">{{ r.n_test | num }}</td><td class="num">{{ r.n_test_error | num }}</td><td class="num">{{ r.test_rate | num }}</td>
   </tr>

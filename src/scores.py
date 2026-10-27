@@ -1,8 +1,8 @@
 """Failure-rate scores and classification metrics."""
 
 __all__ = [
+    "check_probabilities",
     "compute_classification_metrics",
-    "group_scores",
     "log_scores",
     "rate_scores",
     "spearman",
@@ -21,11 +21,34 @@ from sklearn.metrics import (
     precision_score,
     r2_score,
     recall_score,
-    roc_auc_score,
 )
 from sklearn.utils.multiclass import unique_labels
 
 logger = logging.getLogger(__name__)
+
+
+def check_probabilities(y_proba: np.ndarray, n_classes: int, split: str) -> None:
+    """Check a split's probabilities: one finite column per class.
+
+    Args:
+        y_proba: The predicted probabilities, shape (n, columns).
+        n_classes: The classes of the data.
+        split: The split's name, for the error message.
+
+    Raises:
+        ValueError: A column count other than `n_classes`, or a value
+            that is not finite.
+    """
+    if y_proba.shape[1] != n_classes:
+        raise ValueError(
+            f"The model gave {y_proba.shape[1]} probabilities per row on {split} for "
+            f"{n_classes} classes: column k of predictions would not be class k."
+        )
+    if not np.isfinite(y_proba).all():
+        raise ValueError(
+            f"The model predicted non-finite probabilities on {split}: every "
+            "confidence-based score downstream would be NaN."
+        )
 
 
 def spearman(values: np.ndarray, other: np.ndarray) -> float:
@@ -65,66 +88,6 @@ def rate_scores(predicted: ArrayLike, observed: ArrayLike) -> dict[str, float]:
         ),
         "mae": float(mean_absolute_error(observed, predicted)),
         "mse": float(np.mean((predicted - observed) ** 2)),
-    }
-
-
-def group_scores(
-    predicted: ArrayLike, observed: ArrayLike, group: ArrayLike, *, reference: float
-) -> dict[str, float]:
-    """Score a per-row failure prediction, constant within its group.
-
-    `brier` decomposes exactly into `uncertainty` (the variance of
-    `observed`), `resolution` (how far each group's observed rate sits
-    from the overall one) and `reliability` (how far each group's
-    prediction sits from its observed rate):
-    `brier = uncertainty - resolution + reliability`.
-
-    Args:
-        predicted: Each row's predicted failure rate, constant within
-            its group.
-        observed: Each row's observed failure, 0 or 1.
-        group: Each row's group id.
-        reference: The single rate a group-blind model would predict
-            for every row, such as the global val rate. `skill` is the
-            share of its Brier score `predicted` avoids.
-
-    Returns:
-        "brier", its decomposition "uncertainty", "resolution" and
-        "reliability", "skill" and "auroc". "skill" is NaN when
-        `reference` already scores zero Brier, "auroc" when `observed`
-        has only one class.
-    """
-    predicted = np.asarray(predicted, dtype=float)
-    observed = np.asarray(observed, dtype=float)
-    group = np.asarray(group)
-    n_rows = len(observed)
-
-    brier = float(np.mean((predicted - observed) ** 2))
-    base_rate = float(observed.mean())
-    uncertainty = base_rate * (1 - base_rate)
-
-    resolution = 0.0
-    reliability = 0.0
-    for group_id in np.unique(group):
-        in_group = group == group_id
-        share = int(in_group.sum()) / n_rows
-        observed_rate = float(observed[in_group].mean())
-        resolution += share * (observed_rate - base_rate) ** 2
-        reliability += share * (float(predicted[in_group].mean()) - observed_rate) ** 2
-
-    reference_brier = float(np.mean((reference - observed) ** 2))
-    skill = 1 - brier / reference_brier if reference_brier > 1e-12 else float("nan")
-    auroc = (
-        float(roc_auc_score(observed, predicted)) if 0 < base_rate < 1 else float("nan")
-    )
-
-    return {
-        "brier": brier,
-        "skill": skill,
-        "uncertainty": uncertainty,
-        "resolution": resolution,
-        "reliability": reliability,
-        "auroc": auroc,
     }
 
 

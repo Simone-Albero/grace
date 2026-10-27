@@ -1,16 +1,17 @@
 """PyTorch MLP classifier: losses, class weights, loaders, training."""
 
 __all__ = [
+    "DLTraining",
     "LOSSES",
     "MODELS",
-    "build_loader",
-    "class_weights",
+    "fit_classifier",
+    "model_params",
     "predict",
-    "train",
 ]
 
 import logging
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -19,6 +20,8 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader, TensorDataset
+
+from src.data import stratified_holdout
 
 logger = logging.getLogger(__name__)
 
@@ -197,7 +200,7 @@ class MLPClassifier(nn.Module):
 MODELS: dict[str, type[nn.Module]] = {"mlp": MLPClassifier}
 
 
-def class_weights(labels: pd.Series) -> dict[int, float]:
+def _class_weights(labels: pd.Series) -> dict[int, float]:
     """Return each class's weight, a log-damped inverse frequency.
 
     Args:
@@ -229,7 +232,7 @@ def _tensors(
     return x_num, x_cat
 
 
-def build_loader(
+def _build_loader(
     rows: pd.DataFrame,
     *,
     num_cols: list[str],
@@ -320,7 +323,7 @@ def _holdout_loss(
     return _mean(losses)
 
 
-def train(
+def _train(
     model: nn.Module,
     train_loader: DataLoader,
     holdout_loader: DataLoader,
@@ -433,3 +436,195 @@ def predict(
             logits.append(model(*(tensor.to(device) for tensor in tensors)).cpu())
     probabilities = F.softmax(torch.cat(logits), dim=1)
     return probabilities.argmax(dim=1).numpy(), probabilities.numpy()
+
+
+@dataclass(frozen=True)
+class DLTraining:
+    """How one DL classifier is built and trained.
+
+    Attributes:
+        model: A key of `MODELS`.
+        model_params: The model's keyword arguments, shapes included.
+        loss: A key of `LOSSES`.
+        loss_params: The loss's keyword arguments; a `class_weight` of
+            "auto" becomes the log-damped inverse frequency of the rows
+            trained on.
+        optimizer: A `torch.optim` class name.
+        optimizer_params: Its keyword arguments.
+        scheduler: A `torch.optim.lr_scheduler` class name.
+        scheduler_params: Its keyword arguments; a `steps_per_epoch` of
+            "auto" becomes the number of train batches.
+        epochs: The most epochs.
+        max_grad_norm: The gradient clipping norm.
+        patience: The epochs without improvement that stop the training.
+        min_delta: The least holdout loss decrease that counts.
+        holdout_frac: The share of the rows held out to stop on.
+        train_batching: The train `DataLoader` arguments.
+        holdout_batching: The holdout `DataLoader` arguments.
+        num_workers: The loaders' workers.
+        pin_memory: Whether the loaders pin memory.
+        device: A torch device name.
+    """
+
+    model: str
+    model_params: Mapping[str, object]
+    loss: str
+    loss_params: Mapping[str, object]
+    optimizer: str
+    optimizer_params: Mapping[str, object]
+    scheduler: str
+    scheduler_params: Mapping[str, object]
+    epochs: int
+    max_grad_norm: float
+    patience: int
+    min_delta: float
+    holdout_frac: float
+    train_batching: Mapping[str, object]
+    holdout_batching: Mapping[str, object]
+    num_workers: int
+    pin_memory: bool
+    device: str
+
+
+def model_params(
+    params: Mapping[str, object],
+    *,
+    n_classes: int,
+    n_num: int,
+    n_cat: int,
+    cardinality: int,
+) -> dict[str, object]:
+    """Return a DL model's `params` with the shapes of the data added.
+
+    Args:
+        params: The model's own parameters.
+        n_classes: The classes of the data.
+        n_num: The numerical features.
+        n_cat: The categorical features.
+        cardinality: The codes of each categorical feature's embedding.
+
+    Returns:
+        A copy of `params`.
+    """
+    return {
+        **params,
+        "num_classes": n_classes,
+        "num_numerical_features": n_num,
+        "cardinalities": [cardinality] * n_cat,
+    }
+
+
+def fit_classifier(
+    rows: pd.DataFrame,
+    *,
+    num_cols: list[str],
+    cat_cols: list[str],
+    label_col: str,
+    n_classes: int,
+    training: DLTraining,
+    seed: int,
+) -> tuple[nn.Module, list[float], int]:
+    """Train a DL classifier, early stopping on a holdout of `rows`.
+
+    Stopping on val would pick the epoch that suits val best and bias
+    every estimate made from val's labels.
+
+    Args:
+        rows: The encoded rows to fit on.
+        num_cols: The numerical feature names.
+        cat_cols: The categorical feature names.
+        label_col: The label column.
+        n_classes: The classes of the data.
+        training: How to build and train it.
+        seed: The seed of the holdout, the weights and the loaders.
+
+    Returns:
+        The model at its best epoch, the loss of every step and the
+        number of rows it actually trained on (`rows` less the holdout).
+
+    Raises:
+        ValueError: A `class_weight` list that does not hold one weight
+            per class.
+    """
+    device = torch.device(training.device)
+    logger.info("Training %s ...", training.model)
+    train_rows, holdout_rows = stratified_holdout(
+        rows,
+        holdout_frac=training.holdout_frac,
+        label_col=label_col,
+        random_state=seed,
+    )
+
+    loss_params = dict(training.loss_params)
+    if loss_params.get("class_weight") == "auto":
+        weight_by_class = _class_weights(train_rows[label_col])
+        loss_params["class_weight"] = [
+            weight_by_class[class_id] for class_id in range(n_classes)
+        ]
+    weights = loss_params.get("class_weight")
+    if isinstance(weights, list) and len(weights) != n_classes:
+        raise ValueError(
+            f"loss.params.class_weight has {len(weights)} weights for {n_classes} "
+            "classes of prepare; give one per class or 'auto'."
+        )
+
+    # Seeded here, so a fit trains the same whatever ran before it: the
+    # model's initial weights and its dropout are the only draws on the
+    # global stream.
+    torch.manual_seed(seed)
+    model = MODELS[training.model](**training.model_params).to(device)
+    loss_fn = LOSSES[training.loss](**loss_params).to(device)
+
+    loader_options = {
+        "num_workers": training.num_workers,
+        "pin_memory": training.pin_memory,
+    }
+    column_options = {
+        "num_cols": num_cols,
+        "cat_cols": cat_cols,
+        "label_col": label_col,
+        "seed": seed,
+    }
+    train_batching = dict(training.train_batching)
+    # BatchNorm cannot train on a 1-row batch: drop that row (a random
+    # one if shuffled).
+    has_batch_norm = any(
+        isinstance(module, nn.BatchNorm1d) for module in model.modules()
+    )
+    train_batching["drop_last"] = (
+        has_batch_norm and len(train_rows) % train_batching["batch_size"] == 1
+    )
+    train_loader = _build_loader(
+        train_rows, **column_options, **train_batching, **loader_options
+    )
+    holdout_loader = _build_loader(
+        holdout_rows,
+        **column_options,
+        **training.holdout_batching,
+        **loader_options,
+    )
+
+    optimizer = getattr(torch.optim, training.optimizer)(
+        model.parameters(), **training.optimizer_params
+    )
+    scheduler_params = dict(training.scheduler_params)
+    if scheduler_params.get("steps_per_epoch") == "auto":
+        scheduler_params["steps_per_epoch"] = len(train_loader)
+    scheduler = getattr(torch.optim.lr_scheduler, training.scheduler)(
+        optimizer, **scheduler_params
+    )
+
+    history = _train(
+        model,
+        train_loader,
+        holdout_loader,
+        loss_fn=loss_fn,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        epochs=training.epochs,
+        max_grad_norm=training.max_grad_norm,
+        patience=training.patience,
+        min_delta=training.min_delta,
+        device=device,
+    )
+    return model, history, len(train_rows)

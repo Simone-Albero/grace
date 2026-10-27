@@ -19,8 +19,6 @@ import statistics
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
-from dashboard.queries import OPERATING_COLUMNS
-
 # The config keys that do not tell two experiments apart: the seed is
 # what an experiment varies, root and runtime are in no cache key, and
 # the figure keys only steer `render`, whose figures are not shown.
@@ -42,8 +40,7 @@ class SeedRun:
         seed: The seed.
         run: The run, as `queries.runs` lists it.
         metrics: Its metrics by `<stage>.<name>`, those of its done
-            executions only; an operating point's columns are
-            `op.<arm>.<rule>.<column>`.
+            executions only.
         executions: The execution id of each of its done stages.
         earlier: The older runs of the same seed, newest first.
     """
@@ -150,14 +147,13 @@ def _seed_run(
     seed: int,
     seed_runs: Sequence[dict],
     metrics: Mapping[int, Mapping[str, float | None]],
-    operating: Mapping[int, Mapping[str, float | None]],
 ) -> SeedRun:
     """Build the entry of a seed from its runs, newest first."""
     latest = seed_runs[0]
     return SeedRun(
         seed=seed,
         run=latest,
-        metrics={**metrics.get(latest["id"], {}), **operating.get(latest["id"], {})},
+        metrics=dict(metrics.get(latest["id"], {})),
         executions={
             row["stage"]: row["execution_id"]
             for row in latest["stages"]
@@ -170,14 +166,12 @@ def _seed_run(
 def build(
     runs: Sequence[dict],
     metric_rows: Iterable[tuple[int, str, int, str, float | None]],
-    operating_rows: Iterable[Mapping[str, object]],
 ) -> list[Experiment]:
     """Group runs into experiments.
 
     Args:
         runs: Every run, as `queries.runs` lists them.
         metric_rows: `queries.run_metrics`.
-        operating_rows: `queries.operating_points` of every run.
 
     Returns:
         The experiments, the one with the newest run first.
@@ -185,11 +179,6 @@ def build(
     metrics: dict[int, dict[str, float | None]] = {}
     for run_id, stage, _, name, value in metric_rows:
         metrics.setdefault(run_id, {})[f"{stage}.{name}"] = _finite(value)
-    operating: dict[int, dict[str, float | None]] = {}
-    for row in operating_rows:
-        for column in OPERATING_COLUMNS:
-            key = f"op.{row['arm']}.{row['rule']}.{column}"
-            operating.setdefault(row["run_id"], {})[key] = _finite(row[column])
 
     by_config: dict[str, tuple[dict, dict[int, list[dict]]]] = {}
     for run in sorted(runs, key=lambda run: run["id"], reverse=True):
@@ -207,7 +196,7 @@ def build(
             },
             variant=variants[key],
             seeds=[
-                _seed_run(seed, seed_runs, metrics, operating)
+                _seed_run(seed, seed_runs, metrics)
                 for seed, seed_runs in sorted(seeds.items())
             ],
         )
@@ -233,12 +222,8 @@ def summarize(values: Iterable[float | None]) -> tuple[float | None, float | Non
 
 
 def metric_stage(metric: str) -> str:
-    """Return the stage whose execution holds a metric key.
-
-    A `<stage>.<name>` key names its stage; an `op.` key is an operating
-    point of partitions.
-    """
-    return "partitions" if metric.startswith("op.") else metric.split(".")[0]
+    """Return the stage of a `<stage>.<name>` metric key."""
+    return metric.split(".")[0]
 
 
 def compare_rows(experiments: Iterable[Experiment]) -> list[dict]:

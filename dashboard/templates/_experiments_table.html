@@ -5,7 +5,7 @@
      hx-include="#filters, [name=sort], [name=desc]"{% endif %}>
 {% if not rows %}
 <p class="note">No experiment{% if selected.values() | select | list %} matches these filters{% else %} yet:
-  run <code>python -m stages render partitions data=synthetic_test</code>{% endif %}.</p>
+  run <code>python -m stages render data=synthetic_test</code>{% endif %}.</p>
 {% else %}
 {% macro head(col, label, cls="") %}
 <th class="{{ cls }}" hx-get="/" hx-target="#table" hx-include="#filters" hx-push-url="true"

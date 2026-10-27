@@ -22,13 +22,15 @@ from stages import (
     baselines,
     classify,
     complexity,
+    crossfit,
     failures,
-    partitions,
     prepare,
     regions,
     regress,
     render,
+    space,
     split,
+    tree,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,14 +39,16 @@ logger = logging.getLogger(__name__)
 STAGES = {
     "split": split,
     "prepare": prepare,
+    "space": space,
     "regions": regions,
     "classify": classify,
+    "crossfit": crossfit,
+    "tree": tree,
     "failures": failures,
     "baselines": baselines,
     "complexity": complexity,
     "regress": regress,
     "render": render,
-    "partitions": partitions,
 }
 _MISSING = object()
 # The size of every output file, to notice a lost or cut one.

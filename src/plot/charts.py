@@ -3,7 +3,6 @@
 __all__ = [
     "bar_plot",
     "confusion_matrix_plot",
-    "dual_axis_bar_plot",
     "line_plot",
     "predicted_vs_observed_plot",
     "strip_box_plot",
@@ -17,7 +16,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
-from matplotlib.patches import Patch
 
 from src.plot.style import MUTED_COLOR, NEUTRAL_COLOR, PALETTE, extended_palette
 
@@ -422,74 +420,6 @@ def predicted_vs_observed_plot(
     mappable.set_array([])
     colorbar = fig.colorbar(mappable, ax=list(axes), fraction=0.046, pad=0.04)
     colorbar.set_label("Squared error")
-    return fig
-
-
-def dual_axis_bar_plot(
-    group_labels: Sequence[str],
-    left: tuple[str, Sequence[float], str],
-    right: tuple[str, Sequence[float], str],
-    *,
-    x_label: str,
-) -> Figure:
-    """Draw two bars per group, each series on its own y axis.
-
-    The axes are aligned at zero, so both bars of a group start from the
-    same line.
-
-    Args:
-        group_labels: The group names, left to right.
-        left: The name, values and color of the series on the left y
-            axis.
-        right: The same for the series on the right y axis.
-        x_label: The x axis label.
-
-    Returns:
-        The figure.
-    """
-    n_groups = len(group_labels)
-    fig, ax_left = plt.subplots(figsize=(max(5.0, n_groups * 1.1 + 1.5), 3.6))
-    ax_right = ax_left.twinx()
-
-    width = 0.38
-    positions = np.arange(n_groups, dtype=float)
-    handles = []
-    for ax, (name, values, color), offset in (
-        (ax_left, left, -width / 2),
-        (ax_right, right, width / 2),
-    ):
-        ax.bar(
-            positions + offset,
-            np.asarray(values, dtype=float),
-            width=width * 0.92,
-            color=color,
-            edgecolor="white",
-            linewidth=0.4,
-        )
-        ax.set_ylabel(name, color=color)
-        ax.tick_params(axis="y", colors=color)
-        handles.append(Patch(facecolor=color, label=name))
-
-    ax_left.axhline(0.0, color=MUTED_COLOR, linewidth=0.8, linestyle=":", zorder=1)
-    ax_left.set_xticks(positions, group_labels)
-    plt.setp(ax_left.get_xticklabels(), rotation=35, ha="right")
-    ax_right.spines["right"].set_visible(True)
-    lo, hi = -0.05, 1.05
-    lo = min(lo, float(np.nanmin(np.asarray(left[1], dtype=float))))
-    ax_left.set_ylim(lo, hi)
-    top = ax_right.get_ylim()[1]
-    ax_right.set_ylim(lo / hi * top, top)
-    ax_left.grid(True, axis="y")
-    ax_left.grid(False, axis="x")
-    ax_right.grid(False)
-    ax_left.legend(
-        handles=handles,
-        loc="lower center",
-        bbox_to_anchor=(0.5, 1.0),
-        ncol=2,
-        frameon=False,
-    )
-    _apply_labels(ax_left, x_label=x_label)
     return fig
 
 

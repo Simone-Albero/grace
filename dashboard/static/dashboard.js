@@ -54,13 +54,6 @@
       displaylogo: false,
       modeBarButtonsToRemove: ["lasso2d", "select2d"],
     });
-    if (!el.dataset.ready) {
-      el.dataset.ready = "1";
-      el.on("plotly_click", (event) => {
-        const url = event.points[0].customdata;
-        if (typeof url === "string" && url.startsWith("/")) window.location = url;
-      });
-    }
   }
 
   function drawAll(root) {

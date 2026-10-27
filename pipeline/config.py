@@ -156,9 +156,10 @@ def validate(cfg: DictConfig) -> None:
     _validate_loss(cfg)
     _validate_grid_search(cfg.grid_search)
     _validate_regions(cfg)
+    _validate_crossfit(cfg.crossfit)
+    _validate_tree(cfg.tree)
     _validate_regressor(cfg.failure_regressor)
     _validate_runtime(cfg.runtime)
-    _validate_partitions(cfg.partitions)
 
 
 def _validate_data(data: DictConfig) -> None:
@@ -208,6 +209,10 @@ def _validate_data(data: DictConfig) -> None:
     )
     for key in ("min_class_count", "top_n", "hash_buckets"):
         _check(_is_int(data[key]), f"data.{key} {data[key]!r} must be an integer >= 0.")
+    _check(
+        data.max_per_class is None or _is_int(data.max_per_class, 1),
+        f"data.max_per_class {data.max_per_class!r} must be null or an integer > 0.",
+    )
 
 
 def _validate_classifier(classifier: DictConfig) -> None:
@@ -241,14 +246,6 @@ def _validate_classifier(classifier: DictConfig) -> None:
 
 def _validate_fit(fit: DictConfig) -> None:
     """Check the `fit` section."""
-    _check(
-        fit.balance in ("undersample", "none"),
-        f"fit.balance {fit.balance!r} invalid; valid: ['undersample', 'none'].",
-    )
-    _check(
-        fit.n_samples is None or _is_int(fit.n_samples, 1),
-        f"fit.n_samples {fit.n_samples!r} must be null or an integer > 0.",
-    )
     training = fit.training
     _check(
         _is_int(training.epochs, 1),
@@ -414,6 +411,26 @@ def _validate_regions(cfg: DictConfig) -> None:
     )
 
 
+def _validate_crossfit(crossfit: DictConfig) -> None:
+    """Check the `crossfit` section."""
+    _check(
+        _is_int(crossfit.n_folds, 2),
+        f"crossfit.n_folds {crossfit.n_folds!r} must be an integer > 1.",
+    )
+
+
+def _validate_tree(tree: DictConfig) -> None:
+    """Check the `tree` section."""
+    _check(
+        _is_int(tree.n_min, 2),
+        f"tree.n_min {tree.n_min!r} must be an integer > 1.",
+    )
+    _check(
+        _is_int(tree.k_neighbours, 1),
+        f"tree.k_neighbours {tree.k_neighbours!r} must be an integer > 0.",
+    )
+
+
 def _validate_regressor(regressor: DictConfig) -> None:
     """Check the `failure_regressor` section."""
     for key in ("min_eval_support", "n_iter"):
@@ -473,14 +490,6 @@ def _validate_runtime(runtime: DictConfig) -> None:
     _check(
         isinstance(runtime.pin_memory, bool),
         f"runtime.pin_memory {runtime.pin_memory!r} must be true or false.",
-    )
-
-
-def _validate_partitions(partitions: DictConfig) -> None:
-    """Check the `partitions` section."""
-    _check(
-        _is_int(partitions.null_draws, 1),
-        f"partitions.null_draws {partitions.null_draws!r} must be an integer > 0.",
     )
 
 

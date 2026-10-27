@@ -159,7 +159,7 @@ def test_prepare_outputs(tmp_path: Path) -> None:
     run(["prepare"], fast_cfg(tmp_path), force=False)
     with closing(connect(tmp_path / "grace.db")) as db:
         classes = pd.read_sql_query("SELECT * FROM classes WHERE execution_id = 2", db)
-        assert classes["class_id"].tolist() == list(range(9))
+        assert classes["class_id"].tolist() == list(range(10))
         metrics = dict(
             db.execute("SELECT name, value FROM metrics WHERE execution_id = 1")
         )
@@ -223,13 +223,12 @@ def test_failed_stage_rolls_back(
         (["fit.training.early_stopping.holdout=0"], ["prepare"]),
         (["fit.training.early_stopping.holdout=1"], ["prepare"]),
         (["fit.training.max_grad_norm=0"], ["prepare"]),
-        (["fit.balance=oversample"], ["prepare"]),
+        (["data.max_per_class=0"], ["prepare"]),
         (["runtime.num_workers=-1"], ["prepare"]),
         (["graph.k=0"], ["prepare"]),
         (["failure_regressor.n_outer_splits=1"], ["prepare"]),
         (["failure_regressor.param_grid.max_depth=5"], ["prepare"]),
         (["failure_regressor.n_iter=0"], ["prepare"]),
-        (["partitions.null_draws=0"], ["prepare"]),
         ([], ["bogus"]),
     ],
 )
@@ -285,24 +284,11 @@ def test_render_reads_the_regressor_only_when_asked() -> None:
     """Check that regressor_figures decides what render runs after."""
     with_regressor = load_config(["data=synthetic_test"])
     without_regressor = load_config(["data=synthetic_test", "regressor_figures=false"])
-    # render never reads partitions: it is its own, independent target.
-    non_partition_stages = [stage for stage in STAGES if stage != "partitions"]
-    assert plan(["render"], with_regressor) == non_partition_stages
-    skipped = {"complexity", "regress"}
+    assert plan(["render"], with_regressor) == list(STAGES)
+    # Without the regressor's figures, render needs none of its chain.
+    skipped = {"crossfit", "tree", "complexity", "regress"}
     assert plan(["render"], without_regressor) == [
-        stage for stage in non_partition_stages if stage not in skipped
-    ]
-
-
-def test_plan_partitions_skips_the_regressor_chain() -> None:
-    """Check that partitions plans only the chain it reads."""
-    cfg = load_config(["data=synthetic_test"])
-    assert plan(["partitions"], cfg) == [
-        "split",
-        "prepare",
-        "regions",
-        "classify",
-        "partitions",
+        stage for stage in STAGES if stage not in skipped
     ]
 
 

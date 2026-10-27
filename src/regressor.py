@@ -1,6 +1,6 @@
-"""Region descriptors and the random-forest failure-rate regressor."""
+"""Leaf descriptors and the random-forest failure-rate regressor."""
 
-__all__ = ["FailureRegressor", "fit_failure_regressor", "region_descriptors"]
+__all__ = ["FailureRegressor", "fit_failure_regressor", "leaf_descriptors"]
 
 import logging
 import math
@@ -24,17 +24,17 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class FailureRegressor:
-    """Out-of-fold failure rates of every region, and a forest on all.
+    """Out-of-fold failure rates of every leaf, and a forest on all.
 
     Attributes:
-        predicted: The out-of-fold rate by region, indexed like `X`.
-        fold: The outer fold holding each region out, indexed like
+        predicted: The out-of-fold rate by leaf, indexed like `X`.
+        fold: The outer fold holding each leaf out, indexed like
             `X`.
-        folds: One dict per outer fold, with "fold", "n_regions",
+        folds: One dict per outer fold, with "fold", "n_leaves",
             "best_score" and "params".
         importances: The mean `feature_importances_` over the outer
             folds, by descriptor.
-        model: The forest refit on every region.
+        model: The forest refit on every leaf.
         refit_params: The searched parameters of the refit.
         refit_score: The best inner-CV score of the refit; None when it
             was not searched.
@@ -54,19 +54,19 @@ class FailureRegressor:
     n_inner: int
 
 
-def region_descriptors(
-    complexity: pd.DataFrame, region_class: pd.Series
-) -> pd.DataFrame:
-    """Build one row per region: its descriptors, then its class's.
+def leaf_descriptors(complexity: pd.DataFrame, leaf_class: pd.Series) -> pd.DataFrame:
+    """Build one row per leaf: its descriptors, then its class's.
 
     Args:
         complexity: The long complexity table, with "scope", "scope_id",
             "measure" and "value".
-        region_class: The class id of every region, by region id.
+        leaf_class: The class id of every leaf, by node id: the class
+            its root predicts.
 
     Returns:
-        The `region_*` and `class_*` descriptors, indexed by region id,
-        in measure order.
+        The `leaf_*` and `class_*` descriptors, indexed by node id, in
+        measure order; NaN for a leaf no population of which was
+        measured.
     """
     # Measures keep their order of first appearance: the forest draws
     # max_features columns by position, so another order changes its
@@ -77,14 +77,12 @@ def region_descriptors(
         table = complexity[complexity["scope"] == scope].pivot(
             index="scope_id", columns="measure", values="value"
         )
-        return table[measures].loc[ids].add_prefix(prefix)
+        return table.reindex(columns=measures, index=ids).add_prefix(prefix)
 
     return pd.concat(
         [
-            wide("region", region_class.index, "region_"),
-            wide("class", pd.Index(region_class), "class_").set_index(
-                region_class.index
-            ),
+            wide("leaf", leaf_class.index, "leaf_"),
+            wide("class", pd.Index(leaf_class), "class_").set_index(leaf_class.index),
         ],
         axis=1,
     )
@@ -196,7 +194,7 @@ def _inner_cv(
     n_inner = _usable_n_splits(n_fit_worst, n_inner_splits)
     if n_outer < n_outer_splits or n_inner < n_inner_splits:
         logger.warning(
-            "Adapting CV to %d regions: outer %d -> %d, inner %d -> %d%s",
+            "Adapting CV to %d leaves: outer %d -> %d, inner %d -> %d%s",
             n_used,
             n_outer_splits,
             n_outer,
@@ -225,18 +223,18 @@ def fit_failure_regressor(
     n_jobs: int,
     random_state: int,
 ) -> FailureRegressor:
-    """Fit a forest on region descriptors by nested CV, then refit.
+    """Fit a forest on leaf descriptors by nested CV, then refit.
 
     Args:
-        X: The descriptors, one row per region.
-        y: The observed failure rate of each region, indexed like `X`.
-        sample_weight: Each region's weight, indexed like `X`; passed
+        X: The descriptors, one row per leaf.
+        y: The observed failure rate of each leaf, indexed like `X`.
+        sample_weight: Each leaf's weight, indexed like `X`; passed
             to the forest's fit, not to the inner search's own scorer.
         params: The forest's own parameters.
         param_grid: The values the inner search draws from, by forest
             parameter.
         n_outer_splits: The outer folds asked for; fewer when the
-            regions cannot fill them.
+            leaves cannot fill them.
         n_inner_splits: The inner folds asked for, adapted likewise.
         n_iter: The most parameter draws of the inner search.
         n_jobs: The parallel jobs of the inner search.
@@ -245,17 +243,17 @@ def fit_failure_regressor(
 
     Returns:
         The out-of-fold rates, each outer fold's search result, the mean
-        importances and the forest refit on every region.
+        importances and the forest refit on every leaf.
 
     Raises:
-        ValueError: If fewer than two regions have rates that differ.
+        ValueError: If fewer than two leaves have rates that differ.
     """
     n_used = len(X)
     if n_used < 2 or float(y.std()) < 1e-9:
         raise ValueError(
-            f"{n_used} usable region(s), failure-rate std {float(y.std()):.3g}: the "
-            "failure regressor needs two regions whose rates differ. Raise "
-            "data.val_frac for more val-labelled regions; regressor_figures=false "
+            f"{n_used} usable leaf(s), failure-rate std {float(y.std()):.3g}: the "
+            "failure regressor needs two leaves whose rates differ. Raise "
+            "data.val_frac for more val-labelled leaves; regressor_figures=false "
             "draws the classifier's figures without it."
         )
 
@@ -295,14 +293,14 @@ def fit_failure_regressor(
         folds.append(
             {
                 "fold": fold,
-                "n_regions": len(held_idx),
+                "n_leaves": len(held_idx),
                 "best_score": best_score,
                 "params": best_params,
             }
         )
         logger.info("outer fold %d/%d: n_held_out=%d", fold + 1, n_outer, len(held_idx))
 
-    logger.info("Refitting the forest on the %d usable regions", n_used)
+    logger.info("Refitting the forest on the %d usable leaves", n_used)
     model, refit_params, refit_score = _fit_model(
         X,
         y,

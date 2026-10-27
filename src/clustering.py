@@ -8,11 +8,6 @@ __all__ = [
     "cluster_size_balance",
     "compute_centroids",
     "compute_kdn",
-    "granularity_loss",
-    "kmeans_levels",
-    "level_counts",
-    "random_voronoi",
-    "subsample_indices",
 ]
 
 import itertools
@@ -29,6 +24,7 @@ from sklearn.metrics import pairwise_distances
 from sklearn.neighbors import NearestNeighbors
 from tqdm import tqdm
 
+from src.graph import subsample_indices
 from src.space import l2_normalize
 
 logger = logging.getLogger(__name__)
@@ -118,26 +114,6 @@ def cluster_size_balance(labels: np.ndarray) -> float:
     shares = counts / counts.sum()
     entropy = float(-(shares * np.log(shares)).sum())
     return entropy / float(np.log(n_clusters))
-
-
-def subsample_indices(
-    n_rows: int, *, max_samples: int, random_state: int
-) -> np.ndarray:
-    """Return the indices of a random subsample of `n_rows` rows.
-
-    Args:
-        n_rows: The number of rows to sample from.
-        max_samples: The most rows kept; all of them when `n_rows` is
-            not above it.
-        random_state: The seed of the draw.
-
-    Returns:
-        The indices, ascending when all rows are kept.
-    """
-    if n_rows <= max_samples:
-        return np.arange(n_rows)
-    rng = np.random.default_rng(random_state)
-    return rng.choice(n_rows, size=max_samples, replace=False)
 
 
 def _subsample_features(
@@ -436,7 +412,7 @@ ALGORITHMS: dict[str, Callable[..., np.ndarray]] = {
 }
 
 
-def granularity_loss(
+def _granularity_loss(
     labels: np.ndarray,
     hardness: np.ndarray,
     *,
@@ -528,7 +504,7 @@ def _score_candidates(
         labels, n_merged_clusters, n_merged = _merge_small_clusters(
             X_sub, labels, min_size=scaled_floor, metric=metric
         )
-        loss = granularity_loss(
+        loss = _granularity_loss(
             labels,
             hardness,
             n_class=n_class,
@@ -629,7 +605,7 @@ def _select_granularity(
     return best_entry, None if subsampled else best_labels
 
 
-def level_counts(n_rows: int, min_cluster_floor: int) -> list[int]:
+def _level_counts(n_rows: int, min_cluster_floor: int) -> list[int]:
     """Return the group count of each granularity level.
 
     Level 0 targets `min_cluster_floor` rows per group, and each
@@ -653,75 +629,10 @@ def _n_clusters_grid(
 ) -> list[int]:
     """Return the distinct level counts, capped at `max_n_clusters`."""
     counts = {
-        min(max_n_clusters, count) for count in level_counts(n_class, min_cluster_floor)
+        min(max_n_clusters, count)
+        for count in _level_counts(n_class, min_cluster_floor)
     }
     return sorted(counts)
-
-
-def kmeans_levels(
-    X: np.ndarray,
-    *,
-    min_cluster_floor: int,
-    max_fit_samples: int,
-    metric: str,
-    random_state: int,
-) -> list[np.ndarray]:
-    """Cluster X at every granularity level, merging undersized groups.
-
-    Args:
-        X: The points, shape (n, d).
-        min_cluster_floor: The finest level's target group size; also
-            the merge floor for undersized clusters.
-        max_fit_samples: The most rows K-means is fitted on.
-        metric: `euclidean` or `cosine`, the merge's nearest-centroid
-            metric.
-        random_state: The seed of K-means and its subsample.
-
-    Returns:
-        The merged labels of every level, finest first.
-    """
-    level_labels = []
-    for n_clusters in level_counts(X.shape[0], min_cluster_floor):
-        labels = _fit_kmeans(
-            X,
-            n_clusters=n_clusters,
-            max_fit_samples=max_fit_samples,
-            random_state=random_state,
-        )
-        merged, _, _ = _merge_small_clusters(
-            X, labels, min_size=min_cluster_floor, metric=metric
-        )
-        level_labels.append(merged)
-    return level_labels
-
-
-def random_voronoi(
-    X: np.ndarray,
-    n_cells: int,
-    *,
-    min_cluster_floor: int,
-    metric: str,
-    rng: np.random.Generator,
-) -> np.ndarray:
-    """Partition X into Voronoi cells of random rows, small ones merged.
-
-    Args:
-        X: The points, shape (n, d).
-        n_cells: The cells before merging, capped at the row count.
-        min_cluster_floor: The merge floor for undersized cells.
-        metric: `euclidean` or `cosine`.
-        rng: The generator drawing the rows that centre the cells.
-
-    Returns:
-        The merged cell label of every row.
-    """
-    center_rows = rng.choice(X.shape[0], size=min(n_cells, X.shape[0]), replace=False)
-    centroids = dict(enumerate(X[center_rows]))
-    labels = assign_nearest_centroid(X, centroids, metric=metric)
-    merged, _, _ = _merge_small_clusters(
-        X, labels, min_size=min_cluster_floor, metric=metric
-    )
-    return merged
 
 
 def cluster_class(

@@ -14,7 +14,7 @@ from collections.abc import Mapping, Sequence
 
 from dashboard import charts
 from dashboard.experiments import Experiment, SeedRun, metric_stage, summarize
-from dashboard.queries import PREDICTORS, STAGE_ORDER, predictor_stage
+from dashboard.queries import PREDICTORS, STAGE_ORDER
 
 # The metrics of the experiments table, with their column label.
 HEADLINE = {
@@ -22,11 +22,8 @@ HEADLINE = {
     "classify.f1_macro": "F1 macro",
     "failures.test_error_rate": "test error rate",
     "regions.n_regions": "regions",
-    "regress.regressor_spearman": "RF Spearman",
     "baselines.val_spearman": "val Spearman",
-    "regress.regressor_mse": "RF MSE",
     "baselines.val_mse": "val MSE",
-    "op.intra.selected.skill": "intra skill",
 }
 
 
@@ -82,10 +79,7 @@ def experiment_row(experiment: Experiment) -> dict[str, object]:
 
 
 def metric_label(key: str) -> str:
-    """Name a `<stage>.<name>` or `op.<arm>.<rule>.<column>` metric."""
-    if key.startswith("op."):
-        _, arm, rule, column = key.split(".")
-        return f"partitions · {arm} ({rule}) {column}"
+    """Name a `<stage>.<name>` metric."""
     stage, name = key.split(".", 1)
     return f"{stage} · {name}"
 
@@ -99,17 +93,10 @@ def metric_table(experiment: Experiment) -> list[dict]:
     """List every metric of an experiment with its value per seed.
 
     Returns:
-        One row per metric in stage order (an operating point only at
-        the rule each arm shows), with `values` (one per seed, None
-        where it is missing) and the `(mean, std, n)`.
+        One row per metric in stage order, with `values` (one per seed,
+        None where it is missing) and the `(mean, std, n)`.
     """
-    shown = {f"op.{arm}.{rule}." for arm, rule in charts.OPERATING_RULES.items()}
     keys = {key for seed in experiment.seeds for key in seed.metrics}
-    keys = {
-        key
-        for key in keys
-        if not key.startswith("op.") or key.rsplit(".", 1)[0] + "." in shown
-    }
     return [
         {
             "label": metric_label(key),
@@ -137,18 +124,7 @@ def _has_values(series: Mapping[str, Sequence[tuple[int, float | None]]]) -> boo
 
 def _predictor_keys(score: str) -> dict[str, str]:
     """Map each predictor's label to its metric key of `score`."""
-    return {
-        label: f"{predictor_stage(key)}.{key}_{score}"
-        for key, label in PREDICTORS.items()
-    }
-
-
-def _arm_keys(column: str) -> dict[str, str]:
-    """Map each arm, at its shown rule, to its operating-point key."""
-    return {
-        f"{arm} ({rule})": f"op.{arm}.{rule}.{column}"
-        for arm, rule in charts.OPERATING_RULES.items()
-    }
+    return {label: f"baselines.{key}_{score}" for key, label in PREDICTORS.items()}
 
 
 def experiment_figures(experiment: Experiment) -> list[tuple[str, dict]]:
@@ -180,8 +156,6 @@ def experiment_figures(experiment: Experiment) -> list[tuple[str, dict]]:
             _predictor_keys("spearman"),
         ),
         ("Predictors, MSE against the test rates", "MSE", _predictor_keys("mse")),
-        ("Partition arms, skill", "skill", _arm_keys("skill")),
-        ("Partition arms, Brier", "Brier", _arm_keys("brier")),
     ]
     figures = []
     for title, y_title, keys in families:

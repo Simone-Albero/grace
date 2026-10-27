@@ -1,12 +1,7 @@
 """Read-only queries of the dashboard on grace.db."""
 
 __all__ = [
-    "ARM_METRICS",
-    "OPERATING_COLUMNS",
-    "PARTITION_AXES",
-    "PARTITION_METRICS",
     "PREDICTORS",
-    "REGION_COLUMNS",
     "SCORES",
     "STAGE_ORDER",
     "class_clusterings",
@@ -14,18 +9,12 @@ __all__ = [
     "classes",
     "classifier_grid",
     "connect",
-    "descriptors",
     "execution_configs",
     "execution_dirs",
     "features",
     "history",
     "importances",
     "metrics_by_stage",
-    "operating_points",
-    "partition_class_levels",
-    "partition_groups",
-    "partitions",
-    "predictor_stage",
     "regions",
     "regressor_folds",
     "run",
@@ -43,61 +32,17 @@ from pathlib import Path
 # a test keeps the two equal, since importing the runner here would load
 # every stage's dependencies.
 STAGE_ORDER = (
-    "split prepare regions classify failures baselines complexity regress "
-    "render partitions"
+    "split prepare space regions classify crossfit tree failures baselines "
+    "complexity regress render"
 ).split()
 # The failure-rate predictors, each with its label; the `regions`
 # columns carry its rates and `<key>_<score>` metrics its scores.
 PREDICTORS = {
-    "regressor": "RF regressor",
     "val": "Val rate",
     "mcp": "MCP",
     "atc": "ATC",
 }
 SCORES = ("spearman", "mse", "r2", "mae")
-# The numeric columns of `regions` other than the complexity measures;
-# they follow the SELECT there and its abs_error.
-REGION_COLUMNS = (
-    "n_train n_val n_test n_val_error val_rate n_test_error test_rate used fold "
-    "regressor val mcp atc abs_error"
-).split()
-# The partitions columns the panel plots: its metrics and its x axes.
-PARTITION_METRICS = (
-    "skill",
-    "brier",
-    "resolution",
-    "reliability",
-    "auroc",
-    "kdn_spearman",
-    "share_no_val",
-)
-# The scores drawn at each arm's operating point, in reading order.
-ARM_METRICS = (
-    "skill",
-    "brier",
-    "resolution",
-    "reliability",
-    "auroc",
-    "kdn_spearman",
-)
-PARTITION_AXES = ("n_groups", "val_median")
-# The partitions columns averaged into an operating point.
-OPERATING_COLUMNS = (
-    "n_groups val_median share_no_val brier skill resolution reliability "
-    "auroc kdn_spearman"
-).split()
-
-
-def predictor_stage(key: str) -> str:
-    """Return the stage whose metrics hold a predictor's scores.
-
-    Args:
-        key: A key of `PREDICTORS`.
-
-    Returns:
-        "regress" for the regressor, "baselines" for the others.
-    """
-    return "regress" if key == "regressor" else "baselines"
 
 
 def connect(path: Path) -> sqlite3.Connection:
@@ -286,36 +231,6 @@ def execution_configs(
     return configs
 
 
-def operating_points(
-    db: sqlite3.Connection, run_id: int | None = None
-) -> list[dict[str, object]]:
-    """List the operating points of the done partitions executions.
-
-    Args:
-        db: A connection to grace.db.
-        run_id: Only this run's; None lists every run.
-
-    Returns:
-        One row per run, arm and rule other than `level`, with the
-        partitions columns of `OPERATING_COLUMNS` averaged over the
-        draws of `null`.
-    """
-    averages = ", ".join(f"AVG(p.{name}) AS {name}" for name in OPERATING_COLUMNS)
-    return _all(
-        db,
-        f"""
-        SELECT rs.run_id, rs.execution_id, p.arm, p.rule, {averages}
-        FROM run_stages rs
-        JOIN executions e ON e.id = rs.execution_id AND e.status = 'done'
-        JOIN partitions p ON p.execution_id = e.id
-        WHERE rs.stage = 'partitions' AND p.rule != 'level'
-          AND (? IS NULL OR rs.run_id = ?)
-        GROUP BY rs.run_id, p.arm, p.rule ORDER BY rs.run_id, p.arm, p.rule
-        """,
-        (run_id, run_id),
-    )
-
-
 def features(db: sqlite3.Connection, split_id: int) -> list[dict[str, object]]:
     """List the features of a split execution, in column order."""
     return _all(
@@ -427,7 +342,7 @@ def regressor_folds(db: sqlite3.Connection, regress_id: int) -> list[dict[str, o
     return _all(
         db,
         """
-        SELECT fold, n_regions, spearman, r2, mae, best_score, params
+        SELECT fold, n_leaves, best_score, params
         FROM regressor_folds WHERE execution_id = ? ORDER BY fold = -1, fold
         """,
         (regress_id,),
@@ -444,146 +359,30 @@ def importances(db: sqlite3.Connection, regress_id: int) -> list[dict[str, objec
     )
 
 
-def regions(
-    db: sqlite3.Connection, ids: Mapping[str, int], *, measures: bool = True
-) -> tuple[list[str], list[dict[str, object]]]:
-    """List the complexity measures and the regions of a run.
+def regions(db: sqlite3.Connection, ids: Mapping[str, int]) -> list[dict[str, object]]:
+    """List the regions of a run with their rates and predictions.
 
     Args:
         db: A connection to grace.db.
         ids: The execution id of each done stage of the run.
-        measures: Whether to read the complexity measures too; they are
-            most of the rows.
 
     Returns:
-        The measure names and one row per region, with None where a
-        stage did not run.
+        One row per region, with None where a stage did not run.
     """
-    rows = _all(
+    return _all(
         db,
         """
         SELECT g.region_id, g.class_id, k.name AS class,
                g.n_train, g.n_val, g.n_test,
                f.n_val_error, f.val_rate, f.n_test_error, f.test_rate,
-               b.used, e.fold, e.regressor, b.val, b.mcp, b.atc
+               b.used, b.val, b.mcp, b.atc
         FROM regions g
         JOIN classes k ON k.execution_id = :prepare AND k.class_id = g.class_id
         LEFT JOIN failures f
           ON f.execution_id = :failures AND f.region_id = g.region_id
         LEFT JOIN baselines b
           ON b.execution_id = :baselines AND b.region_id = g.region_id
-        LEFT JOIN estimates e
-          ON e.execution_id = :regress AND e.region_id = g.region_id
         WHERE g.execution_id = :regions ORDER BY g.region_id
         """,
-        {
-            key: ids.get(key)
-            for key in ("prepare", "failures", "baselines", "regress", "regions")
-        },
-    )
-    by_id = {row["region_id"]: row for row in rows}
-    names: list[str] = []
-    if measures and "complexity" in ids:
-        for region_id, measure, value in db.execute(
-            "SELECT scope_id, measure, value FROM complexity "
-            "WHERE execution_id = ? AND scope = 'region' ORDER BY rowid",
-            (ids["complexity"],),
-        ):
-            if measure not in names:
-                names.append(measure)
-            if region_id in by_id:
-                by_id[region_id][measure] = value
-    for row in rows:
-        scored = (
-            row["used"] == 1
-            and row["regressor"] is not None
-            and row["test_rate"] is not None
-        )
-        row["abs_error"] = abs(row["regressor"] - row["test_rate"]) if scored else None
-    return names, rows
-
-
-def descriptors(
-    db: sqlite3.Connection, complexity_id: int, region_id: int, class_id: int
-) -> list[dict[str, object]]:
-    """List the region and class value of every complexity measure.
-
-    Args:
-        db: A connection to grace.db.
-        complexity_id: The execution id of complexity.
-        region_id: The region id.
-        class_id: The class of the region.
-
-    Returns:
-        One row per measure, with its `region` and `class` values.
-    """
-    return _all(
-        db,
-        """
-        SELECT r.measure, r.value AS region, c.value AS class
-        FROM complexity r LEFT JOIN complexity c
-          ON c.execution_id = r.execution_id AND c.scope = 'class'
-         AND c.measure = r.measure AND c.scope_id = ?
-        WHERE r.execution_id = ? AND r.scope = 'region' AND r.scope_id = ?
-        ORDER BY r.rowid
-        """,
-        (class_id, complexity_id, region_id),
-    )
-
-
-def partitions(db: sqlite3.Connection, partitions_id: int) -> list[dict[str, object]]:
-    """List the rows of a partitions execution.
-
-    Args:
-        db: A connection to grace.db.
-        partitions_id: The execution id of partitions.
-
-    Returns:
-        One row per arm, rule, level and draw, in that order.
-    """
-    return _all(
-        db,
-        "SELECT * FROM partitions WHERE execution_id = ? "
-        "ORDER BY arm, rule, level, draw",
-        (partitions_id,),
-    )
-
-
-def partition_class_levels(
-    db: sqlite3.Connection, partitions_id: int
-) -> list[dict[str, object]]:
-    """List the intra arm's per-class loss curve.
-
-    Args:
-        db: A connection to grace.db.
-        partitions_id: The execution id of partitions.
-
-    Returns:
-        The rows, ordered by class and level.
-    """
-    return _all(
-        db,
-        "SELECT * FROM partition_class_levels WHERE execution_id = ? "
-        "ORDER BY class_id, level",
-        (partitions_id,),
-    )
-
-
-def partition_groups(
-    db: sqlite3.Connection, partitions_id: int
-) -> list[dict[str, object]]:
-    """List the groups of a partitions execution's operating points.
-
-    Args:
-        db: A connection to grace.db.
-        partitions_id: The execution id of partitions.
-
-    Returns:
-        The rows, ordered by arm, rule and group.
-    """
-    return _all(
-        db,
-        "SELECT * FROM partition_groups WHERE execution_id = ? "
-        "ORDER BY arm, rule, group_id",
-        (partitions_id,),
+        {key: ids.get(key) for key in ("prepare", "failures", "baselines", "regions")},
     )

@@ -2,4 +2,4 @@ name: cross_entropy
 
 params:
   label_smoothing: 0.1
-  class_weight: auto         # auto: log-damped inverse class frequency of train (none when train is rebalanced) | null: none | a list, one per class
+  class_weight: auto         # auto: log-damped inverse class frequency of the rows trained on | null: none | a list, one per class

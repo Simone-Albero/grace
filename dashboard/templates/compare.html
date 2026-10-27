@@ -36,12 +36,6 @@
   <label>predictor score
     <select name="score">{% for s in scores %}<option>{{ s }}</option>{% endfor %}</select>
   </label>
-  <label>arm metric
-    <select name="arm_metric">{% for s in arm_metrics %}<option>{{ s }}</option>{% endfor %}</select>
-  </label>
-  <label>arm operating point
-    <select name="rule">{% for r in rules %}<option>{{ r }}</option>{% endfor %}</select>
-  </label>
 </form>
 <div id="charts"></div>
 {% endblock %}

@@ -1,7 +1,8 @@
 """Static figures of the classifier, its baselines and the regressor.
 
-The regressor's figures need `complexity` and `regress`: render reads
-them, and draws those figures, only when `regressor_figures` is true.
+The regressor's figures need `tree`, `complexity` and `regress`: render
+reads them, and draws those figures, only when `regressor_figures` is
+true.
 Files: figures/<group>/<name>.<figure_format>. DB rows written:
 `figures` (name and file, relative to the execution folder) and metric
 n_figures.
@@ -17,14 +18,13 @@ from sklearn.metrics import confusion_matrix
 from src.plot.charts import (
     bar_plot,
     confusion_matrix_plot,
-    dual_axis_bar_plot,
     line_plot,
     predicted_vs_observed_plot,
     strip_box_plot,
     violin_plot,
 )
-from src.plot.style import PALETTE, descriptor_label, extended_palette
-from src.regressor import region_descriptors
+from src.plot.style import descriptor_label, extended_palette
+from src.regressor import leaf_descriptors
 from stages import Context
 
 CONFIG = ("figure_format", "regressor_figures")
@@ -34,21 +34,20 @@ _BASE_INPUTS = ("prepare", "regions", "classify", "failures", "baselines")
 # The number of most important features that get a descriptor violin.
 _TOP_DESCRIPTORS = 4
 _BASELINES = (("val", "Val rate"), ("mcp", "MCP"), ("atc", "ATC"))
-_PREDICTORS = (("regressor", "RF regressor"), *_BASELINES)
 
 
 def inputs(cfg: DictConfig) -> tuple[str, ...]:
     """Return the stages render reads under this config.
 
     Args:
-        cfg: The config; `regressor_figures` adds complexity and
-            regress.
+        cfg: The config; `regressor_figures` adds tree, complexity
+            and regress.
 
     Returns:
         The input stage names.
     """
     if cfg.regressor_figures:
-        return (*_BASE_INPUTS, "complexity", "regress")
+        return (*_BASE_INPUTS, "tree", "complexity", "regress")
     return _BASE_INPUTS
 
 
@@ -156,28 +155,22 @@ def _violin_by_rate(
 
 
 def _regressor_figures(ctx: Context) -> dict[str, Figure]:
-    """Draw the regressor figures: rates, scores and descriptors."""
-    scores = pd.concat(
-        [ctx.read("metrics", "regress"), ctx.read("metrics", "baselines")]
-    ).set_index("name")["value"]
-    _, rate = _used_rates(ctx)
-    estimates = ctx.read("estimates", "regress").set_index("region_id")
+    """Draw the regressor figures: leaf rates and descriptors."""
+    scores = ctx.read("metrics", "regress").set_index("name")["value"]
+    nodes = ctx.read("tree_nodes", "tree")
+    leaves = nodes[nodes["status"] == "leaf"].set_index("node_id")
+    val_leaves = leaves[leaves["n_val"] > 0]
+    val_rate = val_leaves["n_val_errors"] / val_leaves["n_val"]
+    estimates = ctx.read("estimates", "regress").set_index("node_id")
     importances = ctx.read("importances", "regress").set_index("feature")["importance"]
 
-    predicted = estimates.loc[rate.index, "regressor"].to_numpy(dtype=float)
-    notes = {"Spearman": scores["regressor_spearman"], "MAE": scores["regressor_mae"]}
-    keys = [key for key, _ in _PREDICTORS]
+    predicted = estimates.loc[val_rate.index, "regressor"].to_numpy(dtype=float)
+    notes = {"Spearman": scores["oof_spearman"], "MAE": scores["oof_mae"]}
     figures = {
-        "regress/predicted_vs_observed": predicted_vs_observed_plot(
-            rate.to_numpy(),
+        "regress/predicted_vs_val": predicted_vs_observed_plot(
+            val_rate.to_numpy(),
             {"RF regressor": (predicted, notes)},
             figsize=(5.2, 4.2),
-        ),
-        "regress/scores": dual_axis_bar_plot(
-            [label for _, label in _PREDICTORS],
-            ("Spearman ρ", [scores[f"{key}_spearman"] for key in keys], PALETTE[0]),
-            ("MAE", [scores[f"{key}_mae"] for key in keys], PALETTE[1]),
-            x_label="Predictor",
         ),
         "regress/feature_importances": bar_plot(
             [descriptor_label(feature) for feature in importances.index],
@@ -189,12 +182,11 @@ def _regressor_figures(ctx: Context) -> dict[str, Figure]:
         ),
     }
 
-    descriptors = region_descriptors(
-        ctx.read("complexity", "complexity"),
-        ctx.read("regions", "regions").set_index("region_id")["class_id"],
-    ).loc[rate.index]
+    descriptors = leaf_descriptors(
+        ctx.read("complexity", "complexity"), leaves["class_id"]
+    ).loc[val_rate.index]
     for feature in importances.nlargest(_TOP_DESCRIPTORS).index:
-        violin = _violin_by_rate(descriptors, rate, feature)
+        violin = _violin_by_rate(descriptors, val_rate, feature)
         if violin is not None:
             figures[f"descriptors/{feature}"] = violin
     return figures

@@ -7,10 +7,13 @@ import pandas as pd
 import pytest
 from pandas.testing import assert_frame_equal
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import GridSearchCV
 
-from src import clustering, partitions, scores
-from src.data import stratified_holdout
+from src import clustering, partitions, tree
+from src.complexity.common import weighted_group_measures
+from src.data import cap_per_class, stratified_holdout
 from src.graph import build_train_graph
+from src.ml import grid_search
 from src.regressor import fit_failure_regressor
 
 
@@ -41,6 +44,52 @@ def test_stratified_holdout_rejects_a_split_too_small_for_its_classes() -> None:
     rows = pd.DataFrame({"label": np.repeat([0, 1, 2], 10), "x": np.arange(30)})
     with pytest.raises(ValueError, match="holdout_frac"):
         stratified_holdout(rows, holdout_frac=0.05, label_col="label", random_state=0)
+
+
+def test_cap_per_class_keeps_small_classes_whole() -> None:
+    """Check a class under the cap is kept, a larger one cut to it."""
+    rows = pd.DataFrame(
+        {"label": np.repeat([0, 1, 2], [50, 8, 20]), "x": np.arange(78)}
+    )
+    capped = cap_per_class(rows, 20, label_col="label", random_state=0)
+    assert capped["label"].value_counts().to_dict() == {0: 20, 2: 20, 1: 8}
+    assert cap_per_class(rows, None, label_col="label", random_state=0) is rows
+
+
+def test_grid_search_subsample_keeps_every_class() -> None:
+    """Check a search subsample never leaves a class under `cv` rows."""
+    rng = np.random.default_rng(0)
+    labels = np.repeat([0, 1, 2], [400, 400, 6])
+    X = pd.DataFrame({"num_1": rng.normal(size=len(labels)) + labels})
+    seen = []
+
+    class _Spy(GridSearchCV):
+        def fit(self, X, y, **kwargs):
+            seen.append(np.bincount(np.asarray(y), minlength=3))
+            return super().fit(X, y, **kwargs)
+
+    import src.ml as ml
+
+    original = ml.GridSearchCV
+    ml.GridSearchCV = _Spy
+    try:
+        grid_search(
+            "logistic_regression",
+            {"max_iter": 200},
+            {"C": [1.0]},
+            X,
+            labels,
+            num_cols=["num_1"],
+            cat_cols=[],
+            scoring="f1_macro",
+            cv=3,
+            max_samples=100,
+            n_jobs=1,
+            random_state=0,
+        )
+    finally:
+        ml.GridSearchCV = original
+    assert seen[0].min() >= 3
 
 
 def test_duplicate_points_join_inside_the_mst() -> None:
@@ -259,139 +308,137 @@ def test_kdn_per_row_labels_match_one_class() -> None:
         assert np.allclose(mixed[in_class], per_class)
 
 
-def test_level_pick_matches_cluster_class() -> None:
-    """Check the level kmeans_levels scores best is cluster_class's."""
-    rng = np.random.default_rng(6)
-    X = np.vstack(
-        [
-            rng.normal(loc=loc, scale=0.3, size=(60, 2))
-            for loc in ([0, 0], [5, 5], [0, 5], [5, 0], [2.5, 2.5])
-        ]
+def _blobs(n_per_blob: int = 60) -> tuple[np.ndarray, np.ndarray]:
+    """Return three 2-D blobs and each row's predicted class, 0 or 1."""
+    rng = np.random.default_rng(0)
+    centres = np.array([[0.0, 0.0], [6.0, 0.0], [0.0, 6.0]])
+    points = np.vstack(
+        [centre + rng.normal(size=(n_per_blob, 2)) for centre in centres]
     )
-    row_ids = np.arange(len(X))
-    nodes = clustering.KdnNodes(X=X, y=np.zeros(len(X), dtype=int), row_ids=row_ids)
-    min_cluster_floor = 20
-    hardness_k = 5
-    eval_rows_per_train_row = 0.4
+    predicted = np.repeat([0, 0, 1], n_per_blob)
+    return points, predicted
 
-    best_labels, _, _, best_loss = clustering.cluster_class(
-        X,
-        row_ids=row_ids,
-        label=0,
-        algorithm="kmeans",
-        params={},
-        nodes=nodes,
-        max_fit_samples=10000,
-        max_clusters=1000,
-        min_cluster_floor=min_cluster_floor,
-        hardness_k=hardness_k,
-        eval_rows_per_train_row=eval_rows_per_train_row,
-        metric="euclidean",
-        random_state=7,
+
+def test_route_reproduces_growth_of_train_rows() -> None:
+    """Check descend ends each row where the growth put it."""
+    points, predicted = _blobs()
+    grown, node_of_row = tree.grow_tree(
+        points, predicted, n_classes=2, n_min=10, random_state=0
     )
+    assert len(grown.parent) > 2
+    assert (tree.descend(grown, points, predicted) == node_of_row).all()
 
-    levels = clustering.kmeans_levels(
-        X,
-        min_cluster_floor=min_cluster_floor,
-        max_fit_samples=10000,
-        metric="euclidean",
-        random_state=7,
+
+def test_no_grown_child_under_n_min() -> None:
+    """Check every split leaves n_min rows or more on each side."""
+    points, predicted = _blobs()
+    grown, node_of_row = tree.grow_tree(
+        points, predicted, n_classes=2, n_min=15, random_state=0
     )
-    hardness = clustering.compute_kdn(
-        X,
-        row_ids=row_ids,
-        labels=np.zeros(len(X), dtype=int),
-        nodes=nodes,
-        k=hardness_k,
+    n_rows = tree.subtree_counts(grown, node_of_row, np.ones(len(points)))
+    children = np.flatnonzero(grown.parent >= 0)
+    assert (n_rows[children] >= 15).all()
+    assert n_rows[grown.root].sum() == len(points)
+
+
+def test_identical_points_make_a_leaf() -> None:
+    """Check a node whose points are all the same is never split."""
+    points = np.ones((100, 2))
+    grown, _ = tree.grow_tree(
+        points, np.zeros(100, dtype=int), n_classes=1, n_min=5, random_state=0
     )
-    losses = [
-        clustering.granularity_loss(
-            level_labels,
-            hardness,
-            n_class=len(X),
-            eval_rows_per_train_row=eval_rows_per_train_row,
-        )
-        for level_labels in levels
-    ]
-    best_level = int(np.argmin(losses))
-    assert losses[best_level] == pytest.approx(best_loss)
-    assert np.array_equal(levels[best_level], best_labels)
+    assert len(grown.parent) == 1 and grown.left[0] == -1
 
 
-def test_null_draw_is_seeded() -> None:
-    """Check random_voronoi is reproducible from its own rng seed."""
-    X = np.random.default_rng(8).normal(size=(100, 2))
-    draw_args = dict(min_cluster_floor=2, metric="euclidean")
-    first = clustering.random_voronoi(X, 10, rng=np.random.default_rng(0), **draw_args)
-    again = clustering.random_voronoi(X, 10, rng=np.random.default_rng(0), **draw_args)
-    different = clustering.random_voronoi(
-        X, 10, rng=np.random.default_rng(1), **draw_args
+def _cut_costs(grown: tree.Tree, cost: np.ndarray, node: int) -> list[float]:
+    """List the cost of every cut of the subtree under `node`."""
+    cuts = [cost[node]]
+    if grown.left[node] >= 0:
+        for left in _cut_costs(grown, cost, grown.left[node]):
+            for right in _cut_costs(grown, cost, grown.right[node]):
+                cuts.append(left + right)
+    return cuts
+
+
+def test_prune_matches_brute_force() -> None:
+    """Check the bottom-up cut is the cheapest of all cuts."""
+    points, predicted = _blobs(80)
+    rng = np.random.default_rng(1)
+    errors = (rng.random(len(points)) < np.where(points[:, 0] > 3, 0.6, 0.05)).astype(
+        float
     )
-    assert np.array_equal(first, again)
-    assert not np.array_equal(first, different)
-
-
-def test_brier_decomposition_is_exact() -> None:
-    """Check brier decomposes exactly into its three terms."""
-    rng = np.random.default_rng(2)
-    group = rng.integers(0, 6, size=500)
-    observed = rng.binomial(1, 0.3, size=500).astype(float)
-    group_rate = pd.Series(observed).groupby(group).transform("mean")
-    predicted = np.clip(group_rate.to_numpy() + rng.normal(scale=0.05, size=1), 0, 1)
-    score = scores.group_scores(predicted, observed, group, reference=0.3)
-    assert score["brier"] == pytest.approx(
-        score["uncertainty"] - score["resolution"] + score["reliability"], abs=1e-12
+    grown, node_of_row = tree.grow_tree(
+        points, predicted, n_classes=2, n_min=10, random_state=0
     )
-
-
-def test_kmeans_levels_leave_no_undersized_group() -> None:
-    """Check every level clears the floor, or merges to one group."""
-    rng = np.random.default_rng(4)
-    X = np.vstack([rng.normal(size=(300, 2)), rng.normal(loc=8, size=(7, 2))])
-    levels = clustering.kmeans_levels(
-        X,
-        min_cluster_floor=20,
-        max_fit_samples=10000,
-        metric="euclidean",
-        random_state=0,
+    n_rows = tree.subtree_counts(grown, node_of_row, np.ones(len(points)))
+    n_errors = tree.subtree_counts(grown, node_of_row, errors)
+    is_leaf, is_kept, cost, best = tree.prune_tree(
+        grown, n_rows, n_errors, n_train=len(points), n_val=50
     )
-    assert len(levels) == len(clustering.level_counts(len(X), 20))
-    for labels in levels:
-        _, counts = np.unique(labels, return_counts=True)
-        assert counts.min() >= 20 or counts.size == 1
-    # The finest level must actually survive as more than one group,
-    # not merge everything away: a mutant that always collapses to one
-    # group would otherwise still pass.
-    _, finest_counts = np.unique(levels[0], return_counts=True)
-    assert finest_counts.size > 1
+    for root in grown.root:
+        assert best[root] == pytest.approx(min(_cut_costs(grown, cost, root)))
+    assert cost[is_leaf].sum() == pytest.approx(best[grown.root].sum())
+    assert (is_leaf <= is_kept).all()
 
 
-def test_random_voronoi_leaves_no_undersized_cell() -> None:
-    """Check cells under the floor merge, more than one group left."""
-    X = np.random.default_rng(5).normal(size=(200, 2))
-    labels = clustering.random_voronoi(
-        X,
-        20,
-        min_cluster_floor=8,
-        metric="euclidean",
-        rng=np.random.default_rng(0),
+def test_tau2_never_negative_and_no_val_leaf_takes_regression() -> None:
+    """Check tau2 is not negative and an unseen leaf takes the line."""
+    counts = np.array([40.0, 60.0, 50.0, 80.0])
+    errors = np.array([4.0, 6.0, 5.0, 8.0])
+    covariate = np.array([0.1, 0.1, 0.1, 0.1])
+    intercept, slope, tau2 = tree.fit_fay_herriot(errors, counts, covariate)
+    assert tau2 >= 0 and slope == 0
+    rate, weight = tree.shrink_rates(
+        np.array([0.0, 5.0]),
+        np.array([0.0, 50.0]),
+        np.array([0.2, 0.1]),
+        intercept=0.05,
+        slope=0.5,
+        tau2=0.01,
     )
-    assert labels.shape == (200,)
-    _, counts = np.unique(labels, return_counts=True)
-    assert counts.min() >= 8
-    assert counts.size > 1
+    assert rate[0] == pytest.approx(0.15) and np.isnan(weight[0])
+    assert 0.0 <= rate[1] <= 1.0 and 0.0 < weight[1] < 1.0
 
 
-def test_random_voronoi_caps_n_cells_at_the_row_count() -> None:
-    """Check asking for more cells than rows draws at most one each."""
-    X = np.random.default_rng(5).normal(size=(40, 2))
-    labels = clustering.random_voronoi(
-        X,
-        1000,
-        min_cluster_floor=4,
-        metric="euclidean",
-        rng=np.random.default_rng(0),
+def test_disagreement_excludes_self() -> None:
+    """Check a train row is never its own neighbour."""
+    points = np.arange(10.0)[:, None]
+    labels = np.arange(10)
+    index = tree.build_neighbours(points, n_jobs=1)
+    own = tree.neighbour_disagreement(index, labels, labels, n_neighbours=3)
+    assert (own == 1.0).all()
+    other = tree.neighbour_disagreement(
+        index, labels, labels, n_neighbours=3, points=points
     )
-    assert labels.shape == (40,)
-    _, counts = np.unique(labels, return_counts=True)
-    assert counts.min() >= 4 or counts.size == 1
+    assert (other < 1.0).all()
+
+
+def test_class_never_predicted_oof_gets_an_empty_root() -> None:
+    """Check a class nobody predicted keeps a root with no rows."""
+    points, predicted = _blobs()
+    grown, node_of_row = tree.grow_tree(
+        points, predicted, n_classes=3, n_min=10, random_state=0
+    )
+    n_rows = tree.subtree_counts(grown, node_of_row, np.ones(len(points)))
+    assert n_rows[grown.root[2]] == 0 and grown.left[grown.root[2]] == -1
+    is_leaf, _, _, _ = tree.prune_tree(
+        grown, n_rows, n_rows * 0, n_train=len(points), n_val=50
+    )
+    assert is_leaf[grown.root[2]]
+    reached = tree.descend(grown, points[:3], np.array([2, 2, 2]), stop=is_leaf)
+    assert (reached == grown.root[2]).all()
+
+
+def test_leaf_measures_are_row_weighted_and_skip_undefined_ones() -> None:
+    """Check a leaf averages its populations by rows, ignoring None."""
+    measures = {
+        10: {"f1": 1.0, "n1": None},
+        11: {"f1": 4.0, "n1": 2.0},
+        20: {"f1": 5.0, "n1": None},
+    }
+    leaves = weighted_group_measures(
+        measures, group={10: 0, 11: 0, 20: 1}, weight={10: 30, 11: 10, 20: 7}
+    )
+    assert leaves[0]["f1"] == pytest.approx((30 * 1.0 + 10 * 4.0) / 40)
+    assert leaves[0]["n1"] == pytest.approx(2.0)
+    assert leaves[1]["f1"] == 5.0 and leaves[1]["n1"] is None

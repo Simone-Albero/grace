@@ -2,7 +2,7 @@
 
 import json
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import joblib
@@ -13,10 +13,11 @@ from omegaconf import DictConfig, OmegaConf
 from pandas.testing import assert_frame_equal
 
 import stages.baselines as baselines_stage
-import stages.partitions as partitions_stage
+import stages.classify as classify_stage
+import stages.crossfit as crossfit_stage
 import stages.regress as regress_stage
 from pipeline.runner import STAGES, _config_slice, run
-from src.regressor import region_descriptors
+from src.regressor import leaf_descriptors
 from stages import SPLITS
 from tests.helpers import fast_cfg, query
 
@@ -54,8 +55,6 @@ def test_outputs(root: Path) -> None:
         assert rows.tolist() == list(range(int(metrics["split", f"n_{split}"])))
     assert assignments["region_id"].isin(centroids["region_id"]).all()
 
-    _check_complexity(root, metrics, n_regions)
-
     n_val = int(metrics["split", "n_val"])
     n_train = int(metrics["split", "n_train"])
     # The granularity noise term reads the val budget, not the test one.
@@ -67,30 +66,89 @@ def test_outputs(root: Path) -> None:
     assert _scalar(root, "SELECT SUM(n_test) FROM failures") == n_test
     out_of_range = "val_rate NOT BETWEEN 0 AND 1 OR test_rate NOT BETWEEN 0 AND 1"
     assert _scalar(root, f"SELECT COUNT(*) FROM failures WHERE {out_of_range}") == 0
-    assert _scalar(root, "SELECT COUNT(*) FROM class_metrics") == 9
+    assert _scalar(root, "SELECT COUNT(*) FROM class_metrics") == 10
     assert ("classify", "accuracy") in metrics
+    _check_space(root, metrics, ids)
+    _check_crossfit(root, metrics, ids)
+    _check_tree(root, metrics, ids)
+    _check_complexity(root, metrics)
     _check_baselines(root, metrics)
     _check_regress(root, metrics, ids)
     _check_render(root, ids)
-    _check_partitions(root, metrics)
 
 
-def _check_complexity(
-    root: Path, metrics: Mapping[tuple[str, str], float], n_regions: int
-) -> None:
+def _check_complexity(root: Path, metrics: Mapping[tuple[str, str], float]) -> None:
     measures = {
         scope: query(
             root / "grace.db",
             f"SELECT DISTINCT measure FROM complexity WHERE scope = '{scope}'",
         )
-        for scope in ("region", "class")
+        for scope in ("leaf", "class")
     }
-    assert sorted(measures["region"]) == sorted(measures["class"])
-    n_measures = len(measures["region"])
+    assert sorted(measures["leaf"]) == sorted(measures["class"])
+    n_measures = len(measures["leaf"])
     assert metrics["complexity", "n_measures"] == n_measures
-    for scope, count in (("region", n_regions), ("class", 9)):
-        sql = f"SELECT COUNT(*) FROM complexity WHERE scope = '{scope}'"
-        assert _scalar(root, sql) == count * n_measures
+    sql = "SELECT COUNT(*) FROM complexity WHERE scope = 'class'"
+    assert _scalar(root, sql) == 10 * n_measures
+    # Every measured leaf is a leaf of the tree; a thin one has no row.
+    unknown = (
+        "SELECT COUNT(DISTINCT scope_id) FROM complexity WHERE scope = 'leaf' "
+        "AND scope_id NOT IN (SELECT node_id FROM tree_nodes WHERE status = 'leaf')"
+    )
+    assert _scalar(root, unknown) == 0
+    assert metrics["complexity", "n_populations"] > 0
+    assert metrics["complexity", "n_unmeasured_rows"] >= 0
+
+
+def _check_space(
+    root: Path, metrics: Mapping[tuple[str, str], float], ids: Mapping[str, int]
+) -> None:
+    projected = pd.read_parquet(root / f"artifacts/space/{ids['space']}/z.parquet")
+    for split in SPLITS:
+        rows = projected.loc[projected["split"] == split, "row"]
+        assert rows.tolist() == list(range(int(metrics["split", f"n_{split}"])))
+    coordinates = projected.filter(like="z_")
+    # One discriminant direction fewer than the classes.
+    assert coordinates.shape[1] == metrics["space", "n_components"] == 9
+    assert np.isfinite(coordinates.to_numpy()).all()
+
+
+def _check_tree(
+    root: Path, metrics: Mapping[tuple[str, str], float], ids: Mapping[str, int]
+) -> None:
+    rows = pd.read_parquet(root / f"artifacts/tree/{ids['tree']}/rows.parquet")
+    for split in SPLITS:
+        picked = rows[rows["split"] == split]
+        assert picked["row"].tolist() == list(
+            range(int(metrics["split", f"n_{split}"]))
+        )
+    assert rows[["q_leaf", "q"]].stack().between(0, 1).all()
+    leaves = pd.DataFrame(
+        query(
+            root / "grace.db",
+            "SELECT node_id, n_train, n_val, q FROM tree_nodes "
+            f"WHERE execution_id = {ids['tree']} AND status = 'leaf'",
+        ),
+        columns=["node_id", "n_train", "n_val", "q"],
+    )
+    assert len(leaves) == metrics["tree", "n_leaves"]
+    assert leaves["q"].notna().all()
+    assert leaves["n_val"].sum() == metrics["split", "n_val"]
+    assert leaves["n_train"].sum() == metrics["split", "n_train"]
+    assert set(rows.loc[rows["split"] == "test", "leaf"]) <= set(leaves["node_id"])
+
+
+def _check_crossfit(
+    root: Path, metrics: Mapping[tuple[str, str], float], ids: Mapping[str, int]
+) -> None:
+    oof = pd.read_parquet(root / f"artifacts/crossfit/{ids['crossfit']}/oof.parquet")
+    n_train = int(metrics["split", "n_train"])
+    assert oof["row"].tolist() == list(range(n_train))
+    assert metrics["crossfit", "n_folds"] == oof["fold"].nunique()
+    probabilities = oof.filter(like="proba_")
+    assert probabilities.shape[1] == 10
+    assert np.allclose(probabilities.sum(axis=1), 1, atol=1e-4)
+    assert 0 < metrics["crossfit", "oof_error_rate"] < 1
 
 
 def _check_baselines(root: Path, metrics: Mapping[tuple[str, str], float]) -> None:
@@ -113,28 +171,18 @@ def _check_baselines(root: Path, metrics: Mapping[tuple[str, str], float]) -> No
 def _check_regress(
     root: Path, metrics: Mapping[tuple[str, str], float], ids: Mapping[str, int]
 ) -> None:
-    n_regions = int(metrics["regions", "n_regions"])
-    assert _scalar(root, "SELECT COUNT(*) FROM estimates") == n_regions
-    # A region is predicted iff it is used, has a val row, or both.
-    unpredicted = (
-        "SELECT COUNT(*) FROM estimates "
-        "JOIN baselines USING (region_id) JOIN failures USING (region_id) "
-        f"WHERE estimates.execution_id = {ids['regress']} "
-        f"AND baselines.execution_id = {ids['baselines']} "
-        f"AND failures.execution_id = {ids['failures']} "
-        "AND (regressor IS NULL) != (used = 0 AND n_val = 0)"
-    )
-    assert _scalar(root, unpredicted) == 0
-    # The folds cover exactly the regions with a val row.
+    n_leaves = int(metrics["tree", "n_leaves"])
+    assert _scalar(root, "SELECT COUNT(*) FROM estimates") == n_leaves
+    # The folds cover exactly the leaves with a val row.
     fold_coverage = (
-        "SELECT COUNT(*) FROM estimates JOIN failures USING (region_id) "
+        "SELECT COUNT(*) FROM estimates JOIN tree_nodes USING (node_id) "
         f"WHERE estimates.execution_id = {ids['regress']} "
-        f"AND failures.execution_id = {ids['failures']} "
+        f"AND tree_nodes.execution_id = {ids['tree']} "
         "AND (fold IS NULL) != (n_val = 0)"
     )
     assert _scalar(root, fold_coverage) == 0
     for score in ("spearman", "r2", "mae", "mse"):
-        assert ("regress", f"regressor_{score}") in metrics
+        assert ("regress", f"oof_{score}") in metrics
     folds = int(metrics["regress", "n_outer_splits"]) + 1
     assert _scalar(root, "SELECT COUNT(*) FROM regressor_folds") == folds
     assert _scalar(root, "SELECT COUNT(*) FROM regressor_folds WHERE fold = -1") == 1
@@ -151,8 +199,8 @@ def _check_render(root: Path, ids: Mapping[str, int]) -> None:
         "classification/confusion_matrix",
         "baselines/predicted_vs_observed",
         "failures/rate_by_class",
-        "regress/predicted_vs_observed",
-        "regress/scores",
+        "regress/predicted_vs_val",
+        "regress/feature_importances",
     }
     sql = f"SELECT name, file FROM figures WHERE execution_id = {ids['render']}"
     figures = dict(query(root / "grace.db", sql))
@@ -161,53 +209,6 @@ def _check_render(root: Path, ids: Mapping[str, int]) -> None:
     assert all((folder / file).exists() for file in figures.values())
     # Naive Bayes trains no epochs, so there is no loss history.
     assert "classification/training_loss" not in figures
-
-
-def _check_partitions(root: Path, metrics: Mapping[tuple[str, str], float]) -> None:
-    db_path = root / "grace.db"
-    brier_identity = "ABS(brier - (uncertainty - resolution + reliability)) > 1e-6"
-    assert _scalar(root, f"SELECT COUNT(*) FROM partitions WHERE {brier_identity}") == 0
-    assert (
-        _scalar(root, "SELECT COUNT(*) FROM partitions WHERE n_groups > n_target") == 0
-    )
-
-    bin_arms = "arm IN ('confidence', 'predicted_class')"
-    bins_have_a_spearman = (
-        f"SELECT COUNT(*) FROM partitions WHERE {bin_arms} AND kdn_spearman IS NOT NULL"
-    )
-    assert _scalar(root, bins_have_a_spearman) == 0
-    others_lack_one = (
-        "SELECT COUNT(*) FROM partitions "
-        f"WHERE NOT ({bin_arms}) AND kdn_spearman IS NULL"
-    )
-    assert _scalar(root, others_lack_one) == 0
-
-    # A selected row's loss is at most the least loss of its arm's own
-    # level sweep (intra's per-class pick can do strictly better).
-    selected_rows = query(
-        db_path,
-        "SELECT arm, draw, loss FROM partitions WHERE rule = 'selected' "
-        "AND arm IN ('intra', 'inter', 'null')",
-    )
-    for arm, draw, loss in selected_rows:
-        least_level_loss = query(
-            db_path,
-            "SELECT MIN(loss) FROM partitions "
-            f"WHERE arm = '{arm}' AND rule = 'level' AND draw = {draw}",
-        )[0][0]
-        assert loss <= least_level_loss + 1e-9
-
-    n_val = int(metrics["split", "n_val"])
-    n_test = int(metrics["split", "n_test"])
-    group_counts = query(
-        db_path,
-        "SELECT arm, rule, SUM(n_val), SUM(n_test) FROM partition_groups "
-        "GROUP BY arm, rule",
-    )
-    assert group_counts
-    for _, _, total_val, total_test in group_counts:
-        assert total_val == n_val
-        assert total_test == n_test
 
 
 def test_second_run_is_cached(root: Path) -> None:
@@ -249,21 +250,17 @@ def test_classify_key_ignores_dl_and_runtime_keys(root: Path) -> None:
     assert cached == [(1,)]
 
     ml = _config_slice("classify", fast_cfg(root))
-    assert "loss" not in ml and "runtime" not in ml and "training" not in ml["fit"]
+    assert "loss" not in ml and "runtime" not in ml and "fit" not in ml
     dl = _config_slice("classify", fast_cfg(root, "classifier=mlp"))
     assert "loss" in dl and "runtime" not in dl and "training" in dl["fit"]
 
 
-def test_routing_is_label_free(tmp_path: Path) -> None:
-    """Check that routing val and test rows ignores their labels."""
-    cfg = fast_cfg(tmp_path)
-    run(["regions"], cfg, force=False)
-    first = pd.read_parquet(tmp_path / "artifacts/regions/3/assignments.parquet")
-
+def _shuffle_labels(root: Path, splits: Sequence[str]) -> None:
+    """Shuffle the labels of `splits` in place; prepare stays cached."""
     rng = np.random.default_rng(0)
-    prepared = tmp_path / "artifacts/prepare/2"
+    prepared = root / "artifacts/prepare/2"
     sizes = json.loads((prepared / "sizes.json").read_text())
-    for split in ("val", "test"):
+    for split in splits:
         path = prepared / f"{split}.parquet"
         rows = pd.read_parquet(path)
         rows["label"] = rng.permutation(rows["label"].to_numpy())
@@ -271,8 +268,23 @@ def test_routing_is_label_free(tmp_path: Path) -> None:
         sizes[path.name] = path.stat().st_size
     # Else prepare would rerun, undoing the edit.
     (prepared / "sizes.json").write_text(json.dumps(sizes))
+
+
+def _routed(root: Path) -> pd.DataFrame:
+    """Return the assignments of the latest regions execution."""
+    latest = _scalar(root, "SELECT MAX(id) FROM executions WHERE stage = 'regions'")
+    return pd.read_parquet(root / f"artifacts/regions/{latest}/assignments.parquet")
+
+
+def test_routing_is_label_free(tmp_path: Path) -> None:
+    """Check that routing val and test rows ignores their labels."""
+    cfg = fast_cfg(tmp_path)
+    run(["regions"], cfg, force=False)
+    first = _routed(tmp_path)
+
+    _shuffle_labels(tmp_path, ("val", "test"))
     run(["regions"], cfg, force=True)
-    second = pd.read_parquet(tmp_path / "artifacts/regions/4/assignments.parquet")
+    second = _routed(tmp_path)
     assert_frame_equal(second, first)
 
 
@@ -287,16 +299,7 @@ def test_classify_never_trains_on_val_labels(tmp_path: Path) -> None:
     run(["classify"], cfg, force=False)
     first = pd.read_parquet(tmp_path / "artifacts/classify/3/predictions.parquet")
 
-    rng = np.random.default_rng(0)
-    prepared = tmp_path / "artifacts/prepare/2"
-    sizes = json.loads((prepared / "sizes.json").read_text())
-    path = prepared / "val.parquet"
-    rows = pd.read_parquet(path)
-    rows["label"] = rng.permutation(rows["label"].to_numpy())
-    rows.to_parquet(path, index=False)
-    sizes[path.name] = path.stat().st_size
-    # Else prepare would rerun, undoing the edit.
-    (prepared / "sizes.json").write_text(json.dumps(sizes))
+    _shuffle_labels(tmp_path, ("val",))
     run(["classify"], cfg, force=True)
     second = pd.read_parquet(tmp_path / "artifacts/classify/4/predictions.parquet")
     assert_frame_equal(second, first)
@@ -420,56 +423,37 @@ def test_baseline_val_rate_falls_back_to_the_global_rate(
 
 
 def _regress_tables() -> dict[tuple[str, str], pd.DataFrame]:
-    """Build a four-region toy input for `stages.regress`.
+    """Build a four-leaf toy input for `stages.regress`.
 
-    Region 1: used, has a val row. Region 2: used, no val row (the
-    refit-only case). Region 3: has a val row, not used (too few test
-    rows). Region 4: used, has a val row.
+    Leaves 1, 3 and 4 have val rows. Leaf 2 has none (the refit-only
+    case).
     """
-    regions = pd.DataFrame({"region_id": [1, 2, 3, 4], "class_id": [10, 10, 20, 20]})
+    nodes = pd.DataFrame(
+        {
+            "node_id": [1, 2, 3, 4],
+            "class_id": [10, 10, 20, 20],
+            "status": ["leaf"] * 4,
+            "n_val": [20, 0, 15, 10],
+            "n_val_errors": [2, 0, 6, 1],
+        }
+    )
     complexity = pd.DataFrame(
         [
-            {"scope": "region", "scope_id": 1, "measure": "m1", "value": 1.0},
-            {"scope": "region", "scope_id": 2, "measure": "m1", "value": 2.0},
-            {"scope": "region", "scope_id": 3, "measure": "m1", "value": 3.0},
-            {"scope": "region", "scope_id": 4, "measure": "m1", "value": 4.0},
+            {"scope": "leaf", "scope_id": 1, "measure": "m1", "value": 1.0},
+            {"scope": "leaf", "scope_id": 2, "measure": "m1", "value": 2.0},
+            {"scope": "leaf", "scope_id": 3, "measure": "m1", "value": 3.0},
+            {"scope": "leaf", "scope_id": 4, "measure": "m1", "value": 4.0},
             {"scope": "class", "scope_id": 10, "measure": "m1", "value": 1.5},
             {"scope": "class", "scope_id": 20, "measure": "m1", "value": 3.5},
         ]
     )
-    failures = pd.DataFrame(
-        {
-            "region_id": [1, 2, 3, 4],
-            "n_val": [20, 0, 15, 10],
-            "n_val_error": [2, 0, 6, 1],
-            "val_rate": [0.1, None, 0.4, 0.1],
-            "n_test": [30, 25, 2, 40],
-            "n_test_error": [9, 5, 1, 4],
-            "test_rate": [0.3, 0.2, 0.5, 0.1],
-        }
-    )
-    baselines = pd.DataFrame({"region_id": [1, 2, 3, 4], "used": [1, 1, 0, 1]})
-    metrics = pd.DataFrame(
-        {
-            "name": [
-                f"{predictor}_{score}"
-                for predictor in ("val", "mcp", "atc")
-                for score in ("spearman", "r2", "mae", "mse")
-            ],
-            "value": [0.0] * 12,
-        }
-    )
-    return {
-        ("regions", "regions"): regions,
-        ("complexity", "complexity"): complexity,
-        ("failures", "failures"): failures,
-        ("baselines", "baselines"): baselines,
-        ("baselines", "metrics"): metrics,
-    }
+    return {("tree", "tree_nodes"): nodes, ("complexity", "complexity"): complexity}
 
 
-def test_regress_predicts_a_used_region_without_a_val_row(tmp_path: Path) -> None:
-    """Check the refit, not the CV, predicts a used, val-less region."""
+def test_regress_predicts_a_leaf_without_a_val_row_by_the_refit(
+    tmp_path: Path,
+) -> None:
+    """Check the refit, not the CV, predicts a val-less leaf."""
     cfg = OmegaConf.create(
         {
             "failure_regressor": {
@@ -488,62 +472,118 @@ def test_regress_predicts_a_used_region_without_a_val_row(tmp_path: Path) -> Non
 
     estimates = next(
         frame for name, frame in ctx.pending if name == "estimates"
-    ).set_index("region_id")
+    ).set_index("node_id")
 
-    # Region 2: used, no val row -> predicted by the refit, fold is NA,
-    # and its value is exactly the refit model's own prediction (not,
-    # say, a coincidental fallback to some other rate).
+    # Leaf 2: no val row -> predicted by the refit, fold is NA, and its
+    # value is exactly the refit model's own prediction.
     assert pd.isna(estimates.loc[2, "fold"])
     model = joblib.load(tmp_path / "model.joblib")
     tables = _regress_tables()
-    regions = tables[("regions", "regions")].set_index("region_id")
-    descriptors = region_descriptors(
-        tables[("complexity", "complexity")], regions["class_id"]
+    nodes = tables[("tree", "tree_nodes")].set_index("node_id")
+    descriptors = leaf_descriptors(
+        tables[("complexity", "complexity")], nodes["class_id"]
     )
     expected = np.clip(
         model.predict(descriptors.loc[[2], model.feature_names_in_]), 0.0, 1.0
     )[0]
     assert estimates.loc[2, "regressor"] == pytest.approx(expected)
 
-    # Regions 1 and 4: used, out-of-fold predicted, a real fold index.
-    for region in (1, 4):
-        assert not pd.isna(estimates.loc[region, "fold"])
-        assert 0.0 <= estimates.loc[region, "regressor"] <= 1.0
-
-    # Region 3: has a val row (trained) but is not used: it still gets
-    # an out-of-fold estimate, just never scored against test.
-    assert not pd.isna(estimates.loc[3, "fold"])
-    assert 0.0 <= estimates.loc[3, "regressor"] <= 1.0
-
-    metrics = next(values for name, values in ctx.pending if name == "metrics")
-    assert np.isfinite(metrics["regressor_mae"])
+    # Leaves 1, 3 and 4 have a val row: out-of-fold, a real fold index.
+    for leaf in (1, 3, 4):
+        assert not pd.isna(estimates.loc[leaf, "fold"])
+        assert 0.0 <= estimates.loc[leaf, "regressor"] <= 1.0
 
 
-def test_predicted_class_n_target_counts_a_class_missing_from_val() -> None:
-    """Check n_target widens for a class seen on test but not val.
-
-    Without the widening, `n_groups <= n_target` (the invariant
-    `_check_partitions` relies on) would fail whenever a class is
-    predicted on test but not on val: `assign_class_bins` still gives
-    it a group, uncounted by the bin rule's own `n_bins`.
-    """
-    val = partitions_stage._Predictions(
-        predicted=np.array([0, 0, 2, 2]),
-        confidence=np.array([0.6, 0.65, 0.3, 0.35]),
-        error=np.array([0.0, 1.0, 0.0, 1.0]),
+def test_crossfit_predicts_every_train_row_once(root: Path) -> None:
+    """Check every train row has one out-of-fold prediction."""
+    execution = _scalar(root, "SELECT id FROM executions WHERE stage = 'crossfit'")
+    oof = pd.read_parquet(root / f"artifacts/crossfit/{execution}/oof.parquet")
+    n_train = _scalar(
+        root,
+        "SELECT value FROM metrics JOIN executions ON executions.id = execution_id "
+        "WHERE stage = 'split' AND name = 'n_train'",
     )
-    test = partitions_stage._Predictions(
-        predicted=np.array([0, 1, 2, 2]),
-        confidence=np.array([0.62, 0.5, 0.32, 0.4]),
-        error=np.array([0.0, 1.0, 1.0, 0.0]),
+    assert oof["row"].is_unique and len(oof) == n_train
+    sizes = oof["fold"].value_counts()
+    assert sizes.max() - sizes.min() <= 10
+
+
+def test_crossfit_refits_with_the_best_grid_params(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Check every fold refits with the grid's chosen parameters."""
+    cfg = fast_cfg(tmp_path, "classifier=logistic_regression")
+    run(["classify"], cfg, force=False)
+    chosen = json.loads(
+        _scalar(tmp_path, "SELECT params FROM classifier_grid WHERE best = 1")
     )
+    seen = []
+    build = crossfit_stage.ml.build_pipeline
 
-    rows, _ = partitions_stage._score_bins("predicted_class", val, test, reference=0.5)
+    def spy(name, params, num_cols, cat_cols):
+        seen.append(dict(params))
+        return build(name, params, num_cols, cat_cols)
 
-    for row in rows:
-        assert row["n_groups"] <= row["n_target"]
-        # The one test row of the class val never predicts is the only
-        # one in a group with no val row. Routing val and test through
-        # two separate calls (the id-aliasing bug) instead aliases a
-        # val-only class's rows onto it too, raising this to 0.5.
-        assert row["share_no_val"] == pytest.approx(0.25)
+    monkeypatch.setattr(crossfit_stage.ml, "build_pipeline", spy)
+    run(["crossfit"], cfg, force=False)
+    assert len(seen) == cfg.crossfit.n_folds
+    assert all(params["C"] == chosen["C"] for params in seen)
+
+
+def test_crossfit_dl_stops_on_its_own_fold_holdout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Check a DL fold never fits or stops on the rows it predicts."""
+    cfg = fast_cfg(tmp_path, "classifier=mlp", "fit.training.epochs=1")
+    run(["classify"], cfg, force=False)
+    fits, held = [], []
+    fit = crossfit_stage.dl.fit_classifier
+    predict = crossfit_stage._predict_fold
+
+    def fit_spy(rows, **kwargs):
+        fits.append(set(rows.index))
+        return fit(rows, **kwargs)
+
+    def predict_spy(ctx, model, rows, **kwargs):
+        held.append(set(rows.index))
+        return predict(ctx, model, rows, **kwargs)
+
+    monkeypatch.setattr(crossfit_stage.dl, "fit_classifier", fit_spy)
+    monkeypatch.setattr(crossfit_stage, "_predict_fold", predict_spy)
+    run(["crossfit"], cfg, force=False)
+    assert len(fits) == len(held) == cfg.crossfit.n_folds
+    assert all(not (fit_rows & held_rows) for fit_rows, held_rows in zip(fits, held))
+    assert set().union(*held) == set(range(len(set().union(*held))))
+
+
+@pytest.mark.parametrize("classifier", ["naive_bayes", "mlp"])
+def test_crossfit_keys_cover_classify_keys(classifier: str) -> None:
+    """Check crossfit's cache key holds all classify trains on."""
+    cfg = fast_cfg(Path("unused"), f"classifier={classifier}")
+    classify_keys = set(classify_stage.config_keys(cfg)) - {"grid_search"}
+    assert classify_keys <= set(crossfit_stage.config_keys(cfg))
+
+
+def test_tree_never_reads_test_labels(tmp_path: Path) -> None:
+    """Check the tree and its probabilities ignore the test labels."""
+    cfg = fast_cfg(tmp_path)
+    run(["tree"], cfg, force=False)
+
+    def built() -> tuple[pd.DataFrame, pd.DataFrame]:
+        latest = _scalar(tmp_path, "SELECT MAX(id) FROM executions WHERE stage='tree'")
+        rows = pd.read_parquet(tmp_path / f"artifacts/tree/{latest}/rows.parquet")
+        nodes = pd.DataFrame(
+            query(
+                tmp_path / "grace.db",
+                "SELECT node_id, status, n_val, q FROM tree_nodes "
+                f"WHERE execution_id = {latest} ORDER BY node_id",
+            )
+        )
+        return rows, nodes
+
+    first_rows, first_nodes = built()
+    _shuffle_labels(tmp_path, ("test",))
+    run(["tree"], cfg, force=True)
+    second_rows, second_nodes = built()
+    assert_frame_equal(second_rows, first_rows)
+    assert_frame_equal(second_nodes, first_nodes)

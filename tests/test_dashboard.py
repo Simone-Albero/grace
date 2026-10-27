@@ -10,11 +10,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from dashboard import queries
-from dashboard.app import _format_number, create_app
+from dashboard.app import create_app
 from pipeline.runner import run
 from tests.helpers import BASE_URL, fast_cfg, query
 
-_TABS = "data classifier regions failures predictors partitions".split()
+_TABS = "data classifier regions failures predictors".split()
 
 
 def _execution(root: Path, stage: str) -> int:
@@ -59,7 +59,7 @@ def test_experiments_page(client: TestClient, experiment: dict) -> None:
     assert "naive_bayes" in client.get("/?classifier=naive_bayes").text
     assert "matches these filters" in client.get("/?classifier=mlp").text
     assert client.get("/?sort=regressor_spearman&desc=false").status_code == 400
-    assert client.get("/?sort=regress.regressor_spearman&desc=false").status_code == 200
+    assert client.get("/?sort=baselines.val_spearman&desc=false").status_code == 200
     assert client.get("/?sort=nope").status_code == 400
 
 
@@ -70,7 +70,7 @@ def test_api_experiments(client: TestClient, experiment: dict, root: Path) -> No
     assert all(cell["done"] == 1 for cell in experiment["coverage"])
     for key, stage, name in (
         ("classify.accuracy", "classify", "accuracy"),
-        ("regress.regressor_spearman", "regress", "regressor_spearman"),
+        ("failures.test_error_rate", "failures", "test_error_rate"),
         ("baselines.val_mse", "baselines", "val_mse"),
     ):
         sql = (
@@ -89,7 +89,7 @@ def test_experiment_page(client: TestClient, experiment: dict) -> None:
     assert page.status_code == 200
     for text in ("Seeds", "Across the seeds", "All metrics", "classify · accuracy"):
         assert text in page.text
-    assert page.text.count('class="chart"') >= 5
+    assert page.text.count('class="chart"') >= 4
     assert client.get("/experiments/nope").status_code == 404
 
 
@@ -103,17 +103,9 @@ def test_run_overview_and_tabs(client: TestClient, run_id: int) -> None:
     expected = {
         "data": ("Preprocessing", "class_1", "num_1", "train"),
         "classifier": ("Confusion matrix", "precision", "accuracy"),
-        "regions": ("Clustering of each class", "size balance", "n1_mean"),
+        "regions": ("Clustering of each class", "size balance"),
         "failures": ("Test against val failure rate", "Distribution", "Val − test"),
-        "predictors": ("RF regressor", "Val rate", "MCP", "ATC", "MSE", "Outer folds"),
-        "partitions": (
-            "Operating points",
-            "intra",
-            "predicted_class",
-            "Brier",
-            ">reliability</th>",
-            "Groups per val",
-        ),
+        "predictors": ("Val rate", "MCP", "ATC", "MSE", "Regressor, outer folds"),
     }
     for tab in _TABS:
         page = client.get(f"/runs/{run_id}/{tab}")
@@ -127,58 +119,21 @@ def test_run_overview_and_tabs(client: TestClient, run_id: int) -> None:
     assert invalid.status_code == 422 and "<html" in invalid.text
 
 
-def test_regions_explorer(client: TestClient, root: Path, run_id: int) -> None:
-    """Check that regions filter and sort; a region shows its rate."""
-    url = f"/runs/{run_id}/regions"
-    page = client.get(url)
-    failures = _execution(root, "failures")
-    region_id, rate = query(
-        root / "grace.db",
-        "SELECT region_id, test_rate FROM failures "
-        f"WHERE execution_id = {failures} ORDER BY region_id DESC",
-    )[0]
-    link = f"{url}/{region_id}"
-    assert link in page.text
-    narrowed = client.get(f"{url}?class_id=0")
-    assert narrowed.text.count(f"{url}/") < page.text.count(f"{url}/")
-    fragment = client.get(f"{url}?class_id=0", headers={"HX-Request": "true"})
-    assert "<html" not in fragment.text and f"{url}/" in fragment.text
-    assert client.get(f"{url}?sort=abs_error&desc=true").status_code == 200
-    assert client.get(f"{url}?x=n1_mean&y=regressor").status_code == 200
-    assert client.get(f"{url}?x=bogus").status_code == 400
-    region = client.get(link)
-    assert region.status_code == 200 and "n1_mean" in region.text
-    assert _format_number(rate) in region.text
-    assert client.get(f"{url}/999999").status_code == 404
-
-
-def test_partition_sweeps(client: TestClient, run_id: int) -> None:
-    """Check that the sweep charts draw for every arm."""
-    charts = client.get(f"/runs/{run_id}/partitions/charts")
-    assert charts.status_code == 200
-    assert charts.text.count('class="chart"') == 4
-    for arm in ("intra", "inter", "null", "confidence", "predicted_class"):
-        assert arm in charts.text
-    assert client.get(f"/runs/{run_id}/partitions/charts?metric=x").status_code == 400
-    assert client.get(f"/runs/{run_id}/partitions/charts?x=x").status_code == 400
-    assert client.get("/runs/999999/partitions/charts").status_code == 404
-
-
 def test_compare(client: TestClient) -> None:
-    """Check that the comparison charts draw all three families."""
+    """Check that the comparison charts draw both families."""
     assert client.get("/compare").status_code == 200
     charts = client.get(
         "/compare/charts?metric=classify.accuracy&x=classifier&color=distance"
-        "&score=mse&arm_metric=brier&rule=cbrt"
+        "&score=mse"
     )
-    assert charts.status_code == 200 and charts.text.count('class="chart"') == 3
+    assert charts.status_code == 200 and charts.text.count('class="chart"') == 2
     # No id: HTMX would reset the class of a swapped, id-matched div and
     # with it Plotly's js-plotly-plot, which hover and click need.
     assert 'id="chart' not in charts.text
-    for name in ("RF regressor", "MCP", "ATC", "confidence"):
+    for name in ("Val rate", "MCP", "ATC"):
         assert name in charts.text
     assert "No run matches" in client.get("/compare/charts?classifier=mlp").text
-    queries_400 = ("metric=bogus", "metric=classify", "x=bogus", "rule=bogus")
+    queries_400 = ("metric=bogus", "metric=classify", "x=bogus")
     for query_string in (*queries_400, "color=bogus"):
         assert client.get(f"/compare/charts?{query_string}").status_code == 400
 
@@ -193,11 +148,7 @@ def test_read_routes_never_write(client: TestClient, root: Path, run_id: int) ->
     before = state()
     urls = ["/", "/api/experiments", "/compare", "/compare/charts", f"/runs/{run_id}"]
     urls += [f"/runs/{run_id}/{tab}" for tab in _TABS]
-    urls += [
-        f"/runs/{run_id}/stages?sig=x",
-        f"/runs/{run_id}/partitions/charts",
-        f"/runs/{run_id}/regions/0",
-    ]
+    urls.append(f"/runs/{run_id}/stages?sig=x")
     for url in urls:
         assert client.get(url).status_code == 200, url
     assert state() == before
@@ -242,31 +193,29 @@ def test_a_run_with_only_prepare_shows_what_exists(tmp_path: Path) -> None:
     with TestClient(create_app(tmp_path / "grace.db"), base_url=BASE_URL) as client:
         overview = client.get(f"/runs/{run_id}")
         assert overview.status_code == 200 and "split" in overview.text
-        assert overview.text.count('class="disabled"') == 5
+        assert overview.text.count('class="disabled"') == 4
         data = client.get(f"/runs/{run_id}/data")
         assert "Rows of each class" in data.text and "Preprocessing" in data.text
-        for tab in "classifier regions failures predictors partitions".split():
+        for tab in "classifier regions failures predictors".split():
             page = client.get(f"/runs/{run_id}/{tab}")
             assert page.status_code == 200 and "Nothing to show yet" in page.text
-        assert client.get(f"/runs/{run_id}/regions/0").status_code == 404
-        assert client.get(f"/runs/{run_id}/partitions/charts").status_code == 404
         assert client.get("/api/experiments").json()[0]["n_seeds"] == 1
         assert client.get("/compare/charts").status_code == 200
 
 
 def test_the_regressor_joins_a_run_that_lacked_it(tmp_path: Path) -> None:
-    """Check that predictors show without regress, RF only with it."""
+    """Check predictors show without regress, its folds only with it."""
     first = run(["baselines"], fast_cfg(tmp_path), force=False)
     with TestClient(create_app(tmp_path / "grace.db"), base_url=BASE_URL) as client:
         page = client.get(f"/runs/{first}/predictors")
-        assert "MCP" in page.text and "RF regressor" not in page.text
+        assert "MCP" in page.text and "outer folds" not in page.text
         assert "need" in page.text and "regress" in page.text
         assert client.get(f"/runs/{first}/classifier").status_code == 200
         second = run(["regress"], fast_cfg(tmp_path), force=False)
         (row,) = client.get("/api/experiments").json()
         # Both runs are seed 42: the latest represents it.
         assert row["n_seeds"] == 1 and row["seeds"][0]["run_id"] == second
-        assert "RF regressor" in client.get(f"/runs/{second}/predictors").text
+        assert "outer folds" in client.get(f"/runs/{second}/predictors").text
 
 
 def test_a_running_run_polls_and_reloads_when_a_stage_finishes(

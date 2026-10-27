@@ -48,7 +48,7 @@ def test_seeds_group_and_the_latest_run_represents_a_seed() -> None:
         (2, "classify", 20, "accuracy", 0.7),
         (3, "classify", 30, "accuracy", 0.9),
     ]
-    (experiment,) = build(runs, metrics, [])
+    (experiment,) = build(runs, metrics)
     assert [seed.seed for seed in experiment.seeds] == [1, 2]
     first = experiment.seeds[0]
     assert first.run["id"] == 3 and [r["id"] for r in first.earlier] == [1]
@@ -58,20 +58,12 @@ def test_seeds_group_and_the_latest_run_represents_a_seed() -> None:
 def test_a_different_config_is_another_experiment_with_a_variant() -> None:
     """Check that a differing nested key shows as the variant."""
     runs = [_run(1, 1, loss={"gamma": 1}), _run(2, 1, loss={"gamma": 2})]
-    experiments = build(runs, [], [])
+    experiments = build(runs, [])
     assert len(experiments) == 2
     assert {e.variant for e in experiments} == {"loss.gamma=1", "loss.gamma=2"}
     assert config_key(runs[0])[0] != config_key(runs[1])[0]
-    (alone,) = build([_run(1, 1)], [], [])
+    (alone,) = build([_run(1, 1)], [])
     assert alone.variant == ""
-
-
-def test_operating_points_join_the_metrics() -> None:
-    """Check that an operating point's columns become `op.` metrics."""
-    point = {"run_id": 1, "arm": "intra", "rule": "selected", "skill": 0.2}
-    point |= {name: None for name in queries.OPERATING_COLUMNS if name != "skill"}
-    (experiment,) = build([_run(1, 1)], [], [point])
-    assert experiment.seeds[0].metrics["op.intra.selected.skill"] == 0.2
 
 
 def test_summarize_skips_missing_values() -> None:
@@ -90,7 +82,6 @@ def test_an_execution_counts_once() -> None:
                 (1, "classify", 10, "accuracy", 0.5),
                 (2, "classify", 10, "accuracy", 0.5),
             ],
-            [],
         )
     )
     grouped = grouped_values(rows, "classify.accuracy", "classifier", None)
@@ -102,7 +93,6 @@ def test_an_execution_counts_once() -> None:
                 (1, "classify", 10, "accuracy", 0.5),
                 (2, "classify", 20, "accuracy", 0.7),
             ],
-            [],
         )
     )
     assert grouped_values(other, "classify.accuracy", "classifier", "clustering") == {
@@ -134,6 +124,6 @@ def test_confusion_pairs_rows_by_position(tmp_path: Path) -> None:
 def test_an_infinite_metric_is_not_a_value() -> None:
     """Check that an infinity cannot reach the statistics or the JSON."""
     (experiment,) = build(
-        [_run(1, 1)], [(1, "baselines", 10, "atc_threshold", float("inf"))], []
+        [_run(1, 1)], [(1, "baselines", 10, "atc_threshold", float("inf"))]
     )
     assert experiment.seeds[0].metrics["baselines.atc_threshold"] is None

@@ -32,6 +32,7 @@ train_frac: 0.4
 val_frac: 0.15     # the label budget: the ATC threshold is fitted here, and no classifier trains on it
 test_frac: 0.45    # the only split the regressor and the baselines are judged against
 
-min_class_count: 3000
+min_class_count: 20      # classes with fewer rows are dropped: 20 leaves a few rows in every split and fold
+max_per_class: 4000      # the most train rows of a class a classifier fits on (null: all); a large class is subsampled, a small one kept whole
 top_n: 128
 hash_buckets: 256

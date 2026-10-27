@@ -19,7 +19,6 @@ _FAST = (
     "failure_regressor.n_outer_splits=2",
     "failure_regressor.n_inner_splits=2",
     "failure_regressor.param_grid.n_estimators=[20,50]",
-    "partitions.null_draws=3",
 )
 
 

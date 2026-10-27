@@ -157,8 +157,8 @@ class Context:
         the stage must declare `figure_format` in CONFIG.
 
         Args:
-            draw: Returns the figures by name, e.g. "regress/scores";
-                called under the plot style.
+            draw: Returns the figures by name, e.g.
+                "regress/predicted_vs_val"; called under the plot style.
         """
         extension = self.cfg.figure_format
         rows = []

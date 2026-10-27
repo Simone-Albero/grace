@@ -4,12 +4,11 @@ __all__ = [
     "LogTransformer",
     "TopNHashEncoder",
     "build_preprocessor",
+    "cap_per_class",
     "drop_nans",
     "drop_rare_classes",
     "ml_split",
     "stratified_holdout",
-    "subsample_per_class",
-    "undersample_classes",
 ]
 
 import hashlib
@@ -69,39 +68,30 @@ def _stratified_sample(
     )
 
 
-def subsample_per_class(
-    rows: pd.DataFrame, n_samples: int, *, random_state: int, label_col: str
+def cap_per_class(
+    rows: pd.DataFrame,
+    max_per_class: int | None,
+    *,
+    label_col: str,
+    random_state: int,
 ) -> pd.DataFrame:
-    """Sample up to `n_samples // n_classes` rows from every class.
+    """Sample every class down to at most `max_per_class` rows.
+
+    A class under the cap stays whole, so the shares of the rare classes
+    are kept and only the largest are flattened.
 
     Args:
-        rows: The table to sample.
-        n_samples: The target total, shared evenly by the classes.
-        random_state: The seed of the sampling.
-        label_col: The label column.
-
-    Returns:
-        The sampled rows, with their index.
-    """
-    per_class = n_samples // rows[label_col].nunique()
-    return _stratified_sample(rows, label_col, per_class, random_state=random_state)
-
-
-def undersample_classes(
-    rows: pd.DataFrame, label_col: str, *, random_state: int
-) -> pd.DataFrame:
-    """Sample every class down to the size of the smallest.
-
-    Args:
-        rows: The table to balance.
+        rows: The table to cap.
+        max_per_class: The most rows of a class; None keeps every row.
         label_col: The label column.
         random_state: The seed of the sampling.
 
     Returns:
-        The balanced rows, with their index.
+        The capped rows, with their index.
     """
-    min_count = rows[label_col].value_counts().min()
-    return _stratified_sample(rows, label_col, min_count, random_state=random_state)
+    if max_per_class is None:
+        return rows
+    return _stratified_sample(rows, label_col, max_per_class, random_state=random_state)
 
 
 def ml_split(

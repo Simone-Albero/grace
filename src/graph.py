@@ -1,6 +1,6 @@
 """k-NN search, k-NN graph and approximate MST of the train sample."""
 
-__all__ = ["TrainGraph", "build_train_graph", "nearest_neighbors"]
+__all__ = ["TrainGraph", "build_train_graph", "nearest_neighbors", "subsample_indices"]
 
 import logging
 import os
@@ -240,3 +240,23 @@ def build_train_graph(
     logger.info("Building approximate MST over the k-NN graph...")
     mst_edges = _build_approx_mst(knn_idx, knn_dist, points, metric=metric)
     return TrainGraph(points, knn_idx, knn_dist, mst_edges)
+
+
+def subsample_indices(
+    n_rows: int, *, max_samples: int, random_state: int
+) -> np.ndarray:
+    """Return the indices of a random subsample of `n_rows` rows.
+
+    Args:
+        n_rows: The number of rows to sample from.
+        max_samples: The most rows kept; all of them when `n_rows` is
+            not above it.
+        random_state: The seed of the draw.
+
+    Returns:
+        The indices, ascending when all rows are kept.
+    """
+    if n_rows <= max_samples:
+        return np.arange(n_rows)
+    rng = np.random.default_rng(random_state)
+    return rng.choice(n_rows, size=max_samples, replace=False)

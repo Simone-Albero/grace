@@ -25,31 +25,4 @@
 </table></div>
 {% endif %}
 
-<h2>Explorer</h2>
-<form class="filters" id="filters" hx-get="/runs/{{ run.id }}/regions" hx-target="#explorer"
-      hx-trigger="change" hx-include="#explorer" hx-push-url="true">
-  <label>class
-    <select name="class_id">
-      <option value="">all</option>
-      {% for id, name in class_names %}
-      <option value="{{ id }}"{% if class_id == id | string %} selected{% endif %}>{{ name }}</option>
-      {% endfor %}
-    </select>
-  </label>
-  <label>scored (enough test rows)
-    <select name="used">
-      <option value="">all</option>
-      <option value="1"{% if used == "1" %} selected{% endif %}>used</option>
-      <option value="0"{% if used == "0" %} selected{% endif %}>not used</option>
-    </select>
-  </label>
-  {% for axis, current in (("x", x), ("y", y)) %}
-  <label>{{ axis }}
-    <select name="{{ axis }}">
-      {% for column in axes %}<option{% if column == current %} selected{% endif %}>{{ column }}</option>{% endfor %}
-    </select>
-  </label>
-  {% endfor %}
-</form>
-<div id="explorer">{% include "_regions_explorer.html" %}</div>
 {% endblock %}

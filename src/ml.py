@@ -6,6 +6,7 @@ __all__ = [
     "CalibratedLinearSVC",
     "CappedCategoryEncoder",
     "build_pipeline",
+    "classifier_params",
     "grid_search",
     "predict",
 ]
@@ -198,6 +199,29 @@ CLASSIFIERS: dict[str, tuple[type[BaseEstimator], str | None]] = {
 PARALLEL = frozenset({"random_forest", "knn", "xgboost"})
 
 
+def classifier_params(
+    name: str, params: Mapping[str, object], *, seed: int, n_jobs: int
+) -> dict[str, object]:
+    """Return an ML classifier's `params` with its seed and jobs set.
+
+    Args:
+        name: A key of `CLASSIFIERS`.
+        params: The classifier's own parameters.
+        seed: The `random_state` of a classifier that takes one and was
+            not given one.
+        n_jobs: The parallel jobs of a classifier in `PARALLEL`.
+
+    Returns:
+        A copy of `params`.
+    """
+    params = dict(params)
+    if "random_state" in CLASSIFIERS[name][0]().get_params():
+        params.setdefault("random_state", seed)
+    if name in PARALLEL:
+        params["n_jobs"] = n_jobs
+    return params
+
+
 def build_pipeline(
     name: str,
     params: dict[str, object],
@@ -277,9 +301,23 @@ def grid_search(
     prefixed_grid = {f"clf__{key}": values for key, values in grid.items()}
 
     if max_samples is not None and len(X) > max_samples:
-        _, X_search, _, y_search = train_test_split(
-            X, y, test_size=max_samples, stratify=y, random_state=random_state
+        _, search_positions = train_test_split(
+            np.arange(len(X)),
+            test_size=max_samples,
+            stratify=y,
+            random_state=random_state,
         )
+        # A class too thin to fill every fold keeps all its rows, or a
+        # fit of the search would miss a class the pipeline needs.
+        labels = np.asarray(y)
+        n_kept_by_class = pd.Series(labels[search_positions]).value_counts()
+        thin_classes = [
+            label for label in np.unique(labels) if n_kept_by_class.get(label, 0) < cv
+        ]
+        search_positions = np.union1d(
+            search_positions, np.flatnonzero(np.isin(labels, thin_classes))
+        )
+        X_search, y_search = X.iloc[search_positions], labels[search_positions]
     else:
         X_search, y_search = X, y
 

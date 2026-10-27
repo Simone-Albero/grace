@@ -19,16 +19,8 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from dashboard import charts, experiments, queries, summary, tabs
 from dashboard.experiments import MAIN_KEYS, Experiment
-from dashboard.queries import (
-    ARM_METRICS,
-    PARTITION_AXES,
-    PARTITION_METRICS,
-    REGION_COLUMNS,
-)
 from pipeline.db import explain, reap
 
-# The rendered rows of the region table; the scatter keeps all points.
-_MAX_ROWS = 500
 # The only Host headers served, against DNS rebinding.
 _HOSTS = ["127.0.0.1", "localhost"]
 # Ids are SQLite integers: a larger one is a 422, not an OverflowError.
@@ -36,7 +28,6 @@ _Id = Annotated[int, PathParam(ge=0, le=2**63 - 1)]
 _SORTS = ["latest", "n_seeds", *MAIN_KEYS, *summary.HEADLINE]
 # What the pages poll for while a run is going, in seconds.
 _REFRESH_SECONDS = 5
-_BIN_RULES = ("selected", "fixed15", "cbrt", "per150")
 # The trace of a grouped-bar chart: name, color, values by x.
 _Trace = tuple[str, str, dict[str, list[float]]]
 
@@ -118,9 +109,7 @@ def _list_options(items: Sequence[Mapping]) -> dict[str, list[str]]:
 
 def _load_experiments(db: sqlite3.Connection) -> list[Experiment]:
     """Group every run of the DB into experiments."""
-    return experiments.build(
-        queries.runs(db), queries.run_metrics(db), queries.operating_points(db)
-    )
+    return experiments.build(queries.runs(db), queries.run_metrics(db))
 
 
 def _signature(run: Mapping) -> str:
@@ -161,23 +150,10 @@ def _predictor_traces(rows: Sequence[Mapping], score: str, x: str) -> list[_Trac
     """Build one trace per predictor that has a value of `score`."""
     traces = []
     for key, label in queries.PREDICTORS.items():
-        metric = f"{queries.predictor_stage(key)}.{key}_{score}"
+        metric = f"baselines.{key}_{score}"
         grouped = experiments.grouped_values(rows, metric, x, None)
         if grouped:
             traces.append((label, charts.PREDICTOR_COLORS[key], grouped[""]))
-    return traces
-
-
-def _arm_traces(
-    rows: Sequence[Mapping], arm_metric: str, rule: str, x: str
-) -> list[_Trace]:
-    """Build one trace per arm that has a value at `rule`."""
-    traces = []
-    for arm in charts.OPERATING_RULES:
-        metric = f"op.{arm}.{rule}.{arm_metric}"
-        grouped = experiments.grouped_values(rows, metric, x, None)
-        if grouped:
-            traces.append((arm, charts.ARM_COLORS[arm], grouped[""]))
     return traces
 
 
@@ -210,47 +186,6 @@ def _run_context(connection: sqlite3.Connection, run_id: int) -> dict:
             tab: not needs or any(stage in ids for stage in needs)
             for tab, needs in tabs.TABS.items()
         },
-    }
-
-
-def _explorer_context(
-    connection: sqlite3.Connection,
-    run: dict,
-    ids: dict[str, int],
-    *,
-    class_id: str,
-    used: str,
-    sort: str,
-    desc: bool,
-    x: str,
-    y: str,
-) -> dict:
-    """Build the region explorer: filters, scatter and table."""
-    measures, rows = queries.regions(connection, ids)
-    axes = [*REGION_COLUMNS, *measures]
-    _check_choice("sort", sort, ["region_id", "class", *axes])
-    _check_choice("x", x, axes)
-    _check_choice("y", y, axes)
-    _check_choice("used", used, ["", "1", "0"])
-    names = sorted({(row["class_id"], row["class"]) for row in rows})
-    shown = _sort_rows(
-        _filter_rows(rows, {"class_id": class_id, "used": used}), sort, desc
-    )
-    return {
-        "rows": shown[:_MAX_ROWS],
-        "n_rows": len(shown),
-        "max_rows": _MAX_ROWS,
-        "explorer_figures": [charts.region_scatter(shown, x=x, y=y, run_id=run["id"])],
-        "class_names": names,
-        "axes": axes,
-        "columns": REGION_COLUMNS,
-        "measures": measures,
-        "class_id": class_id,
-        "used": used,
-        "sort": sort,
-        "desc": desc,
-        "x": x,
-        "y": y,
     }
 
 
@@ -425,12 +360,7 @@ def create_app(db_path: Path) -> FastAPI:
     ) -> HTMLResponse:
         rows = experiments.compare_rows(_load_experiments(connection))
         names = sorted(
-            {
-                key
-                for row in rows
-                for key in row["metrics"]
-                if not key.startswith("op.")
-            },
+            {key for row in rows for key in row["metrics"]},
             key=summary.metric_order,
         )
         context = {
@@ -438,8 +368,6 @@ def create_app(db_path: Path) -> FastAPI:
             "metrics": names,
             "labels": {name: summary.metric_label(name) for name in names},
             "scores": queries.SCORES,
-            "arm_metrics": ARM_METRICS,
-            "rules": _BIN_RULES,
         }
         return render(request, "compare.html", context)
 
@@ -452,14 +380,10 @@ def create_app(db_path: Path) -> FastAPI:
         x: str = "classifier",
         color: str = "clustering",
         score: str = "spearman",
-        arm_metric: str = "skill",
-        rule: str = "selected",
     ) -> HTMLResponse:
         _check_choice("x", x, MAIN_KEYS)
         _check_choice("color", color, ["", *MAIN_KEYS])
         _check_choice("score", score, queries.SCORES)
-        _check_choice("arm_metric", arm_metric, ARM_METRICS)
-        _check_choice("rule", rule, _BIN_RULES)
         all_rows = experiments.compare_rows(_load_experiments(connection))
         # A metric of a stage no run has finished is an empty chart, not
         # an error: it is the form's default on a root with few stages.
@@ -470,7 +394,6 @@ def create_app(db_path: Path) -> FastAPI:
         rows = _filter_rows(all_rows, selected)
         main = _metric_traces(rows, all_rows, metric, x, color)
         predictors = _predictor_traces(rows, score, x)
-        arms = _arm_traces(rows, arm_metric, rule, x)
         figures = [
             (
                 summary.metric_label(metric),
@@ -479,10 +402,6 @@ def create_app(db_path: Path) -> FastAPI:
             (
                 f"Predictors, {score}",
                 charts.group_bars(predictors, x_title=x, y_title=score),
-            ),
-            (
-                f"Partition arms, {arm_metric} at {rule}",
-                charts.group_bars(arms, x_title=x, y_title=arm_metric),
             ),
         ]
         context = {
@@ -505,77 +424,6 @@ def create_app(db_path: Path) -> FastAPI:
         headers = {} if sig == context["signature"] else {"HX-Refresh": "true"}
         return render(request, "_stages.html", context, headers=headers)
 
-    @app.get("/runs/{run_id}/partitions/charts", response_class=HTMLResponse)
-    def partition_charts(
-        request: Request,
-        run_id: _Id,
-        connection: sqlite3.Connection = Depends(db),
-        metric: str = "skill",
-        x: str = "n_groups",
-    ) -> HTMLResponse:
-        _check_choice("metric", metric, PARTITION_METRICS)
-        _check_choice("x", x, PARTITION_AXES)
-        run = _found(queries.run(connection, run_id), f"No run {run_id}")
-        ids = queries.stage_ids(run)
-        if "partitions" not in ids:
-            raise HTTPException(404, f"Run {run_id} has no done partitions stage")
-        partitions_id = ids["partitions"]
-        group_rows = queries.partition_groups(connection, partitions_id)
-        class_names = {
-            row["class_id"]: row["name"]
-            for row in queries.classes(connection, ids["prepare"])
-        }
-        figures = [
-            (
-                f"{metric} against {x}",
-                charts.partition_curves(
-                    queries.partitions(connection, partitions_id), metric=metric, x=x
-                ),
-            ),
-            (
-                "Granularity loss of intra, per class",
-                charts.partition_class_curves(
-                    queries.partition_class_levels(connection, partitions_id),
-                    class_names=class_names,
-                ),
-            ),
-            ("Val failure rate of each group", charts.partition_val_rates(group_rows)),
-            (
-                "Test against val failure rate of each group",
-                charts.partition_val_test_scatter(group_rows),
-            ),
-        ]
-        return render(request, "_figures.html", {"figures": figures})
-
-    @app.get("/runs/{run_id}/regions/{region_id}", response_class=HTMLResponse)
-    def region_page(
-        request: Request,
-        run_id: _Id,
-        region_id: _Id,
-        connection: sqlite3.Connection = Depends(db),
-    ) -> HTMLResponse:
-        context = _run_context(connection, run_id)
-        if "regions" not in context["ids"]:
-            raise HTTPException(404, f"Run {run_id} has no done regions stage")
-        _, rows = queries.regions(connection, context["ids"], measures=False)
-        region = next((row for row in rows if row["region_id"] == region_id), None)
-        if region is None:
-            raise HTTPException(404, f"Run {run_id} has no region {region_id}")
-        descriptors = []
-        if "complexity" in context["ids"]:
-            descriptors = queries.descriptors(
-                connection, context["ids"]["complexity"], region_id, region["class_id"]
-            )
-        context.update(
-            tab="regions",
-            available=True,
-            settings={},
-            region=region,
-            columns=REGION_COLUMNS,
-            descriptors=descriptors,
-        )
-        return render(request, "region.html", context)
-
     @app.get("/runs/{run_id}", response_class=HTMLResponse)
     def run_overview(
         request: Request, run_id: _Id, connection: sqlite3.Connection = Depends(db)
@@ -588,33 +436,11 @@ def create_app(db_path: Path) -> FastAPI:
         run_id: _Id,
         tab: str,
         connection: sqlite3.Connection = Depends(db),
-        class_id: str = "",
-        used: str = "",
-        sort: str = "region_id",
-        desc: bool = False,
-        x: str = "val_rate",
-        y: str = "test_rate",
     ) -> HTMLResponse:
         if tab not in tabs.TABS:
             raise HTTPException(404, f"No tab {tab!r}. Valid: {', '.join(tabs.TABS)}")
         context = _run_context(connection, run_id)
         context.update(tabs.build(connection, context["run"], tab, root))
-        fragment = None
-        if tab == "regions" and context["available"]:
-            context.update(
-                _explorer_context(
-                    connection,
-                    context["run"],
-                    context["ids"],
-                    class_id=class_id,
-                    used=used,
-                    sort=sort,
-                    desc=desc,
-                    x=x,
-                    y=y,
-                )
-            )
-            fragment = "_regions_explorer.html"
-        return render(request, f"run_{tab}.html", context, fragment=fragment)
+        return render(request, f"run_{tab}.html", context)
 
     return app

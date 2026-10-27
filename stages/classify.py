@@ -23,13 +23,13 @@ from sklearn.pipeline import Pipeline
 from torch import nn
 
 from src import dl, ml
-from src.data import stratified_holdout, subsample_per_class, undersample_classes
-from src.scores import compute_classification_metrics
+from src.data import cap_per_class
+from src.scores import check_probabilities, compute_classification_metrics
 from stages import LABEL, SPLITS, Context
 
 logger = logging.getLogger(__name__)
 
-_COMMON = ("classifier", "fit.balance", "fit.n_samples", "seed")
+_COMMON = ("classifier", "data.max_per_class", "seed")
 _ML_ONLY = ("grid_search",)
 # DL-only groups never re-train an ML model.
 _DL_ONLY = (
@@ -59,17 +59,6 @@ def config_keys(cfg: DictConfig) -> tuple[str, ...]:
     return _COMMON + (_DL_ONLY if cfg.classifier.kind == "dl" else _ML_ONLY)
 
 
-def _balance_train(cfg: DictConfig, train: pd.DataFrame) -> pd.DataFrame:
-    """Apply `fit.balance` and the `fit.n_samples` cap to train."""
-    if cfg.fit.balance == "undersample":
-        train = undersample_classes(train, LABEL, random_state=cfg.seed)
-    if cfg.fit.n_samples is not None:
-        train = subsample_per_class(
-            train, cfg.fit.n_samples, random_state=cfg.seed, label_col=LABEL
-        )
-    return train
-
-
 def _classifier_params(
     ctx: Context, *, n_classes: int, n_num: int, n_cat: int
 ) -> dict[str, object]:
@@ -77,15 +66,16 @@ def _classifier_params(
     cfg = ctx.cfg
     params = OmegaConf.to_container(cfg.classifier.params, resolve=True)
     if cfg.classifier.kind == "dl":
-        params["num_classes"] = n_classes
-        params["num_numerical_features"] = n_num
-        params["cardinalities"] = [cfg.data.top_n + cfg.data.hash_buckets] * n_cat
-        return params
-    if "random_state" in ml.CLASSIFIERS[cfg.classifier.name][0]().get_params():
-        params.setdefault("random_state", cfg.seed)
-    if cfg.classifier.name in ml.PARALLEL:
-        params["n_jobs"] = ctx.runtime.n_jobs
-    return params
+        return dl.model_params(
+            params,
+            n_classes=n_classes,
+            n_num=n_num,
+            n_cat=n_cat,
+            cardinality=cfg.data.top_n + cfg.data.hash_buckets,
+        )
+    return ml.classifier_params(
+        cfg.classifier.name, params, seed=cfg.seed, n_jobs=ctx.runtime.n_jobs
+    )
 
 
 def _fit_ml(
@@ -136,114 +126,30 @@ def _fit_ml(
     return ml.build_pipeline(name, params, num_cols, cat_cols).fit(X, y), None
 
 
-def _fit_dl(
-    ctx: Context,
-    fit_rows: pd.DataFrame,
-    *,
-    num_cols: list[str],
-    cat_cols: list[str],
-    n_classes: int,
-    params: Mapping[str, object],
-) -> tuple[nn.Module, list[float], int]:
-    """Train the DL classifier, early stopping on a holdout of train.
-
-    Stopping on val would pick the epoch that suits val best and bias
-    every estimate made from val's labels.
-
-    Returns:
-        The model at its best epoch, the loss of every step and the
-        number of rows it actually trained on (`fit_rows` less the
-        holdout).
-    """
+def _dl_training(ctx: Context, params: Mapping[str, object]) -> dl.DLTraining:
+    """Return how the DL classifier trains, from the config."""
     cfg, runtime = ctx.cfg, ctx.runtime
-    device = torch.device(runtime.device)
-    logger.info("Training %s ...", cfg.classifier.name)
-    train_rows, holdout_rows = stratified_holdout(
-        fit_rows,
-        holdout_frac=cfg.fit.training.early_stopping.holdout,
-        label_col=LABEL,
-        random_state=cfg.seed,
-    )
-
-    loss_params = OmegaConf.to_container(cfg.loss.params, resolve=True)
-    if loss_params.get("class_weight") == "auto":
-        # A rebalanced split trains unweighted; otherwise `train_rows`
-        # keeps the class shares of the train split.
-        if cfg.fit.balance == "none" and cfg.fit.n_samples is None:
-            weight_by_class = dl.class_weights(train_rows[LABEL])
-            loss_params["class_weight"] = [
-                weight_by_class[class_id] for class_id in range(n_classes)
-            ]
-        else:
-            loss_params["class_weight"] = None
-    weights = loss_params.get("class_weight")
-    if isinstance(weights, list) and len(weights) != n_classes:
-        raise ValueError(
-            f"loss.params.class_weight has {len(weights)} weights for {n_classes} "
-            "classes of prepare; give one per class or 'auto'."
-        )
-
-    # Seeded here, so a fit trains the same whatever ran before it: the
-    # model's initial weights and its dropout are the only draws on the
-    # global stream.
-    torch.manual_seed(cfg.seed)
-    model = dl.MODELS[cfg.classifier.name](**params).to(device)
-    loss_fn = dl.LOSSES[cfg.loss.name](**loss_params).to(device)
-
-    loader_options = {
-        "num_workers": runtime.num_workers,
-        "pin_memory": runtime.pin_memory,
-    }
-    column_options = {
-        "num_cols": num_cols,
-        "cat_cols": cat_cols,
-        "label_col": LABEL,
-        "seed": cfg.seed,
-    }
-    train_batching = OmegaConf.to_container(cfg.fit.training.dataloader)
-    # BatchNorm cannot train on a 1-row batch: drop that row (a random
-    # one if shuffled).
-    has_batch_norm = any(
-        isinstance(module, nn.BatchNorm1d) for module in model.modules()
-    )
-    train_batching["drop_last"] = (
-        has_batch_norm and len(train_rows) % train_batching["batch_size"] == 1
-    )
-    train_loader = dl.build_loader(
-        train_rows, **column_options, **train_batching, **loader_options
-    )
-    holdout_loader = dl.build_loader(
-        holdout_rows,
-        **column_options,
-        **OmegaConf.to_container(cfg.fit.training.early_stopping.dataloader),
-        **loader_options,
-    )
-
-    optimizer = getattr(torch.optim, cfg.optimizer.name)(
-        model.parameters(), **OmegaConf.to_container(cfg.optimizer.params, resolve=True)
-    )
-    scheduler_params = OmegaConf.to_container(cfg.scheduler.params, resolve=True)
-    if scheduler_params.get("steps_per_epoch") == "auto":
-        scheduler_params["steps_per_epoch"] = len(train_loader)
-    scheduler = getattr(torch.optim.lr_scheduler, cfg.scheduler.name)(
-        optimizer, **scheduler_params
-    )
-
     training = cfg.fit.training
-    history = dl.train(
-        model,
-        train_loader,
-        holdout_loader,
-        loss_fn=loss_fn,
-        optimizer=optimizer,
-        scheduler=scheduler,
+    return dl.DLTraining(
+        model=cfg.classifier.name,
+        model_params=params,
+        loss=cfg.loss.name,
+        loss_params=OmegaConf.to_container(cfg.loss.params, resolve=True),
+        optimizer=cfg.optimizer.name,
+        optimizer_params=OmegaConf.to_container(cfg.optimizer.params, resolve=True),
+        scheduler=cfg.scheduler.name,
+        scheduler_params=OmegaConf.to_container(cfg.scheduler.params, resolve=True),
         epochs=training.epochs,
         max_grad_norm=training.max_grad_norm,
         patience=training.early_stopping.patience,
         min_delta=training.early_stopping.min_delta,
-        device=device,
+        holdout_frac=training.early_stopping.holdout,
+        train_batching=OmegaConf.to_container(training.dataloader),
+        holdout_batching=OmegaConf.to_container(training.early_stopping.dataloader),
+        num_workers=runtime.num_workers,
+        pin_memory=runtime.pin_memory,
+        device=runtime.device,
     )
-    return model, history, len(train_rows)
 
 
 def _predict(
@@ -267,16 +173,7 @@ def _predict(
             cat_cols=cat_cols,
             device=torch.device(ctx.runtime.device),
         )
-    if y_proba.shape[1] != n_classes:
-        raise ValueError(
-            f"The model gave {y_proba.shape[1]} probabilities per row on {split} for "
-            f"{n_classes} classes: column k of predictions would not be class k."
-        )
-    if not np.isfinite(y_proba).all():
-        raise ValueError(
-            f"The model predicted non-finite probabilities on {split}: every "
-            "confidence-based score downstream would be NaN."
-        )
+    check_probabilities(y_proba, n_classes, split)
     return y_pred, y_proba
 
 
@@ -345,7 +242,9 @@ def run(ctx: Context) -> None:
     )
     logger.info("Classifier: %s (kind=%s)", cfg.classifier.name, cfg.classifier.kind)
 
-    fit_rows = _balance_train(cfg, train)
+    fit_rows = cap_per_class(
+        train, cfg.data.max_per_class, label_col=LABEL, random_state=cfg.seed
+    )
     params = _classifier_params(
         ctx, n_classes=n_classes, n_num=len(num_cols), n_cat=len(cat_cols)
     )
@@ -359,13 +258,14 @@ def run(ctx: Context) -> None:
         n_fit = len(fit_rows)
         joblib.dump(model, model_dir / "model.joblib")
     else:
-        model, losses, n_fit = _fit_dl(
-            ctx,
+        model, losses, n_fit = dl.fit_classifier(
             fit_rows,
             num_cols=num_cols,
             cat_cols=cat_cols,
+            label_col=LABEL,
             n_classes=n_classes,
-            params=params,
+            training=_dl_training(ctx, params),
+            seed=cfg.seed,
         )
         summary = None
         torch.save(

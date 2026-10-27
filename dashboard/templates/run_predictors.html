@@ -29,19 +29,18 @@
   {{ m.chart(figures.observed, "Estimate against observed test rate", wide=True) }}
 </div>
 {% if "regress" not in ids %}
-<p class="note">The regressor's estimates, folds and importances need the finished <b>regress</b> stage.</p>
+<p class="note">The regressor's folds and importances need the finished <b>regress</b> stage.</p>
 {% else %}
 <div class="grid">
   {% if figures.importances %}{{ m.chart(figures.importances, "Regressor feature importances") }}{% endif %}
   {% if folds %}
   <section class="card">
-    <h3>Outer folds <span class="muted">(−1 is the refit)</span></h3>
+    <h3>Regressor, outer folds <span class="muted">(−1 is the refit)</span></h3>
     <div class="scroll"><table>
-      <thead><tr><th class="num">fold</th><th class="num">regions</th><th class="num">Spearman</th><th class="num">R²</th><th class="num">MAE</th><th class="num">inner R²</th><th>params</th></tr></thead>
+      <thead><tr><th class="num">fold</th><th class="num">leaves</th><th class="num">inner R²</th><th>params</th></tr></thead>
       <tbody>
       {% for f in folds %}
-      <tr><td class="num">{{ f.fold }}</td><td class="num">{{ f.n_regions | num }}</td><td class="num">{{ f.spearman | num }}</td>
-        <td class="num">{{ f.r2 | num }}</td><td class="num">{{ f.mae | num }}</td><td class="num">{{ f.best_score | num }}</td>
+      <tr><td class="num">{{ f.fold }}</td><td class="num">{{ f.n_leaves | num }}</td><td class="num">{{ f.best_score | num }}</td>
         <td>{{ f.params }}</td></tr>
       {% endfor %}
       </tbody>

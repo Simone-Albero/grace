@@ -7,7 +7,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from dashboard import artifacts, charts, queries
-from dashboard.queries import PREDICTORS, SCORES, predictor_stage
+from dashboard.queries import PREDICTORS, SCORES
 
 # Each tab with the done stages that open it: any of them does.
 TABS = {
@@ -17,17 +17,15 @@ TABS = {
     "regions": ("regions",),
     "failures": ("failures",),
     "predictors": ("baselines", "regress"),
-    "partitions": ("partitions",),
 }
 # The stages whose config a tab shows at its foot.
 _SETTINGS = {
     "overview": (),
     "data": ("split", "prepare"),
     "classifier": ("classify",),
-    "regions": ("regions",),
+    "regions": ("space", "regions"),
     "failures": ("failures",),
     "predictors": ("baselines", "regress"),
-    "partitions": ("partitions",),
 }
 # The tiles of each overview area: (stage, metric, label, kind).
 _OVERVIEW = {
@@ -47,12 +45,9 @@ _OVERVIEW = {
         ("failures", "test_error_rate", "test error rate", "score"),
     ],
     "predictors": [
-        ("regress", "regressor_spearman", "RF Spearman", "score"),
-        ("regress", "regressor_mse", "RF MSE", "score"),
         ("baselines", "val_spearman", "val Spearman", "score"),
         ("baselines", "val_mse", "val MSE", "score"),
     ],
-    "partitions": [("partitions", "reference_brier", "reference Brier", "score")],
 }
 # The metrics each tab shows as tiles: (stage, metric, label, kind).
 _TILES = {
@@ -71,7 +66,7 @@ _TILES = {
     ],
     "regions": [
         ("regions", "n_regions", "regions", "count"),
-        ("regions", "n_graph_rows", "graph rows", "count"),
+        ("space", "n_graph_rows", "graph rows", "count"),
         ("regions", "eval_rows_per_train_row", "eval rows / train row", "score"),
     ],
     "failures": [
@@ -79,12 +74,6 @@ _TILES = {
         ("failures", "test_error_rate", "test error rate", "score"),
         ("failures", "n_regions_with_val", "regions with val rows", "count"),
         ("failures", "n_regions_with_test", "regions with test rows", "count"),
-    ],
-    "partitions": [
-        ("partitions", "reference_brier", "reference Brier", "score"),
-        ("partitions", "val_error_rate", "val error rate", "score"),
-        ("partitions", "test_error_rate", "test error rate", "score"),
-        ("partitions", "inter_fit_rows", "inter fit rows", "count"),
     ],
 }
 # The preprocessing of prepare, in the order it applies.
@@ -205,9 +194,9 @@ def _classifier(
 
 
 def _regions(db: sqlite3.Connection, ids: Mapping[str, int], metrics: _Metrics) -> dict:
-    """Clustering of each class and the region explorer's figures."""
+    """Clustering of each class and the regions' figures."""
     clusterings = queries.class_clusterings(db, ids["regions"], ids["prepare"])
-    _, rows = queries.regions(db, ids, measures=False)
+    rows = queries.regions(db, ids)
     figures = {}
     if clusterings:
         figures["per_class"] = charts.regions_per_class(clusterings)
@@ -221,21 +210,21 @@ def _regions(db: sqlite3.Connection, ids: Mapping[str, int], metrics: _Metrics) 
 
 
 def _failures(
-    db: sqlite3.Connection, ids: Mapping[str, int], metrics: _Metrics, run_id: int
+    db: sqlite3.Connection, ids: Mapping[str, int], metrics: _Metrics
 ) -> dict:
     """The empirical failure rates of the regions."""
-    _, rows = queries.regions(db, ids, measures=False)
+    rows = queries.regions(db, ids)
     worst = sorted(
         (row for row in rows if row["test_rate"] is not None),
         key=lambda row: -row["test_rate"],
     )[:_WORST_REGIONS]
     figures = {
-        "scatter": charts.val_test_scatter(rows, run_id=run_id),
+        "scatter": charts.val_test_scatter(rows),
         "classes": charts.class_rate_bars(rows),
         "ecdf": charts.rate_ecdf(rows),
         "bin_counts": charts.region_rate_bins(rows, measure="count"),
         "bin_sizes": charts.region_rate_bins(rows, measure="size"),
-        "gap": charts.class_rate_gap(rows, run_id=run_id),
+        "gap": charts.class_rate_gap(rows),
     }
     return {
         "tiles": _tiles(metrics, _TILES["failures"]),
@@ -248,7 +237,7 @@ def _scores(metrics: _Metrics) -> dict[str, dict]:
     """Collect each predictor's scores from the stage metrics."""
     scores = {}
     for key in PREDICTORS:
-        stage_metrics = metrics.get(predictor_stage(key), {})
+        stage_metrics = metrics.get("baselines", {})
         found = {score: stage_metrics.get(f"{key}_{score}") for score in SCORES}
         if any(value is not None for value in found.values()):
             scores[key] = found
@@ -256,11 +245,11 @@ def _scores(metrics: _Metrics) -> dict[str, dict]:
 
 
 def _predictors(
-    db: sqlite3.Connection, ids: Mapping[str, int], metrics: _Metrics, run_id: int
+    db: sqlite3.Connection, ids: Mapping[str, int], metrics: _Metrics
 ) -> dict:
     """Predictor scores, estimates against observed, the regressor."""
     scores = _scores(metrics)
-    _, rows = queries.regions(db, ids, measures=False)
+    rows = queries.regions(db, ids)
     best = {
         score: (max if score in ("spearman", "r2") else min)(
             (found[score] for found in scores.values() if found[score] is not None),
@@ -271,7 +260,7 @@ def _predictors(
     figures = {
         score: charts.predictor_bars(scores, score) for score in ("spearman", "mse")
     }
-    figures["observed"] = charts.predicted_vs_observed(rows, run_id=run_id)
+    figures["observed"] = charts.predicted_vs_observed(rows)
     folds = []
     if "regress" in ids:
         folds = queries.regressor_folds(db, ids["regress"])
@@ -293,26 +282,6 @@ def _predictors(
         ],
         "folds": folds,
         "figures": figures,
-    }
-
-
-def _partitions(
-    db: sqlite3.Connection, ids: Mapping[str, int], metrics: _Metrics, run_id: int
-) -> dict:
-    """Each arm's operating points and groups; the sweeps' inputs."""
-    points = queries.operating_points(db, run_id)
-    figures = {
-        metric: charts.arm_bars(points, metric) for metric in queries.ARM_METRICS
-    }
-    groups = queries.partition_groups(db, ids["partitions"])
-    figures["bin_counts"] = charts.group_rate_bins(groups, measure="count")
-    figures["bin_sizes"] = charts.group_rate_bins(groups, measure="size")
-    return {
-        "tiles": _tiles(metrics, _TILES["partitions"]),
-        "points": points,
-        "figures": figures,
-        "metrics": queries.PARTITION_METRICS,
-        "axes": queries.PARTITION_AXES,
     }
 
 
@@ -366,9 +335,7 @@ def build(
         case "regions":
             context.update(_regions(db, ids, metrics))
         case "failures":
-            context.update(_failures(db, ids, metrics, run["id"]))
+            context.update(_failures(db, ids, metrics))
         case "predictors":
-            context.update(_predictors(db, ids, metrics, run["id"]))
-        case "partitions":
-            context.update(_partitions(db, ids, metrics, run["id"]))
+            context.update(_predictors(db, ids, metrics))
     return context

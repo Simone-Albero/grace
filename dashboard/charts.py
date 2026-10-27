@@ -6,30 +6,21 @@ colors below for their dark-theme steps.
 """
 
 __all__ = [
-    "ARM_COLORS",
     "NEUTRAL",
-    "OPERATING_RULES",
     "PREDICTOR_COLORS",
     "SERIES",
-    "arm_bars",
     "class_rate_bars",
     "class_rate_gap",
     "class_score_bars",
     "confusion_heatmap",
     "grid_search",
     "group_bars",
-    "group_rate_bins",
     "importance_bars",
     "loss_curve",
-    "partition_class_curves",
-    "partition_curves",
-    "partition_val_rates",
-    "partition_val_test_scatter",
     "predicted_vs_observed",
     "predictor_bars",
     "rate_ecdf",
     "region_rate_bins",
-    "region_scatter",
     "region_size_box",
     "regions_per_class",
     "seed_strip",
@@ -70,34 +61,12 @@ _SEQUENTIAL = [[0, "#cde2fb"], [0.5, "#3987e5"], [1, "#0d366b"]]
 _SPLIT_COLORS = {"train": SERIES[0], "val": SERIES[1], "test": SERIES[2]}
 _SCORE_COLORS = {"precision": SERIES[0], "recall": SERIES[1], "f1": SERIES[2]}
 PREDICTOR_COLORS = dict(zip(PREDICTORS, SERIES))
-# One fixed hue per arm, so an arm keeps its color in every figure of
-# the partitions panel.
-ARM_COLORS = dict(
-    zip(["intra", "inter", "null", "confidence", "predicted_class"], SERIES)
-)
-# The marker of each operating point: a geometric arm's `selected`,
-# or a bin arm's rule.
-_POINT_SYMBOLS = {
-    "selected": "star",
-    "fixed15": "circle",
-    "cbrt": "diamond",
-    "per150": "square",
-}
-# The rule each arm shows when a figure has room for one point per arm.
-OPERATING_RULES = {
-    "intra": "selected",
-    "inter": "selected",
-    "null": "selected",
-    "confidence": "cbrt",
-    "predicted_class": "cbrt",
-}
 # The upper edges of the failure-rate bins, after a bin of its own for a
 # rate of exactly 0: a good classifier leaves most regions error-free.
 _RATE_EDGES = [0.05, 0.1, 0.2, 0.3, 0.5]
 _RATE_BINS = ["0", "0–5%", "5–10%", "10–20%", "20–30%", "30–50%", "50–100%"]
-# Most classes that get a numbered cell or their own color.
+# Most classes that get a numbered cell.
 _MAX_LABELLED = 15
-_MAX_COLORED = len(SERIES)
 # The feature importances drawn, the largest ones.
 _TOP_IMPORTANCES = 20
 
@@ -390,7 +359,7 @@ def _identity_line(top: float = 1) -> dict[str, object]:
     }
 
 
-def val_test_scatter(rows: Sequence[Mapping], *, run_id: int) -> dict[str, object]:
+def val_test_scatter(rows: Sequence[Mapping]) -> dict[str, object]:
     """Draw each region's test failure rate against its val rate.
 
     A marker's area grows with the region's test rows, so a rate the
@@ -398,7 +367,6 @@ def val_test_scatter(rows: Sequence[Mapping], *, run_id: int) -> dict[str, objec
 
     Args:
         rows: The region rows.
-        run_id: The run, for the link of each marker to its region.
 
     Returns:
         A figure with the `y = x` line and one marker per region.
@@ -422,7 +390,6 @@ def val_test_scatter(rows: Sequence[Mapping], *, run_id: int) -> dict[str, objec
             f"n_val {row['n_val']:,} · n_test {row['n_test']:,}"
             for row in points
         ],
-        "customdata": [f"/runs/{run_id}/regions/{row['region_id']}" for row in points],
         "hovertemplate": "%{text}<br>val %{x:.3f} · test %{y:.3f}<extra></extra>",
     }
     layout = {
@@ -597,41 +564,11 @@ def region_rate_bins(rows: Sequence[Mapping], *, measure: str) -> dict[str, obje
     return _rate_bin_bars(traces, measure=measure)
 
 
-def group_rate_bins(rows: Sequence[Mapping], *, measure: str) -> dict[str, object]:
-    """Bin each arm's groups by val failure rate.
-
-    Args:
-        rows: The partition_groups rows of one execution.
-        measure: "count" or "size", as `_rate_bin_bars` takes it; a
-            group's size is its val rows.
-
-    Returns:
-        A grouped-bar figure with a trace per arm but `null`, at the
-        rule `OPERATING_RULES` gives it; the table keeps one draw of
-        `null`, with far more groups than any other arm.
-    """
-    traces = [
-        (
-            arm,
-            color,
-            [
-                (row["val_rate"], row["n_val"])
-                for row in rows
-                if row["arm"] == arm and row["rule"] == OPERATING_RULES[arm]
-            ],
-        )
-        for arm, color in ARM_COLORS.items()
-        if arm != "null"
-    ]
-    return _rate_bin_bars(traces, measure=measure)
-
-
-def class_rate_gap(rows: Sequence[Mapping], *, run_id: int) -> dict[str, object]:
+def class_rate_gap(rows: Sequence[Mapping]) -> dict[str, object]:
     """Box each class's gap between the val and the test failure rate.
 
     Args:
         rows: The region rows.
-        run_id: The run, for the link of each marker to its region.
 
     Returns:
         A box figure of `val_rate - test_rate`, every region a point,
@@ -648,7 +585,6 @@ def class_rate_gap(rows: Sequence[Mapping], *, run_id: int) -> dict[str, object]
             f"n_val {row['n_val']:,} · n_test {row['n_test']:,}"
             for row in points
         ],
-        "customdata": [f"/runs/{run_id}/regions/{row['region_id']}" for row in points],
         "boxpoints": "all",
         "jitter": 0.5,
         "pointpos": 0,
@@ -707,12 +643,11 @@ def predictor_bars(
     return {"data": [trace], "layout": layout}
 
 
-def predicted_vs_observed(rows: Sequence[Mapping], *, run_id: int) -> dict[str, object]:
+def predicted_vs_observed(rows: Sequence[Mapping]) -> dict[str, object]:
     """Draw each predictor's rate against the test rate, one panel each.
 
     Args:
         rows: The region rows.
-        run_id: The run, for the link of each marker to its region.
 
     Returns:
         A figure of side-by-side panels over the used regions, those
@@ -768,9 +703,6 @@ def predicted_vs_observed(rows: Sequence[Mapping], *, run_id: int) -> dict[str, 
                 "text": [
                     f"region {row['region_id']} · {row['class']}" for row in points
                 ],
-                "customdata": [
-                    f"/runs/{run_id}/regions/{row['region_id']}" for row in points
-                ],
                 "hovertemplate": (
                     "%{text}<br>estimate %{x:.3f} · test %{y:.3f}" "<extra></extra>"
                 ),
@@ -804,39 +736,6 @@ def importance_bars(rows: Sequence[Mapping]) -> dict[str, object]:
         "yaxis": {"autorange": "reversed", "type": "category"},
         "showlegend": False,
         "margin": {"l": 220},
-    }
-    return {"data": [trace], "layout": layout}
-
-
-def arm_bars(points: Sequence[Mapping], metric: str) -> dict[str, object]:
-    """Draw one metric at each arm's operating point of a run.
-
-    Args:
-        points: The `queries.operating_points` rows of one run.
-        metric: A column of them, e.g. "skill".
-
-    Returns:
-        A bar figure, one bar per arm with a value at the rule
-        `OPERATING_RULES` gives it.
-    """
-    shown = [
-        row
-        for row in points
-        if OPERATING_RULES.get(row["arm"]) == row["rule"] and row[metric] is not None
-    ]
-    shown.sort(key=lambda row: list(ARM_COLORS).index(row["arm"]))
-    trace = {
-        "type": "bar",
-        "x": [f"{row['arm']} ({row['rule']})" for row in shown],
-        "y": [row[metric] for row in shown],
-        "marker": {"color": [ARM_COLORS[row["arm"]] for row in shown]},
-        "hovertemplate": f"%{{x}}<br>{metric} %{{y:.4f}}<extra></extra>",
-    }
-    layout = {
-        "height": 300,
-        "xaxis": {"type": "category"},
-        "yaxis": {"title": metric},
-        "showlegend": False,
     }
     return {"data": [trace], "layout": layout}
 
@@ -948,331 +847,3 @@ def group_bars(
         "yaxis": {"title": y_title},
     }
     return {"data": data, "layout": layout}
-
-
-def region_scatter(
-    rows: Sequence[Mapping], *, x: str, y: str, run_id: int
-) -> dict[str, object]:
-    """Draw `y` against `x` per region, a color per class if few.
-
-    Args:
-        rows: The region rows.
-        x: The region column of the x axis.
-        y: The region column of the y axis.
-        run_id: The run, for the link of each marker to its region.
-
-    Returns:
-        A figure; regions without a value of `x` or `y` are left out.
-        With more classes than categorical colors every region has the
-        first color and the class shows on hover.
-    """
-    names = sorted({row["class"] for row in rows})
-    colored = len(names) <= _MAX_COLORED
-    traces = []
-    for i, name in enumerate(names if colored else [""]):
-        points = [
-            row
-            for row in rows
-            if (not colored or row["class"] == name)
-            and row[x] is not None
-            and row[y] is not None
-        ]
-        traces.append(
-            {
-                "type": "scatter",
-                "mode": "markers",
-                "name": name,
-                "showlegend": colored,
-                "x": [row[x] for row in points],
-                "y": [row[y] for row in points],
-                "text": [
-                    f"region {row['region_id']} · {row['class']}" for row in points
-                ],
-                "customdata": [
-                    f"/runs/{run_id}/regions/{row['region_id']}" for row in points
-                ],
-                "marker": {"color": SERIES[i], "size": 7, "opacity": 0.75},
-                "hovertemplate": "%{text}<br>%{x:.4g} · %{y:.4g}<extra></extra>",
-            }
-        )
-    layout = {"height": _HEIGHT, "xaxis": {"title": x}, "yaxis": {"title": y}}
-    return {"data": traces, "layout": layout}
-
-
-def _fade(color: str) -> str:
-    """Return a hex color as translucent rgba, for a band fill."""
-    red, green, blue = (int(color[i : i + 2], 16) for i in (1, 3, 5))
-    return f"rgba({red}, {green}, {blue}, 0.15)"
-
-
-def _mean_points(rows: Sequence[dict], key: str, x: str, y: str) -> dict[str, list]:
-    """Average `x` and `y` over the rows of each value of `key`.
-
-    A row whose `y` is None is left out, and so is a value of `key`
-    that only such rows hold.
-
-    Returns:
-        The lists `key`, `x`, `y`, `y_min` and `y_max`, one item per
-        value of `key`, sorted by it; `y_min` and `y_max` bound the
-        `y` values averaged.
-    """
-    groups: dict[object, list[dict]] = {}
-    for row in rows:
-        if row[y] is not None:
-            groups.setdefault(row[key], []).append(row)
-    groups = dict(sorted(groups.items()))
-    return {
-        "key": list(groups),
-        "x": [statistics.mean(row[x] for row in group) for group in groups.values()],
-        "y": [statistics.mean(row[y] for row in group) for group in groups.values()],
-        "y_min": [min(row[y] for row in group) for group in groups.values()],
-        "y_max": [max(row[y] for row in group) for group in groups.values()],
-    }
-
-
-def _sweep_traces(arm: str, color: str, sweep: dict[str, list], x: str) -> list[dict]:
-    """Build an arm's sweep line, plus its band where draws vary.
-
-    The band only draws for `x == "n_groups"`: `level` orders it, and
-    `n_groups` falls with `level`, but `val_median` has no such order,
-    so tracing it out and back could fold the fill on itself.
-    """
-    if not sweep["key"]:
-        return []
-    traces = []
-    if x == "n_groups" and sweep["y_min"] != sweep["y_max"]:
-        traces.append(
-            {
-                "type": "scatter",
-                "mode": "lines",
-                "name": f"{arm} (min-max)",
-                "legendgroup": arm,
-                "x": sweep["x"] + sweep["x"][::-1],
-                "y": sweep["y_max"] + sweep["y_min"][::-1],
-                "fill": "toself",
-                "fillcolor": _fade(color),
-                "line": {"width": 0},
-                "hoverinfo": "skip",
-                "showlegend": False,
-            }
-        )
-    traces.append(
-        {
-            "type": "scatter",
-            "mode": "lines+markers",
-            "name": arm,
-            "legendgroup": arm,
-            "x": sweep["x"],
-            "y": sweep["y"],
-            "line": {"color": color},
-        }
-    )
-    return traces
-
-
-def _operating_point_trace(
-    arm: str, color: str, points: dict[str, list]
-) -> dict | None:
-    """Build an arm's operating-point markers, or None if empty."""
-    if not points["key"]:
-        return None
-    return {
-        "type": "scatter",
-        "mode": "markers",
-        "name": f"{arm} operating point",
-        "legendgroup": arm,
-        "x": points["x"],
-        "y": points["y"],
-        "marker": {
-            "color": color,
-            "size": 12,
-            "symbol": [_POINT_SYMBOLS[rule] for rule in points["key"]],
-            "line": {"width": 1, "color": _INK},
-        },
-        "text": points["key"],
-        "hoverinfo": "text+x+y+name",
-    }
-
-
-def partition_curves(rows: Sequence[dict], *, metric: str, x: str) -> dict[str, object]:
-    """Draw `metric` against `x`, one line per geometric arm.
-
-    `intra` and `inter` draw their level sweep as one line; `null`
-    draws the mean of its draws with a min-max band. Every arm also
-    gets a marker per operating point (`selected`, or a bin rule),
-    averaged over draws the same way the sweep is.
-
-    Args:
-        rows: The partitions rows of one execution.
-        metric: The partitions column of the y axis.
-        x: The partitions column of the x axis: `n_groups`, on a log
-            scale, or `val_median`.
-
-    Returns:
-        A Plotly figure; rows without a value of `metric` are left
-        out, a bin arm (`confidence`, `predicted_class`) draws markers
-        only, since it sweeps no level, and the band only draws for
-        `x == "n_groups"`.
-    """
-    traces = []
-    for arm, color in ARM_COLORS.items():
-        arm_rows = [row for row in rows if row["arm"] == arm]
-        sweep = _mean_points(
-            [row for row in arm_rows if row["rule"] == "level"], "level", x, metric
-        )
-        traces += _sweep_traces(arm, color, sweep, x)
-        points = _mean_points(
-            [row for row in arm_rows if row["rule"] != "level"], "rule", x, metric
-        )
-        operating_point = _operating_point_trace(arm, color, points)
-        if operating_point is not None:
-            traces.append(operating_point)
-    layout = {
-        "height": _HEIGHT,
-        "xaxis": {"title": x, "type": "log" if x == "n_groups" else "linear"},
-        "yaxis": {"title": metric},
-    }
-    return {"data": traces, "layout": layout}
-
-
-def partition_class_curves(
-    rows: Sequence[dict], *, class_names: Mapping[int, str] | None = None
-) -> dict[str, object]:
-    """Draw intra's granularity loss against level, one line per class.
-
-    Args:
-        rows: The partition_class_levels rows of one execution.
-        class_names: Each class's name, as the regions page shows it;
-            a class missing from it, or no mapping at all, falls back
-            to its id.
-
-    Returns:
-        A Plotly figure; each class's selected level gets a star.
-    """
-    class_names = class_names or {}
-    traces = []
-    for class_id in sorted({row["class_id"] for row in rows}):
-        class_rows = sorted(
-            (row for row in rows if row["class_id"] == class_id),
-            key=lambda row: row["level"],
-        )
-        traces.append(
-            {
-                "type": "scatter",
-                "mode": "lines+markers",
-                "name": class_names.get(class_id, str(class_id)),
-                "x": [row["level"] for row in class_rows],
-                "y": [row["loss"] for row in class_rows],
-            }
-        )
-    selected = [row for row in rows if row["selected"]]
-    if selected:
-        traces.append(
-            {
-                "type": "scatter",
-                "mode": "markers",
-                "name": "selected",
-                "x": [row["level"] for row in selected],
-                "y": [row["loss"] for row in selected],
-                "marker": {"symbol": "star", "size": 14, "color": _INK},
-            }
-        )
-    layout = {
-        "height": _HEIGHT,
-        "xaxis": {"title": "level", "dtick": 1},
-        "yaxis": {"title": "loss"},
-    }
-    return {"data": traces, "layout": layout}
-
-
-def partition_val_rates(rows: Sequence[dict]) -> dict[str, object]:
-    """Box the val failure rate of every operating point's groups.
-
-    Args:
-        rows: The partition_groups rows of one execution.
-
-    Returns:
-        A Plotly figure with one box per arm and rule; a group without
-        a val rate is left out.
-    """
-    rates_by_arm: dict[str, dict[str, list[float]]] = {}
-    for row in rows:
-        if row["val_rate"] is not None:
-            by_rule = rates_by_arm.setdefault(row["arm"], {})
-            by_rule.setdefault(row["rule"], []).append(row["val_rate"])
-    traces = []
-    for arm in ARM_COLORS:
-        for rule, values in sorted(rates_by_arm.get(arm, {}).items()):
-            name = arm if rule == "selected" else f"{arm} ({rule})"
-            traces.append(
-                {
-                    "type": "box",
-                    "name": name,
-                    "y": values,
-                    "marker": {"color": ARM_COLORS[arm]},
-                }
-            )
-    layout = {"height": _HEIGHT, "yaxis": {"title": "val_rate"}, "showlegend": False}
-    return {"data": traces, "layout": layout}
-
-
-def partition_val_test_scatter(rows: Sequence[dict]) -> dict[str, object]:
-    """Draw each operating-point group's test rate against its val rate.
-
-    A marker's size grows with its group's val row count, so a group
-    the val estimate barely covers reads as barely visible.
-
-    Args:
-        rows: The partition_groups rows of one execution.
-
-    Returns:
-        A Plotly figure: the `val = test` line, then one trace per
-        arm; a group without a val or a test rate is left out.
-    """
-    scored = [
-        row
-        for row in rows
-        if row["val_rate"] is not None and row["test_rate"] is not None
-    ]
-    max_n_val = max((row["n_val"] for row in scored), default=1)
-    traces = [
-        {
-            "type": "scatter",
-            "mode": "lines",
-            "name": "val = test",
-            "x": [0, 1],
-            "y": [0, 1],
-            "line": {"dash": "dot", "color": NEUTRAL},
-            "hoverinfo": "skip",
-        }
-    ]
-    for arm, color in ARM_COLORS.items():
-        points = [row for row in scored if row["arm"] == arm]
-        if points:
-            traces.append(
-                {
-                    "type": "scatter",
-                    "mode": "markers",
-                    "name": arm,
-                    "x": [row["val_rate"] for row in points],
-                    "y": [row["test_rate"] for row in points],
-                    "marker": {
-                        "color": color,
-                        "size": [
-                            4 + 20 * (row["n_val"] / max_n_val) ** 0.5 for row in points
-                        ],
-                        "line": {"width": 1, "color": _SURFACE},
-                    },
-                    "text": [
-                        f"{row['rule']} group {row['group_id']}, n_val={row['n_val']}"
-                        for row in points
-                    ],
-                    "hoverinfo": "text+x+y",
-                }
-            )
-    layout = {
-        "height": _HEIGHT,
-        "xaxis": {"title": "val_rate"},
-        "yaxis": {"title": "test_rate"},
-    }
-    return {"data": traces, "layout": layout}

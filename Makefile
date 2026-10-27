@@ -29,8 +29,8 @@ format:
 
 ## smoke: every stage on synthetic_test into resources/verify (own DB), MODE=quick|full; the second pass must be fully cached
 smoke:
-	$(PYTHON) -m stages render partitions $(VERIFY) $(SWEEP)
-	$(PYTHON) -m stages render partitions $(VERIFY) $(SWEEP) 2> resources/verify/cached.log || { cat resources/verify/cached.log; exit 1; }
+	$(PYTHON) -m stages render crossfit $(VERIFY) $(SWEEP)
+	$(PYTHON) -m stages render crossfit $(VERIFY) $(SWEEP) 2> resources/verify/cached.log || { cat resources/verify/cached.log; exit 1; }
 	! grep "running execution" resources/verify/cached.log
 
 ## generate: the synthetic dataset (ROWS=<n> for a smaller one)

@@ -109,8 +109,8 @@ CREATE TABLE IF NOT EXISTS class_clusterings (
 );
 CREATE TABLE IF NOT EXISTS complexity (
     execution_id INTEGER NOT NULL REFERENCES executions (id),
-    scope TEXT NOT NULL CHECK (scope IN ('region', 'class')),
-    scope_id INTEGER NOT NULL,  -- region_id or class_id
+    scope TEXT NOT NULL CHECK (scope IN ('leaf', 'class')),
+    scope_id INTEGER NOT NULL,  -- a tree node_id or a class_id
     measure TEXT NOT NULL,
     value REAL,  -- NULL: undefined measure
     PRIMARY KEY (execution_id, scope, scope_id, measure)
@@ -160,18 +160,15 @@ CREATE TABLE IF NOT EXISTS baselines (
 );
 CREATE TABLE IF NOT EXISTS estimates (
     execution_id INTEGER NOT NULL REFERENCES executions (id),
-    region_id INTEGER NOT NULL,
-    fold INTEGER,  -- outer fold that held it out; NULL for the refit or unpredicted
-    regressor REAL,  -- predicted rate; NULL without a val row and unused
-    PRIMARY KEY (execution_id, region_id)
+    node_id INTEGER NOT NULL,  -- a leaf of the tree
+    fold INTEGER,  -- outer fold that held it out; NULL for a leaf the refit predicts
+    regressor REAL NOT NULL,  -- predicted failure rate
+    PRIMARY KEY (execution_id, node_id)
 );
 CREATE TABLE IF NOT EXISTS regressor_folds (
     execution_id INTEGER NOT NULL REFERENCES executions (id),
-    fold INTEGER NOT NULL,  -- -1: the refit on every val-labelled region
-    n_regions INTEGER NOT NULL,  -- held out (fold) or trained on (refit)
-    spearman REAL,  -- scored on its held-out, used regions; NULL for the refit
-    r2 REAL,
-    mae REAL,
+    fold INTEGER NOT NULL,  -- -1: the refit on every val-labelled leaf
+    n_leaves INTEGER NOT NULL,  -- held out (fold) or trained on (refit)
     best_score REAL,  -- inner-CV clipped R²; NULL without a search
     params TEXT NOT NULL,  -- JSON of the chosen forest parameters
     PRIMARY KEY (execution_id, fold)
@@ -182,62 +179,28 @@ CREATE TABLE IF NOT EXISTS importances (
     importance REAL NOT NULL,  -- mean over the outer folds
     PRIMARY KEY (execution_id, feature)
 );
+CREATE TABLE IF NOT EXISTS tree_nodes (
+    execution_id INTEGER NOT NULL REFERENCES executions (id),
+    node_id INTEGER NOT NULL,
+    parent_id INTEGER,  -- NULL at a root, the root of a predicted class
+    class_id INTEGER NOT NULL,  -- the predicted class of the root above it
+    depth INTEGER NOT NULL,
+    n_train INTEGER NOT NULL,  -- train rows at or below it
+    n_train_errors INTEGER NOT NULL,  -- their out-of-fold errors
+    cost REAL NOT NULL,  -- its expected Brier cost as a leaf
+    best REAL NOT NULL,  -- the least cost of its subtree
+    status TEXT NOT NULL CHECK (status IN ('internal', 'leaf', 'pruned')),
+    n_val INTEGER,  -- validation rows at or below it; NULL when pruned
+    n_val_errors INTEGER,  -- NULL when pruned
+    q REAL,  -- the leaf's failure rate; NULL unless a leaf
+    gamma REAL,  -- the weight of the leaf's own val rate; NULL without val rows
+    PRIMARY KEY (execution_id, node_id)
+);
 CREATE TABLE IF NOT EXISTS figures (
     execution_id INTEGER NOT NULL REFERENCES executions (id),
     name TEXT NOT NULL,  -- e.g. regress/predicted_vs_observed
     file TEXT NOT NULL,  -- relative to the execution dir
     PRIMARY KEY (execution_id, name)
-);
-CREATE TABLE IF NOT EXISTS partitions (
-    execution_id INTEGER NOT NULL REFERENCES executions (id),
-    arm TEXT NOT NULL
-        CHECK (arm IN ('intra', 'inter', 'null', 'confidence', 'predicted_class')),
-    rule TEXT NOT NULL
-        CHECK (rule IN ('level', 'selected', 'fixed15', 'cbrt', 'per150')),
-    level INTEGER NOT NULL,  -- -1: the rule has no level (selected or a bin rule)
-    draw INTEGER NOT NULL,  -- the null arm's draw; 0 elsewhere
-    n_target INTEGER NOT NULL,  -- groups asked for, before merging or binning ties
-    n_groups INTEGER NOT NULL,  -- groups realized; at most n_target
-    loss REAL,  -- NULL for a bin arm, which has no geometric loss
-    routed_loss REAL,  -- NULL for a bin arm
-    val_p10 REAL NOT NULL,
-    val_median REAL NOT NULL,
-    val_p90 REAL NOT NULL,
-    share_no_val REAL NOT NULL,  -- test rows in a group with no val row
-    brier REAL NOT NULL,
-    skill REAL,  -- NULL when the reference model already scores zero Brier
-    uncertainty REAL NOT NULL,
-    resolution REAL NOT NULL,
-    reliability REAL NOT NULL,
-    auroc REAL,  -- NULL when every scored test row failed, or none did
-    kdn_spearman REAL,  -- always NULL for a bin arm; a geometric arm can
-        -- also be NULL, with too few groups holding a test row or a
-        -- constant mean kDN or test rate among them
-    PRIMARY KEY (execution_id, arm, rule, level, draw)
-);
-CREATE TABLE IF NOT EXISTS partition_class_levels (
-    execution_id INTEGER NOT NULL REFERENCES executions (id),
-    class_id INTEGER NOT NULL,
-    level INTEGER NOT NULL,
-    n_clusters INTEGER NOT NULL,
-    loss REAL NOT NULL,
-    selected INTEGER NOT NULL CHECK (selected IN (0, 1)),
-    PRIMARY KEY (execution_id, class_id, level)
-);
-CREATE TABLE IF NOT EXISTS partition_groups (
-    execution_id INTEGER NOT NULL REFERENCES executions (id),
-    arm TEXT NOT NULL
-        CHECK (arm IN ('intra', 'inter', 'null', 'confidence', 'predicted_class')),
-    rule TEXT NOT NULL
-        CHECK (rule IN ('selected', 'fixed15', 'cbrt', 'per150')),  -- no 'level' row
-    group_id INTEGER NOT NULL,
-    n_train INTEGER NOT NULL,  -- 0 for a bin arm, which routes no train row
-    n_val INTEGER NOT NULL,
-    n_test INTEGER NOT NULL,
-    val_rate REAL,  -- NULL when n_val = 0
-    test_rate REAL,  -- NULL when n_test = 0
-    mean_kdn REAL,  -- NULL for a bin arm
-    PRIMARY KEY (execution_id, arm, rule, group_id)
 );
 """
 
