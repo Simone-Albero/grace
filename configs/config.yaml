@@ -3,7 +3,6 @@ groups:                    # the option of each group, configs/<group>/<option>.
   classifier: mlp
   space: default
   graph: default
-  clustering: kmeans
   loss: focal              # consumed only by DL classifiers
   optimizer: adamw         # consumed only by DL classifiers
   scheduler: one_cycle     # consumed only by DL classifiers
@@ -15,16 +14,9 @@ groups:                    # the option of each group, configs/<group>/<option>.
   tree: default
 
 seed: 42
-distance: euclidean        # euclidean | cosine — metric of the graph, the regions and the complexity measures
 figure_format: pdf         # figure file format: pdf (vector, lighter) | png
-regressor_figures: true    # render also draws the regressor's figures, so it reads complexity and regress; false leaves them out of a render run
+regressor: true            # the failure regressor: its chain (tree is always read, complexity and regress) is evaluated and drawn; false leaves it out of an evaluate and render run
 root: resources            # grace.db and artifacts/<stage>/<execution id>/ live here; verify uses resources/verify
-
-clustering:                # shared by every algorithm (configs/clustering/<name>.yaml: name and params)
-  max_fit_samples: 20000   # rows a candidate is fitted and scored on; a larger class is subsampled, then refit whole
-  max_regions: 2500        # regions over all classes, shared equally between them
-  min_cluster_floor: 20    # finest n_clusters candidate ≈ class size / this; also the merge floor for undersized clusters and noise, scaled by the scored sample fraction while sweeping
-  hardness_k: 30           # neighbours behind the kDN hardness a candidate's loss is judged on
 
 runtime:                   # where and how fast stages compute, never what: in no cache key
   device: cpu              # DL classifiers: cpu | cuda | mps

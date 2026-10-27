@@ -1,8 +1,7 @@
-"""Static figures of the classifier, its baselines and the regressor.
+"""Static figures of the classifier, the predictors and the regressor.
 
 The regressor's figures need `tree`, `complexity` and `regress`: render
-reads them, and draws those figures, only when `regressor_figures` is
-true.
+reads them, and draws those figures, only when `regressor` is true.
 Files: figures/<group>/<name>.<figure_format>. DB rows written:
 `figures` (name and file, relative to the execution folder) and metric
 n_figures.
@@ -20,47 +19,42 @@ from src.plot.charts import (
     confusion_matrix_plot,
     line_plot,
     predicted_vs_observed_plot,
-    strip_box_plot,
     violin_plot,
 )
 from src.plot.style import descriptor_label, extended_palette
 from src.regressor import leaf_descriptors
+from src.scores import rate_scores
 from stages import Context
 
-CONFIG = ("figure_format", "regressor_figures")
+CONFIG = ("figure_format", "regressor")
 FILES = ()
 OUTPUTS = ("figures",)
-_BASE_INPUTS = ("prepare", "regions", "classify", "failures", "baselines")
+_BASE_INPUTS = ("prepare", "classify", "evaluate")
 # The number of most important features that get a descriptor violin.
 _TOP_DESCRIPTORS = 4
-_BASELINES = (("val", "Val rate"), ("mcp", "MCP"), ("atc", "ATC"))
+_PREDICTORS = (
+    ("tree", "Tree"),
+    ("tree_leaf", "Tree leaf"),
+    ("regressor", "RF regressor"),
+    ("val_rate", "Val rate"),
+    ("confidence", "Confidence"),
+    ("binned", "Binned"),
+    ("gbm", "GBM"),
+)
 
 
 def inputs(cfg: DictConfig) -> tuple[str, ...]:
     """Return the stages render reads under this config.
 
     Args:
-        cfg: The config; `regressor_figures` adds tree, complexity
-            and regress.
+        cfg: The config; `regressor` adds tree, complexity and regress.
 
     Returns:
         The input stage names.
     """
-    if cfg.regressor_figures:
+    if cfg.regressor:
         return (*_BASE_INPUTS, "tree", "complexity", "regress")
     return _BASE_INPUTS
-
-
-def _used_rates(ctx: Context) -> tuple[pd.DataFrame, pd.Series]:
-    """Return the baselines table and the used regions' test rates.
-
-    Returns:
-        The `baselines` table by region, and the test failure rate of
-        each region that the predictors are scored on.
-    """
-    table = ctx.read("baselines", "baselines").set_index("region_id")
-    observed = ctx.read("failures", "failures").set_index("region_id")["test_rate"]
-    return table, observed.loc[table.index[table["used"] == 1]]
 
 
 def _classification_figures(ctx: Context) -> dict[str, Figure]:
@@ -91,42 +85,6 @@ def _classification_figures(ctx: Context) -> dict[str, Figure]:
     return figures
 
 
-def _baseline_figures(ctx: Context) -> dict[str, Figure]:
-    """Draw the val, MCP and ATC rates against the observed ones."""
-    metrics = ctx.read("metrics", "baselines").set_index("name")["value"]
-    table, rate = _used_rates(ctx)
-
-    predicted = {}
-    for key, label in _BASELINES:
-        notes = {"Spearman": metrics[f"{key}_spearman"], "MAE": metrics[f"{key}_mae"]}
-        predicted[label] = (table.loc[rate.index, key].to_numpy(dtype=float), notes)
-    return {
-        "baselines/predicted_vs_observed": predicted_vs_observed_plot(
-            rate.to_numpy(), predicted, figsize=(3.0 * len(_BASELINES) + 3.0, 4.2)
-        )
-    }
-
-
-def _failure_figure(ctx: Context) -> Figure:
-    """Draw the observed failure rate of each class's regions."""
-    names = ctx.read("classes", "prepare").set_index("class_id")["name"]
-    class_of = ctx.read("regions", "regions").set_index("region_id")["class_id"]
-    failures = ctx.read("failures", "failures").set_index("region_id")
-    failures = failures[failures["n_test"] > 0]
-    class_ids = sorted(class_of.loc[failures.index].unique())
-    per_class = [
-        failures[class_of.loc[failures.index] == class_id] for class_id in class_ids
-    ]
-    return strip_box_plot(
-        [names.loc[class_id] for class_id in class_ids],
-        [frame["test_rate"].to_numpy(dtype=float) for frame in per_class],
-        [frame["n_test"].to_numpy(dtype=float) for frame in per_class],
-        x_label="Class",
-        y_label="Observed failure rate",
-        size_label="Test rows",
-    )
-
-
 def _violin_by_rate(
     descriptors: pd.DataFrame, rate: pd.Series, feature: str
 ) -> Figure | None:
@@ -154,6 +112,27 @@ def _violin_by_rate(
     )
 
 
+def _test_figure(ctx: Context, estimates: pd.DataFrame) -> dict[str, Figure]:
+    """Draw the regressor's leaf estimates against test rates."""
+    tested = ctx.read("leaf_tests", "evaluate").set_index("node_id")
+    tested = tested[tested["n_test"] > 0]
+    predicted = estimates.loc[tested.index, "regressor"].to_numpy(dtype=float)
+    observed = tested["test_rate"].to_numpy(dtype=float)
+    score = rate_scores(predicted, observed)
+    return {
+        "regress/predicted_vs_test": predicted_vs_observed_plot(
+            observed,
+            {
+                "RF regressor": (
+                    predicted,
+                    {"Spearman": score["spearman"], "MAE": score["mae"]},
+                )
+            },
+            figsize=(5.2, 4.2),
+        )
+    }
+
+
 def _regressor_figures(ctx: Context) -> dict[str, Figure]:
     """Draw the regressor figures: leaf rates and descriptors."""
     scores = ctx.read("metrics", "regress").set_index("name")["value"]
@@ -172,6 +151,7 @@ def _regressor_figures(ctx: Context) -> dict[str, Figure]:
             {"RF regressor": (predicted, notes)},
             figsize=(5.2, 4.2),
         ),
+        **_test_figure(ctx, estimates),
         "regress/feature_importances": bar_plot(
             [descriptor_label(feature) for feature in importances.index],
             importances.to_numpy(),
@@ -192,14 +172,32 @@ def _regressor_figures(ctx: Context) -> dict[str, Figure]:
     return figures
 
 
-def _figures(ctx: Context) -> dict[str, Figure]:
-    """Draw the classifier and baseline figures, and the regressor's."""
-    figures = {
-        **_classification_figures(ctx),
-        **_baseline_figures(ctx),
-        "failures/rate_by_class": _failure_figure(ctx),
+def _predictor_figures(ctx: Context) -> dict[str, Figure]:
+    """Draw each predictor's per-sample MSE ratio and Spearman."""
+    metrics = ctx.read("metrics", "evaluate").set_index("name")["value"]
+    shown = [(key, label) for key, label in _PREDICTORS if f"{key}_mse" in metrics]
+    labels = [label for _, label in shown]
+    colors = extended_palette(len(shown))
+    return {
+        "predictors/mse_ratio": bar_plot(
+            labels,
+            [metrics[f"{key}_mse_ratio"] for key, _ in shown],
+            colors=colors,
+            y_label="MSE / MSE of the val rate",
+        ),
+        "predictors/spearman": bar_plot(
+            labels,
+            [metrics[f"{key}_spearman"] for key, _ in shown],
+            colors=colors,
+            y_label="Spearman with the failures",
+        ),
     }
-    if ctx.cfg.regressor_figures:
+
+
+def _figures(ctx: Context) -> dict[str, Figure]:
+    """Draw the classifier, predictor and regressor figures."""
+    figures = {**_classification_figures(ctx), **_predictor_figures(ctx)}
+    if ctx.cfg.regressor:
         figures.update(_regressor_figures(ctx))
     return figures
 

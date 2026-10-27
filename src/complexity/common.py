@@ -1,6 +1,11 @@
 """The sample and aggregation helpers of the complexity families."""
 
-__all__ = ["MeasuredSample", "summarize", "weighted_group_measures"]
+__all__ = [
+    "MeasuredSample",
+    "compute_centroids",
+    "summarize",
+    "weighted_group_measures",
+]
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -13,7 +18,7 @@ class MeasuredSample:
     """The rows sampled from each population, with their graph nodes.
 
     Attributes:
-        X: The sampled rows in the clustering space, shape (n, d).
+        X: The sampled rows, embedded by `Space`, shape (n, d).
         population: The population id of every sampled row.
         neighbors: The nearest graph nodes of every row, as indices into
             the graph, shape (n, k).
@@ -81,3 +86,16 @@ def weighted_group_measures(
             group_measures[name] = weighted_sum / total if total else None
         grouped[group_id] = group_measures
     return grouped
+
+
+def compute_centroids(X: np.ndarray, labels: np.ndarray) -> dict[int, np.ndarray]:
+    """Return the mean point of every label.
+
+    Args:
+        X: The points, shape (n, d).
+        labels: The label of every row.
+
+    Returns:
+        The centroid by label.
+    """
+    return {int(label): X[labels == label].mean(axis=0) for label in np.unique(labels)}

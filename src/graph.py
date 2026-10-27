@@ -13,8 +13,6 @@ import scipy.sparse.csgraph
 from scipy.spatial.distance import cdist
 from tqdm import tqdm
 
-from src.space import scale_for_metric
-
 logger = logging.getLogger(__name__)
 
 # Distances per k-NN batch: each thread holds a float64 block and an
@@ -42,7 +40,6 @@ def nearest_neighbors(
     point_rows: np.ndarray,
     *,
     k: int,
-    metric: str,
     n_jobs: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return the k nearest graph nodes of every point.
@@ -54,8 +51,6 @@ def nearest_neighbors(
         point_rows: The row id of every point; a point that is a node,
             told by its row id, is not its own neighbour.
         k: The neighbours per point, capped at n_nodes - 1.
-        metric: `euclidean` or `cosine`, which fixes how the points are
-            scaled before the euclidean search.
         n_jobs: The threads, in joblib's meaning: -1 is all cores, -2
             all but one.
 
@@ -66,17 +61,13 @@ def nearest_neighbors(
     n_points = points.shape[0]
     effective_k = min(k, nodes.shape[0] - 1)
     rows_per_batch = max(1, _KNN_BATCH_CELLS // nodes.shape[0])
-    scaled_nodes = scale_for_metric(nodes, metric)
-    scaled_points = scale_for_metric(points, metric)
 
     indices = np.empty((n_points, effective_k), dtype=np.int64)
     distances = np.empty((n_points, effective_k), dtype=np.float64)
 
     def fill_batch(start: int) -> None:
         end = min(start + rows_per_batch, n_points)
-        distances_to_nodes = cdist(
-            scaled_points[start:end], scaled_nodes, metric="euclidean"
-        )
+        distances_to_nodes = cdist(points[start:end], nodes, metric="euclidean")
         # A point that is a node is not its own neighbour.
         distances_to_nodes[node_rows[None, :] == point_rows[start:end, None]] = np.inf
 
@@ -116,13 +107,11 @@ def nearest_neighbors(
 
 
 def _build_knn_graph(
-    points: np.ndarray, *, k: int, metric: str, n_jobs: int
+    points: np.ndarray, *, k: int, n_jobs: int
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return every point's k nearest other points: the k-NN graph."""
     rows = np.arange(points.shape[0])
-    return nearest_neighbors(
-        points, rows, points, rows, k=k, metric=metric, n_jobs=n_jobs
-    )
+    return nearest_neighbors(points, rows, points, rows, k=k, n_jobs=n_jobs)
 
 
 def _symmetrize_knn_graph(
@@ -158,7 +147,7 @@ def _symmetrize_knn_graph(
 
 
 def _bridge_disconnected(
-    adjacency: scipy.sparse.csr_matrix, points: np.ndarray, *, metric: str
+    adjacency: scipy.sparse.csr_matrix, points: np.ndarray
 ) -> scipy.sparse.csr_matrix:
     """Join each disconnected component to the first by one edge."""
     n_components, component_of = scipy.sparse.csgraph.connected_components(
@@ -169,8 +158,7 @@ def _bridge_disconnected(
 
     adjacency = adjacency.tolil()
     anchor = int(np.where(component_of == 0)[0][0])
-    scaled = scale_for_metric(points, metric)
-    anchor_dist = cdist(scaled[anchor : anchor + 1], scaled, metric="euclidean")[0]
+    anchor_dist = cdist(points[anchor : anchor + 1], points, metric="euclidean")[0]
 
     for component in range(1, n_components):
         component_nodes = np.where(component_of == component)[0]
@@ -185,12 +173,10 @@ def _build_approx_mst(
     knn_indices: np.ndarray,
     knn_distances: np.ndarray,
     points: np.ndarray,
-    *,
-    metric: str,
 ) -> np.ndarray:
     """Return the MST edges of the k-NN graph, bridged if split."""
     graph = _symmetrize_knn_graph(knn_indices, knn_distances, points.shape[0])
-    graph = _bridge_disconnected(graph, points, metric=metric)
+    graph = _bridge_disconnected(graph, points)
     mst = scipy.sparse.csgraph.minimum_spanning_tree(graph).tocoo()
     if mst.nnz == 0:
         return np.empty((0, 2), dtype=np.int64)
@@ -204,7 +190,7 @@ class TrainGraph:
     Every population is measured against it.
 
     Attributes:
-        points: The sampled rows in the clustering space, shape (n, d).
+        points: The sampled rows, embedded by `Space`, shape (n, d).
         knn_idx: The k nearest others of every point, shape (n, k).
         knn_dist: The distances to them, shape (n, k).
         mst_edges: The approximate MST as point pairs, shape (m, 2).
@@ -216,15 +202,12 @@ class TrainGraph:
     mst_edges: np.ndarray
 
 
-def build_train_graph(
-    points: np.ndarray, *, k: int, metric: str, n_jobs: int
-) -> TrainGraph:
+def build_train_graph(points: np.ndarray, *, k: int, n_jobs: int) -> TrainGraph:
     """Return the k-NN graph and the approximate MST of a point cloud.
 
     Args:
         points: The point cloud, shape (n, d).
         k: The neighbours per point.
-        metric: `euclidean` or `cosine`.
         n_jobs: The threads of the search, as in `nearest_neighbors`.
 
     Returns:
@@ -235,10 +218,10 @@ def build_train_graph(
     """
     if points.shape[0] < 2:
         raise ValueError(f"A graph of {points.shape[0]} row(s) has no neighbours.")
-    logger.info("Building the %s k-NN graph (k=%d)...", metric, k)
-    knn_idx, knn_dist = _build_knn_graph(points, k=k, metric=metric, n_jobs=n_jobs)
+    logger.info("Building the k-NN graph (k=%d)...", k)
+    knn_idx, knn_dist = _build_knn_graph(points, k=k, n_jobs=n_jobs)
     logger.info("Building approximate MST over the k-NN graph...")
-    mst_edges = _build_approx_mst(knn_idx, knn_dist, points, metric=metric)
+    mst_edges = _build_approx_mst(knn_idx, knn_dist, points)
     return TrainGraph(points, knn_idx, knn_dist, mst_edges)
 
 

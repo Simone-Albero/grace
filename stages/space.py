@@ -20,7 +20,7 @@ from src.graph import build_train_graph, subsample_indices
 from src.space import Space
 from stages import LABEL, SPLITS, Context
 
-CONFIG = ("space", "graph", "distance", "seed")
+CONFIG = ("space", "graph", "seed")
 # Split gives the feature kinds; prepare, the splits.
 INPUTS = ("split", "prepare")
 FILES = ()
@@ -87,7 +87,6 @@ def run(ctx: Context) -> None:
     train_graph = build_train_graph(
         space.embed(train.iloc[graph_rows]),
         k=cfg.graph.k,
-        metric=cfg.distance,
         n_jobs=ctx.runtime.n_jobs,
     )
 

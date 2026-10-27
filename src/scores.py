@@ -70,8 +70,8 @@ def rate_scores(predicted: ArrayLike, observed: ArrayLike) -> dict[str, float]:
     """Score predicted failure rates against the observed ones.
 
     Args:
-        predicted: The predicted rate of every region.
-        observed: The observed rate of every region.
+        predicted: The predicted rate of every leaf.
+        observed: The observed rate of every leaf.
 
     Returns:
         "spearman", "r2", "mae" and "mse". Spearman is NaN when either

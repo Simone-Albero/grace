@@ -87,26 +87,6 @@ CREATE TABLE IF NOT EXISTS classes (
     n_test INTEGER NOT NULL,
     PRIMARY KEY (execution_id, class_id)
 );
-CREATE TABLE IF NOT EXISTS regions (
-    execution_id INTEGER NOT NULL REFERENCES executions (id),
-    region_id INTEGER NOT NULL,
-    class_id INTEGER NOT NULL,
-    n_train INTEGER NOT NULL,
-    n_val INTEGER NOT NULL,
-    n_test INTEGER NOT NULL,
-    PRIMARY KEY (execution_id, region_id)
-);
-CREATE TABLE IF NOT EXISTS class_clusterings (
-    execution_id INTEGER NOT NULL REFERENCES executions (id),
-    class_id INTEGER NOT NULL,
-    n_train INTEGER NOT NULL,
-    n_clusters INTEGER NOT NULL,
-    loss REAL,
-    size_balance REAL,
-    n_merged_clusters INTEGER NOT NULL,
-    n_merged INTEGER NOT NULL,
-    PRIMARY KEY (execution_id, class_id)
-);
 CREATE TABLE IF NOT EXISTS complexity (
     execution_id INTEGER NOT NULL REFERENCES executions (id),
     scope TEXT NOT NULL CHECK (scope IN ('leaf', 'class')),
@@ -137,26 +117,6 @@ CREATE TABLE IF NOT EXISTS history (
     step INTEGER NOT NULL,
     loss REAL NOT NULL,
     PRIMARY KEY (execution_id, step)
-);
-CREATE TABLE IF NOT EXISTS failures (
-    execution_id INTEGER NOT NULL REFERENCES executions (id),
-    region_id INTEGER NOT NULL,
-    n_val INTEGER NOT NULL,
-    n_val_error INTEGER NOT NULL,
-    val_rate REAL,  -- NULL when n_val = 0
-    n_test INTEGER NOT NULL,
-    n_test_error INTEGER NOT NULL,
-    test_rate REAL,  -- NULL when n_test = 0
-    PRIMARY KEY (execution_id, region_id)
-);
-CREATE TABLE IF NOT EXISTS baselines (
-    execution_id INTEGER NOT NULL REFERENCES executions (id),
-    region_id INTEGER NOT NULL,
-    used INTEGER NOT NULL CHECK (used IN (0, 1)),  -- scored: enough test rows
-    val REAL,  -- the region's own val rate; the global val rate without one
-    mcp REAL,  -- mean 1 - max probability of its test rows; NULL without any
-    atc REAL,  -- share of its test rows under the ATC threshold; NULL without any
-    PRIMARY KEY (execution_id, region_id)
 );
 CREATE TABLE IF NOT EXISTS estimates (
     execution_id INTEGER NOT NULL REFERENCES executions (id),
@@ -196,9 +156,18 @@ CREATE TABLE IF NOT EXISTS tree_nodes (
     gamma REAL,  -- the weight of the leaf's own val rate; NULL without val rows
     PRIMARY KEY (execution_id, node_id)
 );
+CREATE TABLE IF NOT EXISTS leaf_tests (
+    execution_id INTEGER NOT NULL REFERENCES executions (id),
+    node_id INTEGER NOT NULL,  -- a leaf of the tree
+    n_test INTEGER NOT NULL,  -- test rows routed to it
+    n_test_errors INTEGER NOT NULL,
+    mean_q REAL,  -- the mean probability the tree gave them; NULL without rows
+    test_rate REAL,  -- NULL without test rows
+    PRIMARY KEY (execution_id, node_id)
+);
 CREATE TABLE IF NOT EXISTS figures (
     execution_id INTEGER NOT NULL REFERENCES executions (id),
-    name TEXT NOT NULL,  -- e.g. regress/predicted_vs_observed
+    name TEXT NOT NULL,  -- e.g. regress/predicted_vs_val
     file TEXT NOT NULL,  -- relative to the execution dir
     PRIMARY KEY (execution_id, name)
 );

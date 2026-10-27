@@ -9,12 +9,11 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
-from omegaconf import OmegaConf
 
 import stages.prepare
-from pipeline.config import CONFIGS, load_config, sweep, validate
+from pipeline.config import CONFIGS, load_config, sweep
 from pipeline.db import KILLED, RUNS_LOCK, connect, reap
-from pipeline.runner import STAGES, _config_slice, plan, run
+from pipeline.runner import STAGES, plan, run
 from stages import SPLITS, Context
 from tests.helpers import fast_cfg, query
 
@@ -212,7 +211,8 @@ def test_failed_stage_rolls_back(
     [
         (["data=nope"], ["prepare"]),
         (["data.trian_frac=0.5"], ["prepare"]),
-        (["distance=manhattan"], ["prepare"]),
+        (["crossfit.n_folds=1"], ["prepare"]),
+        (["tree.n_min=1"], ["prepare"]),
         (["groups.data=nb15_v2"], ["prepare"]),
         (["root="], ["prepare"]),
         (["classifier.kind=xx"], ["prepare"]),
@@ -255,12 +255,6 @@ def test_config_errors(
         (["fit.training.dataloader.batch_size=1"], "batch_size"),
         (["fit.training.early_stopping.dataloader.batch_size=0"], "batch_size"),
         (["runtime.device=cuda:x"], "runtime.device"),
-        (["clustering.params=5"], "must be a mapping"),
-        (
-            ["clustering=hdbscan", "clustering.params.min_samples=[]"],
-            "at least one",
-        ),
-        (["clustering.name=birch"], "pick it with <group>=<option>"),
         (["classifier.name=knn"], "pick it with <group>=<option>"),
         (["classifier.kind=ml"], "pick it with <group>=<option>"),
         (["groups.data=nb15_v2"], "pick it with <group>=<option>"),
@@ -268,7 +262,7 @@ def test_config_errors(
         (["seed=-1"], "seed"),
         # The regressor's searches take seed + fold, below 2**32.
         ([f"seed={2**31}"], "seed"),
-        (["regressor_figures=maybe"], "regressor_figures"),
+        (["regressor=maybe"], "regressor"),
         (["data.num_cols=[num_1,num_1]"], "more than once"),
         (["loss.params.label_smoothing=1.0"], "label_smoothing"),
         (["loss=focal", "loss.params.gamma=-1"], "gamma"),
@@ -281,42 +275,15 @@ def test_config_errors_name_the_key(overrides: list[str], match: str) -> None:
 
 
 def test_render_reads_the_regressor_only_when_asked() -> None:
-    """Check that regressor_figures decides what render runs after."""
+    """Check that `regressor` decides what render runs after."""
     with_regressor = load_config(["data=synthetic_test"])
-    without_regressor = load_config(["data=synthetic_test", "regressor_figures=false"])
+    without_regressor = load_config(["data=synthetic_test", "regressor=false"])
     assert plan(["render"], with_regressor) == list(STAGES)
-    # Without the regressor's figures, render needs none of its chain.
-    skipped = {"crossfit", "tree", "complexity", "regress"}
+    # Without the regressor, render needs none of its chain.
+    skipped = {"complexity", "regress"}
     assert plan(["render"], without_regressor) == [
         stage for stage in STAGES if stage not in skipped
     ]
-
-
-def test_clustering_params_checked() -> None:
-    """Check that pipeline-owned and unknown clustering params fail."""
-    cfg = load_config(["data=synthetic_test"])
-    OmegaConf.set_struct(cfg, False)
-    for params, key in (({"n_clusters": [5]}, "n_clusters"), ({"bogus": 1}, "bogus")):
-        cfg.clustering.params = params
-        with pytest.raises(ValueError, match=key):
-            validate(cfg)
-    cfg = load_config(["data=synthetic_test", "clustering=hdbscan"])
-    OmegaConf.set_struct(cfg, False)
-    cfg.clustering.params = {"min_cluster_size": [5]}
-    validate(cfg)
-
-
-@pytest.mark.parametrize(
-    "path", sorted((CONFIGS / "clustering").glob("*.yaml")), ids=lambda path: path.stem
-)
-def test_clustering_shared_keys(path: Path) -> None:
-    """Check that each clustering YAML has a name and shared keys."""
-    cfg = load_config(["data=synthetic_test", f"clustering={path.stem}"])
-    shared = OmegaConf.load(CONFIGS / "config.yaml").clustering
-    assert cfg.clustering.name == path.stem
-    for key, value in shared.items():
-        assert cfg.clustering[key] == value
-    assert "max_regions" in _config_slice("regions", cfg)["clustering"]
 
 
 @pytest.mark.parametrize(
@@ -329,25 +296,22 @@ def test_every_data_config_validates(path: Path) -> None:
 
 def test_sweep() -> None:
     """Check that a sweep is the product of its values, lists too."""
-    combos = sweep(["classifier=a,b", "distance=x,y,z"])
+    combos = sweep(["classifier=a,b", "seed=1,2,3"])
     assert len(combos) == 6
-    assert combos[0] == ["classifier=a", "distance=x"]
-    assert combos[-1] == ["classifier=b", "distance=z"]
+    assert combos[0] == ["classifier=a", "seed=1"]
+    assert combos[-1] == ["classifier=b", "seed=3"]
     assert sweep([]) == [[]]
-    min_samples = "clustering.params.min_samples"
-    assert sweep([f"{min_samples}=[1,5],[15]"]) == [
-        [f"{min_samples}=[1,5]"],
-        [f"{min_samples}=[15]"],
-    ]
+    grid = "classifier.grid.C"
+    assert sweep([f"{grid}=[1,5],[15]"]) == [[f"{grid}=[1,5]"], [f"{grid}=[15]"]]
     assert len(sweep(["x=[[1,2],[3]],[4]"])) == 2
     cfg = load_config(
         [
             "data=synthetic_test",
-            "clustering=hdbscan",
-            *sweep([f"{min_samples}=[1,5],[15]"])[0],
+            "classifier=logistic_regression",
+            *sweep([f"{grid}=[1,5],[15]"])[0],
         ]
     )
-    assert cfg.clustering.params.min_samples == [1, 5]
+    assert cfg.classifier.grid.C == [1, 5]
     for bad in ("classifier", "classifier=a,", "=a,b", "a=[1,2],"):
         with pytest.raises(ValueError, match="--sweep"):
             sweep([bad])

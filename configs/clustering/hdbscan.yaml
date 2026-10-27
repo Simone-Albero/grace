@@ -1,6 +1,0 @@
-name: hdbscan
-params:
-  min_cluster_size: [5, 10, 25, 50, 100, 200]   # small floor so small classes can form genuine clusters instead of collapsing to all-noise
-  min_samples: [1, 5, 15, 50, 100]              # capped low: high min_samples inflates core distances and manufactures noise
-  cluster_selection_method: leaf                # leaf over eom: extracts finer, more numerous clusters
-  # Noise merges into the nearest surviving region, like any undersized cluster.

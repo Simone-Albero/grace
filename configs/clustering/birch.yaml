@@ -1,3 +1,0 @@
-name: birch                # n_clusters derived per class
-params:
-  branching_factor: 50

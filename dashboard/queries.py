@@ -4,7 +4,6 @@ __all__ = [
     "PREDICTORS",
     "SCORES",
     "STAGE_ORDER",
-    "class_clusterings",
     "class_metrics",
     "classes",
     "classifier_grid",
@@ -14,13 +13,16 @@ __all__ = [
     "features",
     "history",
     "importances",
+    "leaf_descriptors",
+    "leaf_path",
+    "leaves",
     "metrics_by_stage",
-    "regions",
     "regressor_folds",
     "run",
     "run_metrics",
     "runs",
     "stage_ids",
+    "tree_roots",
 ]
 
 import json
@@ -32,17 +34,21 @@ from pathlib import Path
 # a test keeps the two equal, since importing the runner here would load
 # every stage's dependencies.
 STAGE_ORDER = (
-    "split prepare space regions classify crossfit tree failures baselines "
-    "complexity regress render"
+    "split prepare space classify crossfit tree complexity regress "
+    "baselines evaluate render"
 ).split()
-# The failure-rate predictors, each with its label; the `regions`
-# columns carry its rates and `<key>_<score>` metrics its scores.
+# The failure predictors, each with its label; its scores are the
+# `evaluate` metrics `<key>_<score>`.
 PREDICTORS = {
-    "val": "Val rate",
-    "mcp": "MCP",
-    "atc": "ATC",
+    "tree": "Tree",
+    "tree_leaf": "Tree leaf",
+    "regressor": "RF regressor",
+    "val_rate": "Val rate",
+    "confidence": "Confidence",
+    "binned": "Binned",
+    "gbm": "GBM",
 }
-SCORES = ("spearman", "mse", "r2", "mae")
+SCORES = ("mse", "mse_ratio", "spearman")
 
 
 def connect(path: Path) -> sqlite3.Connection:
@@ -251,33 +257,6 @@ def classes(db: sqlite3.Connection, prepare_id: int) -> list[dict[str, object]]:
     )
 
 
-def class_clusterings(
-    db: sqlite3.Connection, regions_id: int, prepare_id: int
-) -> list[dict[str, object]]:
-    """List the clustering of every class of a regions execution.
-
-    Args:
-        db: A connection to grace.db.
-        regions_id: The execution id of regions.
-        prepare_id: The execution id of prepare, for the class names.
-
-    Returns:
-        One row per class: id, name, its clustering columns and the
-        number of regions it holds.
-    """
-    return _all(
-        db,
-        """
-        SELECT c.class_id, k.name, c.n_train, c.n_clusters, c.loss,
-               c.size_balance, c.n_merged_clusters, c.n_merged
-        FROM class_clusterings c
-        JOIN classes k ON k.execution_id = ? AND k.class_id = c.class_id
-        WHERE c.execution_id = ? ORDER BY c.class_id
-        """,
-        (prepare_id, regions_id),
-    )
-
-
 def class_metrics(
     db: sqlite3.Connection, prepare_id: int, classify_id: int
 ) -> list[dict[str, object]]:
@@ -359,30 +338,133 @@ def importances(db: sqlite3.Connection, regress_id: int) -> list[dict[str, objec
     )
 
 
-def regions(db: sqlite3.Connection, ids: Mapping[str, int]) -> list[dict[str, object]]:
-    """List the regions of a run with their rates and predictions.
+def tree_roots(
+    db: sqlite3.Connection, tree_id: int, prepare_id: int
+) -> list[dict[str, object]]:
+    """List the root of every predicted class of a tree execution.
+
+    Args:
+        db: A connection to grace.db.
+        tree_id: The execution id of tree.
+        prepare_id: The execution id of prepare, for the class names.
+
+    Returns:
+        One row per class: id, name, the train rows and out-of-fold
+        errors at its root, its leaves and the depth of its cut.
+    """
+    return _all(
+        db,
+        """
+        SELECT k.class_id, k.name,
+               SUM(CASE WHEN t.parent_id IS NULL THEN t.n_train END) AS n_train,
+               SUM(CASE WHEN t.parent_id IS NULL THEN t.n_train_errors END)
+                 AS n_train_errors,
+               SUM(t.status = 'leaf') AS n_leaves,
+               MAX(CASE WHEN t.status != 'pruned' THEN t.depth END) AS depth
+        FROM tree_nodes t
+        JOIN classes k ON k.execution_id = :prepare AND k.class_id = t.class_id
+        WHERE t.execution_id = :tree
+        GROUP BY k.class_id ORDER BY k.class_id
+        """,
+        {"prepare": prepare_id, "tree": tree_id},
+    )
+
+
+def leaves(db: sqlite3.Connection, ids: Mapping[str, int]) -> list[dict[str, object]]:
+    """List the leaves of a run with their rates and estimates.
 
     Args:
         db: A connection to grace.db.
         ids: The execution id of each done stage of the run.
 
     Returns:
-        One row per region, with None where a stage did not run.
+        One row per leaf, with None where a stage did not run or a
+        count is 0: the out-of-fold, val and test rates, the tree's
+        rate `q`, the regressor's estimate and the mean corrected
+        probability of the leaf's test rows.
+    """
+    rows = _all(
+        db,
+        """
+        SELECT t.node_id, t.class_id, k.name AS class, t.depth,
+               t.n_train, t.n_train_errors, t.n_val, t.n_val_errors, t.q, t.gamma,
+               e.regressor, l.n_test, l.n_test_errors, l.mean_q
+        FROM tree_nodes t
+        JOIN classes k ON k.execution_id = :prepare AND k.class_id = t.class_id
+        LEFT JOIN estimates e
+          ON e.execution_id = :regress AND e.node_id = t.node_id
+        LEFT JOIN leaf_tests l
+          ON l.execution_id = :evaluate AND l.node_id = t.node_id
+        WHERE t.execution_id = :tree AND t.status = 'leaf'
+        ORDER BY t.node_id
+        """,
+        {key: ids.get(key) for key in ("prepare", "tree", "regress", "evaluate")},
+    )
+    for row in rows:
+        for rate, errors, count in (
+            ("oof_rate", "n_train_errors", "n_train"),
+            ("val_rate", "n_val_errors", "n_val"),
+            ("test_rate", "n_test_errors", "n_test"),
+        ):
+            row[rate] = row[errors] / row[count] if row[count] else None
+    return rows
+
+
+def leaf_path(
+    db: sqlite3.Connection, tree_id: int, node_id: int
+) -> list[dict[str, object]]:
+    """List a leaf and its ancestors, root first.
+
+    Args:
+        db: A connection to grace.db.
+        tree_id: The execution id of tree.
+        node_id: The leaf.
+
+    Returns:
+        The nodes from the root of its predicted class down to the leaf.
     """
     return _all(
         db,
         """
-        SELECT g.region_id, g.class_id, k.name AS class,
-               g.n_train, g.n_val, g.n_test,
-               f.n_val_error, f.val_rate, f.n_test_error, f.test_rate,
-               b.used, b.val, b.mcp, b.atc
-        FROM regions g
-        JOIN classes k ON k.execution_id = :prepare AND k.class_id = g.class_id
-        LEFT JOIN failures f
-          ON f.execution_id = :failures AND f.region_id = g.region_id
-        LEFT JOIN baselines b
-          ON b.execution_id = :baselines AND b.region_id = g.region_id
-        WHERE g.execution_id = :regions ORDER BY g.region_id
+        WITH RECURSIVE path(node_id, parent_id) AS (
+          SELECT node_id, parent_id FROM tree_nodes
+          WHERE execution_id = :tree AND node_id = :node
+          UNION ALL
+          SELECT t.node_id, t.parent_id FROM tree_nodes t
+          JOIN path p ON t.node_id = p.parent_id WHERE t.execution_id = :tree
+        )
+        SELECT t.node_id, t.depth, t.status, t.n_train, t.n_train_errors,
+               t.n_val, t.n_val_errors
+        FROM tree_nodes t JOIN path USING (node_id)
+        WHERE t.execution_id = :tree ORDER BY t.depth
         """,
-        {key: ids.get(key) for key in ("prepare", "failures", "baselines", "regions")},
+        {"tree": tree_id, "node": node_id},
+    )
+
+
+def leaf_descriptors(
+    db: sqlite3.Connection, complexity_id: int, node_id: int, class_id: int
+) -> list[dict[str, object]]:
+    """List the leaf and class value of every complexity measure.
+
+    Args:
+        db: A connection to grace.db.
+        complexity_id: The execution id of complexity.
+        node_id: The leaf.
+        class_id: The class its root predicts.
+
+    Returns:
+        One row per measure, with its `leaf` and `class` values.
+    """
+    return _all(
+        db,
+        """
+        SELECT r.measure, r.value AS leaf, c.value AS class
+        FROM complexity r LEFT JOIN complexity c
+          ON c.execution_id = r.execution_id AND c.scope = 'class'
+         AND c.measure = r.measure AND c.scope_id = ?
+        WHERE r.execution_id = ? AND r.scope = 'leaf' AND r.scope_id = ?
+        ORDER BY r.rowid
+        """,
+        (class_id, complexity_id, node_id),
     )

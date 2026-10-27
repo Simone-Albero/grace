@@ -9,7 +9,7 @@ from pandas.testing import assert_frame_equal
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import GridSearchCV
 
-from src import clustering, partitions, tree
+from src import baselines, tree
 from src.complexity.common import weighted_group_measures
 from src.data import cap_per_class, stratified_holdout
 from src.graph import build_train_graph
@@ -97,50 +97,10 @@ def test_duplicate_points_join_inside_the_mst() -> None:
     rng = np.random.default_rng(0)
     points = np.vstack([rng.normal(size=(50, 4)), np.tile(rng.normal(size=4), (10, 1))])
     duplicates = np.arange(50, 60)
-    mst = build_train_graph(points, k=3, metric="euclidean", n_jobs=1).mst_edges
+    mst = build_train_graph(points, k=3, n_jobs=1).mst_edges
     assert len(mst) == len(points) - 1
     # Else each copy is bridged to node 0 alone, by a long edge.
     assert np.isin(mst, duplicates).all(axis=1).sum() == len(duplicates) - 1
-
-
-def _split_on_refit(
-    X: np.ndarray, *, max_fit_samples: int, random_state: int
-) -> np.ndarray:
-    """Label 2 clusters on the subsample and 3 on the full class."""
-    return np.arange(len(X)) % (2 if len(X) <= max_fit_samples else 3)
-
-
-@pytest.mark.parametrize("max_clusters", [2, 3])
-def test_refit_keeps_at_most_max_clusters(
-    monkeypatch: pytest.MonkeyPatch, max_clusters: int
-) -> None:
-    """Check that a subsampled class's refit stays within its cap."""
-    monkeypatch.setitem(clustering.ALGORITHMS, "split_on_refit", _split_on_refit)
-    rng = np.random.default_rng(0)
-    nodes = clustering.KdnNodes(
-        X=rng.normal(size=(60, 2)),
-        y=np.repeat([0, 1], 30),
-        row_ids=np.arange(1000, 1060),
-    )
-    labels, n_merged_clusters, _, _ = clustering.cluster_class(
-        rng.normal(size=(210, 2)),
-        row_ids=np.arange(210),
-        label=0,
-        algorithm="split_on_refit",
-        params={},
-        nodes=nodes,
-        max_fit_samples=100,
-        max_clusters=max_clusters,
-        min_cluster_floor=10,
-        hardness_k=3,
-        eval_rows_per_train_row=1.0,
-        metric="euclidean",
-        random_state=0,
-    )
-    # Three refit clusters of 70 rows, all above the floor of 10: a tie
-    # at the cut must still keep `max_clusters` of them.
-    assert np.unique(labels).size == min(max_clusters, 3)
-    assert n_merged_clusters == 3 - min(max_clusters, 3)
 
 
 def test_fit_failure_regressor_passes_sample_weight_to_the_forest(
@@ -190,9 +150,9 @@ def test_fit_failure_regressor_passes_sample_weight_to_the_forest(
 def test_tied_confidences_share_a_bin() -> None:
     """Check that a tie on every confidence leaves one bin, index 0."""
     confidence = np.full(10, 0.5)
-    edges = partitions.confidence_edges(confidence, n_bins=4)
+    edges = baselines.confidence_edges(confidence, n_bins=4)
     assert edges.size == 1
-    assert (partitions.assign_bins(confidence, edges) == 0).all()
+    assert (baselines.assign_bins(confidence, edges) == 0).all()
 
 
 def test_class_bins_cover_every_class() -> None:
@@ -200,10 +160,10 @@ def test_class_bins_cover_every_class() -> None:
     rng = np.random.default_rng(1)
     confidence = rng.uniform(size=101)
     predicted_class = np.array([0] * 95 + [1] * 5 + [2])
-    edges = partitions.class_confidence_edges(confidence, predicted_class, n_bins=4)
+    edges = baselines.class_confidence_edges(confidence, predicted_class, n_bins=4)
     assert set(edges) == {0, 1, 2}
     assert len(edges[0]) >= 2 and len(edges[1]) >= 2
-    bins = partitions.assign_class_bins(confidence, predicted_class, edges)
+    bins = baselines.assign_class_bins(confidence, predicted_class, edges)
     # Every group id belongs to exactly one predicted class: none is
     # shared across classes, unlike a plain within-class bin index.
     for class_id in (0, 1, 2):
@@ -216,11 +176,11 @@ def test_class_missing_from_edges_gets_its_own_group() -> None:
     """Check a class edges never saw gets one id, not a KeyError."""
     confidence = np.array([0.1, 0.9, 0.5])
     predicted_class = np.array([0, 0, 2])
-    edges = partitions.class_confidence_edges(
+    edges = baselines.class_confidence_edges(
         confidence[:2], predicted_class[:2], n_bins=2
     )
     assert set(edges) == {0}
-    bins = partitions.assign_class_bins(confidence, predicted_class, edges)
+    bins = baselines.assign_class_bins(confidence, predicted_class, edges)
     assert bins[2] not in bins[:2]
 
 
@@ -237,13 +197,13 @@ def test_class_bins_stay_consistent_across_a_split_call() -> None:
     first_predicted = np.array([0, 0, 2, 2])
     second_confidence = np.array([0.62, 0.5, 0.32, 0.4])
     second_predicted = np.array([0, 1, 2, 2])  # class 1 only here.
-    edges = partitions.class_confidence_edges(
+    edges = baselines.class_confidence_edges(
         first_confidence, first_predicted, n_bins=2
     )
 
     confidence = np.concatenate([first_confidence, second_confidence])
     predicted = np.concatenate([first_predicted, second_predicted])
-    group = partitions.assign_class_bins(confidence, predicted, edges)
+    group = baselines.assign_class_bins(confidence, predicted, edges)
     first_group, second_group = np.split(group, [len(first_confidence)])
 
     for class_id in (0, 1, 2):
@@ -268,7 +228,7 @@ def test_apportion_sums_to_the_total() -> None:
         (3, [998, 1, 1]),  # flooring every share to 1 overshoots 3.
     ]
     for total, weights in cases:
-        allocated = partitions._apportion(total, np.array(weights))
+        allocated = baselines._apportion(total, np.array(weights))
         assert int(allocated.sum()) == total
         assert (allocated >= 1).all()
 
@@ -277,35 +237,10 @@ def test_empty_group_takes_global_rate() -> None:
     """Check a group id with no rows gets the global rate, not NaN."""
     group = np.array([0, 0, 1, 1, 1])
     observed = np.array([1, 0, 0, 1, 1])
-    rates = partitions.estimate_group_rates(group, observed, [0, 1, 2])
+    rates = baselines.estimate_group_rates(group, observed, [0, 1, 2])
     assert rates.loc[0] == pytest.approx(0.5)
     assert rates.loc[1] == pytest.approx(2 / 3)
     assert rates.loc[2] == pytest.approx(observed.mean())
-
-
-def test_kdn_per_row_labels_match_one_class() -> None:
-    """Check per-row labels reproduce separate single-class calls."""
-    rng = np.random.default_rng(3)
-    nodes = clustering.KdnNodes(
-        X=rng.normal(size=(60, 2)),
-        y=np.repeat([0, 1], 30),
-        row_ids=np.arange(1000, 1060),
-    )
-    X = rng.normal(size=(20, 2))
-    row_ids = np.arange(2000, 2020)
-    labels = np.repeat([0, 1], 10)
-
-    mixed = clustering.compute_kdn(X, row_ids=row_ids, labels=labels, nodes=nodes, k=5)
-    for label in (0, 1):
-        in_class = labels == label
-        per_class = clustering.compute_kdn(
-            X[in_class],
-            row_ids=row_ids[in_class],
-            labels=np.full(in_class.sum(), label),
-            nodes=nodes,
-            k=5,
-        )
-        assert np.allclose(mixed[in_class], per_class)
 
 
 def _blobs(n_per_blob: int = 60) -> tuple[np.ndarray, np.ndarray]:
@@ -442,3 +377,25 @@ def test_leaf_measures_are_row_weighted_and_skip_undefined_ones() -> None:
     assert leaves[0]["f1"] == pytest.approx((30 * 1.0 + 10 * 4.0) / 40)
     assert leaves[0]["n1"] == pytest.approx(2.0)
     assert leaves[1]["f1"] == 5.0 and leaves[1]["n1"] is None
+
+
+def test_bin_count_is_one_per_150_rows_and_at_least_one_per_class() -> None:
+    """Check the bin rule and its floor of one bin per class."""
+    assert baselines.bin_count(10_275, 9) == 68
+    assert baselines.bin_count(300, 9) == 9
+
+
+def test_calibrate_isotonic_never_decreases_in_the_score() -> None:
+    """Check the map is monotone and stays a probability."""
+    rng = np.random.default_rng(0)
+    score = rng.random(500)
+    errors = (rng.random(500) < score).astype(float)
+    mapped = baselines.calibrate_isotonic(score, errors, np.linspace(-1, 2, 50))
+    assert (np.diff(mapped) >= 0).all() and mapped.min() >= 0 and mapped.max() <= 1
+
+
+def test_error_gbm_is_constant_when_every_row_has_the_same_outcome() -> None:
+    """Check a one-valued target gives its rate, not a failed fit."""
+    features = pd.DataFrame({"z_0": np.arange(10.0), "predicted": np.zeros(10, int)})
+    predict = baselines.fit_error_gbm(features, np.zeros(10), random_state=0)
+    assert (predict(features) == 0.0).all()

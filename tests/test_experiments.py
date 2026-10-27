@@ -20,13 +20,12 @@ from pipeline.runner import STAGES
 def _run(run_id: int, seed: int, *, classifier: str = "rf", **extra) -> dict:
     """Build a run as `queries.runs` lists it."""
     config = {
-        "groups": {"data": "d", "classifier": classifier, "clustering": "kmeans"},
-        "distance": "euclidean",
+        "groups": {"data": "d", "classifier": classifier},
         "seed": seed,
         "root": f"root{run_id}",
         "runtime": {"n_jobs": run_id},
         "figure_format": "pdf",
-        "regressor_figures": True,
+        "regressor": True,
         **extra,
     }
     stages = [
@@ -95,8 +94,8 @@ def test_an_execution_counts_once() -> None:
             ],
         )
     )
-    assert grouped_values(other, "classify.accuracy", "classifier", "clustering") == {
-        "kmeans": {"rf": [0.5, 0.7]}
+    assert grouped_values(other, "classify.accuracy", "classifier", "data") == {
+        "d": {"rf": [0.5, 0.7]}
     }
 
 
@@ -124,6 +123,6 @@ def test_confusion_pairs_rows_by_position(tmp_path: Path) -> None:
 def test_an_infinite_metric_is_not_a_value() -> None:
     """Check that an infinity cannot reach the statistics or the JSON."""
     (experiment,) = build(
-        [_run(1, 1)], [(1, "baselines", 10, "atc_threshold", float("inf"))]
+        [_run(1, 1)], [(1, "evaluate", 10, "tree_mse_ratio", float("inf"))]
     )
-    assert experiment.seeds[0].metrics["baselines.atc_threshold"] is None
+    assert experiment.seeds[0].metrics["evaluate.tree_mse_ratio"] is None

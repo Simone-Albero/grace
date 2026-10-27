@@ -1,0 +1,42 @@
+{% extends "run_base.html" %}
+{% block title %}Run {{ run.id }} leaf {{ leaf.node_id }}{% endblock %}
+{% block content %}
+<h2>Leaf {{ leaf.node_id }} <span class="muted">· {{ leaf["class"] }} ·
+  <a href="/runs/{{ run.id }}/tree">back to the tree</a></span></h2>
+<div class="grid">
+  <section class="card">
+    <h3>Counts and rates</h3>
+    <dl class="facts">
+      {% for key in columns %}<dt>{{ key }}</dt><dd>{{ leaf[key] | num }}</dd>{% endfor %}
+    </dl>
+  </section>
+  <section class="card">
+    <h3>From the root of {{ leaf["class"] }}</h3>
+    <div class="scroll"><table>
+      <thead><tr><th class="num">depth</th><th class="num">node</th><th>status</th>
+        <th class="num">train rows</th><th class="num">out-of-fold errors</th>
+        <th class="num">val rows</th><th class="num">val errors</th></tr></thead>
+      <tbody>
+      {% for n in path %}
+      <tr><td class="num">{{ n.depth }}</td><td class="num">{{ n.node_id }}</td><td>{{ n.status }}</td>
+        <td class="num">{{ n.n_train | num }}</td><td class="num">{{ n.n_train_errors | num }}</td>
+        <td class="num">{{ n.n_val | num }}</td><td class="num">{{ n.n_val_errors | num }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table></div>
+  </section>
+</div>
+<section class="card">
+  <h3>Complexity descriptors</h3>
+  {% if descriptors %}
+  <div class="scroll"><table>
+    <thead><tr><th>measure</th><th class="num">leaf</th><th class="num">class</th></tr></thead>
+    <tbody>
+    {% for d in descriptors %}
+    <tr><td>{{ d.measure }}</td><td class="num">{{ d.leaf | num }}</td><td class="num">{{ d["class"] | num }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}<p class="note">Needs the finished <b>complexity</b> stage, and a leaf with a population of enough train rows.</p>{% endif %}
+</section>
+{% endblock %}

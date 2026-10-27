@@ -8,7 +8,6 @@ import numpy as np
 from tqdm import tqdm
 
 from src.complexity.common import summarize
-from src.space import scale_for_metric
 
 _EPS = 1e-8
 _F_KEYS = ("f1", "f2", "f3", "f4")
@@ -91,8 +90,6 @@ def compute_f_measures(
     points: np.ndarray,
     population: np.ndarray,
     rivals: Mapping[int, Sequence[int]],
-    *,
-    metric: str,
 ) -> dict[int, dict[str, float | None]]:
     """Return F1-F4 per population against its nearest rivals.
 
@@ -100,16 +97,14 @@ def compute_f_measures(
         points: The sampled rows, shape (n, d).
         population: The population id of every row of `points`.
         rivals: The nearest rival ids of every population.
-        metric: The distance, which fixes how `points` is scaled.
 
     Returns:
         By population id, the min, mean and max of each measure over
         its rivals; None each when the population has fewer than two
         rows or none of its rivals does.
     """
-    scaled = scale_for_metric(points, metric)
     rows_by_population = {
-        int(population_id): scaled[population == population_id]
+        int(population_id): points[population == population_id]
         for population_id in np.unique(population)
     }
 

@@ -9,26 +9,19 @@ __all__ = [
     "NEUTRAL",
     "PREDICTOR_COLORS",
     "SERIES",
-    "class_rate_bars",
-    "class_rate_gap",
     "class_score_bars",
     "confusion_heatmap",
     "grid_search",
     "group_bars",
     "importance_bars",
     "loss_curve",
-    "predicted_vs_observed",
     "predictor_bars",
-    "rate_ecdf",
-    "region_rate_bins",
-    "region_size_box",
-    "regions_per_class",
     "seed_strip",
+    "shrinkage_scatter",
     "split_bars",
-    "val_test_scatter",
+    "test_scatter",
 ]
 
-import bisect
 import math
 import statistics
 from collections.abc import Mapping, Sequence
@@ -61,10 +54,6 @@ _SEQUENTIAL = [[0, "#cde2fb"], [0.5, "#3987e5"], [1, "#0d366b"]]
 _SPLIT_COLORS = {"train": SERIES[0], "val": SERIES[1], "test": SERIES[2]}
 _SCORE_COLORS = {"precision": SERIES[0], "recall": SERIES[1], "f1": SERIES[2]}
 PREDICTOR_COLORS = dict(zip(PREDICTORS, SERIES))
-# The upper edges of the failure-rate bins, after a bin of its own for a
-# rate of exactly 0: a good classifier leaves most regions error-free.
-_RATE_EDGES = [0.05, 0.1, 0.2, 0.3, 0.5]
-_RATE_BINS = ["0", "0–5%", "5–10%", "10–20%", "20–30%", "30–50%", "50–100%"]
 # Most classes that get a numbered cell.
 _MAX_LABELLED = 15
 # The feature importances drawn, the largest ones.
@@ -74,25 +63,6 @@ _TOP_IMPORTANCES = 20
 def _stdev(values: Sequence[float]) -> float:
     """Return the sample standard deviation, 0 for a single value."""
     return statistics.stdev(values) if len(values) > 1 else 0.0
-
-
-def _empty(message: str) -> dict[str, object]:
-    """Draw a figure that only says why there is nothing to draw."""
-    note = {
-        "text": message,
-        "showarrow": False,
-        "xref": "paper",
-        "yref": "paper",
-        "x": 0.5,
-        "y": 0.5,
-    }
-    layout = {
-        "height": 160,
-        "xaxis": {"visible": False},
-        "yaxis": {"visible": False},
-        "annotations": [note],
-    }
-    return {"data": [], "layout": layout}
 
 
 def split_bars(classes: Sequence[Mapping]) -> dict[str, object]:
@@ -282,337 +252,6 @@ def loss_curve(history: Sequence[Mapping]) -> dict[str, object]:
     return {"data": [trace], "layout": layout}
 
 
-def regions_per_class(clusterings: Sequence[Mapping]) -> dict[str, object]:
-    """Draw how many regions each class was divided into.
-
-    Args:
-        clusterings: The `queries.class_clusterings` rows.
-
-    Returns:
-        A bar figure.
-    """
-    trace = {
-        "type": "bar",
-        "x": [row["name"] for row in clusterings],
-        "y": [row["n_clusters"] for row in clusterings],
-        "marker": {"color": SERIES[0]},
-    }
-    layout = {
-        "height": _HEIGHT,
-        "xaxis": {"type": "category"},
-        "yaxis": {"title": "regions"},
-        "showlegend": False,
-    }
-    return {"data": [trace], "layout": layout}
-
-
-def region_size_box(rows: Sequence[Mapping]) -> dict[str, object]:
-    """Box the train rows of the regions of each class.
-
-    Args:
-        rows: The region rows.
-
-    Returns:
-        A box figure, every region a point.
-    """
-    kept = [row for row in rows if row["n_train"] > 0]
-    trace = {
-        "type": "box",
-        "x": [row["class"] for row in kept],
-        "y": [row["n_train"] for row in kept],
-        "text": [f"region {row['region_id']}" for row in kept],
-        "boxpoints": "all",
-        "jitter": 0.5,
-        "pointpos": 0,
-        "marker": {"color": SERIES[0], "size": 4, "opacity": 0.6},
-        "line": {"width": 1.5},
-        "fillcolor": "rgba(0,0,0,0)",
-    }
-    layout = {
-        "height": _HEIGHT,
-        "xaxis": {"type": "category"},
-        "yaxis": {"title": "train rows per region", "rangemode": "tozero"},
-        "showlegend": False,
-    }
-    return {"data": [trace], "layout": layout}
-
-
-def _rate_points(rows: Sequence[Mapping]) -> list[Mapping]:
-    """Return the regions that have a val and a test failure rate."""
-    return [
-        row
-        for row in rows
-        if row["val_rate"] is not None and row["test_rate"] is not None
-    ]
-
-
-def _identity_line(top: float = 1) -> dict[str, object]:
-    """Build the y = x reference line, from 0 to `top`."""
-    return {
-        "type": "scatter",
-        "mode": "lines",
-        "name": "y = x",
-        "x": [0, top],
-        "y": [0, top],
-        "line": {"dash": "dot", "color": NEUTRAL},
-        "hoverinfo": "skip",
-    }
-
-
-def val_test_scatter(rows: Sequence[Mapping]) -> dict[str, object]:
-    """Draw each region's test failure rate against its val rate.
-
-    A marker's area grows with the region's test rows, so a rate the
-    test barely covers reads as barely visible.
-
-    Args:
-        rows: The region rows.
-
-    Returns:
-        A figure with the `y = x` line and one marker per region.
-    """
-    points = _rate_points(rows)
-    largest = max((row["n_test"] for row in points), default=1) or 1
-    trace = {
-        "type": "scatter",
-        "mode": "markers",
-        "name": "region",
-        "x": [row["val_rate"] for row in points],
-        "y": [row["test_rate"] for row in points],
-        "marker": {
-            "color": SERIES[0],
-            "opacity": 0.7,
-            "size": [4 + 18 * (row["n_test"] / largest) ** 0.5 for row in points],
-            "line": {"width": 1, "color": _SURFACE},
-        },
-        "text": [
-            f"region {row['region_id']} · {row['class']}<br>"
-            f"n_val {row['n_val']:,} · n_test {row['n_test']:,}"
-            for row in points
-        ],
-        "hovertemplate": "%{text}<br>val %{x:.3f} · test %{y:.3f}<extra></extra>",
-    }
-    layout = {
-        "height": _HEIGHT,
-        "xaxis": {"title": "val failure rate"},
-        "yaxis": {"title": "test failure rate"},
-        "showlegend": False,
-    }
-    top = max(
-        [row["val_rate"] for row in points] + [row["test_rate"] for row in points],
-        default=1,
-    )
-    return {"data": [_identity_line(top * 1.05), trace], "layout": layout}
-
-
-def class_rate_bars(rows: Sequence[Mapping]) -> dict[str, object]:
-    """Draw each class's failure rate on val and on test.
-
-    The rate is the class's errors over its rows, so a region weighs by
-    its size.
-
-    Args:
-        rows: The region rows.
-
-    Returns:
-        A grouped-bar figure.
-    """
-    names = list(dict.fromkeys(row["class"] for row in rows))
-    traces = []
-    for split in ("val", "test"):
-        rates = []
-        for name in names:
-            members = [row for row in rows if row["class"] == name]
-            seen = sum(row[f"n_{split}"] for row in members)
-            errors = sum(row[f"n_{split}_error"] or 0 for row in members)
-            rates.append(errors / seen if seen else None)
-        traces.append(
-            {
-                "type": "bar",
-                "name": split,
-                "x": names,
-                "y": rates,
-                "marker": {"color": _SPLIT_COLORS[split]},
-            }
-        )
-    layout = {
-        "barmode": "group",
-        "height": _HEIGHT,
-        "xaxis": {"type": "category"},
-        "yaxis": {"title": "failure rate"},
-    }
-    return {"data": traces, "layout": layout}
-
-
-def rate_ecdf(rows: Sequence[Mapping]) -> dict[str, object]:
-    """Draw the distribution of the regions' failure rates per split.
-
-    Args:
-        rows: The region rows.
-
-    Returns:
-        A step figure: for each rate, the share of regions at or below.
-    """
-    traces = []
-    for split in ("val", "test"):
-        rates = sorted(
-            row[f"{split}_rate"] for row in rows if row[f"{split}_rate"] is not None
-        )
-        traces.append(
-            {
-                "type": "scatter",
-                "mode": "lines",
-                "name": split,
-                "x": rates,
-                "y": [(i + 1) / len(rates) for i in range(len(rates))],
-                "line": {"shape": "hv", "color": _SPLIT_COLORS[split], "width": 2},
-            }
-        )
-    layout = {
-        "height": _HEIGHT,
-        "xaxis": {"title": "region failure rate"},
-        "yaxis": {"title": "share of regions", "range": [0, 1.02]},
-    }
-    return {"data": traces, "layout": layout}
-
-
-def _rate_bin(rate: float) -> str:
-    """Return the label of the failure-rate bin of `rate`."""
-    if rate == 0:
-        return _RATE_BINS[0]
-    return _RATE_BINS[1 + bisect.bisect_left(_RATE_EDGES, rate)]
-
-
-def _rate_bin_bars(
-    traces: Sequence[tuple[str, str, Sequence[tuple[float | None, int]]]],
-    *,
-    measure: str,
-) -> dict[str, object]:
-    """Draw how a set of clusters spreads over the failure-rate bins.
-
-    Args:
-        traces: One `(name, color, clusters)` per trace, a cluster being
-            its `(failure rate, rows)`; a cluster without a rate is left
-            out.
-        measure: "count" for the clusters in each bin, "size" for their
-            mean rows.
-
-    Returns:
-        A grouped-bar figure with every bin on the x axis, empty ones
-        included; the hover shows both measures.
-    """
-    data = []
-    for name, color, clusters in traces:
-        sizes: dict[str, list[int]] = {label: [] for label in _RATE_BINS}
-        for rate, n_rows in clusters:
-            if rate is not None and not math.isnan(rate):
-                sizes[_rate_bin(rate)].append(n_rows)
-        counts = [len(sizes[label]) for label in _RATE_BINS]
-        means = [
-            statistics.mean(sizes[label]) if sizes[label] else None
-            for label in _RATE_BINS
-        ]
-        data.append(
-            {
-                "type": "bar",
-                "name": name,
-                "x": _RATE_BINS,
-                "y": counts if measure == "count" else means,
-                "customdata": [[count, mean] for count, mean in zip(counts, means)],
-                "marker": {"color": color},
-                "hovertemplate": (
-                    "%{x}<br>%{customdata[0]} in the bin · mean "
-                    f"%{{customdata[1]:,.1f}} rows<extra>{name}</extra>"
-                ),
-            }
-        )
-    layout = {
-        "barmode": "group",
-        "height": _HEIGHT,
-        "xaxis": {
-            "title": "failure rate",
-            "type": "category",
-            "categoryorder": "array",
-            "categoryarray": _RATE_BINS,
-        },
-        "yaxis": {
-            "title": "clusters" if measure == "count" else "mean rows per cluster"
-        },
-    }
-    return {"data": data, "layout": layout}
-
-
-def region_rate_bins(rows: Sequence[Mapping], *, measure: str) -> dict[str, object]:
-    """Bin the regions by failure rate, on val and on test.
-
-    Args:
-        rows: The region rows.
-        measure: "count" or "size", as `_rate_bin_bars` takes it; a
-            region's size is its rows in the split of the rate.
-
-    Returns:
-        A grouped-bar figure with a trace per split.
-    """
-    traces = [
-        (
-            split,
-            _SPLIT_COLORS[split],
-            [(row[f"{split}_rate"], row[f"n_{split}"]) for row in rows],
-        )
-        for split in ("val", "test")
-    ]
-    return _rate_bin_bars(traces, measure=measure)
-
-
-def class_rate_gap(rows: Sequence[Mapping]) -> dict[str, object]:
-    """Box each class's gap between the val and the test failure rate.
-
-    Args:
-        rows: The region rows.
-
-    Returns:
-        A box figure of `val_rate - test_rate`, every region a point,
-        with a line at 0: a point above it is a region whose val rate
-        overshot the test one.
-    """
-    points = _rate_points(rows)
-    trace = {
-        "type": "box",
-        "x": [row["class"] for row in points],
-        "y": [row["val_rate"] - row["test_rate"] for row in points],
-        "text": [
-            f"region {row['region_id']}<br>"
-            f"n_val {row['n_val']:,} · n_test {row['n_test']:,}"
-            for row in points
-        ],
-        "boxpoints": "all",
-        "jitter": 0.5,
-        "pointpos": 0,
-        "marker": {"color": SERIES[0], "size": 4, "opacity": 0.6},
-        "line": {"width": 1.5},
-        "fillcolor": "rgba(0,0,0,0)",
-        "hovertemplate": "%{text}<br>val − test %{y:.3f}<extra></extra>",
-    }
-    layout = {
-        "height": _HEIGHT,
-        "xaxis": {"type": "category"},
-        "yaxis": {"title": "val − test failure rate", "zeroline": False},
-        "shapes": [
-            {
-                "type": "line",
-                "xref": "paper",
-                "x0": 0,
-                "x1": 1,
-                "y0": 0,
-                "y1": 0,
-                "line": {"dash": "dot", "color": NEUTRAL},
-            }
-        ],
-        "showlegend": False,
-    }
-    return {"data": [trace], "layout": layout}
-
-
 def predictor_bars(
     scores: Mapping[str, Mapping[str, float | None]], score: str
 ) -> dict[str, object]:
@@ -641,75 +280,6 @@ def predictor_bars(
         "showlegend": False,
     }
     return {"data": [trace], "layout": layout}
-
-
-def predicted_vs_observed(rows: Sequence[Mapping]) -> dict[str, object]:
-    """Draw each predictor's rate against the test rate, one panel each.
-
-    Args:
-        rows: The region rows.
-
-    Returns:
-        A figure of side-by-side panels over the used regions, those
-        that have a prediction and a test rate; the panels share both
-        axes and the `y = x` line.
-    """
-    scored = [row for row in rows if row["used"] == 1 and row["test_rate"] is not None]
-    panels = [key for key in PREDICTORS if any(row[key] is not None for row in scored)]
-    if not panels:
-        return _empty("No predictor has a prediction for a region with test rows.")
-    gap = 0.04
-    width = (1 - gap * (len(panels) - 1)) / len(panels)
-    traces, layout, notes = [], {"height": 360, "showlegend": False}, []
-    for i, key in enumerate(panels, start=1):
-        suffix = "" if i == 1 else str(i)
-        points = [row for row in scored if row[key] is not None]
-        domain = [(i - 1) * (width + gap), (i - 1) * (width + gap) + width]
-        layout[f"xaxis{suffix}"] = {
-            "domain": domain,
-            "range": [0, 1],
-            "title": f"{PREDICTORS[key]} estimate",
-            "anchor": f"y{suffix}",
-        }
-        layout[f"yaxis{suffix}"] = {
-            "range": [0, 1],
-            "anchor": f"x{suffix}",
-            **({"title": "test failure rate"} if i == 1 else {"matches": "y"}),
-        }
-        notes.append(
-            {
-                "text": PREDICTORS[key],
-                "showarrow": False,
-                "xref": "paper",
-                "yref": "paper",
-                "x": domain[0],
-                "y": 1.08,
-                "xanchor": "left",
-            }
-        )
-        traces.append(
-            {**_identity_line(), "xaxis": f"x{suffix}", "yaxis": f"y{suffix}"}
-        )
-        traces.append(
-            {
-                "type": "scatter",
-                "mode": "markers",
-                "name": PREDICTORS[key],
-                "xaxis": f"x{suffix}",
-                "yaxis": f"y{suffix}",
-                "x": [row[key] for row in points],
-                "y": [row["test_rate"] for row in points],
-                "marker": {"color": PREDICTOR_COLORS[key], "size": 7, "opacity": 0.7},
-                "text": [
-                    f"region {row['region_id']} · {row['class']}" for row in points
-                ],
-                "hovertemplate": (
-                    "%{text}<br>estimate %{x:.3f} · test %{y:.3f}" "<extra></extra>"
-                ),
-            }
-        )
-    layout["annotations"] = notes
-    return {"data": traces, "layout": layout}
 
 
 def importance_bars(rows: Sequence[Mapping]) -> dict[str, object]:
@@ -847,3 +417,95 @@ def group_bars(
         "yaxis": {"title": y_title},
     }
     return {"data": data, "layout": layout}
+
+
+def _leaf_scatter(
+    leaves: Sequence[Mapping],
+    *,
+    x_key: str,
+    y_key: str,
+    size_key: str,
+    x_title: str,
+    y_title: str,
+    run_id: int,
+) -> dict[str, object]:
+    """Draw leaves as markers sized by a count, linked to their page."""
+    kept = [
+        leaf for leaf in leaves if leaf[x_key] is not None and leaf[y_key] is not None
+    ]
+    biggest = max((leaf[size_key] for leaf in kept), default=1) or 1
+    trace = {
+        "type": "scatter",
+        "mode": "markers",
+        "x": [leaf[x_key] for leaf in kept],
+        "y": [leaf[y_key] for leaf in kept],
+        "text": [
+            f"leaf {leaf['node_id']} · {leaf['class']} · {leaf[size_key]} rows"
+            for leaf in kept
+        ],
+        "customdata": [f"/runs/{run_id}/leaves/{leaf['node_id']}" for leaf in kept],
+        "marker": {
+            "color": SERIES[0],
+            "opacity": 0.7,
+            "size": [6 + 18 * (leaf[size_key] / biggest) ** 0.5 for leaf in kept],
+        },
+        "hovertemplate": "%{text}<br>%{x:.3f} · %{y:.3f}<extra></extra>",
+    }
+    identity = {
+        "type": "scatter",
+        "mode": "lines",
+        "x": [0, 1],
+        "y": [0, 1],
+        "line": {"color": NEUTRAL, "dash": "dot"},
+        "hoverinfo": "skip",
+    }
+    layout = {
+        "height": _HEIGHT,
+        "showlegend": False,
+        "xaxis": {"title": x_title},
+        "yaxis": {"title": y_title},
+    }
+    return {"data": [identity, trace], "layout": layout}
+
+
+def shrinkage_scatter(leaves: Sequence[Mapping], *, run_id: int) -> dict[str, object]:
+    """Draw each leaf's estimate against its raw val failure rate.
+
+    Args:
+        leaves: The `queries.leaves` rows.
+        run_id: The run, for the link of each marker to its leaf.
+
+    Returns:
+        A figure of the leaves with val rows, sized by them; the points
+        off the diagonal are the ones the shrinkage moved.
+    """
+    return _leaf_scatter(
+        leaves,
+        x_key="val_rate",
+        y_key="q",
+        size_key="n_val",
+        x_title="val failure rate of the leaf",
+        y_title="estimate q",
+        run_id=run_id,
+    )
+
+
+def test_scatter(leaves: Sequence[Mapping], *, run_id: int) -> dict[str, object]:
+    """Draw each leaf's test failure rate against its estimate.
+
+    Args:
+        leaves: The `queries.leaves` rows.
+        run_id: The run, for the link of each marker to its leaf.
+
+    Returns:
+        A figure of the leaves with test rows, sized by them.
+    """
+    return _leaf_scatter(
+        leaves,
+        x_key="q",
+        y_key="test_rate",
+        size_key="n_test",
+        x_title="estimate q",
+        y_title="test failure rate of the leaf",
+        run_id=run_id,
+    )

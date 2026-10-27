@@ -1,3 +1,3 @@
-"""The complexity measure families of a clustered population."""
+"""The complexity measure families of a population of train rows."""
 
 __all__ = []

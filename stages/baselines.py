@@ -1,144 +1,137 @@
-"""Val, MCP and ATC failure-rate baselines, every region, on test.
+"""Per-sample failure probabilities from the classifier's own outputs.
 
-`val` is a region's own validation failure rate, falling back to the
-global validation rate when the region has no validation row. MCP and
-ATC predict a region's failure rate from the classifier's
-probabilities on the test rows routed to it, the ATC threshold fit on
-val. A region is scored (`used`) when at least
-`failure_regressor.min_eval_support` test rows fell in it: the regressor
-is scored on the same regions. DB rows written: `baselines` (every
-region) and the scores of val, MCP and ATC in metrics.
+Four predictors, each a probability that the classifier fails on a row,
+estimated on val and written for val and test: `val_rate`, the global
+val failure rate; `confidence`, the isotonic calibration on val of one
+minus the top class probability; `binned`, the val failure rate of the
+row's bin of equal-mass confidence within its predicted class (one bin
+per 150 val rows, at least one per class); and `gbm`, a gradient
+boosting classifier trained on the out-of-fold errors of train from the
+row's coordinates, confidence and predicted class, then calibrated
+isotonically on val. No test label is read. Artifact: the probabilities
+of every val and test row. DB rows written: metrics val_error_rate,
+n_bins and n_gbm_rows.
 """
 
 __all__ = ["CONFIG", "INPUTS", "FILES", "OUTPUTS", "run"]
 
-import logging
-
 import numpy as np
 import pandas as pd
 
-from src.baselines import atc_rate, atc_threshold, mcp_rate
-from src.scores import log_scores, rate_scores
+from src.baselines import (
+    assign_class_bins,
+    bin_count,
+    calibrate_isotonic,
+    class_confidence_edges,
+    estimate_group_rates,
+    fit_error_gbm,
+)
 from stages import Context
 
-logger = logging.getLogger(__name__)
-
-CONFIG = ("failure_regressor.min_eval_support",)
-INPUTS = ("prepare", "regions", "classify", "failures")
+CONFIG = ("seed",)
+INPUTS = ("prepare", "space", "classify", "crossfit")
 FILES = ()
-# The stage writes DB rows only.
-OUTPUTS = ()
+OUTPUTS = ("scores.parquet",)
+_SPLITS = ("val", "test")
 
 
-def _rates(ctx: Context) -> tuple[float, pd.Series, pd.Series]:
-    """Return the ATC threshold and the MCP and ATC rates on test."""
-    val = ctx.split_rows("classify", "predictions.parquet", "val")
-    test = ctx.split_rows("classify", "predictions.parquet", "test")
-    region = ctx.split_rows("regions", "assignments.parquet", "test", ["region_id"])
-    region = region["region_id"]
-    val_labels = ctx.labels("val")
-    if len(val) != len(val_labels):
-        raise ValueError(
-            f"Rows disagree: {len(val_labels)} val labels for {len(val)} predictions. "
-            "Re-run `python -m stages prepare classify --force`."
-        )
-    proba_columns = [col for col in test.columns if col.startswith("proba_")]
-    val_confidence = val[proba_columns].to_numpy(np.float64).max(axis=1)
-    test_confidence = test[proba_columns].to_numpy(np.float64).max(axis=1)
-    threshold = atc_threshold(val_confidence, val_labels == val["y_pred"].to_numpy())
-    return (
-        threshold,
-        mcp_rate(test_confidence, region.to_numpy()),
-        atc_rate(test_confidence, region.to_numpy(), threshold=threshold),
-    )
+def _confidence(predictions: pd.DataFrame) -> np.ndarray:
+    """Return each row's top class probability."""
+    proba = predictions.filter(like="proba_")
+    return proba.to_numpy(dtype=np.float64).max(axis=1)
 
 
-def _used_regions(
-    failures: pd.DataFrame, min_eval_support: int
-) -> tuple[pd.Index, pd.Series, pd.Series]:
-    """Pick the regions with enough test rows to be scored.
-
-    Args:
-        failures: The failures table, indexed by region id.
-        min_eval_support: The fewest test rows a scored region has.
-
-    Returns:
-        The ids of the used regions, and the masks of the regions with
-        no test row and with fewer than `min_eval_support`.
-
-    Raises:
-        ValueError: No region has enough test rows.
-    """
-    # A region can end up with no test row, e.g. a small one.
-    no_test_mask = failures["n_test"] == 0
-    low_support_mask = ~no_test_mask & (failures["n_test"] < min_eval_support)
-    used = failures.index[~no_test_mask & ~low_support_mask]
-    n_excluded = int(no_test_mask.sum() + low_support_mask.sum())
-    # Losing over a fifth of the regions earns a warning: routine on a
-    # small test split, whose rows starve per-region support.
-    log = logger.warning if n_excluded > 0.2 * len(failures) else logger.info
-    log(
-        "%d/%d regions used (no test row: %d, fewer than %d: %d)",
-        len(used),
-        len(failures),
-        no_test_mask.sum(),
-        min_eval_support,
-        low_support_mask.sum(),
-    )
-    if used.empty:
-        raise ValueError(
-            f"No region has {min_eval_support} test rows or more "
-            "(failure_regressor.min_eval_support). Lower it or evaluate on more "
-            "test rows."
-        )
-    return used, no_test_mask, low_support_mask
+def _features(ctx: Context, split: str, predictions: pd.DataFrame) -> pd.DataFrame:
+    """Return a split's gbm features: points, confidence, prediction."""
+    features = ctx.split_rows("space", "z.parquet", split).filter(like="z_")
+    features = features.reset_index(drop=True)
+    features["confidence"] = _confidence(predictions)
+    features["predicted"] = predictions["y_pred"].to_numpy()
+    return features
 
 
 def run(ctx: Context) -> None:
-    """Compute the val, MCP and ATC rate of each region and score them.
+    """Estimate each predictor on val and write it for val and test.
 
     Args:
         ctx: The stage context.
-
-    Raises:
-        ValueError: If the val or test rows of classify, regions and
-            prepare disagree, or if no region has enough test rows.
     """
-    failures = ctx.read("failures", "failures").set_index("region_id")
-    used, no_test_mask, low_support_mask = _used_regions(
-        failures, ctx.cfg.failure_regressor.min_eval_support
-    )
-
-    threshold, mcp, atc = _rates(ctx)
-    global_val_rate = failures["n_val_error"].sum() / failures["n_val"].sum()
-    table = pd.DataFrame(
-        {"used": failures.index.isin(used).astype(int)}, index=failures.index
-    )
-    table["val"] = failures["val_rate"].fillna(global_val_rate)
-    table["mcp"] = mcp.reindex(failures.index)
-    table["atc"] = atc.reindex(failures.index)
-    ctx.write("baselines", table.reset_index())
-
-    test_rate = failures.loc[used, "test_rate"].astype(float)
-    scores = {
-        name: rate_scores(rate.loc[used], test_rate)
-        for name, rate in (("val", table["val"]), ("mcp", mcp), ("atc", atc))
+    seed = ctx.cfg.seed
+    out_of_fold = ctx.split_rows("crossfit", "oof.parquet", "train")
+    predictions = {
+        split: ctx.split_rows("classify", "predictions.parquet", split)
+        for split in _SPLITS
     }
-    for name, score in scores.items():
-        log_scores(name, score)
+    confidence = {split: _confidence(predictions[split]) for split in _SPLITS}
+    predicted = {split: predictions[split]["y_pred"].to_numpy() for split in _SPLITS}
+    val_errors = (ctx.labels("val") != predicted["val"]).astype(np.float64)
 
-    metrics = {}
-    for predictor, score in scores.items():
-        metrics.update({f"{predictor}_{name}": value for name, value in score.items()})
-    n_test = failures.loc[used, "n_test"].sum()
+    calibrated = {
+        split: calibrate_isotonic(
+            1.0 - confidence["val"], val_errors, 1.0 - split_confidence
+        )
+        for split, split_confidence in confidence.items()
+    }
+
+    # Bins of equal val mass inside each predicted class; val and test
+    # are grouped in one call so that no two classes share a group id.
+    n_bins = bin_count(len(val_errors), np.unique(predicted["val"]).size)
+    edges = class_confidence_edges(confidence["val"], predicted["val"], n_bins)
+    group = assign_class_bins(
+        np.concatenate([confidence["val"], confidence["test"]]),
+        np.concatenate([predicted["val"], predicted["test"]]),
+        edges,
+    )
+    val_group, test_group = np.split(group, [len(val_errors)])
+    group_rate = estimate_group_rates(val_group, val_errors, np.unique(group))
+    binned = {
+        "val": group_rate.loc[val_group].to_numpy(),
+        "test": group_rate.loc[test_group].to_numpy(),
+    }
+
+    # Out-of-fold errors of train teach the gbm; val calibrates it.
+    train_features = _features(ctx, "train", out_of_fold)
+    train_errors = (ctx.labels("train") != out_of_fold["y_pred"].to_numpy()).astype(int)
+    predict_failure = fit_error_gbm(train_features, train_errors, random_state=seed)
+    raw_gbm = {
+        split: predict_failure(_features(ctx, split, predictions[split]))
+        for split in _SPLITS
+    }
+    gbm = {
+        split: calibrate_isotonic(raw_gbm["val"], val_errors, split_scores)
+        for split, split_scores in raw_gbm.items()
+    }
+
+    val_error_rate = float(val_errors.mean())
+    scores = pd.concat(
+        [
+            pd.DataFrame(
+                {
+                    "split": split,
+                    "row": np.arange(len(confidence[split]), dtype=np.int32),
+                    "val_rate": np.full(len(confidence[split]), val_error_rate),
+                    "confidence": calibrated[split],
+                    "binned": binned[split],
+                    "gbm": gbm[split],
+                }
+            ).astype(
+                {
+                    "val_rate": np.float32,
+                    "confidence": np.float32,
+                    "binned": np.float32,
+                    "gbm": np.float32,
+                }
+            )
+            for split in _SPLITS
+        ],
+        ignore_index=True,
+    )
+    scores["split"] = pd.Categorical(scores["split"], categories=list(_SPLITS))
+    scores.to_parquet(ctx.out / "scores.parquet", index=False)
     ctx.save_metrics(
         {
-            **metrics,
-            "atc_threshold": threshold,
-            "n_regions": len(failures),
-            "n_regions_used": len(used),
-            "n_excluded_no_test": no_test_mask.sum(),
-            "n_excluded_low_support": low_support_mask.sum(),
-            "error_rate_used": failures.loc[used, "n_test_error"].sum() / n_test,
+            "val_error_rate": val_error_rate,
+            "n_bins": len(np.unique(val_group)),
+            "n_gbm_rows": len(train_features),
         }
     )

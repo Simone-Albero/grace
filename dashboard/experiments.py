@@ -21,14 +21,14 @@ from dataclasses import dataclass
 
 # The config keys that do not tell two experiments apart: the seed is
 # what an experiment varies, root and runtime are in no cache key, and
-# the figure keys only steer `render`, whose figures are not shown.
-_IGNORED = ("seed", "root", "runtime", "figure_format", "regressor_figures")
+# `figure_format` only steers `render`, whose figures are not shown, and
+# `regressor` only adds the regressor's stages to a run, whose seed the
+# run that has them completes.
+_IGNORED = ("seed", "root", "runtime", "figure_format", "regressor")
 # The config values every page shows, each with its place in the config.
 MAIN_KEYS = {
     "data": ("groups", "data"),
     "classifier": ("groups", "classifier"),
-    "clustering": ("groups", "clustering"),
-    "distance": ("distance",),
 }
 
 

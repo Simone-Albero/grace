@@ -3,7 +3,7 @@
 {% block title %}Experiment {{ experiment.key }}{% endblock %}
 {% block body %}
 <div class="crumbs"><a href="/">Experiments</a> › {{ experiment.key }}</div>
-<h1>{{ experiment.values.data }} · {{ experiment.values.classifier }} · {{ experiment.values.clustering }}</h1>
+<h1>{{ experiment.values.data }} · {{ experiment.values.classifier }}</h1>
 <div class="chips">
   {% for key in MAIN_KEYS %}<span class="chip">{{ key }} <b>{{ experiment.values[key] }}</b></span>{% endfor %}
   {% if experiment.variant %}<span class="chip">variant <b>{{ experiment.variant }}</b></span>{% endif %}

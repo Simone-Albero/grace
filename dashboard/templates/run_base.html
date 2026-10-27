@@ -4,14 +4,12 @@
 {% block title %}Run {{ run.id }}{% endblock %}
 {% block body %}
 <div class="crumbs"><a href="/">Experiments</a> ›
-  <a href="/experiments/{{ experiment }}">{{ run.config.groups.data }} · {{ run.config.groups.classifier }} · {{ run.config.groups.clustering }}</a>
+  <a href="/experiments/{{ experiment }}">{{ run.config.groups.data }} · {{ run.config.groups.classifier }}</a>
   › seed {{ run.config.seed }}</div>
 <h1>Run {{ run.id }} <span class="status {{ run.status }}">{{ run.status }}</span></h1>
 <div class="chips">
   <span class="chip">data <b>{{ run.config.groups.data }}</b></span>
   <span class="chip">classifier <b>{{ run.config.groups.classifier }}</b></span>
-  <span class="chip">clustering <b>{{ run.config.groups.clustering }}</b></span>
-  <span class="chip">distance <b>{{ run.config.distance }}</b></span>
   <span class="chip">seed <b>{{ run.config.seed }}</b></span>
   <span class="chip">targets <b>{{ run.targets | join(", ") }}</b></span>
   <span class="chip">started <b>{{ run.started_at }}</b></span>

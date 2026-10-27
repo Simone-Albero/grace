@@ -1,13 +1,11 @@
-"""Space (numerics, weighted one-hot) and its scaling helpers."""
+"""Space: the numerics and weighted one-hot categoricals of geometry."""
 
-__all__ = ["Space", "l2_normalize", "scale_for_metric"]
+__all__ = ["Space"]
 
 from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
-
-_EPS = 1e-8
 
 
 @dataclass(frozen=True)
@@ -99,33 +97,3 @@ class Space:
             block[np.arange(len(rows)), slot] = weight
             blocks.append(block)
         return np.hstack(blocks)
-
-
-def l2_normalize(points: np.ndarray) -> np.ndarray:
-    """Return the rows scaled to unit L2 norm.
-
-    Euclidean distance on unit vectors is monotone in the cosine
-    distance.
-
-    Args:
-        points: The points, shape (n, d).
-
-    Returns:
-        The normalized points; a row of norm under 1e-8 is divided by
-        1e-8 instead.
-    """
-    norms = np.linalg.norm(points, axis=1, keepdims=True)
-    return points / np.maximum(norms, _EPS)
-
-
-def scale_for_metric(points: np.ndarray, metric: str) -> np.ndarray:
-    """Return the points as the graph measures them.
-
-    Args:
-        points: The points, shape (n, d).
-        metric: `euclidean` or `cosine`.
-
-    Returns:
-        The unit rows under cosine, else the points unchanged.
-    """
-    return l2_normalize(points) if metric == "cosine" else points

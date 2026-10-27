@@ -8,7 +8,7 @@ import numpy as np
 class RowsBy:
     """The rows of each distinct label, found with one sort.
 
-    Labels are a region or a class. Each group's rows stay in their
+    Labels are a population or a class. Each group's rows stay in their
     original order, so a reduction gives exactly what
     `values[labels == g]` would, at a cost of n log n plus one slice per
     group.

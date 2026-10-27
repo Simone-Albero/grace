@@ -12,7 +12,6 @@ import pytest
 from omegaconf import DictConfig, OmegaConf
 from pandas.testing import assert_frame_equal
 
-import stages.baselines as baselines_stage
 import stages.classify as classify_stage
 import stages.crossfit as crossfit_stage
 import stages.regress as regress_stage
@@ -38,42 +37,15 @@ def test_outputs(root: Path) -> None:
             "JOIN executions ON executions.id = execution_id",
         )
     }
-    n_regions = int(metrics["regions", "n_regions"])
-    n_test = int(metrics["split", "n_test"])
-    assert _scalar(root, "SELECT COUNT(*) FROM regions") == n_regions
-    assert _scalar(root, "SELECT SUM(n_test) FROM regions") == n_test
-    centroids = pd.read_parquet(
-        root / f"artifacts/regions/{ids['regions']}/centroids.parquet"
-    )
-    assert len(centroids) == n_regions
-
-    assignments = pd.read_parquet(
-        root / f"artifacts/regions/{ids['regions']}/assignments.parquet"
-    )
-    for split in SPLITS:
-        rows = assignments.loc[assignments["split"] == split, "row"]
-        assert rows.tolist() == list(range(int(metrics["split", f"n_{split}"])))
-    assert assignments["region_id"].isin(centroids["region_id"]).all()
-
-    n_val = int(metrics["split", "n_val"])
-    n_train = int(metrics["split", "n_train"])
-    # The granularity noise term reads the val budget, not the test one.
-    assert metrics["regions", "eval_rows_per_train_row"] == pytest.approx(
-        n_val / n_train
-    )
-    assert _scalar(root, "SELECT COUNT(*) FROM failures") == n_regions
-    assert _scalar(root, "SELECT SUM(n_val) FROM failures") == n_val
-    assert _scalar(root, "SELECT SUM(n_test) FROM failures") == n_test
-    out_of_range = "val_rate NOT BETWEEN 0 AND 1 OR test_rate NOT BETWEEN 0 AND 1"
-    assert _scalar(root, f"SELECT COUNT(*) FROM failures WHERE {out_of_range}") == 0
     assert _scalar(root, "SELECT COUNT(*) FROM class_metrics") == 10
     assert ("classify", "accuracy") in metrics
     _check_space(root, metrics, ids)
     _check_crossfit(root, metrics, ids)
     _check_tree(root, metrics, ids)
     _check_complexity(root, metrics)
-    _check_baselines(root, metrics)
+    _check_baselines(root, metrics, ids)
     _check_regress(root, metrics, ids)
+    _check_evaluate(root, metrics, ids)
     _check_render(root, ids)
 
 
@@ -151,21 +123,48 @@ def _check_crossfit(
     assert 0 < metrics["crossfit", "oof_error_rate"] < 1
 
 
-def _check_baselines(root: Path, metrics: Mapping[tuple[str, str], float]) -> None:
-    n_regions = int(metrics["regions", "n_regions"])
-    assert _scalar(root, "SELECT COUNT(*) FROM baselines") == n_regions
-    n_used = int(metrics["baselines", "n_regions_used"])
-    assert _scalar(root, "SELECT SUM(used) FROM baselines") == n_used
-    outside = (
-        "val NOT BETWEEN 0 AND 1 OR mcp NOT BETWEEN 0 AND 1 OR "
-        "atc NOT BETWEEN 0 AND 1"
+def _check_baselines(
+    root: Path, metrics: Mapping[tuple[str, str], float], ids: Mapping[str, int]
+) -> None:
+    scores = pd.read_parquet(
+        root / f"artifacts/baselines/{ids['baselines']}/scores.parquet"
     )
-    assert _scalar(root, f"SELECT COUNT(*) FROM baselines WHERE {outside}") == 0
-    assert _scalar(root, "SELECT COUNT(*) FROM baselines WHERE val IS NULL") == 0
-    for predictor in ("val", "mcp", "atc"):
-        for score in ("spearman", "r2", "mae", "mse"):
-            assert ("baselines", f"{predictor}_{score}") in metrics
-    assert ("baselines", "atc_threshold") in metrics
+    for split in ("val", "test"):
+        rows = scores.loc[scores["split"] == split, "row"]
+        assert rows.tolist() == list(range(int(metrics["split", f"n_{split}"])))
+    predictors = ["val_rate", "confidence", "binned", "gbm"]
+    assert scores[predictors].stack().between(0, 1).all()
+    assert scores["val_rate"].nunique() == 1
+    assert scores["val_rate"].iloc[0] == pytest.approx(
+        metrics["baselines", "val_error_rate"], abs=1e-6
+    )
+    assert metrics["baselines", "n_gbm_rows"] == metrics["split", "n_train"]
+
+
+def _check_evaluate(
+    root: Path, metrics: Mapping[tuple[str, str], float], ids: Mapping[str, int]
+) -> None:
+    for predictor in (
+        "tree",
+        "tree_leaf",
+        "regressor",
+        "val_rate",
+        "confidence",
+        "binned",
+        "gbm",
+    ):
+        for score in ("mse", "mse_ratio", "spearman"):
+            assert ("evaluate", f"{predictor}_{score}") in metrics
+    # The constant val rate is the reference of every ratio.
+    assert metrics["evaluate", "val_rate_mse_ratio"] == pytest.approx(1.0)
+    assert metrics["evaluate", "n_test"] == metrics["split", "n_test"]
+    assert (
+        _scalar(root, "SELECT COUNT(*) FROM leaf_tests") == metrics["tree", "n_leaves"]
+    )
+    assert (
+        _scalar(root, "SELECT SUM(n_test) FROM leaf_tests")
+        == metrics["split", "n_test"]
+    )
 
 
 def _check_regress(
@@ -197,9 +196,10 @@ def _check_regress(
 def _check_render(root: Path, ids: Mapping[str, int]) -> None:
     expected = {
         "classification/confusion_matrix",
-        "baselines/predicted_vs_observed",
-        "failures/rate_by_class",
+        "predictors/mse_ratio",
+        "predictors/spearman",
         "regress/predicted_vs_val",
+        "regress/predicted_vs_test",
         "regress/feature_importances",
     }
     sql = f"SELECT name, file FROM figures WHERE execution_id = {ids['render']}"
@@ -268,24 +268,6 @@ def _shuffle_labels(root: Path, splits: Sequence[str]) -> None:
         sizes[path.name] = path.stat().st_size
     # Else prepare would rerun, undoing the edit.
     (prepared / "sizes.json").write_text(json.dumps(sizes))
-
-
-def _routed(root: Path) -> pd.DataFrame:
-    """Return the assignments of the latest regions execution."""
-    latest = _scalar(root, "SELECT MAX(id) FROM executions WHERE stage = 'regions'")
-    return pd.read_parquet(root / f"artifacts/regions/{latest}/assignments.parquet")
-
-
-def test_routing_is_label_free(tmp_path: Path) -> None:
-    """Check that routing val and test rows ignores their labels."""
-    cfg = fast_cfg(tmp_path)
-    run(["regions"], cfg, force=False)
-    first = _routed(tmp_path)
-
-    _shuffle_labels(tmp_path, ("val", "test"))
-    run(["regions"], cfg, force=True)
-    second = _routed(tmp_path)
-    assert_frame_equal(second, first)
 
 
 def test_classify_never_trains_on_val_labels(tmp_path: Path) -> None:
@@ -382,44 +364,6 @@ class _FakeContext:
 
     def save_metrics(self, values: Mapping[str, float]) -> None:
         self.pending.append(("metrics", dict(values)))
-
-
-def test_baseline_val_rate_falls_back_to_the_global_rate(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Check a region with no val row takes the global val rate."""
-    failures = pd.DataFrame(
-        {
-            "region_id": [1, 2, 3],
-            "n_val": [10, 0, 20],
-            "n_val_error": [1, 0, 6],
-            "val_rate": [0.1, None, 0.3],
-            "n_test": [50, 50, 50],
-            "n_test_error": [5, 5, 5],
-            "test_rate": [0.1, 0.1, 0.1],
-        }
-    )
-    monkeypatch.setattr(
-        baselines_stage,
-        "_rates",
-        lambda ctx: (
-            0.5,
-            pd.Series([0.3, 0.3, 0.3], index=[1, 2, 3]),
-            pd.Series([0.4, 0.4, 0.4], index=[1, 2, 3]),
-        ),
-    )
-    cfg = OmegaConf.create({"failure_regressor": {"min_eval_support": 1}})
-    ctx = _FakeContext({("failures", "failures"): failures}, cfg, tmp_path)
-
-    baselines_stage.run(ctx)
-
-    table = next(frame for name, frame in ctx.pending if name == "baselines").set_index(
-        "region_id"
-    )
-    # The global rate is (1 + 0 + 6) / (10 + 0 + 20) = 7/30.
-    assert table.loc[1, "val"] == pytest.approx(0.1)
-    assert table.loc[3, "val"] == pytest.approx(0.3)
-    assert table.loc[2, "val"] == pytest.approx(7 / 30)
 
 
 def _regress_tables() -> dict[tuple[str, str], pd.DataFrame]:
@@ -587,3 +531,22 @@ def test_tree_never_reads_test_labels(tmp_path: Path) -> None:
     second_rows, second_nodes = built()
     assert_frame_equal(second_rows, first_rows)
     assert_frame_equal(second_nodes, first_nodes)
+
+
+def test_baselines_never_read_test_labels(tmp_path: Path) -> None:
+    """Check the baselines' probabilities ignore the test labels."""
+    cfg = fast_cfg(tmp_path)
+    run(["baselines"], cfg, force=False)
+
+    def built() -> pd.DataFrame:
+        latest = _scalar(
+            tmp_path, "SELECT MAX(id) FROM executions WHERE stage = 'baselines'"
+        )
+        return pd.read_parquet(
+            tmp_path / f"artifacts/baselines/{latest}/scores.parquet"
+        )
+
+    first = built()
+    _shuffle_labels(tmp_path, ("test",))
+    run(["baselines"], cfg, force=True)
+    assert_frame_equal(built(), first)

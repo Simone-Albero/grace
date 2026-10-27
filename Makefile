@@ -9,7 +9,7 @@ ROOT ?= resources
 PORT ?= 8000
 CLASSIFIERS := logistic_regression,decision_tree,naive_bayes,hist_gradient_boosting,lda,linear_svc,xgboost,knn,random_forest,mlp
 SWEEP_quick := --sweep classifier=random_forest,mlp
-SWEEP_full := --sweep classifier=$(CLASSIFIERS) --sweep clustering=kmeans,hdbscan,birch,spectral --sweep distance=euclidean,cosine
+SWEEP_full := --sweep classifier=$(CLASSIFIERS)
 SWEEP = $(or $(SWEEP_$(MODE)),$(error MODE must be quick or full, not '$(MODE)'))
 
 .PHONY: help test format smoke generate dashboard

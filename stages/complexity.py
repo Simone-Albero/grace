@@ -20,17 +20,20 @@ import numpy as np
 import pandas as pd
 from omegaconf import DictConfig
 
-from src.clustering import compute_centroids
-from src.complexity.common import MeasuredSample, weighted_group_measures
+from src.complexity.common import (
+    MeasuredSample,
+    compute_centroids,
+    weighted_group_measures,
+)
 from src.complexity.measure import compute_population_complexity
 from src.graph import TrainGraph, nearest_neighbors
 from src.grouping import RowsBy
-from src.space import Space, l2_normalize, scale_for_metric
+from src.space import Space
 from stages import LABEL, Context
 
 logger = logging.getLogger(__name__)
 
-CONFIG = ("complexity", "graph.k", "distance", "seed")
+CONFIG = ("complexity", "graph.k", "seed")
 INPUTS = ("prepare", "space", "tree")
 FILES = ()
 # The stage writes DB rows only.
@@ -81,7 +84,6 @@ def _draw_sample(
         points,
         rows,
         k=cfg.graph.k,
-        metric=cfg.distance,
         n_jobs=n_jobs,
     )
     return MeasuredSample(points, population[rows], neighbors, neighbor_dist)
@@ -107,7 +109,6 @@ def _measure(
         centroids=centroids,
         sizes=dict(zip(ids.tolist(), counts.tolist())),
         top_k_clusters=cfg.complexity.top_k_clusters,
-        metric=cfg.distance,
         silhouette_max_samples=cfg.complexity.silhouette_max_samples,
         silhouette_min_per_cluster=cfg.complexity.silhouette_min_per_cluster,
         random_state=cfg.seed,
@@ -152,7 +153,7 @@ def _load_train_graph(
 
 
 def _compute_population_centroids(
-    space: Space, train: pd.DataFrame, population: np.ndarray, metric: str
+    space: Space, train: pd.DataFrame, population: np.ndarray
 ) -> dict[int, np.ndarray]:
     """Return the exact centroid of every measured population.
 
@@ -162,16 +163,13 @@ def _compute_population_centroids(
     for start in range(0, len(train), _CENTROID_ROWS):
         chunk_population = population[start : start + _CENTROID_ROWS]
         is_measured = chunk_population >= 0
-        points = scale_for_metric(
-            space.embed(train.iloc[start : start + _CENTROID_ROWS][is_measured]),
-            metric,
+        points = space.embed(
+            train.iloc[start : start + _CENTROID_ROWS][is_measured]
         ).astype(np.float64)
         chunk_sums = pd.DataFrame(points).groupby(chunk_population[is_measured]).sum()
         sums = chunk_sums if sums is None else sums.add(chunk_sums, fill_value=0.0)
     ids, counts = np.unique(population[population >= 0], return_counts=True)
     means = sums.loc[ids].to_numpy() / counts[:, None]
-    if metric == "cosine":
-        means = l2_normalize(means)
     return dict(zip(ids.tolist(), means))
 
 
@@ -230,7 +228,7 @@ def run(ctx: Context) -> None:
         population=population,
         sample=population_sample,
         population_class=population_class,
-        centroids=_compute_population_centroids(space, train, population, cfg.distance),
+        centroids=_compute_population_centroids(space, train, population),
     )
     leaf_measures = weighted_group_measures(
         population_measures,
@@ -260,11 +258,7 @@ def run(ctx: Context) -> None:
         population_class={
             int(class_id): int(class_id) for class_id in np.unique(label)
         },
-        centroids=compute_centroids(
-            scale_for_metric(label_sample.X, cfg.distance),
-            label_sample.population,
-            metric=cfg.distance,
-        ),
+        centroids=compute_centroids(label_sample.X, label_sample.population),
     )
     rows = pd.concat(
         [_long_rows("leaf", leaf_measures), _long_rows("class", class_measures)],

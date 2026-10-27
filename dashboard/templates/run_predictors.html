@@ -1,13 +1,14 @@
 {% extends "run_base.html" %}
 {% block content %}
-<p class="muted">Each predictor estimates a region's test failure rate; the scores compare the
-  estimates with the observed test rates of the regions with enough test rows. The best score is bold.</p>
+<p class="muted">Each predictor gives every test row a probability that the classifier fails on it. MSE is
+  the mean squared error of that probability against the failure; the ratio divides it by the one of the
+  constant val failure rate; Spearman correlates it with the failure. The best score is bold.</p>
 {% if scores %}
 <div class="grid">
   <section class="card">
     <h3>Scores</h3>
     <table>
-      <thead><tr><th>predictor</th>{% for s in score_names %}<th class="num">{{ s | upper if s in ("mse", "mae") else s | capitalize }}</th>{% endfor %}</tr></thead>
+      <thead><tr><th>predictor</th>{% for s in score_names %}<th class="num">{{ "MSE ratio" if s == "mse_ratio" else s | upper if s == "mse" else s | capitalize }}</th>{% endfor %}</tr></thead>
       <tbody>
       {% for key, found in scores.items() %}
       <tr><td>{{ predictors[key] }}</td>
@@ -16,18 +17,13 @@
       {% endfor %}
       </tbody>
     </table>
-    {% if "baselines" in ids %}
-    <h3 style="margin-top:1rem">Regions scored</h3>
+    <h3 style="margin-top:1rem">Test split</h3>
     <dl class="facts">{% for label, value in counts %}<dt>{{ label }}</dt><dd>{{ value | num }}</dd>{% endfor %}</dl>
-    {% endif %}
   </section>
-  {{ m.chart(figures.spearman, "Spearman with the test rates") }}
-  {{ m.chart(figures.mse, "MSE against the test rates") }}
+  {{ m.chart(figures.mse_ratio, "MSE over the val rate's MSE") }}
+  {{ m.chart(figures.spearman, "Spearman with the failures") }}
 </div>
 {% endif %}
-<div class="grid" style="margin-top:1rem">
-  {{ m.chart(figures.observed, "Estimate against observed test rate", wide=True) }}
-</div>
 {% if "regress" not in ids %}
 <p class="note">The regressor's folds and importances need the finished <b>regress</b> stage.</p>
 {% else %}

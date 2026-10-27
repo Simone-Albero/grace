@@ -6,7 +6,6 @@ matplotlib
 omegaconf
 pyyaml
 pyarrow
-hdbscan
 xgboost
 joblib
 tqdm

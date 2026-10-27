@@ -6,7 +6,6 @@ import itertools
 import math
 import re
 from collections.abc import Sequence
-from inspect import signature
 from pathlib import Path
 
 import torch
@@ -16,7 +15,6 @@ from omegaconf.errors import ConfigKeyError, OmegaConfBaseException
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import get_scorer_names
 
-from src.clustering import ALGORITHMS
 from src.dl import LOSSES, MODELS
 from src.ml import CLASSIFIERS
 from stages import LABEL
@@ -24,7 +22,7 @@ from stages import LABEL
 CONFIGS = Path(__file__).resolve().parent.parent / "configs"
 # The keys a group option sets: changing them would make the `groups`
 # label of the results lie.
-_PICKED = ("clustering.name", "classifier.name", "classifier.kind")
+_PICKED = ("classifier.name", "classifier.kind")
 
 
 def _group_files(group: str, configs: Path) -> dict[str, Path]:
@@ -87,7 +85,7 @@ def load_config(overrides: Sequence[str], *, configs: Path = CONFIGS) -> DictCon
             ),
             f"Override {item!r} changes what a group option sets "
             f"({', '.join(['groups.*', *_PICKED])}); pick it with "
-            "<group>=<option>, e.g. clustering=birch.",
+            "<group>=<option>, e.g. classifier=mlp.",
         )
     try:
         cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
@@ -135,16 +133,12 @@ def validate(cfg: DictConfig) -> None:
         f"seed {cfg.seed!r} must be an integer in [0, 2**31).",
     )
     _check(
-        cfg.distance in ("euclidean", "cosine"),
-        f"distance {cfg.distance!r} invalid; valid: ['euclidean', 'cosine'].",
-    )
-    _check(
         cfg.figure_format in ("pdf", "png"),
         f"figure_format {cfg.figure_format!r} invalid; valid: ['pdf', 'png'].",
     )
     _check(
-        isinstance(cfg.regressor_figures, bool),
-        f"regressor_figures {cfg.regressor_figures!r} must be true or false.",
+        isinstance(cfg.regressor, bool),
+        f"regressor {cfg.regressor!r} must be true or false.",
     )
     _check(
         isinstance(cfg.root, str) and bool(cfg.root),
@@ -155,7 +149,7 @@ def validate(cfg: DictConfig) -> None:
     _validate_fit(cfg.fit)
     _validate_loss(cfg)
     _validate_grid_search(cfg.grid_search)
-    _validate_regions(cfg)
+    _validate_space(cfg)
     _validate_crossfit(cfg.crossfit)
     _validate_tree(cfg.tree)
     _validate_regressor(cfg.failure_regressor)
@@ -348,49 +342,9 @@ def _validate_grid_search(grid_search: DictConfig) -> None:
     )
 
 
-def _validate_clustering_params(clustering: DictConfig) -> None:
-    """Check `clustering.params` against the algorithm's keywords."""
-    params = clustering.params
-    _check(
-        OmegaConf.is_dict(params),
-        f"clustering.params {params!r} must be a mapping ({{}} for none).",
-    )
-    # The pipeline passes max_fit_samples, random_state and, if the
-    # algorithm takes it, n_clusters.
-    keywords = {
-        parameter.name
-        for parameter in signature(ALGORITHMS[clustering.name]).parameters.values()
-        if parameter.kind is parameter.KEYWORD_ONLY
-    }
-    supplied = {"max_fit_samples", "random_state"} | ({"n_clusters"} & keywords)
-    for key in params:
-        _check(
-            key in keywords - supplied,
-            f"clustering.params key {key!r} invalid for {clustering.name!r}; "
-            f"valid: {sorted(keywords - supplied)} (n_clusters, max_fit_samples "
-            "and random_state come from the pipeline).",
-        )
-        _check(
-            not OmegaConf.is_list(params[key]) or len(params[key]) > 0,
-            f"clustering.params.{key} [] must list at least one value.",
-        )
-
-
-def _validate_regions(cfg: DictConfig) -> None:
-    """Check the clustering, space, graph and complexity sections."""
-    clustering = cfg.clustering
-    _check(
-        clustering.name in ALGORITHMS,
-        f"clustering.name {clustering.name!r} invalid; valid: {sorted(ALGORITHMS)}.",
-    )
-    _validate_clustering_params(clustering)
+def _validate_space(cfg: DictConfig) -> None:
+    """Check the space, graph and complexity sections."""
     positive_keys = {
-        "clustering": (
-            "max_fit_samples",
-            "max_regions",
-            "min_cluster_floor",
-            "hardness_k",
-        ),
         "graph": ("k", "max_samples"),
         "complexity": tuple(cfg.complexity),
     }
@@ -433,11 +387,10 @@ def _validate_tree(tree: DictConfig) -> None:
 
 def _validate_regressor(regressor: DictConfig) -> None:
     """Check the `failure_regressor` section."""
-    for key in ("min_eval_support", "n_iter"):
-        _check(
-            _is_int(regressor[key], 1),
-            f"failure_regressor.{key} {regressor[key]!r} must be an integer > 0.",
-        )
+    _check(
+        _is_int(regressor.n_iter, 1),
+        f"failure_regressor.n_iter {regressor.n_iter!r} must be an integer > 0.",
+    )
     for key in ("n_outer_splits", "n_inner_splits"):
         _check(
             _is_int(regressor[key], 2),

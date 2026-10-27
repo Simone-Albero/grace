@@ -20,10 +20,10 @@ from dashboard.queries import PREDICTORS, STAGE_ORDER
 HEADLINE = {
     "classify.accuracy": "accuracy",
     "classify.f1_macro": "F1 macro",
-    "failures.test_error_rate": "test error rate",
-    "regions.n_regions": "regions",
-    "baselines.val_spearman": "val Spearman",
-    "baselines.val_mse": "val MSE",
+    "evaluate.test_error_rate": "test error rate",
+    "evaluate.tree_mse_ratio": "tree MSE ratio",
+    "evaluate.tree_spearman": "tree Spearman",
+    "evaluate.confidence_mse_ratio": "confidence MSE ratio",
 }
 
 
@@ -124,7 +124,7 @@ def _has_values(series: Mapping[str, Sequence[tuple[int, float | None]]]) -> boo
 
 def _predictor_keys(score: str) -> dict[str, str]:
     """Map each predictor's label to its metric key of `score`."""
-    return {label: f"baselines.{key}_{score}" for key, label in PREDICTORS.items()}
+    return {label: f"evaluate.{key}_{score}" for key, label in PREDICTORS.items()}
 
 
 def experiment_figures(experiment: Experiment) -> list[tuple[str, dict]]:
@@ -146,16 +146,20 @@ def experiment_figures(experiment: Experiment) -> list[tuple[str, dict]]:
             "Failure rate",
             "error rate",
             {
-                "val": "failures.val_error_rate",
-                "test": "failures.test_error_rate",
+                "val": "tree.val_error_rate",
+                "test": "evaluate.test_error_rate",
             },
         ),
         (
-            "Predictors, Spearman with the test rates",
+            "Predictors, Spearman with the failures",
             "Spearman",
             _predictor_keys("spearman"),
         ),
-        ("Predictors, MSE against the test rates", "MSE", _predictor_keys("mse")),
+        (
+            "Predictors, MSE over the val rate's",
+            "MSE ratio",
+            _predictor_keys("mse_ratio"),
+        ),
     ]
     figures = []
     for title, y_title, keys in families:

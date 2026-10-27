@@ -1,0 +1,39 @@
+{% extends "run_base.html" %}
+{% block content %}
+<p class="muted">Each predicted class has a tree of 2-means splits in the LDA space. A leaf is a region: its
+  estimate <b>q</b> is the failure rate of the val rows routed to it, shrunk toward its out-of-fold rate.
+  Click a marker, or a leaf id, for its page.</p>
+{{ m.tiles(tiles) }}
+<div class="grid">
+  {{ m.chart(figures.shrinkage, "Estimate against the raw val rate of each leaf") }}
+  {{ m.chart(figures.test, "Test rate of each leaf against its estimate") }}
+</div>
+<h2>Predicted classes</h2>
+<div class="scroll"><table>
+  <thead><tr><th>class</th><th class="num">train rows</th><th class="num">out-of-fold errors</th>
+    <th class="num">leaves</th><th class="num">depth of the cut</th></tr></thead>
+  <tbody>
+  {% for r in roots %}
+  <tr><td>{{ r.name }}</td><td class="num">{{ r.n_train | num }}</td><td class="num">{{ r.n_train_errors | num }}</td>
+    <td class="num">{{ r.n_leaves | num }}</td><td class="num">{{ r.depth | num }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table></div>
+<h2>Leaves</h2>
+<p class="muted">{{ leaves | length }} leaves{% if leaves | length > max_rows %}, the first {{ max_rows }} shown{% endif %}.</p>
+<div class="scroll"><table>
+  <thead><tr>
+    {% for col in columns %}
+    <th><a href="?sort={{ col }}&desc={{ 'false' if sort == col and desc else 'true' }}">{{ col }}{% if sort == col %} {{ '▼' if desc else '▲' }}{% endif %}</a></th>
+    {% endfor %}
+  </tr></thead>
+  <tbody>
+  {% for r in leaves[:max_rows] %}
+  <tr>
+    <td><a href="/runs/{{ run.id }}/leaves/{{ r.node_id }}">{{ r.node_id }}</a></td><td>{{ r["class"] }}</td>
+    {% for col in columns[2:] %}<td class="num">{{ r[col] | num }}</td>{% endfor %}
+  </tr>
+  {% endfor %}
+  </tbody>
+</table></div>
+{% endblock %}

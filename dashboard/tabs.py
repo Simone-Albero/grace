@@ -14,18 +14,16 @@ TABS = {
     "overview": (),
     "data": ("split",),
     "classifier": ("classify",),
-    "regions": ("regions",),
-    "failures": ("failures",),
-    "predictors": ("baselines", "regress"),
+    "tree": ("tree",),
+    "predictors": ("evaluate", "regress"),
 }
 # The stages whose config a tab shows at its foot.
 _SETTINGS = {
     "overview": (),
     "data": ("split", "prepare"),
     "classifier": ("classify",),
-    "regions": ("space", "regions"),
-    "failures": ("failures",),
-    "predictors": ("baselines", "regress"),
+    "tree": ("space", "crossfit", "tree"),
+    "predictors": ("evaluate", "regress"),
 }
 # The tiles of each overview area: (stage, metric, label, kind).
 _OVERVIEW = {
@@ -39,14 +37,15 @@ _OVERVIEW = {
         ("classify", "accuracy", "accuracy", "score"),
         ("classify", "f1_macro", "F1 macro", "score"),
     ],
-    "regions": [("regions", "n_regions", "regions", "count")],
-    "failures": [
-        ("failures", "val_error_rate", "val error rate", "score"),
-        ("failures", "test_error_rate", "test error rate", "score"),
+    "tree": [
+        ("tree", "n_leaves", "leaves", "count"),
+        ("tree", "beta", "β", "score"),
     ],
     "predictors": [
-        ("baselines", "val_spearman", "val Spearman", "score"),
-        ("baselines", "val_mse", "val MSE", "score"),
+        ("evaluate", "test_error_rate", "test error rate", "score"),
+        ("evaluate", "tree_mse_ratio", "tree MSE ratio", "score"),
+        ("evaluate", "tree_spearman", "tree Spearman", "score"),
+        ("evaluate", "confidence_mse_ratio", "confidence MSE ratio", "score"),
     ],
 }
 # The metrics each tab shows as tiles: (stage, metric, label, kind).
@@ -64,16 +63,15 @@ _TILES = {
         ("classify", "best_score", "best CV score", "score"),
         ("classify", "n_fit", "rows fitted", "count"),
     ],
-    "regions": [
-        ("regions", "n_regions", "regions", "count"),
-        ("space", "n_graph_rows", "graph rows", "count"),
-        ("regions", "eval_rows_per_train_row", "eval rows / train row", "score"),
-    ],
-    "failures": [
-        ("failures", "val_error_rate", "val error rate", "score"),
-        ("failures", "test_error_rate", "test error rate", "score"),
-        ("failures", "n_regions_with_val", "regions with val rows", "count"),
-        ("failures", "n_regions_with_test", "regions with test rows", "count"),
+    "tree": [
+        ("space", "n_components", "LDA components", "count"),
+        ("crossfit", "oof_error_rate", "out-of-fold error rate", "score"),
+        ("tree", "n_nodes", "nodes grown", "count"),
+        ("tree", "n_leaves", "leaves", "count"),
+        ("tree", "max_depth", "depth of the cut", "count"),
+        ("tree", "n_leaves_without_val", "leaves without val rows", "count"),
+        ("tree", "beta", "β of the correction", "score"),
+        ("tree", "fh_tau2", "τ² of the shrinkage", "score"),
     ],
 }
 # The preprocessing of prepare, in the order it applies.
@@ -84,7 +82,6 @@ _PREPROCESSING = {
         "then hash buckets"
     ),
 }
-_WORST_REGIONS = 15
 
 
 _Metrics = Mapping[str, Mapping[str, float | None]]
@@ -193,43 +190,19 @@ def _classifier(
     }
 
 
-def _regions(db: sqlite3.Connection, ids: Mapping[str, int], metrics: _Metrics) -> dict:
-    """Clustering of each class and the regions' figures."""
-    clusterings = queries.class_clusterings(db, ids["regions"], ids["prepare"])
-    rows = queries.regions(db, ids)
-    figures = {}
-    if clusterings:
-        figures["per_class"] = charts.regions_per_class(clusterings)
-    if rows:
-        figures["sizes"] = charts.region_size_box(rows)
-    return {
-        "tiles": _tiles(metrics, _TILES["regions"]),
-        "clusterings": clusterings,
-        "figures": figures,
-    }
-
-
-def _failures(
-    db: sqlite3.Connection, ids: Mapping[str, int], metrics: _Metrics
+def _tree(
+    db: sqlite3.Connection, ids: Mapping[str, int], metrics: _Metrics, run_id: int
 ) -> dict:
-    """The empirical failure rates of the regions."""
-    rows = queries.regions(db, ids)
-    worst = sorted(
-        (row for row in rows if row["test_rate"] is not None),
-        key=lambda row: -row["test_rate"],
-    )[:_WORST_REGIONS]
-    figures = {
-        "scatter": charts.val_test_scatter(rows),
-        "classes": charts.class_rate_bars(rows),
-        "ecdf": charts.rate_ecdf(rows),
-        "bin_counts": charts.region_rate_bins(rows, measure="count"),
-        "bin_sizes": charts.region_rate_bins(rows, measure="size"),
-        "gap": charts.class_rate_gap(rows),
-    }
+    """The tree's roots, its leaves and how the leaf estimates move."""
+    leaves = queries.leaves(db, ids)
     return {
-        "tiles": _tiles(metrics, _TILES["failures"]),
-        "worst": worst,
-        "figures": figures,
+        "tiles": _tiles(metrics, _TILES["tree"]),
+        "roots": queries.tree_roots(db, ids["tree"], ids["prepare"]),
+        "leaves": leaves,
+        "figures": {
+            "shrinkage": charts.shrinkage_scatter(leaves, run_id=run_id),
+            "test": charts.test_scatter(leaves, run_id=run_id),
+        },
     }
 
 
@@ -237,7 +210,7 @@ def _scores(metrics: _Metrics) -> dict[str, dict]:
     """Collect each predictor's scores from the stage metrics."""
     scores = {}
     for key in PREDICTORS:
-        stage_metrics = metrics.get("baselines", {})
+        stage_metrics = metrics.get("evaluate", {})
         found = {score: stage_metrics.get(f"{key}_{score}") for score in SCORES}
         if any(value is not None for value in found.values()):
             scores[key] = found
@@ -247,38 +220,42 @@ def _scores(metrics: _Metrics) -> dict[str, dict]:
 def _predictors(
     db: sqlite3.Connection, ids: Mapping[str, int], metrics: _Metrics
 ) -> dict:
-    """Predictor scores, estimates against observed, the regressor."""
+    """Predictor scores, and the regressor's folds and importances."""
     scores = _scores(metrics)
-    rows = queries.regions(db, ids)
     best = {
-        score: (max if score in ("spearman", "r2") else min)(
+        score: min(
             (found[score] for found in scores.values() if found[score] is not None),
             default=None,
         )
-        for score in SCORES
+        for score in ("mse", "mse_ratio")
     }
+    best["spearman"] = max(
+        (
+            found["spearman"]
+            for found in scores.values()
+            if found["spearman"] is not None
+        ),
+        default=None,
+    )
     figures = {
-        score: charts.predictor_bars(scores, score) for score in ("spearman", "mse")
+        score: charts.predictor_bars(scores, score)
+        for score in ("mse_ratio", "spearman")
     }
-    figures["observed"] = charts.predicted_vs_observed(rows)
     folds = []
     if "regress" in ids:
         folds = queries.regressor_folds(db, ids["regress"])
         importances = queries.importances(db, ids["regress"])
         if importances:
             figures["importances"] = charts.importance_bars(importances)
-    baselines = metrics.get("baselines", {})
+    evaluated = metrics.get("evaluate", {})
     return {
         "scores": scores,
         "best": best,
         "predictors": PREDICTORS,
         "score_names": SCORES,
         "counts": [
-            ("regions", baselines.get("n_regions")),
-            ("used", baselines.get("n_regions_used")),
-            ("excluded, no test rows", baselines.get("n_excluded_no_test")),
-            ("excluded, low support", baselines.get("n_excluded_low_support")),
-            ("ATC threshold", baselines.get("atc_threshold")),
+            ("test rows", evaluated.get("n_test")),
+            ("test error rate", evaluated.get("test_error_rate")),
         ],
         "folds": folds,
         "figures": figures,
@@ -332,10 +309,8 @@ def build(
         case "classifier":
             dirs = queries.execution_dirs(run)
             context.update(_classifier(db, ids, metrics, root, dirs))
-        case "regions":
-            context.update(_regions(db, ids, metrics))
-        case "failures":
-            context.update(_failures(db, ids, metrics))
+        case "tree":
+            context.update(_tree(db, ids, metrics, run["id"]))
         case "predictors":
             context.update(_predictors(db, ids, metrics))
     return context

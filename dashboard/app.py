@@ -1,4 +1,4 @@
-"""The FastAPI app: experiments, runs, regions and comparisons."""
+"""The FastAPI app: experiments, runs and comparisons."""
 
 __all__ = ["create_app"]
 
@@ -25,6 +25,12 @@ from pipeline.db import explain, reap
 _HOSTS = ["127.0.0.1", "localhost"]
 # Ids are SQLite integers: a larger one is a 422, not an OverflowError.
 _Id = Annotated[int, PathParam(ge=0, le=2**63 - 1)]
+# The columns of the leaves table, in reading order.
+_LEAF_COLUMNS = (
+    "node_id class depth n_train oof_rate n_val val_rate q gamma regressor n_test "
+    "test_rate mean_q"
+).split()
+_MAX_LEAVES = 500
 _SORTS = ["latest", "n_seeds", *MAIN_KEYS, *summary.HEADLINE]
 # What the pages poll for while a run is going, in seconds.
 _REFRESH_SECONDS = 5
@@ -150,7 +156,7 @@ def _predictor_traces(rows: Sequence[Mapping], score: str, x: str) -> list[_Trac
     """Build one trace per predictor that has a value of `score`."""
     traces = []
     for key, label in queries.PREDICTORS.items():
-        metric = f"baselines.{key}_{score}"
+        metric = f"evaluate.{key}_{score}"
         grouped = experiments.grouped_values(rows, metric, x, None)
         if grouped:
             traces.append((label, charts.PREDICTOR_COLORS[key], grouped[""]))
@@ -378,7 +384,7 @@ def create_app(db_path: Path) -> FastAPI:
         selected: dict[str, str] = Depends(_read_filters),
         metric: str = "classify.accuracy",
         x: str = "classifier",
-        color: str = "clustering",
+        color: str = "",
         score: str = "spearman",
     ) -> HTMLResponse:
         _check_choice("x", x, MAIN_KEYS)
@@ -424,6 +430,43 @@ def create_app(db_path: Path) -> FastAPI:
         headers = {} if sig == context["signature"] else {"HX-Refresh": "true"}
         return render(request, "_stages.html", context, headers=headers)
 
+    @app.get("/runs/{run_id}/leaves/{node_id}", response_class=HTMLResponse)
+    def leaf_page(
+        request: Request,
+        run_id: _Id,
+        node_id: _Id,
+        connection: sqlite3.Connection = Depends(db),
+    ) -> HTMLResponse:
+        context = _run_context(connection, run_id)
+        ids = context["ids"]
+        if "tree" not in ids:
+            raise HTTPException(404, f"Run {run_id} has no done tree stage")
+        leaf = next(
+            (
+                row
+                for row in queries.leaves(connection, ids)
+                if row["node_id"] == node_id
+            ),
+            None,
+        )
+        if leaf is None:
+            raise HTTPException(404, f"Run {run_id} has no leaf {node_id}")
+        descriptors = []
+        if "complexity" in ids:
+            descriptors = queries.leaf_descriptors(
+                connection, ids["complexity"], node_id, leaf["class_id"]
+            )
+        context.update(
+            tab="tree",
+            available=True,
+            settings={},
+            leaf=leaf,
+            columns=_LEAF_COLUMNS[2:],
+            path=queries.leaf_path(connection, ids["tree"], node_id),
+            descriptors=descriptors,
+        )
+        return render(request, "leaf.html", context)
+
     @app.get("/runs/{run_id}", response_class=HTMLResponse)
     def run_overview(
         request: Request, run_id: _Id, connection: sqlite3.Connection = Depends(db)
@@ -436,11 +479,22 @@ def create_app(db_path: Path) -> FastAPI:
         run_id: _Id,
         tab: str,
         connection: sqlite3.Connection = Depends(db),
+        sort: str = "node_id",
+        desc: bool = False,
     ) -> HTMLResponse:
         if tab not in tabs.TABS:
             raise HTTPException(404, f"No tab {tab!r}. Valid: {', '.join(tabs.TABS)}")
         context = _run_context(connection, run_id)
         context.update(tabs.build(connection, context["run"], tab, root))
+        if tab == "tree" and context["available"]:
+            _check_choice("sort", sort, _LEAF_COLUMNS)
+            context.update(
+                leaves=_sort_rows(context["leaves"], sort, desc),
+                columns=_LEAF_COLUMNS,
+                max_rows=_MAX_LEAVES,
+                sort=sort,
+                desc=desc,
+            )
         return render(request, f"run_{tab}.html", context)
 
     return app

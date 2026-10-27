@@ -78,7 +78,7 @@ def descriptor_label(feature: str) -> str:
     """Return the display notation of a descriptor name.
 
     Args:
-        feature: A `{region|class}_{measure}[_agg]` descriptor name.
+        feature: A `{leaf|class}_{measure}[_agg]` descriptor name.
 
     Returns:
         The measure label, with the class level and the aggregate in

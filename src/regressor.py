@@ -39,7 +39,7 @@ class FailureRegressor:
         refit_score: The best inner-CV score of the refit; None when it
             was not searched.
         n_outer: The outer split count, after adapting to the number of
-            regions.
+            leaves.
         n_inner: The inner split count, after the same adaptation.
     """
 
@@ -253,7 +253,7 @@ def fit_failure_regressor(
         raise ValueError(
             f"{n_used} usable leaf(s), failure-rate std {float(y.std()):.3g}: the "
             "failure regressor needs two leaves whose rates differ. Raise "
-            "data.val_frac for more val-labelled leaves; regressor_figures=false "
+            "data.val_frac for more val-labelled leaves; regressor=false "
             "draws the classifier's figures without it."
         )
 

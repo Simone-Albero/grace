@@ -5,7 +5,6 @@ __all__ = [
     "confusion_matrix_plot",
     "line_plot",
     "predicted_vs_observed_plot",
-    "strip_box_plot",
     "violin_plot",
 ]
 
@@ -382,7 +381,7 @@ def predicted_vs_observed_plot(
     """Draw predicted against observed failure rates per predictor.
 
     Args:
-        observed: The observed failure rate of each region.
+        observed: The observed failure rate of each leaf.
         predicted: For each predictor name, its predicted rates and the
             scores noted in its panel.
         figsize: The figure size in inches.
@@ -420,85 +419,4 @@ def predicted_vs_observed_plot(
     mappable.set_array([])
     colorbar = fig.colorbar(mappable, ax=list(axes), fraction=0.046, pad=0.04)
     colorbar.set_label("Squared error")
-    return fig
-
-
-def strip_box_plot(
-    groups: Sequence[str],
-    values: Sequence[np.ndarray],
-    sizes: Sequence[np.ndarray],
-    *,
-    x_label: str,
-    y_label: str,
-    size_label: str,
-) -> Figure:
-    """Draw a box and jittered points per group, sized by `sizes`.
-
-    Args:
-        groups: The group names, left to right.
-        values: The values of each group.
-        sizes: The size of each value, shaped like `values`; it sets
-            the area of its point.
-        x_label: The x axis label.
-        y_label: The y axis label.
-        size_label: The title of the size legend.
-
-    Returns:
-        The figure.
-    """
-    n_groups = len(groups)
-    colors = extended_palette(n_groups)
-    point_values = [np.asarray(value, dtype=float) for value in values]
-    point_sizes = [np.asarray(size, dtype=float) for size in sizes]
-    all_sizes = np.concatenate(point_sizes)
-    top = float(all_sizes.max())
-
-    def area(size: np.ndarray | float) -> np.ndarray | float:
-        return 8 + 120 * size / top
-
-    fig, ax = plt.subplots(figsize=(max(5.0, 0.7 * n_groups + 1.5), 3.8))
-    ax.boxplot(
-        point_values,
-        positions=range(n_groups),
-        widths=0.5,
-        showfliers=False,
-        boxprops={"color": MUTED_COLOR},
-        medianprops={"color": MUTED_COLOR, "linewidth": 1.8},
-        whiskerprops={"color": MUTED_COLOR},
-        capprops={"color": MUTED_COLOR},
-    )
-    rng = np.random.default_rng(0)
-    for i, (value, size, color) in enumerate(
-        zip(point_values, point_sizes, colors, strict=True)
-    ):
-        jitter = rng.uniform(-0.18, 0.18, size=len(value))
-        ax.scatter(
-            i + jitter,
-            value,
-            s=area(size),
-            color=color,
-            alpha=0.6,
-            edgecolors="none",
-            zorder=3,
-        )
-
-    marks = [float(all_sizes.min()), float(np.median(all_sizes)), top]
-    handles = [
-        ax.scatter([], [], s=area(mark), color=NEUTRAL_COLOR, label=f"{mark:.0f}")
-        for mark in marks
-    ]
-    ax.legend(
-        handles=handles,
-        title=size_label,
-        frameon=False,
-        loc="upper left",
-        bbox_to_anchor=(1.0, 1.0),
-    )
-
-    ax.set_xticks(range(n_groups), list(groups))
-    if n_groups > 6:
-        plt.setp(ax.get_xticklabels(), rotation=35, ha="right")
-    ax.grid(True, axis="y", alpha=0.15, linewidth=0.5)
-    ax.grid(False, axis="x")
-    _apply_labels(ax, x_label, y_label)
     return fig
