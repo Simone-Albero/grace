@@ -2,38 +2,22 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{% block title %}grace{% endblock %}</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/static/dashboard.css">
 <script src="https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js"></script>
 <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
-<style>
-body { font: 14px/1.4 system-ui, sans-serif; margin: 0 1.5rem 3rem; color: #222; }
-nav { padding: .8rem 0; border-bottom: 1px solid #ccc; margin-bottom: 1rem; }
-nav a { margin-right: 1.2rem; font-weight: 600; text-decoration: none; }
-h1 { font-size: 1.3rem; } h2 { font-size: 1.05rem; margin-top: 1.5rem; }
-form { display: flex; flex-wrap: wrap; gap: .5rem 1rem; margin-bottom: 1rem; }
-label { display: flex; flex-direction: column; font-size: .8rem; color: #555; }
-.scroll { overflow: auto; max-height: 75vh; }
-table { border-collapse: collapse; }
-th, td { padding: 2px 8px; border-bottom: 1px solid #e4e4e4; white-space: nowrap; }
-th { position: sticky; top: 0; background: #f3f3f3; text-align: left; cursor: default; }
-th[hx-get] { cursor: pointer; }
-td.num { text-align: right; font-variant-numeric: tabular-nums; }
-tbody tr:nth-child(even) { background: #fafafa; }
-.done { color: #1a7f37; } .failed { color: #c62828; } .running { color: #b26a00; }
-.queued { color: #777; } .cancelled { color: #777; text-decoration: line-through; }
-.muted { color: #777; } pre { background: #f6f6f6; padding: .6rem; overflow: auto; }
-textarea { font: 13px monospace; width: 36rem; }
-form.inline { display: inline; margin: 0; }
-button { font: inherit; padding: 0 .5rem; cursor: pointer; }
-pre.log { max-height: 60vh; }
-.cols { display: flex; flex-wrap: wrap; gap: 1.5rem; align-items: flex-start; }
-.figure { margin: 0 1rem 1rem 0; } .figure img { max-width: 560px; }
-</style>
+<script src="/static/dashboard.js" defer></script>
 </head>
 <body hx-history="false">  <!-- Back refetches the page: a snapshot loses the selects -->
-<nav>
-  <a href="/">Results</a><a href="/compare">Compare</a><a href="/runs">Runs</a><a href="/presets">Presets</a><a href="/jobs">Jobs</a>
-</nav>
+<div class="topbar">
+  <span class="brand">grace</span>
+  <a href="/"{% if nav == "experiments" %} class="current"{% endif %}>Experiments</a>
+  <a href="/compare"{% if nav == "compare" %} class="current"{% endif %}>Compare</a>
+</div>
+<main>
 {% block body %}{% endblock %}
+</main>
 </body>
 </html>

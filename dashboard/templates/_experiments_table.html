@@ -1,0 +1,42 @@
+{% import "_macros.html" as m %}
+<input type="hidden" name="sort" value="{{ sort }}">
+<input type="hidden" name="desc" value="{{ 'true' if desc else 'false' }}">
+<div {% if active %}hx-get="/" hx-trigger="every {{ REFRESH }}s" hx-target="#table"
+     hx-include="#filters, [name=sort], [name=desc]"{% endif %}>
+{% if not rows %}
+<p class="note">No experiment{% if selected.values() | select | list %} matches these filters{% else %} yet:
+  run <code>python -m stages render partitions data=synthetic_test</code>{% endif %}.</p>
+{% else %}
+{% macro head(col, label, cls="") %}
+<th class="{{ cls }}" hx-get="/" hx-target="#table" hx-include="#filters" hx-push-url="true"
+    hx-vals='{"sort": "{{ col }}", "desc": "{{ 'false' if sort == col and desc else 'true' }}"}'>
+  {{ label }}{% if sort == col %} {{ '▼' if desc else '▲' }}{% endif %}</th>
+{% endmacro %}
+<div class="scroll">
+<table>
+  <thead><tr>
+    {% for key in MAIN_KEYS %}{{ head(key, key) }}{% endfor %}
+    <th>variant</th>
+    {{ head("n_seeds", "seeds", "num") }}
+    <th title="Seeds that finished each stage, in pipeline order">stages</th>
+    {% for key, label in headline.items() %}{{ head(key, label, "num") }}{% endfor %}
+    {{ head("latest", "latest run", "num") }}
+  </tr></thead>
+  <tbody>
+  {% for r in rows %}
+  <tr>
+    {% for key in MAIN_KEYS %}
+    <td>{% if loop.first %}<a href="/experiments/{{ r.key }}">{{ r["values"][key] }}</a>{% else %}{{ r["values"][key] }}{% endif %}</td>
+    {% endfor %}
+    <td class="trunc muted" title="{{ r.variant }}">{{ r.variant or "–" }}</td>
+    <td class="num">{{ r.n_seeds }}{% if r.running %} <span class="badge running" title="seeds running">{{ r.running }} ◐</span>{% endif %}{% if r.failed %} <span class="badge failed" title="seeds whose latest run failed">{{ r.failed }} ✕</span>{% endif %}</td>
+    <td>{{ m.coverage(r.coverage) }}</td>
+    {% for key in headline %}<td class="num">{{ r.aggregates[key] | pm(r.n_seeds) }}</td>{% endfor %}
+    <td class="num"><a href="/runs/{{ r.latest }}">{{ r.latest }}</a></td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endif %}
+</div>

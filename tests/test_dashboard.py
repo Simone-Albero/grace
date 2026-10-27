@@ -10,9 +10,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from dashboard import queries
-from dashboard.app import _num, create_app
+from dashboard.app import _format_number, create_app
 from pipeline.runner import run
 from tests.helpers import BASE_URL, fast_cfg, query
+
+_TABS = "data classifier regions failures predictors partitions".split()
 
 
 def _execution(root: Path, stage: str) -> int:
@@ -28,21 +30,24 @@ def client(root: Path) -> Iterator[TestClient]:
 
 
 @pytest.fixture(scope="module")
-def run_id(client: TestClient) -> int:
-    """Return the run that the results row of the shared root shows."""
-    return client.get("/api/results").json()[0]["run_id"]
+def experiment(client: TestClient) -> dict:
+    """Return the one experiment of the shared root."""
+    (row,) = client.get("/api/experiments").json()
+    return row
 
 
-def test_results(client: TestClient, run_id: int) -> None:
-    """Check that results filter, sort and serve HTMX fragments."""
+@pytest.fixture(scope="module")
+def run_id(experiment: dict) -> int:
+    """Return the run that represents the shared root's seed."""
+    return experiment["seeds"][0]["run_id"]
+
+
+def test_experiments_page(client: TestClient, experiment: dict) -> None:
+    """Check that the experiments table filters, sorts and swaps."""
     page = client.get("/")
     assert page.status_code == 200 and "<html" in page.text
     assert "naive_bayes" in page.text and "kmeans" in page.text
-    # Another page must not frame this one: its POST buttons would be
-    # clicked for the user.
-    assert page.headers["x-frame-options"] == "DENY"
-    assert client.get("/runs/999999").headers["x-frame-options"] == "DENY"
-    assert f"/runs/{run_id}" in page.text
+    assert f"/experiments/{experiment['key']}" in page.text
     fragment = client.get("/", headers={"HX-Request": "true"})
     assert fragment.status_code == 200 and "<html" not in fragment.text
     assert "naive_bayes" in fragment.text
@@ -52,89 +57,73 @@ def test_results(client: TestClient, run_id: int) -> None:
     )
     assert "<html" in restore.text
     assert "naive_bayes" in client.get("/?classifier=naive_bayes").text
-    empty = client.get("/?classifier=mlp")
-    assert "No finished failures execution yet." in empty.text
-    assert client.get("/?sort=regressor_spearman&desc=false").status_code == 200
-    assert client.get("/?sort=bogus").status_code == 400
+    assert "matches these filters" in client.get("/?classifier=mlp").text
+    assert client.get("/?sort=regressor_spearman&desc=false").status_code == 400
+    assert client.get("/?sort=regress.regressor_spearman&desc=false").status_code == 200
+    assert client.get("/?sort=nope").status_code == 400
 
 
-def test_api_results(client: TestClient, root: Path) -> None:
-    """Check that the results API row's ids and metrics match the DB."""
-    rows = client.get("/api/results").json()
-    assert len(rows) == 1
-    row = rows[0]
-    assert {*queries.CONFIG_KEYS, *queries.METRICS} <= row.keys()
-    for key in ("failures", "baselines", "regress"):
-        assert row[f"{key}_id"] == _execution(root, key)
-    for name, stage in (
-        ("regressor_spearman", "regress"),
-        ("mcp_spearman", "baselines"),
-        ("accuracy", "classify"),
+def test_api_experiments(client: TestClient, experiment: dict, root: Path) -> None:
+    """Check that the API row's ids and aggregates match the DB."""
+    assert experiment["n_seeds"] == 1 and experiment["variant"] == ""
+    assert experiment["values"]["classifier"] == "naive_bayes"
+    assert all(cell["done"] == 1 for cell in experiment["coverage"])
+    for key, stage, name in (
+        ("classify.accuracy", "classify", "accuracy"),
+        ("regress.regressor_spearman", "regress", "regressor_spearman"),
+        ("baselines.val_mse", "baselines", "val_mse"),
     ):
         sql = (
             f"SELECT value FROM metrics WHERE name = '{name}' "
             f"AND execution_id = {_execution(root, stage)}"
         )
-        assert row[name] == query(root / "grace.db", sql)[0][0]
-    assert client.get("/api/results?classifier=mlp").json() == []
+        expected = query(root / "grace.db", sql)[0][0]
+        assert experiment["aggregates"][key]["mean"] == expected
+        assert experiment["aggregates"][key]["n"] == 1
+    assert client.get("/api/experiments?classifier=mlp").json() == []
 
 
-def test_compare(client: TestClient) -> None:
-    """Check that the comparison charts draw all three predictors."""
-    assert client.get("/compare").status_code == 200
-    charts = client.get(
-        "/compare/charts?metric=accuracy&x=classifier&color=distance&score=mae"
-    )
-    assert charts.status_code == 200 and "Plotly.newPlot" in charts.text
-    # No id: HTMX would reset the class of a swapped, id-matched div and
-    # with it Plotly's js-plotly-plot, which hover and click need.
-    assert 'class="chart"' in charts.text and 'id="chart' not in charts.text
-    for name in ("RF regressor", "MCP", "ATC"):
-        assert name in charts.text
-    assert client.get("/compare/charts?metric=bogus").status_code == 400
-
-
-def test_runs_and_run_detail(client: TestClient, run_id: int) -> None:
-    """Check that the run page shows every stage and figures."""
-    assert f"/runs/{run_id}" in client.get("/runs").text
-    page = client.get(f"/runs/{run_id}")
+def test_experiment_page(client: TestClient, experiment: dict) -> None:
+    """Check that the experiment page shows seeds, figures, metrics."""
+    page = client.get(f"/experiments/{experiment['key']}")
     assert page.status_code == 200
-    stages = (
-        "split prepare regions classify failures baselines complexity regress render"
-    ).split()
-    figures = ("baselines/predicted_vs_observed", "regress/predicted_vs_observed")
-    for text in (*stages, *figures, "failures/rate_by_class", "class_1"):
+    for text in ("Seeds", "Across the seeds", "All metrics", "classify · accuracy"):
         assert text in page.text
+    assert page.text.count('class="chart"') >= 5
+    assert client.get("/experiments/nope").status_code == 404
+
+
+def test_run_overview_and_tabs(client: TestClient, run_id: int) -> None:
+    """Check that every tab of a complete run has its content."""
+    overview = client.get(f"/runs/{run_id}")
+    assert overview.status_code == 200
+    for stage in queries.STAGE_ORDER:
+        assert stage in overview.text
+    assert "disabled" not in overview.text
+    expected = {
+        "data": ("Preprocessing", "class_1", "num_1", "train"),
+        "classifier": ("Confusion matrix", "precision", "accuracy"),
+        "regions": ("Clustering of each class", "size balance", "n1_mean"),
+        "failures": ("Test against val failure rate", "Distribution"),
+        "predictors": ("RF regressor", "Val rate", "MCP", "ATC", "MSE", "Outer folds"),
+        "partitions": ("Operating points", "intra", "predicted_class", "Brier"),
+    }
+    for tab in _TABS:
+        page = client.get(f"/runs/{run_id}/{tab}")
+        assert page.status_code == 200, tab
+        for text in expected[tab]:
+            assert text in page.text, (tab, text)
+        assert "Settings of the stages shown" in page.text
+    assert client.get(f"/runs/{run_id}/nope").status_code == 404
     assert client.get("/runs/999999").status_code == 404
     invalid = client.get("/runs/abc")
     assert invalid.status_code == 422 and "<html" in invalid.text
 
 
-def test_figures(client: TestClient, root: Path) -> None:
-    """Check that render's figures are served as saved."""
-    render = _execution(root, "render")
-    sql = f"SELECT name, file FROM figures WHERE execution_id = {render}"
-    rows = query(root / "grace.db", sql)
-    assert rows
-    for name, file in rows:
-        response = client.get(f"/figures/{render}/{name}")
-        assert response.status_code == 200
-        assert response.headers["content-type"] == "application/pdf"
-        saved = root / f"artifacts/render/{render}" / file
-        assert response.content == saved.read_bytes()
-    name, file = rows[0]
-    assert client.get(f"/figures/{render}/nope").status_code == 404
-    assert client.get(f"/figures/{render}/{file}").status_code == 404
-    assert (
-        client.get(f"/figures/{_execution(root, 'regress')}/{name}").status_code == 404
-    )
-
-
-def test_regions(client: TestClient, root: Path, run_id: int) -> None:
+def test_regions_explorer(client: TestClient, root: Path, run_id: int) -> None:
     """Check that regions filter and sort; a region shows its rate."""
     url = f"/runs/{run_id}/regions"
     page = client.get(url)
-    assert page.status_code == 200 and "n1_mean" in page.text
     failures = _execution(root, "failures")
     region_id, rate = query(
         root / "grace.db",
@@ -145,27 +134,46 @@ def test_regions(client: TestClient, root: Path, run_id: int) -> None:
     assert link in page.text
     narrowed = client.get(f"{url}?class_id=0")
     assert narrowed.text.count(f"{url}/") < page.text.count(f"{url}/")
+    fragment = client.get(f"{url}?class_id=0", headers={"HX-Request": "true"})
+    assert "<html" not in fragment.text and f"{url}/" in fragment.text
     assert client.get(f"{url}?sort=abs_error&desc=true").status_code == 200
     assert client.get(f"{url}?x=n1_mean&y=regressor").status_code == 200
     assert client.get(f"{url}?x=bogus").status_code == 400
-
     region = client.get(link)
     assert region.status_code == 200 and "n1_mean" in region.text
-    assert _num(rate) in region.text
+    assert _format_number(rate) in region.text
     assert client.get(f"{url}/999999").status_code == 404
 
 
-def test_partitions_panel(client: TestClient, run_id: int) -> None:
-    """Check that the panel appears and the charts draw."""
-    assert "Partitions" in client.get(f"/runs/{run_id}/regions").text
-    charts = client.get(f"/runs/{run_id}/partitions")
+def test_partition_sweeps(client: TestClient, run_id: int) -> None:
+    """Check that the sweep charts draw for every arm."""
+    charts = client.get(f"/runs/{run_id}/partitions/charts")
     assert charts.status_code == 200
-    assert charts.text.count("Plotly.newPlot") == 4
+    assert charts.text.count('class="chart"') == 4
     for arm in ("intra", "inter", "null", "confidence", "predicted_class"):
         assert arm in charts.text
-    assert client.get(f"/runs/{run_id}/partitions?metric=bogus").status_code == 400
-    assert client.get(f"/runs/{run_id}/partitions?x=bogus").status_code == 400
-    assert client.get("/runs/999999/partitions").status_code == 404
+    assert client.get(f"/runs/{run_id}/partitions/charts?metric=x").status_code == 400
+    assert client.get(f"/runs/{run_id}/partitions/charts?x=x").status_code == 400
+    assert client.get("/runs/999999/partitions/charts").status_code == 404
+
+
+def test_compare(client: TestClient) -> None:
+    """Check that the comparison charts draw all three families."""
+    assert client.get("/compare").status_code == 200
+    charts = client.get(
+        "/compare/charts?metric=classify.accuracy&x=classifier&color=distance"
+        "&score=mse&arm_metric=brier&rule=cbrt"
+    )
+    assert charts.status_code == 200 and charts.text.count('class="chart"') == 3
+    # No id: HTMX would reset the class of a swapped, id-matched div and
+    # with it Plotly's js-plotly-plot, which hover and click need.
+    assert 'id="chart' not in charts.text
+    for name in ("RF regressor", "MCP", "ATC", "confidence"):
+        assert name in charts.text
+    assert "No run matches" in client.get("/compare/charts?classifier=mlp").text
+    queries_400 = ("metric=bogus", "metric=classify", "x=bogus", "rule=bogus")
+    for query_string in (*queries_400, "color=bogus"):
+        assert client.get(f"/compare/charts?{query_string}").status_code == 400
 
 
 def test_read_routes_never_write(client: TestClient, root: Path, run_id: int) -> None:
@@ -175,25 +183,15 @@ def test_read_routes_never_write(client: TestClient, root: Path, run_id: int) ->
     def state() -> tuple[str, float]:
         return hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_mtime
 
-    render = _execution(root, "render")
-    name = query(
-        root / "grace.db", f"SELECT name FROM figures WHERE execution_id = {render}"
-    )[0][0]
     before = state()
-    for url in (
-        "/",
-        "/api/results",
-        "/compare",
-        "/compare/charts",
-        "/runs",
-        "/presets",
-        "/jobs",
-        f"/runs/{run_id}",
-        f"/runs/{run_id}/regions",
+    urls = ["/", "/api/experiments", "/compare", "/compare/charts", f"/runs/{run_id}"]
+    urls += [f"/runs/{run_id}/{tab}" for tab in _TABS]
+    urls += [
+        f"/runs/{run_id}/stages?sig=x",
+        f"/runs/{run_id}/partitions/charts",
         f"/runs/{run_id}/regions/0",
-        f"/runs/{run_id}/partitions",
-        f"/figures/{render}/{name}",
-    ):
+    ]
+    for url in urls:
         assert client.get(url).status_code == 200, url
     assert state() == before
     with closing(queries.connect(path)) as db:
@@ -201,83 +199,86 @@ def test_read_routes_never_write(client: TestClient, root: Path, run_id: int) ->
             db.execute("DELETE FROM runs")
 
 
-def test_unavailable_db_and_huge_ids(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
+def test_unavailable_db_huge_ids_and_foreign_host(
+    client: TestClient, root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Check that a DB error is a 503 and a huge id a 422."""
-    for url in ("/runs/99999999999999999999", "/jobs/99999999999999999999/log"):
-        assert client.get(url).status_code == 422, url
+    """Check the 503 of a DB error, 422 of a huge id, 400 of a Host."""
+    assert client.get("/runs/99999999999999999999").status_code == 422
+    # Against DNS rebinding: only the dashboard's own names are served.
+    with TestClient(create_app(root / "grace.db"), base_url="http://evil.test") as bad:
+        assert bad.get("/").status_code == 400
 
     def broken(path: Path) -> None:
         raise sqlite3.OperationalError("database is locked")
 
     monkeypatch.setattr(queries, "connect", broken)
-    page = client.get("/runs")
-    assert page.status_code == 503 and "<nav>" in page.text
+    page = client.get("/")
+    assert page.status_code == 503 and "Experiments" in page.text
     assert "grace.db" in page.text and "locked" in page.text
 
 
 def test_fresh_root(tmp_path: Path) -> None:
-    """Check that a new root gets a DB with the dashboard tables."""
+    """Check that a new root gets a DB and every page says so."""
     path = tmp_path / "grace.db"
     with TestClient(create_app(path), base_url=BASE_URL) as client:
         assert path.exists()
         page = client.get("/")
-        assert (
-            page.status_code == 200
-            and "No finished failures execution yet." in page.text
-        )
-        assert client.get("/presets").status_code == 200
-        assert client.get("/jobs").status_code == 200
-    tables = {
-        name
-        for (name,) in query(tmp_path / "grace.db", "SELECT name FROM sqlite_master")
-    }
-    assert {"presets", "jobs"} <= tables
+        assert page.status_code == 200 and "No experiment yet" in page.text
+        assert client.get("/compare").status_code == 200
+        assert "No run matches" in client.get("/compare/charts").text
+        assert client.get("/api/experiments").json() == []
 
 
-def test_render_without_then_with_regressor(tmp_path: Path) -> None:
-    """Check that a run without regress shows; regress joins it."""
-    run_id = run(["render"], fast_cfg(tmp_path, "regressor_figures=false"), force=False)
-    linked = query(
-        tmp_path / "grace.db", f"SELECT stage FROM run_stages WHERE run_id = {run_id}"
-    )
-    stages = {stage for (stage,) in linked}
-    assert stages == set(
-        "split prepare regions classify failures baselines render".split()
-    )
-    names = {
-        name for (name,) in query(tmp_path / "grace.db", "SELECT name FROM figures")
-    }
-    assert {"failures/rate_by_class", "baselines/predicted_vs_observed"} <= names
-    assert not any(name.startswith("regress/") for name in names)
-
+def test_a_run_with_only_prepare_shows_what_exists(tmp_path: Path) -> None:
+    """Check that tabs whose stage is missing are off, and say why."""
+    run_id = run(["prepare"], fast_cfg(tmp_path), force=False)
     with TestClient(create_app(tmp_path / "grace.db"), base_url=BASE_URL) as client:
-        rows = client.get("/api/results").json()
-        assert len(rows) == 1 and rows[0]["run_id"] == run_id
-        assert rows[0]["regress_id"] is None and rows[0]["regressor_spearman"] is None
-        sql = (
-            "SELECT value FROM metrics WHERE name = 'mcp_spearman' "
-            f"AND execution_id = {_execution(tmp_path, 'baselines')}"
-        )
-        assert rows[0]["mcp_spearman"] == query(tmp_path / "grace.db", sql)[0][0]
-        render = _execution(tmp_path, "render")
-        figure = f"/figures/{render}/failures/rate_by_class"
-        page = client.get(f"/runs/{run_id}")
-        assert page.status_code == 200 and "failures/rate_by_class" in page.text
-        charts = client.get("/compare/charts?metric=regressor_spearman")
-        assert charts.status_code == 200
-        assert "MCP" in charts.text and "RF regressor" not in charts.text
-        for url in (
-            "/",
-            f"/runs/{run_id}/regions",
-            f"/runs/{run_id}/regions/0",
-            figure,
-        ):
-            assert client.get(url).status_code == 200, url
+        overview = client.get(f"/runs/{run_id}")
+        assert overview.status_code == 200 and "split" in overview.text
+        assert overview.text.count('class="disabled"') == 5
+        data = client.get(f"/runs/{run_id}/data")
+        assert "Rows of each class" in data.text and "Preprocessing" in data.text
+        for tab in "classifier regions failures predictors partitions".split():
+            page = client.get(f"/runs/{run_id}/{tab}")
+            assert page.status_code == 200 and "Nothing to show yet" in page.text
+        assert client.get(f"/runs/{run_id}/regions/0").status_code == 404
+        assert client.get(f"/runs/{run_id}/partitions/charts").status_code == 404
+        assert client.get("/api/experiments").json()[0]["n_seeds"] == 1
+        assert client.get("/compare/charts").status_code == 200
 
-        run(["render"], fast_cfg(tmp_path), force=False)
-        run(["failures"], fast_cfg(tmp_path), force=False)
-        rows = client.get("/api/results").json()
-        assert len(rows) == 1 and rows[0]["n_runs"] == 3
-        assert rows[0]["run_id"] == run_id + 1 and rows[0]["regress_id"] is not None
+
+def test_the_regressor_joins_a_run_that_lacked_it(tmp_path: Path) -> None:
+    """Check that predictors show without regress, RF only with it."""
+    first = run(["baselines"], fast_cfg(tmp_path), force=False)
+    with TestClient(create_app(tmp_path / "grace.db"), base_url=BASE_URL) as client:
+        page = client.get(f"/runs/{first}/predictors")
+        assert "MCP" in page.text and "RF regressor" not in page.text
+        assert "need" in page.text and "regress" in page.text
+        assert client.get(f"/runs/{first}/classifier").status_code == 200
+        second = run(["regress"], fast_cfg(tmp_path), force=False)
+        (row,) = client.get("/api/experiments").json()
+        # Both runs are seed 42: the latest represents it.
+        assert row["n_seeds"] == 1 and row["seeds"][0]["run_id"] == second
+        assert "RF regressor" in client.get(f"/runs/{second}/predictors").text
+
+
+def test_a_running_run_polls_and_reloads_when_a_stage_finishes(
+    tmp_path: Path,
+) -> None:
+    """Check that the stage strip polls a run, reloads when stale."""
+    run_id = run(["split"], fast_cfg(tmp_path), force=False)
+    db = tmp_path / "grace.db"
+    with TestClient(create_app(db), base_url=BASE_URL) as client:
+        done = client.get(f"/runs/{run_id}")
+        assert f"/runs/{run_id}/stages" not in done.text
+        with closing(sqlite3.connect(db)) as connection, connection:
+            connection.execute("UPDATE runs SET status = 'running'")
+        live = client.get(f"/runs/{run_id}")
+        assert f"/runs/{run_id}/stages?sig=" in live.text
+        # The page's own signature: nothing changed, so no reload.
+        sig = live.text.split("stages?sig=")[1].split('"')[0]
+
+        same = client.get(f"/runs/{run_id}/stages?sig={sig}")
+        assert "hx-refresh" not in same.headers
+        stale = client.get(f"/runs/{run_id}/stages?sig=old")
+        assert stale.headers["hx-refresh"] == "true"

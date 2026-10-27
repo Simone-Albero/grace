@@ -1,0 +1,67 @@
+{% import "_macros.html" as m %}
+<div id="experiment" {% if active %}hx-get="/experiments/{{ experiment.key }}" hx-trigger="every {{ REFRESH }}s"
+     hx-target="#experiment" hx-swap="outerHTML"{% endif %}>
+<h2>Seeds</h2>
+<div class="scroll">
+<table>
+  <thead><tr>
+    <th class="num">seed</th><th class="num">run</th><th>status</th><th>stages</th>
+    {% for label in headline.values() %}<th class="num">{{ label }}</th>{% endfor %}
+  </tr></thead>
+  <tbody>
+  {% for s in experiment.seeds %}
+  <tr>
+    <td class="num">{{ s.seed }}</td>
+    <td class="num"><a href="/runs/{{ s.run.id }}">{{ s.run.id }}</a></td>
+    <td class="{{ s.run.status }}">{{ s.run.status }}</td>
+    <td>{{ m.strip(states[s.seed], compact=True) }}</td>
+    {% for key in headline %}<td class="num">{{ s.metrics.get(key) | num }}</td>{% endfor %}
+  </tr>
+  {% endfor %}
+  <tr class="summary">
+    <td colspan="4">mean ± std</td>
+    {% for key in headline %}<td class="num">{{ aggregates[key] | pm(experiment.seeds | length) }}</td>{% endfor %}
+  </tr>
+  </tbody>
+</table>
+</div>
+{% if experiment.seeds | selectattr("earlier") | list %}
+<details><summary>Earlier runs of the same seeds</summary>
+  <ul>
+  {% for s in experiment.seeds if s.earlier %}
+    <li>seed {{ s.seed }}: {% for r in s.earlier %}<a href="/runs/{{ r.id }}">{{ r.id }}</a> <span class="{{ r.status }}">{{ r.status }}</span>{{ ", " if not loop.last }}{% endfor %}</li>
+  {% endfor %}
+  </ul>
+</details>
+{% endif %}
+
+<h2>Across the seeds</h2>
+{% if figures %}
+<div class="grid">
+  {% for title, fig in figures %}{{ m.chart(fig, title) }}{% endfor %}
+</div>
+<p class="muted">Dots are seeds, the dash is their mean.</p>
+{% else %}
+<p class="note">No seed has a finished stage with metrics yet.</p>
+{% endif %}
+
+<h2>All metrics</h2>
+<div class="scroll">
+<table>
+  <thead><tr>
+    <th>metric</th>
+    {% for s in experiment.seeds %}<th class="num">seed {{ s.seed }}</th>{% endfor %}
+    <th class="num">mean ± std</th>
+  </tr></thead>
+  <tbody>
+  {% for row in table %}
+  <tr>
+    <td>{{ row.label }}</td>
+    {% for value in row["values"] %}<td class="num">{{ value | num }}</td>{% endfor %}
+    <td class="num">{{ row.summary | pm(experiment.seeds | length) }}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+</div>

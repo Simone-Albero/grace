@@ -9,7 +9,6 @@ from pathlib import Path
 
 import uvicorn
 
-from dashboard import jobs
 from dashboard.app import create_app
 from pipeline.db import DB_NAME, explain
 
@@ -25,7 +24,7 @@ def main() -> None:
     path = Path(args.root) / DB_NAME
     try:
         app = create_app(path)
-    except (jobs.RootInUseError, OSError) as error:
+    except OSError as error:
         sys.exit(f"error: {error}")
     except sqlite3.Error as error:
         sys.exit(f"error: {explain(error, path)}")

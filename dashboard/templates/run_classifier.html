@@ -1,0 +1,38 @@
+{% extends "run_base.html" %}
+{% block content %}
+{{ m.tiles(tiles) }}
+<div class="grid">
+  {% if figures.scores %}{{ m.chart(figures.scores, "Test scores per class") }}{% endif %}
+  {% if figures.confusion %}{{ m.chart(figures.confusion, "Confusion matrix on test, each row a true class") }}
+  {% elif classes %}<section class="card"><h3>Confusion matrix</h3><p class="note">{{ confusion_note }}</p></section>{% endif %}
+  {% if figures.grid %}{{ m.chart(figures.grid, "Grid search, cross-validated score") }}{% endif %}
+  {% if figures.loss %}{{ m.chart(figures.loss, "Training loss") }}{% endif %}
+</div>
+{% if classes %}
+<h2>Per class, on test</h2>
+<div class="scroll"><table>
+  <thead><tr><th>class</th><th class="num">test rows</th><th class="num">precision</th><th class="num">recall</th><th class="num">F1</th></tr></thead>
+  <tbody>
+  {% for c in classes %}
+  <tr><td>{{ c.name }}</td><td class="num">{{ c.n_test | num }}</td><td class="num">{{ c.precision | num }}</td>
+    <td class="num">{{ c.recall | num }}</td><td class="num">{{ c.f1 | num }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table></div>
+{% else %}
+<p class="note">Per-class scores need the finished <b>prepare</b> stage.</p>
+{% endif %}
+{% if grid %}
+<h2>Grid-search candidates</h2>
+<div class="scroll"><table>
+  <thead><tr><th class="num">candidate</th><th class="num">mean score</th><th class="num">std</th><th>params</th></tr></thead>
+  <tbody>
+  {% for g in grid %}
+  <tr{% if g.best %} class="best"{% endif %}><td class="num">{{ g.candidate }}{% if g.best %} ★{% endif %}</td>
+    <td class="num">{{ g.mean_score | num }}</td><td class="num">{{ g.std_score | num }}</td>
+    <td>{{ g.params | tojson }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table></div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,33 @@
+{% extends "run_base.html" %}
+{% block content %}
+<h2>Stages</h2>
+<div class="scroll">
+<table>
+  <thead><tr>
+    <th>stage</th><th class="num">execution</th><th>result</th><th>started</th>
+    <th class="num">seconds</th><th>error</th>
+  </tr></thead>
+  <tbody>
+  {% for s in run.stages %}
+  <tr>
+    <td>{{ s.stage }}</td><td class="num">{{ s.execution_id }}</td>
+    <td class="{{ states[s.stage] }}">{{ m.glyph(states[s.stage]) }} {{ states[s.stage] }}</td>
+    <td>{{ s.started_at }}</td><td class="num">{{ s.duration_s | num }}</td>
+    <td class="trunc" title="{{ s.error or '' }}">{{ (s.error or "")[:120] }}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% if areas %}
+<h2>Results</h2>
+{% for area in areas %}
+<div class="area">
+  <h3><a href="/runs/{{ run.id }}/{{ area.tab }}">{{ area.tab | capitalize }} →</a></h3>
+  {{ m.tiles(area.tiles) }}
+</div>
+{% endfor %}
+{% else %}
+<p class="note">No stage has finished yet.</p>
+{% endif %}
+{% endblock %}

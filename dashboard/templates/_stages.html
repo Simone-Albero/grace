@@ -1,0 +1,5 @@
+{% import "_macros.html" as m %}
+<div id="stages" {% if run.status == "running" %}hx-get="/runs/{{ run.id }}/stages?sig={{ signature | urlencode }}"
+     hx-trigger="every {{ REFRESH }}s" hx-swap="outerHTML"{% endif %}>
+  {{ m.strip(states) }}
+</div>

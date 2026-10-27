@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% set nav = "experiments" %}
+{% import "_macros.html" as m %}
+{% block title %}Run {{ run.id }}{% endblock %}
+{% block body %}
+<div class="crumbs"><a href="/">Experiments</a> ›
+  <a href="/experiments/{{ experiment }}">{{ run.config.groups.data }} · {{ run.config.groups.classifier }} · {{ run.config.groups.clustering }}</a>
+  › seed {{ run.config.seed }}</div>
+<h1>Run {{ run.id }} <span class="status {{ run.status }}">{{ run.status }}</span></h1>
+<div class="chips">
+  <span class="chip">data <b>{{ run.config.groups.data }}</b></span>
+  <span class="chip">classifier <b>{{ run.config.groups.classifier }}</b></span>
+  <span class="chip">clustering <b>{{ run.config.groups.clustering }}</b></span>
+  <span class="chip">distance <b>{{ run.config.distance }}</b></span>
+  <span class="chip">seed <b>{{ run.config.seed }}</b></span>
+  <span class="chip">targets <b>{{ run.targets | join(", ") }}</b></span>
+  <span class="chip">started <b>{{ run.started_at }}</b></span>
+</div>
+{% include "_stages.html" %}
+{% if run.error %}<pre class="failed">{{ run.error }}</pre>{% endif %}
+<div class="tabs">
+  {% for name, needs in TABS.items() %}
+    {% if open_tabs[name] %}
+    <a href="/runs/{{ run.id }}{{ '' if name == 'overview' else '/' ~ name }}"{% if tab == name %} class="current"{% endif %}>{{ name | capitalize }}</a>
+    {% else %}
+    <span class="disabled" title="needs {{ needs | join(' or ') }}">{{ name | capitalize }}</span>
+    {% endif %}
+  {% endfor %}
+</div>
+{% if not available %}
+{{ m.missing(needs) }}
+{% else %}
+{% block content %}{% endblock %}
+{{ m.settings(settings) }}
+{% endif %}
+{% endblock %}

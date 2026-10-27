@@ -1,0 +1,55 @@
+{% extends "run_base.html" %}
+{% block content %}
+{{ m.tiles(tiles) }}
+<div class="grid">
+  {% if figures.per_class %}{{ m.chart(figures.per_class, "Regions per class") }}{% endif %}
+  {% if figures.sizes %}{{ m.chart(figures.sizes, "Train rows per region") }}{% endif %}
+</div>
+{% if clusterings %}
+<h2>Clustering of each class</h2>
+<div class="scroll"><table>
+  <thead><tr>
+    <th>class</th><th class="num">train rows</th><th class="num">regions</th>
+    <th class="num" title="Granularity loss of the chosen number of clusters">loss</th>
+    <th class="num" title="Normalized entropy of the cluster sizes: 1 is balanced">size balance</th>
+    <th class="num" title="Undersized clusters absorbed, plus clusters cut by the cap">merged clusters</th>
+    <th class="num" title="Rows moved by the merge, noise included">rows merged</th>
+  </tr></thead>
+  <tbody>
+  {% for c in clusterings %}
+  <tr><td>{{ c.name }}</td><td class="num">{{ c.n_train | num }}</td><td class="num">{{ c.n_clusters | num }}</td>
+    <td class="num">{{ c.loss | num }}</td><td class="num">{{ c.size_balance | num }}</td>
+    <td class="num">{{ c.n_merged_clusters | num }}</td><td class="num">{{ c.n_merged | num }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table></div>
+{% endif %}
+
+<h2>Explorer</h2>
+<form class="filters" id="filters" hx-get="/runs/{{ run.id }}/regions" hx-target="#explorer"
+      hx-trigger="change" hx-include="#explorer" hx-push-url="true">
+  <label>class
+    <select name="class_id">
+      <option value="">all</option>
+      {% for id, name in class_names %}
+      <option value="{{ id }}"{% if class_id == id | string %} selected{% endif %}>{{ name }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>scored (enough test rows)
+    <select name="used">
+      <option value="">all</option>
+      <option value="1"{% if used == "1" %} selected{% endif %}>used</option>
+      <option value="0"{% if used == "0" %} selected{% endif %}>not used</option>
+    </select>
+  </label>
+  {% for axis, current in (("x", x), ("y", y)) %}
+  <label>{{ axis }}
+    <select name="{{ axis }}">
+      {% for column in axes %}<option{% if column == current %} selected{% endif %}>{{ column }}</option>{% endfor %}
+    </select>
+  </label>
+  {% endfor %}
+</form>
+<div id="explorer">{% include "_regions_explorer.html" %}</div>
+{% endblock %}

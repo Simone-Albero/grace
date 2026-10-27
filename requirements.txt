@@ -167,8 +167,6 @@ python-dateutil==2.9.0.post0
     # via
     #   matplotlib
     #   pandas
-python-multipart==0.0.29
-    # via -r grace/requirements.in
 pytokens==0.4.1
     # via black
 pyyaml==6.0.3

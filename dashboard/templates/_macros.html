@@ -1,0 +1,62 @@
+{% macro tiles(items) %}
+{% if items %}
+<div class="tiles">
+  {% for t in items %}
+  <div class="tile"><div class="tile-value">{{ t.value | num }}</div>
+    <div class="tile-label">{{ t.label }}</div></div>
+  {% endfor %}
+</div>
+{% endif %}
+{% endmacro %}
+
+{% macro chart(fig, title="", wide=False) %}
+<section class="card{% if wide %} wide{% endif %}">
+  {% if title %}<h3>{{ title }}</h3>{% endif %}
+  <div class="chart" data-figure='{{ fig | tojson }}'></div>
+</section>
+{% endmacro %}
+
+{% macro glyph(state) -%}
+{{ {"done": "●", "cached": "◉", "running": "◐", "failed": "✕"}.get(state, "·") }}
+{%- endmacro %}
+
+{% macro strip(states, compact=False) %}
+<div class="stages{% if compact %} compact{% endif %}">
+  {% for stage in STAGES %}
+  <span class="stage {{ states[stage] or 'none' }}"
+        title="{{ stage }}: {{ states[stage] or 'not run' }}"><i>{{ glyph(states[stage]) }}</i>{% if not compact %}{{ stage }}{% endif %}</span>
+  {% endfor %}
+</div>
+{% endmacro %}
+
+{% macro coverage(cells) %}
+<span class="cov">
+  {% for c in cells %}
+  <i class="{{ 'full' if c.done == c.seeds else ('part' if c.done else '') }}"
+     title="{{ c.stage }}: {{ c.done }} of {{ c.seeds }} seeds"></i>
+  {% endfor %}
+</span>
+{% endmacro %}
+
+{% macro facts(config) %}
+<dl class="facts">
+  {% for key, value in config | flat %}<dt>{{ key }}</dt><dd>{{ value }}</dd>{% endfor %}
+</dl>
+{% endmacro %}
+
+{% macro settings(configs) %}
+{% if configs %}
+<details class="settings">
+  <summary>Settings of the stages shown</summary>
+  {% for stage, config in configs.items() %}
+  <h4>{{ stage }}</h4>
+  {{ facts(config) }}
+  {% endfor %}
+</details>
+{% endif %}
+{% endmacro %}
+
+{% macro missing(needs) %}
+<p class="note">Nothing to show yet: this run has no finished
+  {% for stage in needs %}<b>{{ stage }}</b>{{ " or " if not loop.last }}{% endfor %} stage.</p>
+{% endmacro %}

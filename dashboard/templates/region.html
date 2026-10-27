@@ -1,25 +1,27 @@
-{% extends "base.html" %}
-{% block title %}Region {{ region.region_id }}{% endblock %}
-{% block body %}
-<h1>Run <a href="/runs/{{ run_id }}">{{ run_id }}</a> · region {{ region.region_id }}
-  <span class="muted">({{ region["class"] }})</span></h1>
-<p><a href="/runs/{{ run_id }}/regions">back to regions</a></p>
-<table>
-  <thead><tr><th>column</th><th>value</th></tr></thead>
-  {% for key in columns %}
-  <tr><td>{{ key }}</td><td class="num">{{ region[key] | num }}</td></tr>
-  {% endfor %}
-</table>
-<h2>Complexity descriptors</h2>
-<table>
-  <thead><tr><th>measure</th><th>region</th><th>class</th></tr></thead>
-  <tbody>
-  {% for d in descriptors %}
-  <tr>
-    <td>{{ d.measure }}</td><td class="num">{{ d.region | num }}</td>
-    <td class="num">{{ d["class"] | num }}</td>
-  </tr>
-  {% endfor %}
-  </tbody>
-</table>
+{% extends "run_base.html" %}
+{% block title %}Run {{ run.id }} region {{ region.region_id }}{% endblock %}
+{% block content %}
+<h2>Region {{ region.region_id }} <span class="muted">· {{ region["class"] }} ·
+  <a href="/runs/{{ run.id }}/regions">back to the regions</a></span></h2>
+<div class="grid">
+  <section class="card">
+    <h3>Counts and rates</h3>
+    <dl class="facts">
+      {% for key in columns %}<dt>{{ key }}</dt><dd>{{ region[key] | num }}</dd>{% endfor %}
+    </dl>
+  </section>
+  <section class="card">
+    <h3>Complexity descriptors</h3>
+    {% if descriptors %}
+    <div class="scroll"><table>
+      <thead><tr><th>measure</th><th class="num">region</th><th class="num">class</th></tr></thead>
+      <tbody>
+      {% for d in descriptors %}
+      <tr><td>{{ d.measure }}</td><td class="num">{{ d.region | num }}</td><td class="num">{{ d["class"] | num }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table></div>
+    {% else %}<p class="note">Needs the finished <b>complexity</b> stage.</p>{% endif %}
+  </section>
+</div>
 {% endblock %}

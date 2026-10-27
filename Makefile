@@ -37,6 +37,6 @@ smoke:
 generate:
 	$(PYTHON) -m pipeline.generate_synthetic $(if $(ROWS),--rows $(ROWS),)
 
-## dashboard: dashboard (results, presets, jobs) of ROOT/grace.db (default resources), created if missing, on 127.0.0.1:PORT (default 8000); remote host: ssh -L PORT:127.0.0.1:PORT <host>
+## dashboard: dashboard (the results of every stage, by experiment) of ROOT/grace.db (default resources), created if missing, on 127.0.0.1:PORT (default 8000); remote host: ssh -L PORT:127.0.0.1:PORT <host>
 dashboard:
 	$(PYTHON) -m dashboard --root $(ROOT) --port $(PORT)

@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% set nav = "experiments" %}
+{% block title %}Experiments{% endblock %}
+{% block body %}
+<h1>Experiments</h1>
+<p class="muted">One row per config; its seeds are the runs that differ only by seed, each
+  taken at its latest run. Values are mean ± std over the seeds.</p>
+<form class="filters" id="filters" hx-get="/" hx-target="#table" hx-trigger="change"
+      hx-include="#table" hx-push-url="true">
+  {% for key in MAIN_KEYS %}
+  <label>{{ key }}
+    <select name="{{ key }}">
+      <option value="">all</option>
+      {% for value in options[key] %}
+      <option{% if selected[key] == value %} selected{% endif %}>{{ value }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  {% endfor %}
+</form>
+<div id="table">{% include "_experiments_table.html" %}</div>
+{% endblock %}

@@ -1,0 +1,25 @@
+{% import "_macros.html" as m %}
+{% if not n_rows %}
+<p class="note">No run matches these filters, or none has finished a stage with metrics.</p>
+{% else %}
+<div class="grid">
+  {% for title, fig in figures %}{{ m.chart(fig, title) }}{% endfor %}
+</div>
+<h2>First chart as a table <span class="muted">· {{ n_rows }} seeds</span></h2>
+<div class="scroll">
+<table>
+  <thead><tr><th>{{ x }}</th>{% for c in pivot.columns %}<th class="num">{{ c }}</th>{% endfor %}</tr></thead>
+  <tbody>
+  {% for value in pivot.rows %}
+  <tr>
+    <td>{{ value }}</td>
+    {% for cells in pivot.cells %}
+    {% set cell = cells[value] %}
+    <td class="num">{% if cell[0] is none %}–{% else %}{{ cell[0] | num }}{% if cell[1] is not none %} ± {{ "%.4f" | format(cell[1]) }}{% endif %} <span class="muted">(n={{ cell[2] }})</span>{% endif %}</td>
+    {% endfor %}
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endif %}

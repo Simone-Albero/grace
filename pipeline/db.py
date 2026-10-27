@@ -22,7 +22,7 @@ RUNS_LOCK = "runs.lock"
 KILLED = "its process ended before it finished (killed?)"
 _CORRUPTED = (
     "it looks corrupted; restore a copy, or move it away together with "
-    "artifacts/ and jobs/ to start a new one"
+    "artifacts/ to start a new one"
 )
 # What to do about an sqlite3 error, by a word of its message. An error
 # matching none gets no advice: only these name a certain remedy.
@@ -238,26 +238,6 @@ CREATE TABLE IF NOT EXISTS partition_groups (
     test_rate REAL,  -- NULL when n_test = 0
     mean_kdn REAL,  -- NULL for a bin arm
     PRIMARY KEY (execution_id, arm, rule, group_id)
-);
-CREATE TABLE IF NOT EXISTS presets (  -- dashboard: one python -m stages call
-    name TEXT PRIMARY KEY,
-    targets TEXT NOT NULL,  -- JSON list of stage names
-    overrides TEXT NOT NULL,  -- JSON list of key=value
-    sweeps TEXT NOT NULL,  -- JSON list of key=v1,v2
-    force INTEGER NOT NULL CHECK (force IN (0, 1)),
-    updated_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS jobs (  -- dashboard: preset launches, run one at a time
-    id INTEGER PRIMARY KEY,
-    preset TEXT NOT NULL,  -- its name at launch; the preset may change or go later
-    argv TEXT NOT NULL,  -- JSON: the arguments after `python -m stages`
-    status TEXT NOT NULL
-        CHECK (status IN ('queued', 'running', 'done', 'failed', 'cancelled')),
-    returncode INTEGER,
-    error TEXT,  -- why the dashboard ended it (restart, launch error)
-    created_at TEXT NOT NULL,
-    started_at TEXT,
-    finished_at TEXT
 );
 """
 

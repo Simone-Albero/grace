@@ -1,0 +1,38 @@
+{% extends "run_base.html" %}
+{% block content %}
+{{ m.tiles(tiles) }}
+<div class="grid">
+  {{ m.chart(figures.brier, "Brier score at each arm's operating point") }}
+  {{ m.chart(figures.kdn_spearman, "kDN Spearman at each arm's operating point") }}
+</div>
+<p class="muted">An arm's operating point is its selected grouping, or for a bin arm the
+  cube-root rule; <code>null</code> is the mean of its draws.</p>
+<h2>Operating points</h2>
+<div class="scroll"><table>
+  <thead><tr>
+    <th>arm</th><th>rule</th><th class="num">groups</th><th class="num">val median</th>
+    <th class="num">no val</th><th class="num">Brier</th><th class="num">skill</th>
+    <th class="num">AUROC</th><th class="num">kDN Spearman</th>
+  </tr></thead>
+  <tbody>
+  {% for p in points %}
+  <tr><td>{{ p.arm }}</td><td>{{ p.rule }}</td><td class="num">{{ p.n_groups | num }}</td>
+    <td class="num">{{ p.val_median | num }}</td><td class="num">{{ p.share_no_val | num }}</td>
+    <td class="num">{{ p.brier | num }}</td><td class="num">{{ p.skill | num }}</td>
+    <td class="num">{{ p.auroc | num }}</td><td class="num">{{ p.kdn_spearman | num }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table></div>
+
+<h2>Sweeps over the granularity</h2>
+<form class="filters" hx-get="/runs/{{ run.id }}/partitions/charts" hx-target="#sweeps"
+      hx-trigger="load, change" autocomplete="off">
+  <label>metric
+    <select name="metric">{% for name in metrics %}<option{% if name == "skill" %} selected{% endif %}>{{ name }}</option>{% endfor %}</select>
+  </label>
+  <label>x
+    <select name="x">{% for axis in axes %}<option{% if axis == "n_groups" %} selected{% endif %}>{{ axis }}</option>{% endfor %}</select>
+  </label>
+</form>
+<div id="sweeps"></div>
+{% endblock %}

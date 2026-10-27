@@ -1,125 +1,46 @@
-"""The FastAPI app: results, runs, regions, presets and jobs."""
+"""The FastAPI app: experiments, runs, regions and comparisons."""
 
 __all__ = ["create_app"]
 
-import json
 import sqlite3
-from collections.abc import (
-    AsyncIterator,
-    Awaitable,
-    Callable,
-    Collection,
-    Iterator,
-    Mapping,
-    Sequence,
-)
-from contextlib import asynccontextmanager
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, Form, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi import Path as PathParam
 from fastapi import Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import (
-    FileResponse,
-    HTMLResponse,
-    JSONResponse,
-    RedirectResponse,
-    Response,
-)
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from dashboard import charts, jobs, queries, store
-from dashboard.queries import (
-    CONFIG_KEYS,
-    METRICS,
-    PARTITION_AXES,
-    PARTITION_METRICS,
-    REGION_COLUMNS,
-    SCORES,
-)
-from pipeline.db import explain
+from dashboard import charts, experiments, queries, summary, tabs
+from dashboard.experiments import MAIN_KEYS, Experiment
+from dashboard.queries import PARTITION_AXES, PARTITION_METRICS, REGION_COLUMNS
+from pipeline.db import explain, reap
 
 # The rendered rows of the region table; the scatter keeps all points.
 _MAX_ROWS = 500
 # The only Host headers served, against DNS rebinding.
 _HOSTS = ["127.0.0.1", "localhost"]
-# The job statuses that are not final.
-_ACTIVE = ("queued", "running")
 # Ids are SQLite integers: a larger one is a 422, not an OverflowError.
 _Id = Annotated[int, PathParam(ge=0, le=2**63 - 1)]
-_RESULT_COLUMNS = ["run_id", "n_runs", *CONFIG_KEYS, *METRICS]
+_SORTS = ["latest", "n_seeds", *MAIN_KEYS, *summary.HEADLINE]
+# What the pages poll for while a run is going, in seconds.
+_REFRESH_SECONDS = 5
+_BIN_RULES = ("selected", "fixed15", "cbrt", "per150")
+_ARM_METRICS = ("skill", "brier", "auroc", "kdn_spearman")
+# The trace of a grouped-bar chart: name, color, values by x.
+_Trace = tuple[str, str, dict[str, list[float]]]
 
 
-def _choice(name: str, value: str, valid: Collection[str]) -> None:
+def _check_choice(name: str, value: str, valid: Collection[str]) -> None:
     """Raise a 400 naming the valid values unless `value` is one."""
     if value not in valid:
         raise HTTPException(400, f"Unknown {name} {value!r}. Valid: {', '.join(valid)}")
-
-
-def _sort(rows: Sequence[dict], key: str, desc: bool) -> list[dict]:
-    """Return `rows` ordered by `key`, with the None values last."""
-    known = [row for row in rows if row[key] is not None]
-    missing = [row for row in rows if row[key] is None]
-    return sorted(known, key=lambda row: row[key], reverse=desc) + missing
-
-
-def _keep(rows: Sequence[dict], selected: Mapping[str, str]) -> list[dict]:
-    """Return the rows whose value of each selected key matches.
-
-    An empty selection value matches any row.
-    """
-    return [
-        row
-        for row in rows
-        if all(value in ("", str(row[key])) for key, value in selected.items())
-    ]
-
-
-def _options(rows: Sequence[dict]) -> dict[str, list[str]]:
-    """Return the distinct values of every config key, for selects."""
-    return {key: sorted({str(row[key]) for row in rows}) for key in CONFIG_KEYS}
-
-
-def _num(value: float | None) -> str:
-    """Format a table cell: an en dash for None, else a number."""
-    if value is None:
-        return "–"
-    if isinstance(value, float) and not value.is_integer():
-        return f"{value:.4f}"
-    return str(int(value))
-
-
-def _filters(request: Request) -> dict[str, str]:
-    """Read the results filters of the query string.
-
-    Args:
-        request: The request.
-
-    Returns:
-        The value of every config key; "" means no filter.
-    """
-    return {key: request.query_params.get(key, "") for key in CONFIG_KEYS}
-
-
-def _same_origin(request: Request) -> None:
-    """Refuse a POST from another web page.
-
-    The Host is already pinned, so `base_url` is this dashboard's own
-    origin.
-
-    Args:
-        request: The request.
-
-    Raises:
-        HTTPException: The 403 for a cross-origin POST.
-    """
-    origin = request.headers.get("origin")
-    if origin is not None and origin != str(request.base_url).rstrip("/"):
-        raise HTTPException(403, f"Cross-origin POST from {origin!r} refused")
 
 
 def _found(row: dict | None, detail: str) -> dict:
@@ -129,24 +50,204 @@ def _found(row: dict | None, detail: str) -> dict:
     return row
 
 
-def _stage_ids_with(
-    connection: sqlite3.Connection, run_id: int, stage: str
-) -> dict[str, int]:
-    """Return a run's stage ids, or raise a 404 if it lacks `stage`."""
-    _found(queries.run(connection, run_id), f"No run {run_id}")
-    ids = queries.stage_ids(connection, run_id)
-    if stage not in ids:
-        raise HTTPException(404, f"Run {run_id} has no {stage} stage")
-    return ids
+def _sort_rows(rows: Sequence[dict], key: str, desc: bool) -> list[dict]:
+    """Return `rows` ordered by `key`, with the None values last."""
+    known = [row for row in rows if row[key] is not None]
+    missing = [row for row in rows if row[key] is None]
+    return sorted(known, key=lambda row: row[key], reverse=desc) + missing
 
 
-def _region_rows(
-    connection: sqlite3.Connection, run_id: int
-) -> tuple[dict[str, int], list[str], list[dict]]:
-    """Return the stage ids, measures and region rows of a run."""
-    ids = _stage_ids_with(connection, run_id, "regions")
+def _matches(values: Mapping, selected: Mapping[str, str]) -> bool:
+    """Say whether `values` matches every selected key; "" is any."""
+    return all(value in ("", str(values[key])) for key, value in selected.items())
+
+
+def _filter_rows(rows: Sequence[Mapping], selected: Mapping[str, str]) -> list[Mapping]:
+    """Return the rows whose value of each selected key matches."""
+    return [row for row in rows if _matches(row, selected)]
+
+
+def _format_number(value: float | None) -> str:
+    """Format a table cell: an en dash for None, else a number."""
+    if value is None:
+        return "–"
+    if isinstance(value, float) and not value.is_integer():
+        return f"{value:,.1f}" if abs(value) >= 100 else f"{value:.4f}"
+    return f"{int(value):,}"
+
+
+def _format_aggregate(
+    aggregate: tuple[float | None, float | None, int], n_seeds: int
+) -> str:
+    """Format `(mean, std, n)`; the count shows when a seed lacks it."""
+    mean, std, n_values = aggregate
+    if mean is None:
+        return "–"
+    text = (
+        _format_number(mean)
+        if std is None
+        else f"{_format_number(mean)} ± {_format_number(std)}"
+    )
+    return text if n_values == n_seeds else f"{text} (n={n_values})"
+
+
+def _flatten(config: Mapping, prefix: str = "") -> list[tuple[str, object]]:
+    """List a nested config as `(dotted key, value)` pairs."""
+    pairs: list[tuple[str, object]] = []
+    for name, value in config.items():
+        if isinstance(value, Mapping):
+            pairs += _flatten(value, f"{prefix}{name}.")
+        else:
+            pairs.append((f"{prefix}{name}", value))
+    return pairs
+
+
+def _read_filters(request: Request) -> dict[str, str]:
+    """Read the config filters of the query string; "" means any."""
+    return {key: request.query_params.get(key, "") for key in MAIN_KEYS}
+
+
+def _list_options(items: Sequence[Mapping]) -> dict[str, list[str]]:
+    """Return the distinct values of every main config key."""
+    return {key: sorted({str(item[key]) for item in items}) for key in MAIN_KEYS}
+
+
+def _load_experiments(db: sqlite3.Connection) -> list[Experiment]:
+    """Group every run of the DB into experiments."""
+    return experiments.build(
+        queries.runs(db), queries.run_metrics(db), queries.operating_points(db)
+    )
+
+
+def _signature(run: Mapping) -> str:
+    """Summarize a run's progress, to tell when its page is stale."""
+    states = summary.stage_states(run)
+    progress = ",".join(f"{stage}:{state}" for stage, state in states.items())
+    return run["status"] + "|" + progress
+
+
+def _slot_color(slot: int) -> str:
+    """Return the categorical color of a slot; a ninth is neutral."""
+    return charts.SERIES[slot] if slot < len(charts.SERIES) else charts.NEUTRAL
+
+
+def _metric_traces(
+    rows: Sequence[Mapping],
+    all_rows: Sequence[Mapping],
+    metric: str,
+    x: str,
+    color: str,
+) -> list[_Trace]:
+    """Build the traces of `metric`, one per value of `color`."""
+    # Color follows the entity, over all rows, so the survivors of a
+    # filter keep theirs.
+    tints = sorted({str(row[color]) for row in all_rows}) if color else [""]
+    by_tint = experiments.grouped_values(rows, metric, x, color or None)
+    return [
+        (
+            f"{color}={value}" if color else summary.metric_label(metric),
+            _slot_color(tints.index(value)),
+            groups,
+        )
+        for value, groups in sorted(by_tint.items())
+    ]
+
+
+def _predictor_traces(rows: Sequence[Mapping], score: str, x: str) -> list[_Trace]:
+    """Build one trace per predictor that has a value of `score`."""
+    traces = []
+    for key, label in queries.PREDICTORS.items():
+        metric = f"{queries.predictor_stage(key)}.{key}_{score}"
+        grouped = experiments.grouped_values(rows, metric, x, None)
+        if grouped:
+            traces.append((label, charts.PREDICTOR_COLORS[key], grouped[""]))
+    return traces
+
+
+def _arm_traces(
+    rows: Sequence[Mapping], arm_metric: str, rule: str, x: str
+) -> list[_Trace]:
+    """Build one trace per arm that has a value at `rule`."""
+    traces = []
+    for arm in charts.OPERATING_RULES:
+        metric = f"op.{arm}.{rule}.{arm_metric}"
+        grouped = experiments.grouped_values(rows, metric, x, None)
+        if grouped:
+            traces.append((arm, charts.ARM_COLORS[arm], grouped[""]))
+    return traces
+
+
+def _pivot(
+    traces: Sequence[_Trace], rows: Sequence[Mapping], x: str
+) -> dict[str, list]:
+    """Lay the traces out as a table, a row per x value."""
+    x_values = sorted({str(row[x]) for row in rows})
+    return {
+        "columns": [name for name, _, _ in traces],
+        "rows": x_values,
+        "cells": [
+            {value: experiments.summarize(groups.get(value, [])) for value in x_values}
+            for _, _, groups in traces
+        ],
+    }
+
+
+def _run_context(connection: sqlite3.Connection, run_id: int) -> dict:
+    """Read what every tab of a run shows in its header."""
+    found = _found(queries.run(connection, run_id), f"No run {run_id}")
+    ids = queries.stage_ids(found)
+    return {
+        "run": found,
+        "ids": ids,
+        "experiment": experiments.config_key(found)[0],
+        "states": summary.stage_states(found),
+        "signature": _signature(found),
+        "open_tabs": {
+            tab: not needs or any(stage in ids for stage in needs)
+            for tab, needs in tabs.TABS.items()
+        },
+    }
+
+
+def _explorer_context(
+    connection: sqlite3.Connection,
+    run: dict,
+    ids: dict[str, int],
+    *,
+    class_id: str,
+    used: str,
+    sort: str,
+    desc: bool,
+    x: str,
+    y: str,
+) -> dict:
+    """Build the region explorer: filters, scatter and table."""
     measures, rows = queries.regions(connection, ids)
-    return ids, measures, rows
+    axes = [*REGION_COLUMNS, *measures]
+    _check_choice("sort", sort, ["region_id", "class", *axes])
+    _check_choice("x", x, axes)
+    _check_choice("y", y, axes)
+    _check_choice("used", used, ["", "1", "0"])
+    names = sorted({(row["class_id"], row["class"]) for row in rows})
+    shown = _sort_rows(
+        _filter_rows(rows, {"class_id": class_id, "used": used}), sort, desc
+    )
+    return {
+        "rows": shown[:_MAX_ROWS],
+        "n_rows": len(shown),
+        "max_rows": _MAX_ROWS,
+        "explorer_figures": [charts.region_scatter(shown, x=x, y=y, run_id=run["id"])],
+        "class_names": names,
+        "axes": axes,
+        "columns": REGION_COLUMNS,
+        "measures": measures,
+        "class_id": class_id,
+        "used": used,
+        "sort": sort,
+        "desc": desc,
+        "x": x,
+        "y": y,
+    }
 
 
 def create_app(db_path: Path) -> FastAPI:
@@ -156,48 +257,34 @@ def create_app(db_path: Path) -> FastAPI:
         db_path: The experiment root's `grace.db`; created if new.
 
     Returns:
-        The app. Its root stays locked until its lifespan ends.
+        The app.
 
     Raises:
-        RootInUseError: Another dashboard already serves the root.
+        OSError: The root cannot be written to.
         sqlite3.Error: The DB cannot be opened or created; `explain`
             says why.
     """
     root = db_path.parent.resolve()
-    # Before recover: a refused instance must not close live jobs.
-    lock = jobs.lock_root(root)
-    try:
-        store.recover(db_path)
-    except BaseException:
-        lock.close()
-        raise
-    worker = jobs.Worker(db_path)
+    # Creates the DB if new, and fails the runs that nothing is running.
+    reap(root)
 
-    @asynccontextmanager
-    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        yield
-        worker.stop()
-        # The closure keeps the file, and so the lock, alive until here.
-        lock.close()
-
-    app = FastAPI(title="grace", docs_url=None, redoc_url=None, lifespan=lifespan)
+    app = FastAPI(title="grace", docs_url=None, redoc_url=None)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=_HOSTS)
-
-    @app.middleware("http")
-    async def refuse_framing(
-        request: Request, call_next: Callable[[Request], Awaitable[Response]]
-    ) -> Response:
-        """Forbid framing: another page could click for the user."""
-        response = await call_next(request)
-        response.headers["X-Frame-Options"] = "DENY"
-        return response
-
-    # Tests stop the worker through the state.
-    app.state.worker = worker
+    app.mount(
+        "/static",
+        StaticFiles(directory=Path(__file__).parent / "static"),
+        name="static",
+    )
     templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
-    templates.env.filters["num"] = _num
-    templates.env.globals["ACTIVE"] = _ACTIVE
-    artifacts = (db_path.parent / "artifacts").resolve()
+    templates.env.filters["num"] = _format_number
+    templates.env.filters["pm"] = _format_aggregate
+    templates.env.filters["flat"] = _flatten
+    templates.env.globals.update(
+        STAGES=queries.STAGE_ORDER,
+        TABS=tabs.TABS,
+        REFRESH=_REFRESH_SECONDS,
+        MAIN_KEYS=list(MAIN_KEYS),
+    )
 
     def db() -> Iterator[sqlite3.Connection]:
         connection = queries.connect(db_path)
@@ -213,19 +300,20 @@ def create_app(db_path: Path) -> FastAPI:
         *,
         fragment: str | None = None,
         status_code: int = 200,
+        headers: Mapping[str, str] | None = None,
     ) -> HTMLResponse:
         """Render the full `page`, or `fragment` for an HTMX request."""
         # A history restore (the back button after a cache miss) needs
         # the full page.
-        htmx = request.headers.get("HX-Request") and not request.headers.get(
+        is_htmx = request.headers.get("HX-Request") and not request.headers.get(
             "HX-History-Restore-Request"
         )
         return templates.TemplateResponse(
             request,
-            fragment if htmx and fragment else page,
+            fragment if is_htmx and fragment else page,
             context,
             status_code=status_code,
-            headers={"Vary": "HX-Request"},
+            headers={"Vary": "HX-Request", **(headers or {})},
         )
 
     @app.exception_handler(StarletteHTTPException)
@@ -245,43 +333,109 @@ def create_app(db_path: Path) -> FastAPI:
         return render(request, "error.html", context, status_code=422)
 
     @app.get("/", response_class=HTMLResponse)
-    def results_page(
+    def experiments_page(
         request: Request,
         connection: sqlite3.Connection = Depends(db),
-        selected: dict[str, str] = Depends(_filters),
-        sort: str = "run_id",
+        selected: dict[str, str] = Depends(_read_filters),
+        sort: str = "latest",
         desc: bool = True,
     ) -> HTMLResponse:
-        _choice("sort", sort, _RESULT_COLUMNS)
-        rows = queries.results(connection)
+        _check_choice("sort", sort, _SORTS)
+        rows = [
+            summary.experiment_row(experiment)
+            for experiment in _load_experiments(connection)
+        ]
+        shown = [row for row in rows if _matches(row["values"], selected)]
+        for row in shown:
+            row.update(row["values"])
+            row.update(
+                {key: aggregate[0] for key, aggregate in row["aggregates"].items()}
+            )
         context = {
-            "rows": _sort(_keep(rows, selected), sort, desc),
-            "options": _options(rows),
+            "rows": _sort_rows(shown, sort, desc),
+            "options": _list_options([row["values"] for row in rows]),
             "selected": selected,
             "sort": sort,
             "desc": desc,
-            "config_keys": list(CONFIG_KEYS),
-            "metrics": list(METRICS),
+            "headline": summary.HEADLINE,
+            "active": any(row["running"] for row in shown),
         }
-        return render(request, "results.html", context, fragment="_results_table.html")
+        return render(
+            request, "experiments.html", context, fragment="_experiments_table.html"
+        )
 
-    @app.get("/api/results")
-    def results_api(
+    @app.get("/api/experiments")
+    def experiments_api(
         connection: sqlite3.Connection = Depends(db),
-        selected: dict[str, str] = Depends(_filters),
+        selected: dict[str, str] = Depends(_read_filters),
     ) -> JSONResponse:
-        return JSONResponse(_keep(queries.results(connection), selected))
+        rows = []
+        for experiment in _load_experiments(connection):
+            row = summary.experiment_row(experiment)
+            if _matches(row["values"], selected):
+                row["seeds"] = [
+                    {
+                        "seed": seed.seed,
+                        "run_id": seed.run["id"],
+                        "metrics": seed.metrics,
+                    }
+                    for seed in experiment.seeds
+                ]
+                row["aggregates"] = {
+                    key: {"mean": mean, "std": std, "n": n}
+                    for key, (mean, std, n) in row["aggregates"].items()
+                }
+                rows.append(row)
+        return JSONResponse(rows)
+
+    @app.get("/experiments/{key}", response_class=HTMLResponse)
+    def experiment_page(
+        request: Request, key: str, connection: sqlite3.Connection = Depends(db)
+    ) -> HTMLResponse:
+        experiment = next(
+            (found for found in _load_experiments(connection) if found.key == key),
+            None,
+        )
+        if experiment is None:
+            raise HTTPException(404, f"No experiment {key!r}")
+        seeds = experiment.seeds
+        context = {
+            "experiment": experiment,
+            "headline": summary.HEADLINE,
+            "states": {seed.seed: summary.stage_states(seed.run) for seed in seeds},
+            "aggregates": {
+                metric: experiments.summarize(
+                    seed.metrics.get(metric) for seed in seeds
+                )
+                for metric in summary.HEADLINE
+            },
+            "figures": summary.experiment_figures(experiment),
+            "table": summary.metric_table(experiment),
+            "active": any(seed.run["status"] == "running" for seed in seeds),
+        }
+        return render(request, "experiment.html", context, fragment="_experiment.html")
 
     @app.get("/compare", response_class=HTMLResponse)
     def compare_page(
         request: Request, connection: sqlite3.Connection = Depends(db)
     ) -> HTMLResponse:
-        rows = queries.results(connection)
+        rows = experiments.compare_rows(_load_experiments(connection))
+        names = sorted(
+            {
+                key
+                for row in rows
+                for key in row["metrics"]
+                if not key.startswith("op.")
+            },
+            key=summary.metric_order,
+        )
         context = {
-            "options": _options(rows),
-            "metrics": list(METRICS),
-            "config_keys": list(CONFIG_KEYS),
-            "scores": SCORES,
+            "options": _list_options(rows),
+            "metrics": names,
+            "labels": {name: summary.metric_label(name) for name in names},
+            "scores": queries.SCORES,
+            "arm_metrics": _ARM_METRICS,
+            "rules": _BIN_RULES,
         }
         return render(request, "compare.html", context)
 
@@ -289,130 +443,105 @@ def create_app(db_path: Path) -> FastAPI:
     def compare_charts(
         request: Request,
         connection: sqlite3.Connection = Depends(db),
-        selected: dict[str, str] = Depends(_filters),
-        metric: str = "regressor_spearman",
+        selected: dict[str, str] = Depends(_read_filters),
+        metric: str = "classify.accuracy",
         x: str = "classifier",
         color: str = "clustering",
         score: str = "spearman",
+        arm_metric: str = "skill",
+        rule: str = "selected",
     ) -> HTMLResponse:
-        _choice("metric", metric, METRICS)
-        _choice("x", x, CONFIG_KEYS)
-        _choice("color", color, ["", *CONFIG_KEYS])
-        _choice("score", score, SCORES)
-        rows = _keep(queries.results(connection), selected)
+        _check_choice("x", x, MAIN_KEYS)
+        _check_choice("color", color, ["", *MAIN_KEYS])
+        _check_choice("score", score, queries.SCORES)
+        _check_choice("arm_metric", arm_metric, _ARM_METRICS)
+        _check_choice("rule", rule, _BIN_RULES)
+        all_rows = experiments.compare_rows(_load_experiments(connection))
+        # A metric of a stage no run has finished is an empty chart, not
+        # an error: it is the form's default on a root with few stages.
+        stage, _, name = metric.partition(".")
+        _check_choice("metric", stage, queries.STAGE_ORDER)
+        if not name:
+            raise HTTPException(400, f"Metric {metric!r} is not <stage>.<name>")
+        rows = _filter_rows(all_rows, selected)
+        main = _metric_traces(rows, all_rows, metric, x, color)
+        predictors = _predictor_traces(rows, score, x)
+        arms = _arm_traces(rows, arm_metric, rule, x)
         figures = [
-            charts.metric_bars(rows, metric=metric, x=x, color=color or None),
-            charts.predictor_bars(rows, score=score, x=x),
+            (
+                summary.metric_label(metric),
+                charts.group_bars(main, x_title=x, y_title=metric.split(".")[-1]),
+            ),
+            (
+                f"Predictors, {score}",
+                charts.group_bars(predictors, x_title=x, y_title=score),
+            ),
+            (
+                f"Partition arms, {arm_metric} at {rule}",
+                charts.group_bars(arms, x_title=x, y_title=arm_metric),
+            ),
         ]
-        return render(request, "_charts.html", {"figures": figures})
-
-    @app.get("/runs", response_class=HTMLResponse)
-    def runs_page(
-        request: Request, connection: sqlite3.Connection = Depends(db)
-    ) -> HTMLResponse:
-        context = {"runs": queries.runs(connection), "config_keys": list(CONFIG_KEYS)}
-        return render(request, "runs.html", context)
-
-    @app.get("/runs/{run_id}", response_class=HTMLResponse)
-    def run_page(
-        request: Request, run_id: _Id, connection: sqlite3.Connection = Depends(db)
-    ) -> HTMLResponse:
-        run = _found(queries.run(connection, run_id), f"No run {run_id}")
-        stages = queries.run_stages(connection, run_id)
-        ids = queries.stage_ids(connection, run_id)
-        classes = []
-        if "prepare" in ids and "classify" in ids:
-            classes = queries.class_metrics(connection, ids["prepare"], ids["classify"])
-        folds = []
-        if "regress" in ids:
-            folds = queries.regressor_folds(connection, ids["regress"])
         context = {
-            "run": run,
-            "config_keys": list(CONFIG_KEYS),
-            "config": json.dumps(run["config"], indent=2),
-            "stages": stages,
-            "metrics": queries.stage_metrics(connection, run_id),
-            "has_regions": "regions" in ids,
-            "classes": classes,
-            "folds": folds,
-            "figures": queries.figures(connection, run_id),
+            "figures": [(title, fig) for title, fig in figures if fig["data"]],
+            "pivot": _pivot(main, rows, x),
+            "x": x,
+            "n_rows": len(rows),
         }
-        return render(request, "run.html", context)
+        return render(request, "_compare.html", context)
 
-    @app.get("/runs/{run_id}/regions", response_class=HTMLResponse)
-    def regions_page(
+    @app.get("/runs/{run_id}/stages", response_class=HTMLResponse)
+    def run_stages(
         request: Request,
         run_id: _Id,
+        sig: str = "",
         connection: sqlite3.Connection = Depends(db),
-        class_id: str = "",
-        used: str = "",
-        sort: str = "region_id",
-        desc: bool = False,
-        x: str = "regressor",
-        y: str = "test_rate",
     ) -> HTMLResponse:
-        ids, measures, rows = _region_rows(connection, run_id)
-        sortable = ["region_id", "class", *REGION_COLUMNS, *measures]
-        _choice("sort", sort, sortable)
-        axes = [*REGION_COLUMNS, *measures]
-        _choice("x", x, axes)
-        _choice("y", y, axes)
-        _choice("used", used, ["", "1", "0"])
-        classes = sorted({(row["class_id"], row["class"]) for row in rows})
-        shown = _sort(_keep(rows, {"class_id": class_id, "used": used}), sort, desc)
-        context = {
-            "run_id": run_id,
-            "rows": shown[:_MAX_ROWS],
-            "n_rows": len(shown),
-            "max_rows": _MAX_ROWS,
-            "figures": [charts.region_scatter(shown, x=x, y=y, run_id=run_id)],
-            "classes": classes,
-            "axes": axes,
-            "columns": REGION_COLUMNS,
-            "measures": measures,
-            "class_id": class_id,
-            "used": used,
-            "sort": sort,
-            "desc": desc,
-            "x": x,
-            "y": y,
-            "has_partitions": "partitions" in ids,
-            "partition_metrics": PARTITION_METRICS,
-            "partition_axes": PARTITION_AXES,
-        }
-        return render(request, "regions.html", context, fragment="_regions.html")
+        context = _run_context(connection, run_id)
+        # The page is stale once a stage finished: reload it whole.
+        headers = {} if sig == context["signature"] else {"HX-Refresh": "true"}
+        return render(request, "_stages.html", context, headers=headers)
 
-    @app.get("/runs/{run_id}/partitions", response_class=HTMLResponse)
-    def partitions_panel(
+    @app.get("/runs/{run_id}/partitions/charts", response_class=HTMLResponse)
+    def partition_charts(
         request: Request,
         run_id: _Id,
         connection: sqlite3.Connection = Depends(db),
         metric: str = "skill",
         x: str = "n_groups",
     ) -> HTMLResponse:
-        _choice("metric", metric, PARTITION_METRICS)
-        _choice("x", x, PARTITION_AXES)
-        ids = _stage_ids_with(connection, run_id, "partitions")
+        _check_choice("metric", metric, PARTITION_METRICS)
+        _check_choice("x", x, PARTITION_AXES)
+        run = _found(queries.run(connection, run_id), f"No run {run_id}")
+        ids = queries.stage_ids(run)
+        if "partitions" not in ids:
+            raise HTTPException(404, f"Run {run_id} has no done partitions stage")
         partitions_id = ids["partitions"]
         group_rows = queries.partition_groups(connection, partitions_id)
         class_names = {
             row["class_id"]: row["name"]
-            for row in queries.class_metrics(
-                connection, ids["prepare"], ids["classify"]
-            )
+            for row in queries.classes(connection, ids["prepare"])
         }
         figures = [
-            charts.partition_curves(
-                queries.partitions(connection, partitions_id), metric=metric, x=x
+            (
+                f"{metric} against {x}",
+                charts.partition_curves(
+                    queries.partitions(connection, partitions_id), metric=metric, x=x
+                ),
             ),
-            charts.partition_class_curves(
-                queries.partition_class_levels(connection, partitions_id),
-                class_names=class_names,
+            (
+                "Granularity loss of intra, per class",
+                charts.partition_class_curves(
+                    queries.partition_class_levels(connection, partitions_id),
+                    class_names=class_names,
+                ),
             ),
-            charts.partition_val_rates(group_rows),
-            charts.partition_val_test_scatter(group_rows),
+            ("Val failure rate of each group", charts.partition_val_rates(group_rows)),
+            (
+                "Test against val failure rate of each group",
+                charts.partition_val_test_scatter(group_rows),
+            ),
         ]
-        return render(request, "_charts.html", {"figures": figures})
+        return render(request, "_figures.html", {"figures": figures})
 
     @app.get("/runs/{run_id}/regions/{region_id}", response_class=HTMLResponse)
     def region_page(
@@ -421,152 +550,67 @@ def create_app(db_path: Path) -> FastAPI:
         region_id: _Id,
         connection: sqlite3.Connection = Depends(db),
     ) -> HTMLResponse:
-        ids, _, rows = _region_rows(connection, run_id)
+        context = _run_context(connection, run_id)
+        if "regions" not in context["ids"]:
+            raise HTTPException(404, f"Run {run_id} has no done regions stage")
+        _, rows = queries.regions(connection, context["ids"], measures=False)
         region = next((row for row in rows if row["region_id"] == region_id), None)
         if region is None:
             raise HTTPException(404, f"Run {run_id} has no region {region_id}")
         descriptors = []
-        if "complexity" in ids:
+        if "complexity" in context["ids"]:
             descriptors = queries.descriptors(
-                connection, ids["complexity"], region_id, region["class_id"]
+                connection, context["ids"]["complexity"], region_id, region["class_id"]
             )
-        context = {
-            "run_id": run_id,
-            "region": region,
-            "columns": REGION_COLUMNS,
-            "descriptors": descriptors,
-        }
+        context.update(
+            tab="regions",
+            available=True,
+            settings={},
+            region=region,
+            columns=REGION_COLUMNS,
+            descriptors=descriptors,
+        )
         return render(request, "region.html", context)
 
-    @app.get("/figures/{execution_id}/{name:path}")
-    def figure(
-        execution_id: _Id, name: str, connection: sqlite3.Connection = Depends(db)
-    ) -> FileResponse:
-        found = queries.figure_file(connection, execution_id, name)
-        if found is None:
-            raise HTTPException(404, f"No figure {name!r} in execution {execution_id}")
-        stage, file = found
-        path = (artifacts / stage / str(execution_id) / file).resolve()
-        if not path.is_relative_to(artifacts) or not path.is_file():
-            raise HTTPException(404, f"Figure file of {name!r} is missing")
-        return FileResponse(path)
-
-    @app.get("/presets", response_class=HTMLResponse)
-    def presets_page(
-        request: Request, connection: sqlite3.Connection = Depends(db)
+    @app.get("/runs/{run_id}", response_class=HTMLResponse)
+    def run_overview(
+        request: Request, run_id: _Id, connection: sqlite3.Connection = Depends(db)
     ) -> HTMLResponse:
-        presets = [
-            {**preset, "command": jobs.command(jobs.argv(preset, root))}
-            for preset in queries.presets(connection)
-        ]
-        return render(request, "presets.html", {"presets": presets, "root": root})
+        return run_tab(request, run_id, "overview", connection)
 
-    def form(
+    @app.get("/runs/{run_id}/{tab}", response_class=HTMLResponse)
+    def run_tab(
         request: Request,
-        preset: dict,
-        *,
-        original: str,
-        error: str | None = None,
-        status_code: int = 200,
+        run_id: _Id,
+        tab: str,
+        connection: sqlite3.Connection = Depends(db),
+        class_id: str = "",
+        used: str = "",
+        sort: str = "region_id",
+        desc: bool = False,
+        x: str = "val_rate",
+        y: str = "test_rate",
     ) -> HTMLResponse:
-        context = {"preset": preset, "original": original, "error": error}
-        return render(request, "preset_form.html", context, status_code=status_code)
-
-    @app.get("/presets/new", response_class=HTMLResponse)
-    def new_preset(request: Request) -> HTMLResponse:
-        preset = jobs.parse(name="", targets="", overrides="", sweeps="", force=False)
-        return form(request, preset, original="")
-
-    @app.get("/presets/{name}", response_class=HTMLResponse)
-    def preset_page(
-        request: Request, name: str, connection: sqlite3.Connection = Depends(db)
-    ) -> HTMLResponse:
-        preset = _found(queries.preset(connection, name), f"No preset {name!r}")
-        return form(request, preset, original=name)
-
-    @app.post("/presets", dependencies=[Depends(_same_origin)])
-    def save_preset(
-        request: Request,
-        original: Annotated[str, Form()] = "",
-        name: Annotated[str, Form()] = "",
-        targets: Annotated[str, Form()] = "",
-        overrides: Annotated[str, Form()] = "",
-        sweeps: Annotated[str, Form()] = "",
-        force: Annotated[bool, Form()] = False,
-    ) -> Response:
-        preset = jobs.parse(
-            name=name, targets=targets, overrides=overrides, sweeps=sweeps, force=force
-        )
-        try:
-            jobs.check(preset, root)
-            store.save_preset(db_path, preset, original=original)
-        except ValueError as error:
-            return form(
-                request, preset, original=original, error=str(error), status_code=400
+        if tab not in tabs.TABS:
+            raise HTTPException(404, f"No tab {tab!r}. Valid: {', '.join(tabs.TABS)}")
+        context = _run_context(connection, run_id)
+        context.update(tabs.build(connection, context["run"], tab, root))
+        fragment = None
+        if tab == "regions" and context["available"]:
+            context.update(
+                _explorer_context(
+                    connection,
+                    context["run"],
+                    context["ids"],
+                    class_id=class_id,
+                    used=used,
+                    sort=sort,
+                    desc=desc,
+                    x=x,
+                    y=y,
+                )
             )
-        return RedirectResponse("/presets", status_code=303)
-
-    @app.post("/presets/{name}/delete", dependencies=[Depends(_same_origin)])
-    def delete_preset(name: str) -> RedirectResponse:
-        if not store.delete_preset(db_path, name):
-            raise HTTPException(404, f"No preset {name!r}")
-        return RedirectResponse("/presets", status_code=303)
-
-    @app.post("/presets/{name}/launch", dependencies=[Depends(_same_origin)])
-    def launch_preset(
-        name: str, connection: sqlite3.Connection = Depends(db)
-    ) -> RedirectResponse:
-        preset = _found(queries.preset(connection, name), f"No preset {name!r}")
-        try:
-            # The configs may have changed since the save.
-            jobs.check(preset, root)
-        except ValueError as error:
-            raise HTTPException(400, str(error)) from None
-        job_id = store.add_job(db_path, name, jobs.argv(preset, root))
-        worker.kick()
-        return RedirectResponse(f"/jobs/{job_id}", status_code=303)
-
-    @app.get("/jobs", response_class=HTMLResponse)
-    def jobs_page(
-        request: Request, connection: sqlite3.Connection = Depends(db)
-    ) -> HTMLResponse:
-        rows = queries.jobs(connection)
-        active = any(row["status"] in _ACTIVE for row in rows)
-        context = {"jobs": rows, "active": active}
-        return render(request, "jobs.html", context, fragment="_jobs.html")
-
-    @app.get("/jobs/{job_id}", response_class=HTMLResponse)
-    def job_page(
-        request: Request, job_id: _Id, connection: sqlite3.Connection = Depends(db)
-    ) -> HTMLResponse:
-        row = _found(queries.job(connection, job_id), f"No job {job_id}")
-        runs = []
-        if row["started_at"]:
-            runs = queries.job_runs(connection, row["started_at"], row["finished_at"])
-        context = {
-            "job": row,
-            "command": jobs.command(row["argv"]),
-            "active": row["status"] in _ACTIVE,
-            "runs": runs,
-            "log": jobs.tail(jobs.log_path(root, job_id)),
-        }
-        return render(request, "job.html", context, fragment="_job.html")
-
-    @app.get("/jobs/{job_id}/log")
-    def job_log_file(job_id: _Id) -> Response:
-        path = jobs.log_path(root, job_id)
-        if not path.is_file():
-            raise HTTPException(404, f"No log for job {job_id}")
-        # A snapshot: a growing file would outrun the Content-Length of
-        # a FileResponse.
-        return Response(path.read_bytes(), media_type="text/plain")
-
-    @app.post("/jobs/{job_id}/cancel", dependencies=[Depends(_same_origin)])
-    def cancel_job(
-        job_id: _Id, connection: sqlite3.Connection = Depends(db)
-    ) -> RedirectResponse:
-        _found(queries.job(connection, job_id), f"No job {job_id}")
-        worker.cancel(job_id)
-        return RedirectResponse(f"/jobs/{job_id}", status_code=303)
+            fragment = "_regions_explorer.html"
+        return render(request, f"run_{tab}.html", context, fragment=fragment)
 
     return app

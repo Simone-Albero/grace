@@ -1,0 +1,56 @@
+{% extends "run_base.html" %}
+{% block content %}
+{{ m.tiles(tiles) }}
+<div class="tiles">
+  {% for s in shares %}
+  <div class="tile"><div class="tile-value">{{ s.rows | num }}</div>
+    <div class="tile-label">{{ s.label }} · {{ "%.1f" | format(s.share * 100) }}%</div></div>
+  {% endfor %}
+  <div class="tile"><div class="tile-value">{{ dropped | num }}</div>
+    <div class="tile-label">rows dropped (NaN, inf, rare class)</div></div>
+  <div class="tile"><div class="tile-value">{{ kinds.num }} / {{ kinds.cat }}</div>
+    <div class="tile-label">numeric / categorical features</div></div>
+  {% if n_classes %}<div class="tile"><div class="tile-value">{{ n_classes }}</div>
+    <div class="tile-label">classes</div></div>{% endif %}
+</div>
+<div class="grid">
+  {% if figures.split %}{{ m.chart(figures.split, "Rows of each class, per split") }}{% endif %}
+  {% if classes %}
+  <section class="card">
+    <h3>Classes</h3>
+    <div class="scroll"><table>
+      <thead><tr><th>id</th><th>class</th><th class="num">train</th><th class="num">val</th><th class="num">test</th></tr></thead>
+      <tbody>
+      {% for c in classes %}
+      <tr><td>{{ c.class_id }}</td><td>{{ c.name }}</td><td class="num">{{ c.n_train | num }}</td>
+        <td class="num">{{ c.n_val | num }}</td><td class="num">{{ c.n_test | num }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table></div>
+  </section>
+  {% else %}
+  <section class="card"><p class="note">The class table needs the finished <b>prepare</b> stage.</p></section>
+  {% endif %}
+  <section class="card">
+    <h3>Preprocessing</h3>
+    <p><b>Numeric</b>: {{ preprocessing.num }}.<br>
+       <b>Categorical</b>: {{ preprocessing.cat }}.</p>
+    {% if prepare_config %}{{ m.facts(prepare_config) }}{% endif %}
+    <h3 style="margin-top:1rem">Cleaning and splitting</h3>
+    <p>Rows with a NaN or infinite value in the used columns are dropped, then the
+      classes with too few rows; the rest is split stratified by class.</p>
+    {{ m.facts(split_config) }}
+  </section>
+  <section class="card">
+    <h3>Features</h3>
+    <div class="scroll"><table>
+      <thead><tr><th class="num">#</th><th>name</th><th>kind</th></tr></thead>
+      <tbody>
+      {% for f in features %}
+      <tr><td class="num">{{ f.position }}</td><td>{{ f.name }}</td><td>{{ f.kind }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table></div>
+  </section>
+</div>
+{% endblock %}

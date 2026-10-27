@@ -1,15 +1,14 @@
+{% import "_macros.html" as m %}
 <input type="hidden" name="sort" value="{{ sort }}">
 <input type="hidden" name="desc" value="{{ 'true' if desc else 'false' }}">
-{% include "_charts.html" %}
-<p class="muted">
-  showing {{ rows | length }} of {{ n_rows }} regions{% if n_rows > max_rows %}
-  (first {{ max_rows }} only; the scatter has all){% endif %}
-</p>
+{% for fig in explorer_figures %}{{ m.chart(fig) }}{% endfor %}
+<p class="muted">showing {{ rows | length }} of {{ n_rows }} regions{% if n_rows > max_rows %}
+  (first {{ max_rows }} only; the scatter has all){% endif %}</p>
 <div class="scroll">
 <table>
   <thead><tr>
     {% for col in ["region_id", "class"] + columns + measures %}
-    <th hx-get="/runs/{{ run_id }}/regions" hx-target="#regions" hx-include="#filters"
+    <th hx-get="/runs/{{ run.id }}/regions" hx-target="#explorer" hx-include="#filters"
         hx-push-url="true"
         hx-vals='{"sort": "{{ col }}", "desc": "{{ 'false' if sort == col and desc else 'true' }}"}'>
       {{ col }}{% if sort == col %} {{ '▼' if desc else '▲' }}{% endif %}</th>
@@ -18,7 +17,7 @@
   <tbody>
   {% for r in rows %}
   <tr>
-    <td><a href="/runs/{{ run_id }}/regions/{{ r.region_id }}">{{ r.region_id }}</a></td>
+    <td><a href="/runs/{{ run.id }}/regions/{{ r.region_id }}">{{ r.region_id }}</a></td>
     <td>{{ r["class"] }}</td>
     {% for col in columns + measures %}<td class="num">{{ r[col] | num }}</td>{% endfor %}
   </tr>

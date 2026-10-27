@@ -1,11 +1,14 @@
 {% extends "base.html" %}
+{% set nav = "compare" %}
 {% block title %}Compare{% endblock %}
 {% block body %}
 <h1>Compare</h1>
-<form hx-get="/compare/charts" hx-target="#charts" hx-trigger="load, change"
+<p class="muted">Each seed counts at its latest run, and each execution once. Bars are the mean
+  over seeds, whiskers the std.</p>
+<form class="filters" hx-get="/compare/charts" hx-target="#charts" hx-trigger="load, change"
       autocomplete="off">
-  {% for key in config_keys %}
-  <label>{{ key }}
+  {% for key in MAIN_KEYS %}
+  <label>filter {{ key }}
     <select name="{{ key }}">
       <option value="">all</option>
       {% for value in options[key] %}<option>{{ value }}</option>{% endfor %}
@@ -14,28 +17,30 @@
   {% endfor %}
   <label>metric
     <select name="metric">
-      {% for m in metrics %}
-      <option{% if m == "regressor_spearman" %} selected{% endif %}>{{ m }}</option>
+      {% for name in metrics %}
+      <option value="{{ name }}"{% if name == "classify.accuracy" %} selected{% endif %}>{{ labels[name] }}</option>
       {% endfor %}
     </select>
   </label>
   <label>x
     <select name="x">
-      {% for key in config_keys %}
-      <option{% if key == "classifier" %} selected{% endif %}>{{ key }}</option>
-      {% endfor %}
+      {% for key in MAIN_KEYS %}<option{% if key == "classifier" %} selected{% endif %}>{{ key }}</option>{% endfor %}
     </select>
   </label>
   <label>color
     <select name="color">
       <option value="">none</option>
-      {% for key in config_keys %}
-      <option{% if key == "clustering" %} selected{% endif %}>{{ key }}</option>
-      {% endfor %}
+      {% for key in MAIN_KEYS %}<option{% if key == "clustering" %} selected{% endif %}>{{ key }}</option>{% endfor %}
     </select>
   </label>
-  <label>score (RF vs val vs MCP vs ATC)
+  <label>predictor score
     <select name="score">{% for s in scores %}<option>{{ s }}</option>{% endfor %}</select>
+  </label>
+  <label>arm metric
+    <select name="arm_metric">{% for s in arm_metrics %}<option>{{ s }}</option>{% endfor %}</select>
+  </label>
+  <label>arm operating point
+    <select name="rule">{% for r in rules %}<option>{{ r }}</option>{% endfor %}</select>
   </label>
 </form>
 <div id="charts"></div>

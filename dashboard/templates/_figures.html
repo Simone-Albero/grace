@@ -1,0 +1,4 @@
+{% import "_macros.html" as m %}
+<div class="grid">
+  {% for title, fig in figures %}{{ m.chart(fig, title) }}{% endfor %}
+</div>

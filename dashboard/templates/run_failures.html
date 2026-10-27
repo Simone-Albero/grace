@@ -1,0 +1,27 @@
+{% extends "run_base.html" %}
+{% block content %}
+{{ m.tiles(tiles) }}
+<div class="grid">
+  {{ m.chart(figures.scatter, "Test against val failure rate of each region", wide=True) }}
+  {{ m.chart(figures.classes, "Failure rate per class") }}
+  {{ m.chart(figures.ecdf, "Distribution of the region failure rates") }}
+</div>
+<p class="muted">A marker is a region, its area grows with its test rows. The empirical
+  rates are errors over rows of the region in that split.</p>
+<h2>Regions with the highest test failure rate</h2>
+<div class="scroll"><table>
+  <thead><tr>
+    <th>region</th><th>class</th><th class="num">n val</th><th class="num">val errors</th><th class="num">val rate</th>
+    <th class="num">n test</th><th class="num">test errors</th><th class="num">test rate</th>
+  </tr></thead>
+  <tbody>
+  {% for r in worst %}
+  <tr>
+    <td><a href="/runs/{{ run.id }}/regions/{{ r.region_id }}">{{ r.region_id }}</a></td><td>{{ r["class"] }}</td>
+    <td class="num">{{ r.n_val | num }}</td><td class="num">{{ r.n_val_error | num }}</td><td class="num">{{ r.val_rate | num }}</td>
+    <td class="num">{{ r.n_test | num }}</td><td class="num">{{ r.n_test_error | num }}</td><td class="num">{{ r.test_rate | num }}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table></div>
+{% endblock %}

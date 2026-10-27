@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% set nav = "experiments" %}
+{% block title %}Experiment {{ experiment.key }}{% endblock %}
+{% block body %}
+<div class="crumbs"><a href="/">Experiments</a> › {{ experiment.key }}</div>
+<h1>{{ experiment.values.data }} · {{ experiment.values.classifier }} · {{ experiment.values.clustering }}</h1>
+<div class="chips">
+  {% for key in MAIN_KEYS %}<span class="chip">{{ key }} <b>{{ experiment.values[key] }}</b></span>{% endfor %}
+  {% if experiment.variant %}<span class="chip">variant <b>{{ experiment.variant }}</b></span>{% endif %}
+  <span class="chip">seeds <b>{{ experiment.seeds | length }}</b></span>
+</div>
+<details><summary>config, without the seed</summary>{% import "_macros.html" as m %}{{ m.facts(experiment.config) }}</details>
+{% include "_experiment.html" %}
+{% endblock %}
