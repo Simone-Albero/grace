@@ -158,7 +158,7 @@ class Context:
 
         Args:
             draw: Returns the figures by name, e.g.
-                "regress/predicted_vs_val"; called under the plot style.
+                "predictors/mse_ratio"; called under the plot style.
         """
         extension = self.cfg.figure_format
         rows = []

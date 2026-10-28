@@ -15,7 +15,7 @@ TABS = {
     "data": ("split",),
     "classifier": ("classify",),
     "tree": ("tree",),
-    "predictors": ("evaluate", "regress"),
+    "predictors": ("evaluate",),
 }
 # The stages whose config a tab shows at its foot.
 _SETTINGS = {
@@ -23,7 +23,7 @@ _SETTINGS = {
     "data": ("split", "prepare"),
     "classifier": ("classify",),
     "tree": ("space", "crossfit", "tree"),
-    "predictors": ("evaluate", "regress"),
+    "predictors": ("evaluate",),
 }
 # The tiles of each overview area: (stage, metric, label, kind).
 _OVERVIEW = {
@@ -254,10 +254,8 @@ def _scores(metrics: _Metrics) -> dict[str, dict]:
     return scores
 
 
-def _predictors(
-    db: sqlite3.Connection, ids: Mapping[str, int], metrics: _Metrics
-) -> dict:
-    """Predictor scores, and the regressor's folds and importances."""
+def _predictors(metrics: _Metrics) -> dict:
+    """Predictor scores and their charts."""
     scores = _scores(metrics)
     best = {
         score: min(
@@ -278,12 +276,6 @@ def _predictors(
         score: charts.predictor_bars(scores, score)
         for score in ("mse_ratio", "spearman")
     }
-    folds = []
-    if "regress" in ids:
-        folds = queries.regressor_folds(db, ids["regress"])
-        importances = queries.importances(db, ids["regress"])
-        if importances:
-            figures["importances"] = charts.importance_bars(importances)
     evaluated = metrics.get("evaluate", {})
     return {
         "scores": scores,
@@ -294,7 +286,6 @@ def _predictors(
             ("test rows", evaluated.get("n_test")),
             ("test error rate", evaluated.get("test_error_rate")),
         ],
-        "folds": folds,
         "figures": figures,
     }
 
@@ -349,5 +340,5 @@ def build(
         case "tree":
             context.update(_tree(db, ids, metrics, run["id"]))
         case "predictors":
-            context.update(_predictors(db, ids, metrics))
+            context.update(_predictors(metrics))
     return context

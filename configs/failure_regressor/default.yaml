@@ -1,9 +1,0 @@
-n_outer_splits: 5          # outer CV folds: each leaf's rate is predicted by a fit that never saw it
-n_inner_splits: 5          # inner CV folds of the hyper-parameter search
-n_iter: 40                 # RandomizedSearchCV draws per fit; a grid smaller than this is searched whole
-params: {}                 # fixed RandomForestRegressor parameters (random_state comes from seed)
-param_grid:
-  n_estimators: [100, 200, 300, 500]
-  max_depth: [null, 3, 5, 10, 20]
-  min_samples_leaf: [1, 2, 3, 5]
-  max_features: [sqrt, 0.5]

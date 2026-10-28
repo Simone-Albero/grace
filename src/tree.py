@@ -1,12 +1,13 @@
-"""Regions as the leaves of a tree grown on geometry, cut by errors.
+"""Regions as the leaves of a tree grown on points, cut by errors.
 
 A tree has one root per predicted class. Every node splits its rows in
 two with 2-means, and a row goes to the nearer of the two centres: the
-rule that builds the tree is the rule that routes a new row. The
-out-of-fold errors of train then say how deep to cut, each leaf gets the
-failure rate of the validation rows that reach it, and a per-row
-correction moves it with how many nearest train rows disagree with the
-prediction.
+rule that builds the tree is the rule that routes a new row. The points
+are the rows' coordinates plus the share of nearest train rows that
+disagree with the prediction, as one more axis. The out-of-fold errors
+of train then say how deep to cut, each leaf gets the failure rate of
+the validation rows that reach it, and a per-row correction moves it
+with the classifier's own confidence.
 """
 
 __all__ = [
@@ -17,6 +18,7 @@ __all__ = [
     "fit_beta",
     "fit_fay_herriot",
     "grow_tree",
+    "low_confidence",
     "neighbour_disagreement",
     "node_depths",
     "prune_tree",
@@ -427,14 +429,26 @@ def _logit(rate: np.ndarray) -> np.ndarray:
     return logit(np.clip(rate, _RATE_EPS, 1 - _RATE_EPS))
 
 
+def low_confidence(top_probability: np.ndarray) -> np.ndarray:
+    """Return the log-odds that a row's predicted class is wrong.
+
+    Args:
+        top_probability: Each row's highest class probability.
+
+    Returns:
+        The logit of one minus it, finite even at a probability of 1.
+    """
+    return _logit(1.0 - np.asarray(top_probability, dtype=np.float64))
+
+
 def correct_rates(
     leaf_rate: np.ndarray, standardized: np.ndarray, beta: float
 ) -> np.ndarray:
-    """Move each row's leaf rate by its standardized disagreement.
+    """Move each row's leaf rate by its standardized signal.
 
     Args:
         leaf_rate: Each row's leaf rate.
-        standardized: Each row's disagreement, centred and scaled.
+        standardized: Each row's signal, centred and scaled.
         beta: The slope on the log-odds scale.
 
     Returns:
@@ -450,7 +464,7 @@ def fit_beta(
 
     Args:
         leaf_rate: Each row's leaf rate.
-        standardized: Each row's disagreement, centred and scaled.
+        standardized: Each row's signal, centred and scaled.
         errors: Each row's failure, 0 or 1.
 
     Returns:

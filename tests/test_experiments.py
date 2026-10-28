@@ -25,7 +25,6 @@ def _run(run_id: int, seed: int, *, classifier: str = "rf", **extra) -> dict:
         "root": f"root{run_id}",
         "runtime": {"n_jobs": run_id},
         "figure_format": "pdf",
-        "regressor": True,
         **extra,
     }
     stages = [

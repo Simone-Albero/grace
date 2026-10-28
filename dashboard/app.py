@@ -28,7 +28,7 @@ _Id = Annotated[int, PathParam(ge=0, le=2**63 - 1)]
 _ClassId = Annotated[int, Query(ge=0, le=2**63 - 1)]
 # The columns of the leaves table, in reading order.
 _LEAF_COLUMNS = (
-    "node_id class depth n_train oof_rate n_val val_rate q gamma regressor n_test "
+    "node_id class depth n_train oof_rate n_val val_rate q gamma n_test "
     "test_rate mean_q"
 ).split()
 _MAX_LEAVES = 500

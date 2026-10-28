@@ -1,30 +1,22 @@
-"""Failure-rate scores and classification metrics."""
+"""Probability checks, Spearman's rho and classification metrics."""
 
 __all__ = [
     "check_probabilities",
     "compute_classification_metrics",
-    "log_scores",
-    "rate_scores",
     "spearman",
 ]
 
-import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 
 import numpy as np
-from numpy.typing import ArrayLike
 from scipy.stats import spearmanr
 from sklearn.metrics import (
     accuracy_score,
     f1_score,
-    mean_absolute_error,
     precision_score,
-    r2_score,
     recall_score,
 )
 from sklearn.utils.multiclass import unique_labels
-
-logger = logging.getLogger(__name__)
 
 
 def check_probabilities(y_proba: np.ndarray, n_classes: int, split: str) -> None:
@@ -64,47 +56,6 @@ def spearman(values: np.ndarray, other: np.ndarray) -> float:
     if np.std(values) > 1e-12 and np.std(other) > 1e-12:
         return float(spearmanr(values, other).statistic)
     return float("nan")
-
-
-def rate_scores(predicted: ArrayLike, observed: ArrayLike) -> dict[str, float]:
-    """Score predicted failure rates against the observed ones.
-
-    Args:
-        predicted: The predicted rate of every leaf.
-        observed: The observed rate of every leaf.
-
-    Returns:
-        "spearman", "r2", "mae" and "mse". Spearman is NaN when either
-        side is constant, R² when the observed rates are.
-    """
-    predicted = np.asarray(predicted, dtype=float)
-    observed = np.asarray(observed, dtype=float)
-    return {
-        "spearman": spearman(predicted, observed),
-        "r2": (
-            float(r2_score(observed, predicted))
-            if len(observed) > 1 and np.std(observed) > 0
-            else float("nan")
-        ),
-        "mae": float(mean_absolute_error(observed, predicted)),
-        "mse": float(np.mean((predicted - observed) ** 2)),
-    }
-
-
-def log_scores(name: str, scores: Mapping[str, float]) -> None:
-    """Log a predictor's Spearman, R² and MAE on one line.
-
-    Args:
-        name: The predictor name.
-        scores: Its scores, as `rate_scores` returns them.
-    """
-    logger.info(
-        "%-9s rho=%.4f r2=%.4f mae=%.4f",
-        name,
-        scores["spearman"],
-        scores["r2"],
-        scores["mae"],
-    )
 
 
 _METRICS: list[tuple[str, Callable]] = [

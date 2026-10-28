@@ -53,7 +53,7 @@ cat_cols: []
 
 train_frac: 0.4
 val_frac: 0.15     # the label budget: the ATC threshold is fitted here, and no classifier trains on it
-test_frac: 0.45    # the only split the regressor and the baselines are judged against
+test_frac: 0.45    # the only split the predictors are judged against
 
 # All 6 classes have 626–1533 instances
 min_class_count: 20      # classes with fewer rows are dropped: 20 leaves a few rows in every split and fold

@@ -58,7 +58,7 @@ def test_experiments_page(client: TestClient, experiment: dict) -> None:
     assert "<html" in restore.text
     assert "naive_bayes" in client.get("/?classifier=naive_bayes").text
     assert "matches these filters" in client.get("/?classifier=mlp").text
-    assert client.get("/?sort=regressor_spearman&desc=false").status_code == 400
+    assert client.get("/?sort=tree_spearman&desc=false").status_code == 400
     assert client.get("/?sort=evaluate.tree_spearman&desc=false").status_code == 200
     assert client.get("/?sort=nope").status_code == 400
 
@@ -120,7 +120,6 @@ def test_run_overview_and_tabs(client: TestClient, run_id: int) -> None:
             "Confidence",
             "GBM",
             "MSE ratio",
-            "Regressor, outer folds",
         ),
     }
     for tab in _TABS:
@@ -281,21 +280,6 @@ def test_a_run_with_only_prepare_shows_what_exists(tmp_path: Path) -> None:
             assert page.status_code == 200 and "Nothing to show yet" in page.text
         assert client.get("/api/experiments").json()[0]["n_seeds"] == 1
         assert client.get("/compare/charts").status_code == 200
-
-
-def test_the_regressor_joins_a_run_that_lacked_it(tmp_path: Path) -> None:
-    """Check predictors show without regress, its folds only with it."""
-    first = run(["evaluate"], fast_cfg(tmp_path, "regressor=false"), force=False)
-    with TestClient(create_app(tmp_path / "grace.db"), base_url=BASE_URL) as client:
-        page = client.get(f"/runs/{first}/predictors")
-        assert "Confidence" in page.text and "outer folds" not in page.text
-        assert "need" in page.text and "regress" in page.text
-        assert client.get(f"/runs/{first}/classifier").status_code == 200
-        second = run(["regress"], fast_cfg(tmp_path), force=False)
-        (row,) = client.get("/api/experiments").json()
-        # Both runs are seed 42: the latest represents it.
-        assert row["n_seeds"] == 1 and row["seeds"][0]["run_id"] == second
-        assert "outer folds" in client.get(f"/runs/{second}/predictors").text
 
 
 def test_a_running_run_polls_and_reloads_when_a_stage_finishes(

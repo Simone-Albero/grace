@@ -13,12 +13,10 @@ __all__ = [
     "execution_dirs",
     "features",
     "history",
-    "importances",
     "leaf_descriptors",
     "leaf_path",
     "leaves",
     "metrics_by_stage",
-    "regressor_folds",
     "run",
     "run_metrics",
     "runs",
@@ -35,15 +33,13 @@ from pathlib import Path
 # a test keeps the two equal, since importing the runner here would load
 # every stage's dependencies.
 STAGE_ORDER = (
-    "split prepare space classify crossfit tree complexity regress "
-    "baselines evaluate render"
+    "split prepare space classify crossfit tree complexity baselines evaluate render"
 ).split()
 # The failure predictors, each with its label; its scores are the
 # `evaluate` metrics `<key>_<score>`.
 PREDICTORS = {
     "tree": "Tree",
     "tree_leaf": "Tree leaf",
-    "regressor": "RF regressor",
     "val_rate": "Val rate",
     "confidence": "Confidence",
     "binned": "Binned",
@@ -310,36 +306,6 @@ def history(db: sqlite3.Connection, classify_id: int) -> list[dict[str, object]]
     )
 
 
-def regressor_folds(db: sqlite3.Connection, regress_id: int) -> list[dict[str, object]]:
-    """List the outer folds of the regressor, the refit (-1) last.
-
-    Args:
-        db: A connection to grace.db.
-        regress_id: The execution id of regress.
-
-    Returns:
-        One row per fold, with its sizes, scores and parameters.
-    """
-    return _all(
-        db,
-        """
-        SELECT fold, n_leaves, best_score, params
-        FROM regressor_folds WHERE execution_id = ? ORDER BY fold = -1, fold
-        """,
-        (regress_id,),
-    )
-
-
-def importances(db: sqlite3.Connection, regress_id: int) -> list[dict[str, object]]:
-    """List the regressor's mean feature importances, largest first."""
-    return _all(
-        db,
-        "SELECT feature, importance FROM importances WHERE execution_id = ? "
-        "ORDER BY importance DESC",
-        (regress_id,),
-    )
-
-
 def tree_roots(
     db: sqlite3.Connection, tree_id: int, prepare_id: int
 ) -> list[dict[str, object]]:
@@ -382,25 +348,23 @@ def leaves(db: sqlite3.Connection, ids: Mapping[str, int]) -> list[dict[str, obj
     Returns:
         One row per leaf, with None where a stage did not run or a
         count is 0: the out-of-fold, val and test rates, the tree's
-        rate `q`, the regressor's estimate and the mean corrected
-        probability of the leaf's test rows.
+        rate `q` and the mean corrected probability of the leaf's test
+        rows.
     """
     rows = _all(
         db,
         """
         SELECT t.node_id, t.class_id, k.name AS class, t.depth,
                t.n_train, t.n_train_errors, t.n_val, t.n_val_errors, t.q, t.gamma,
-               e.regressor, l.n_test, l.n_test_errors, l.mean_q
+               l.n_test, l.n_test_errors, l.mean_q
         FROM tree_nodes t
         JOIN classes k ON k.execution_id = :prepare AND k.class_id = t.class_id
-        LEFT JOIN estimates e
-          ON e.execution_id = :regress AND e.node_id = t.node_id
         LEFT JOIN leaf_tests l
           ON l.execution_id = :evaluate AND l.node_id = t.node_id
         WHERE t.execution_id = :tree AND t.status = 'leaf'
         ORDER BY t.node_id
         """,
-        {key: ids.get(key) for key in ("prepare", "tree", "regress", "evaluate")},
+        {key: ids.get(key) for key in ("prepare", "tree", "evaluate")},
     )
     _add_rates(rows)
     return rows

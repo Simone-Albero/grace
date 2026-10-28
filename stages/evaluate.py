@@ -2,61 +2,41 @@
 
 The only stage that reads the test labels to judge, besides classify's
 own classification metrics. Predictors: `tree` (the row's corrected
-probability), `tree_leaf` (its leaf's rate), `regressor` (the leaf's
-regressor estimate, when `regressor` is true), and baselines'
-`val_rate`, `confidence`, `binned` and `gbm`. Each is scored per test
-row, by the mean squared error of its probability against the row's
-failure, that error over the one of the constant val rate, and the
-Spearman correlation of the probability with the failure. DB rows
-written: `leaf_tests` (the test rows and failures of every leaf) and
-metrics `<predictor>_mse`, `<predictor>_mse_ratio` and
-`<predictor>_spearman`, plus test_error_rate and n_test.
+probability), `tree_leaf` (its leaf's rate), and baselines' `val_rate`,
+`confidence`, `binned` and `gbm`. Each is scored per test row, by the
+mean squared error of its probability against the row's failure, that
+error over the one of the constant val rate, and the Spearman
+correlation of the probability with the failure. DB rows written:
+`leaf_tests` (the test rows and failures of every leaf) and metrics
+`<predictor>_mse`, `<predictor>_mse_ratio` and `<predictor>_spearman`,
+plus test_error_rate and n_test.
 """
 
-__all__ = ["CONFIG", "FILES", "OUTPUTS", "inputs", "run"]
+__all__ = ["CONFIG", "INPUTS", "FILES", "OUTPUTS", "run"]
 
 import numpy as np
 import pandas as pd
-from omegaconf import DictConfig
 
 from src.scores import spearman
 from stages import Context
 
-CONFIG = ("regressor",)
+CONFIG = ()
+INPUTS = ("prepare", "classify", "tree", "baselines")
 FILES = ()
 # The stage writes DB rows only.
 OUTPUTS = ()
 _BASELINES = ("val_rate", "confidence", "binned", "gbm")
 
 
-def inputs(cfg: DictConfig) -> tuple[str, ...]:
-    """Return the stages evaluate reads under this config.
-
-    Args:
-        cfg: The config; `regressor` adds regress.
-
-    Returns:
-        The input stage names.
-    """
-    base = ("prepare", "classify", "tree", "baselines")
-    return (*base, "regress") if cfg.regressor else base
-
-
 def _probabilities(ctx: Context) -> dict[str, np.ndarray]:
     """Return every predictor's probability for every test row."""
-    tree = ctx.split_rows("tree", "rows.parquet", "test", ["leaf", "q_leaf", "q"])
+    tree = ctx.split_rows("tree", "rows.parquet", "test", ["q_leaf", "q"])
     scores = ctx.split_rows("baselines", "scores.parquet", "test", list(_BASELINES))
-    probabilities = {
+    return {
         "tree": tree["q"].to_numpy(dtype=np.float64),
         "tree_leaf": tree["q_leaf"].to_numpy(dtype=np.float64),
         **{name: scores[name].to_numpy(dtype=np.float64) for name in _BASELINES},
     }
-    if "regress" in ctx.inputs:
-        estimates = ctx.read("estimates", "regress").set_index("node_id")["regressor"]
-        probabilities["regressor"] = estimates.loc[tree["leaf"]].to_numpy(
-            dtype=np.float64
-        )
-    return probabilities
 
 
 def run(ctx: Context) -> None:

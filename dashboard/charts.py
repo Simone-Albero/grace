@@ -13,7 +13,6 @@ __all__ = [
     "confusion_heatmap",
     "grid_search",
     "group_bars",
-    "importance_bars",
     "leaf_size_bars",
     "loss_curve",
     "predictor_bars",
@@ -57,8 +56,6 @@ _SCORE_COLORS = {"precision": SERIES[0], "recall": SERIES[1], "f1": SERIES[2]}
 PREDICTOR_COLORS = dict(zip(PREDICTORS, SERIES))
 # Most classes that get a numbered cell.
 _MAX_LABELLED = 15
-# The feature importances drawn, the largest ones.
-_TOP_IMPORTANCES = 20
 
 
 def _stdev(values: Sequence[float]) -> float:
@@ -294,34 +291,6 @@ def predictor_bars(
         "xaxis": {"type": "category"},
         "yaxis": {"title": score},
         "showlegend": False,
-    }
-    return {"data": [trace], "layout": layout}
-
-
-def importance_bars(rows: Sequence[Mapping]) -> dict[str, object]:
-    """Draw the regressor's largest feature importances.
-
-    Args:
-        rows: The `queries.importances` rows, largest first.
-
-    Returns:
-        A horizontal bar figure of the twenty largest, the largest on
-        top.
-    """
-    kept = list(rows[:_TOP_IMPORTANCES])
-    trace = {
-        "type": "bar",
-        "orientation": "h",
-        "y": [row["feature"] for row in kept],
-        "x": [row["importance"] for row in kept],
-        "marker": {"color": SERIES[0]},
-    }
-    layout = {
-        "height": max(260, 24 * len(kept) + 100),
-        "xaxis": {"title": "mean importance"},
-        "yaxis": {"autorange": "reversed", "type": "category"},
-        "showlegend": False,
-        "margin": {"l": 220},
     }
     return {"data": [trace], "layout": layout}
 

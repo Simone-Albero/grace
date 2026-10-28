@@ -12,7 +12,6 @@ import torch
 import yaml
 from omegaconf import DictConfig, OmegaConf
 from omegaconf.errors import ConfigKeyError, OmegaConfBaseException
-from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import get_scorer_names
 
 from src.dl import LOSSES, MODELS
@@ -126,8 +125,7 @@ def validate(cfg: DictConfig) -> None:
         ValueError: A value is invalid; the message names the key, the
             value and, where a set exists, the valid ones.
     """
-    # The regressor seeds each search with seed + fold, which must stay
-    # below numpy's 2**32.
+    # A seed must be a valid numpy seed, below 2**32, with a margin.
     _check(
         _is_int(cfg.seed) and cfg.seed < 2**31,
         f"seed {cfg.seed!r} must be an integer in [0, 2**31).",
@@ -135,10 +133,6 @@ def validate(cfg: DictConfig) -> None:
     _check(
         cfg.figure_format in ("pdf", "png"),
         f"figure_format {cfg.figure_format!r} invalid; valid: ['pdf', 'png'].",
-    )
-    _check(
-        isinstance(cfg.regressor, bool),
-        f"regressor {cfg.regressor!r} must be true or false.",
     )
     _check(
         isinstance(cfg.root, str) and bool(cfg.root),
@@ -152,7 +146,6 @@ def validate(cfg: DictConfig) -> None:
     _validate_space(cfg)
     _validate_crossfit(cfg.crossfit)
     _validate_tree(cfg.tree)
-    _validate_regressor(cfg.failure_regressor)
     _validate_runtime(cfg.runtime)
 
 
@@ -383,45 +376,12 @@ def _validate_tree(tree: DictConfig) -> None:
         _is_int(tree.k_neighbours, 1),
         f"tree.k_neighbours {tree.k_neighbours!r} must be an integer > 0.",
     )
-
-
-def _validate_regressor(regressor: DictConfig) -> None:
-    """Check the `failure_regressor` section."""
     _check(
-        _is_int(regressor.n_iter, 1),
-        f"failure_regressor.n_iter {regressor.n_iter!r} must be an integer > 0.",
+        _is_number(tree.d_weight)
+        and math.isfinite(tree.d_weight)
+        and tree.d_weight >= 0,
+        f"tree.d_weight {tree.d_weight!r} must be a number >= 0.",
     )
-    for key in ("n_outer_splits", "n_inner_splits"):
-        _check(
-            _is_int(regressor[key], 2),
-            f"failure_regressor.{key} {regressor[key]!r} must be an integer >= 2.",
-        )
-    accepted = RandomForestRegressor().get_params()
-    _check(
-        OmegaConf.is_dict(regressor.params),
-        f"failure_regressor.params {regressor.params!r} must be a mapping.",
-    )
-    for key in regressor.params:
-        _check(
-            key in accepted and key != "random_state",
-            f"failure_regressor.params key {key!r} invalid (random_state comes from "
-            f"seed); valid: {sorted(set(accepted) - {'random_state'})}.",
-        )
-    grid = regressor.param_grid
-    _check(
-        OmegaConf.is_dict(grid) and len(grid) > 0,
-        f"failure_regressor.param_grid {grid!r} must be a non-empty mapping.",
-    )
-    for key, values in grid.items():
-        _check(
-            key in accepted,
-            f"failure_regressor.param_grid key {key!r} is not a "
-            f"RandomForestRegressor parameter; valid: {sorted(accepted)}.",
-        )
-        _check(
-            OmegaConf.is_list(values) and len(values) > 0,
-            f"failure_regressor.param_grid.{key} {values!r} must be a non-empty list.",
-        )
 
 
 def _validate_runtime(runtime: DictConfig) -> None:

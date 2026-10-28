@@ -9,14 +9,12 @@ import joblib
 import numpy as np
 import pandas as pd
 import pytest
-from omegaconf import DictConfig, OmegaConf
 from pandas.testing import assert_frame_equal
 
 import stages.classify as classify_stage
 import stages.crossfit as crossfit_stage
-import stages.regress as regress_stage
+import stages.tree as tree_stage
 from pipeline.runner import STAGES, _config_slice, run
-from src.regressor import leaf_descriptors
 from stages import SPLITS
 from tests.helpers import fast_cfg, query
 
@@ -44,7 +42,6 @@ def test_outputs(root: Path) -> None:
     _check_tree(root, metrics, ids)
     _check_complexity(root, metrics)
     _check_baselines(root, metrics, ids)
-    _check_regress(root, metrics, ids)
     _check_evaluate(root, metrics, ids)
     _check_render(root, ids)
 
@@ -94,7 +91,22 @@ def _check_tree(
         assert picked["row"].tolist() == list(
             range(int(metrics["split", f"n_{split}"]))
         )
-    assert rows[["q_leaf", "q"]].stack().between(0, 1).all()
+    assert rows[["q_leaf", "q", "confidence"]].stack().between(0, 1).all()
+    for name in ("d_scale", "mu_c", "sigma_c"):
+        assert ("tree", name) in metrics
+    # The correction's signal is the classifier's own top probability.
+    predictions = pd.read_parquet(
+        root / f"artifacts/classify/{ids['classify']}/predictions.parquet"
+    )
+    for split in ("val", "test"):
+        top = (
+            predictions[predictions["split"] == split]
+            .sort_values("row")
+            .filter(like="proba_")
+            .max(axis=1)
+        )
+        tree_rows = rows[rows["split"] == split].sort_values("row")
+        assert np.allclose(tree_rows["confidence"], top, atol=1e-6)
     leaves = pd.DataFrame(
         query(
             root / "grace.db",
@@ -147,7 +159,6 @@ def _check_evaluate(
     for predictor in (
         "tree",
         "tree_leaf",
-        "regressor",
         "val_rate",
         "confidence",
         "binned",
@@ -167,40 +178,11 @@ def _check_evaluate(
     )
 
 
-def _check_regress(
-    root: Path, metrics: Mapping[tuple[str, str], float], ids: Mapping[str, int]
-) -> None:
-    n_leaves = int(metrics["tree", "n_leaves"])
-    assert _scalar(root, "SELECT COUNT(*) FROM estimates") == n_leaves
-    # The folds cover exactly the leaves with a val row.
-    fold_coverage = (
-        "SELECT COUNT(*) FROM estimates JOIN tree_nodes USING (node_id) "
-        f"WHERE estimates.execution_id = {ids['regress']} "
-        f"AND tree_nodes.execution_id = {ids['tree']} "
-        "AND (fold IS NULL) != (n_val = 0)"
-    )
-    assert _scalar(root, fold_coverage) == 0
-    for score in ("spearman", "r2", "mae", "mse"):
-        assert ("regress", f"oof_{score}") in metrics
-    folds = int(metrics["regress", "n_outer_splits"]) + 1
-    assert _scalar(root, "SELECT COUNT(*) FROM regressor_folds") == folds
-    assert _scalar(root, "SELECT COUNT(*) FROM regressor_folds WHERE fold = -1") == 1
-    n_features = int(metrics["regress", "n_features"])
-    assert _scalar(root, "SELECT COUNT(*) FROM importances") == n_features
-    model = joblib.load(root / f"artifacts/regress/{ids['regress']}/model.joblib")
-    assert len(model.feature_names_in_) == n_features
-    X = pd.DataFrame(np.zeros((2, n_features)), columns=model.feature_names_in_)
-    assert model.predict(X).shape == (2,)
-
-
 def _check_render(root: Path, ids: Mapping[str, int]) -> None:
     expected = {
         "classification/confusion_matrix",
         "predictors/mse_ratio",
         "predictors/spearman",
-        "regress/predicted_vs_val",
-        "regress/predicted_vs_test",
-        "regress/feature_importances",
     }
     sql = f"SELECT name, file FROM figures WHERE execution_id = {ids['render']}"
     figures = dict(query(root / "grace.db", sql))
@@ -341,103 +323,6 @@ def test_mlp_trains_on_a_one_row_last_batch(root: Path) -> None:
     assert n_train % batch_size == 1
 
 
-class _FakeContext:
-    """A minimal stage Context double: DB tables, an output folder."""
-
-    def __init__(
-        self,
-        tables: Mapping[tuple[str, str], pd.DataFrame],
-        cfg: DictConfig,
-        out: Path,
-    ) -> None:
-        self.cfg = cfg
-        self.runtime = OmegaConf.create({"n_jobs": 1})
-        self.out = out
-        self._tables = tables
-        self.pending: list[tuple[str, object]] = []
-
-    def read(self, table: str, stage: str) -> pd.DataFrame:
-        return self._tables[(stage, table)].copy()
-
-    def write(self, table: str, frame: pd.DataFrame) -> None:
-        self.pending.append((table, frame))
-
-    def save_metrics(self, values: Mapping[str, float]) -> None:
-        self.pending.append(("metrics", dict(values)))
-
-
-def _regress_tables() -> dict[tuple[str, str], pd.DataFrame]:
-    """Build a four-leaf toy input for `stages.regress`.
-
-    Leaves 1, 3 and 4 have val rows. Leaf 2 has none (the refit-only
-    case).
-    """
-    nodes = pd.DataFrame(
-        {
-            "node_id": [1, 2, 3, 4],
-            "class_id": [10, 10, 20, 20],
-            "status": ["leaf"] * 4,
-            "n_val": [20, 0, 15, 10],
-            "n_val_errors": [2, 0, 6, 1],
-        }
-    )
-    complexity = pd.DataFrame(
-        [
-            {"scope": "leaf", "scope_id": 1, "measure": "m1", "value": 1.0},
-            {"scope": "leaf", "scope_id": 2, "measure": "m1", "value": 2.0},
-            {"scope": "leaf", "scope_id": 3, "measure": "m1", "value": 3.0},
-            {"scope": "leaf", "scope_id": 4, "measure": "m1", "value": 4.0},
-            {"scope": "class", "scope_id": 10, "measure": "m1", "value": 1.5},
-            {"scope": "class", "scope_id": 20, "measure": "m1", "value": 3.5},
-        ]
-    )
-    return {("tree", "tree_nodes"): nodes, ("complexity", "complexity"): complexity}
-
-
-def test_regress_predicts_a_leaf_without_a_val_row_by_the_refit(
-    tmp_path: Path,
-) -> None:
-    """Check the refit, not the CV, predicts a val-less leaf."""
-    cfg = OmegaConf.create(
-        {
-            "failure_regressor": {
-                "params": {},
-                "param_grid": {"n_estimators": [5]},
-                "n_outer_splits": 2,
-                "n_inner_splits": 0,
-                "n_iter": 1,
-            },
-            "seed": 0,
-        }
-    )
-    ctx = _FakeContext(_regress_tables(), cfg, tmp_path)
-
-    regress_stage.run(ctx)
-
-    estimates = next(
-        frame for name, frame in ctx.pending if name == "estimates"
-    ).set_index("node_id")
-
-    # Leaf 2: no val row -> predicted by the refit, fold is NA, and its
-    # value is exactly the refit model's own prediction.
-    assert pd.isna(estimates.loc[2, "fold"])
-    model = joblib.load(tmp_path / "model.joblib")
-    tables = _regress_tables()
-    nodes = tables[("tree", "tree_nodes")].set_index("node_id")
-    descriptors = leaf_descriptors(
-        tables[("complexity", "complexity")], nodes["class_id"]
-    )
-    expected = np.clip(
-        model.predict(descriptors.loc[[2], model.feature_names_in_]), 0.0, 1.0
-    )[0]
-    assert estimates.loc[2, "regressor"] == pytest.approx(expected)
-
-    # Leaves 1, 3 and 4 have a val row: out-of-fold, a real fold index.
-    for leaf in (1, 3, 4):
-        assert not pd.isna(estimates.loc[leaf, "fold"])
-        assert 0.0 <= estimates.loc[leaf, "regressor"] <= 1.0
-
-
 def test_crossfit_predicts_every_train_row_once(root: Path) -> None:
     """Check every train row has one out-of-fold prediction."""
     execution = _scalar(root, "SELECT id FROM executions WHERE stage = 'crossfit'")
@@ -531,6 +416,35 @@ def test_tree_never_reads_test_labels(tmp_path: Path) -> None:
     second_rows, second_nodes = built()
     assert_frame_equal(second_rows, first_rows)
     assert_frame_equal(second_nodes, first_nodes)
+
+
+def test_tree_standardizes_with_the_train_statistics() -> None:
+    """Check val and test are scaled by train's mean and std alone."""
+    values = {
+        "train": np.array([1.0, 2.0, 3.0, 4.0]),
+        "val": np.array([10.0, 20.0]),
+        "test": np.array([0.0]),
+    }
+    scaled, mean, std = tree_stage._standardize(values)
+    assert mean == pytest.approx(2.5) and std == pytest.approx(values["train"].std())
+    assert scaled["val"] == pytest.approx((values["val"] - 2.5) / std)
+    values["val"] = values["val"] * 7
+    assert tree_stage._standardize(values)[1:] == (mean, std)
+    flat, _, flat_std = tree_stage._standardize(
+        {"train": np.full(4, 3.0), "val": np.array([1.0, 2.0])}
+    )
+    assert flat_std == 0.0 and (flat["val"] == 0).all()
+
+
+def test_tree_without_weight_grows_on_the_lda_space(tmp_path: Path) -> None:
+    """Check d_weight=0 leaves the disagreement axis out of the tree."""
+    run(["tree"], fast_cfg(tmp_path, "tree.d_weight=0"), force=False)
+    latest = _scalar(tmp_path, "SELECT MAX(id) FROM executions WHERE stage='tree'")
+    fitted = joblib.load(tmp_path / f"artifacts/tree/{latest}/tree.joblib")
+    z_file = next((tmp_path / "artifacts/space").glob("*/z.parquet"))
+    n_axes = pd.read_parquet(z_file).filter(like="z_").shape[1]
+    assert fitted["scale"] == 0.0
+    assert fitted["tree"].centroid.shape[1] == n_axes
 
 
 def test_baselines_never_read_test_labels(tmp_path: Path) -> None:

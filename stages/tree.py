@@ -1,21 +1,23 @@
 """Regions as the leaves of a tree, and each row's failure probability.
 
-The tree is grown on geometry alone (2-means in the LDA space, one root
-per predicted class), cut where the out-of-fold errors of train say a
-deeper cut costs more noise than it removes, and its leaves take the
-failure rate of the validation rows that reach them, shrunk toward the
-out-of-fold rate. A per-row correction by the share of nearest train
-rows that disagree with the prediction gives every row its probability.
-Test labels are never read. Artifacts: the tree and its estimates, and
-every row's leaf, disagreement, leaf rate and probability. DB rows
-written: `tree_nodes` and metrics n_nodes, n_leaves, n_empty_roots,
-max_depth, oof_error_rate, val_error_rate, fh_a, fh_b, fh_tau2, beta,
-mu_d, sigma_d and n_leaves_without_val.
+The tree is grown with 2-means on the LDA space plus one axis, the
+share of nearest train rows that disagree with the predicted class
+(one root per predicted class), cut where the out-of-fold errors of
+train say a deeper cut costs more noise than it removes, and its leaves
+take the failure rate of the validation rows that reach them, shrunk
+toward the out-of-fold rate. A per-row correction by the classifier's
+confidence gives every row its probability. Test labels are never
+read. Artifacts: the tree and its estimates, and every row's leaf,
+disagreement, confidence, leaf rate and probability. DB rows written:
+`tree_nodes` and metrics n_nodes, n_leaves, n_empty_roots, max_depth,
+oof_error_rate, val_error_rate, fh_a, fh_b, fh_tau2, beta, mu_d,
+sigma_d, d_scale, mu_c, sigma_c and n_leaves_without_val.
 """
 
 __all__ = ["CONFIG", "INPUTS", "FILES", "OUTPUTS", "run"]
 
 import logging
+from collections.abc import Mapping
 
 import joblib
 import numpy as np
@@ -42,9 +44,37 @@ def _read_points(ctx: Context, split: str) -> np.ndarray:
     return rows[columns].to_numpy(dtype=np.float64)
 
 
-def _read_predictions(ctx: Context, stage: str, file: str, split: str) -> np.ndarray:
-    """Return a split's predicted classes from classify or crossfit."""
-    return ctx.split_rows(stage, file, split, ["y_pred"])["y_pred"].to_numpy()
+def _read_predictions(
+    ctx: Context, stage: str, file: str, split: str
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return a split's predicted classes and top probabilities.
+
+    Read from classify or crossfit.
+    """
+    rows = ctx.split_rows(stage, file, split)
+    probabilities = rows.filter(like="proba_").to_numpy(dtype=np.float64)
+    return rows["y_pred"].to_numpy(), probabilities.max(axis=1)
+
+
+def _standardize(
+    by_split: Mapping[str, np.ndarray],
+) -> tuple[dict[str, np.ndarray], float, float]:
+    """Centre and scale every split by the mean and std of train.
+
+    Returns:
+        The standardized splits, all zeros when the std of train is at
+        most 1e-12, then the mean and std of train.
+    """
+    mean = float(by_split["train"].mean())
+    std = float(by_split["train"].std())
+    return (
+        {
+            split: (values - mean) / std if std > 1e-12 else np.zeros(len(values))
+            for split, values in by_split.items()
+        },
+        mean,
+        std,
+    )
 
 
 def _nan_to_none(values: np.ndarray) -> list[object]:
@@ -105,15 +135,55 @@ def run(ctx: Context) -> None:
     n_classes = len(ctx.read("classes", "prepare"))
     y_train = ctx.labels("train")
     points = {split: _read_points(ctx, split) for split in SPLITS}
-    predicted = {
-        "train": _read_predictions(ctx, "crossfit", "oof.parquet", "train"),
-        "val": _read_predictions(ctx, "classify", "predictions.parquet", "val"),
-        "test": _read_predictions(ctx, "classify", "predictions.parquet", "test"),
+    sources = {
+        "train": ("crossfit", "oof.parquet"),
+        "val": ("classify", "predictions.parquet"),
+        "test": ("classify", "predictions.parquet"),
     }
+    predicted, confidence = {}, {}
+    for split in SPLITS:
+        predicted[split], confidence[split] = _read_predictions(
+            ctx, *sources[split], split
+        )
     train_errors = (predicted["train"] != y_train).astype(np.float64)
 
+    neighbour_index = trees.build_neighbours(points["train"], n_jobs=ctx.runtime.n_jobs)
+    n_neighbours = min(cfg.tree.k_neighbours, len(y_train) - 1)
+    disagreement = {
+        "train": trees.neighbour_disagreement(
+            neighbour_index, y_train, predicted["train"], n_neighbours=n_neighbours
+        )
+    } | {
+        split: trees.neighbour_disagreement(
+            neighbour_index,
+            y_train,
+            predicted[split],
+            n_neighbours=n_neighbours,
+            points=points[split],
+        )
+        for split in SPLITS[1:]
+    }
+    standardized_disagreement, disagreement_mean, disagreement_std = _standardize(
+        disagreement
+    )
+
+    # The disagreement is one more axis, weighted in units of the spread
+    # of the LDA space. Without weight the axis is left out, so that the
+    # geometric tree is grown on exactly its own points.
+    disagreement_scale = cfg.tree.d_weight * float(
+        np.sqrt(points["train"].var(axis=0).sum())
+    )
+    grown_points = points
+    if disagreement_scale > 0:
+        grown_points = {
+            split: np.column_stack(
+                [points[split], disagreement_scale * standardized_disagreement[split]]
+            )
+            for split in SPLITS
+        }
+
     tree, node_of_row = trees.grow_tree(
-        points["train"],
+        grown_points["train"],
         predicted["train"],
         n_classes=n_classes,
         n_min=cfg.tree.n_min,
@@ -129,7 +199,7 @@ def run(ctx: Context) -> None:
         n_val=len(points["val"]),
     )
     leaf_of_row = {
-        split: trees.descend(tree, points[split], predicted[split], stop=is_leaf)
+        split: trees.descend(tree, grown_points[split], predicted[split], stop=is_leaf)
         for split in SPLITS
     }
 
@@ -157,34 +227,11 @@ def run(ctx: Context) -> None:
         tau2=tau2,
     )
 
-    neighbour_index = trees.build_neighbours(points["train"], n_jobs=ctx.runtime.n_jobs)
-    n_neighbours = min(cfg.tree.k_neighbours, len(y_train) - 1)
-    disagreement = {
-        "train": trees.neighbour_disagreement(
-            neighbour_index, y_train, predicted["train"], n_neighbours=n_neighbours
-        )
-    } | {
-        split: trees.neighbour_disagreement(
-            neighbour_index,
-            y_train,
-            predicted[split],
-            n_neighbours=n_neighbours,
-            points=points[split],
-        )
-        for split in SPLITS[1:]
-    }
-    disagreement_mean = float(disagreement["train"].mean())
-    disagreement_std = float(disagreement["train"].std())
-    standardized = {
-        split: (
-            (disagreement[split] - disagreement_mean) / disagreement_std
-            if disagreement_std > 1e-12
-            else np.zeros(len(disagreement[split]))
-        )
-        for split in SPLITS
-    }
+    standardized_low_confidence, low_confidence_mean, low_confidence_std = _standardize(
+        {split: trees.low_confidence(confidence[split]) for split in SPLITS}
+    )
     beta = trees.fit_beta(
-        node_rate[leaf_of_row["val"]], standardized["val"], val_errors
+        node_rate[leaf_of_row["val"]], standardized_low_confidence["val"], val_errors
     )
 
     leaf_rate = {split: node_rate[leaf_of_row[split]] for split in SPLITS}
@@ -196,9 +243,10 @@ def run(ctx: Context) -> None:
                     "row": np.arange(len(points[split]), dtype=np.int32),
                     "leaf": leaf_of_row[split].astype(np.int32),
                     "d": disagreement[split].astype(np.float32),
+                    "confidence": confidence[split].astype(np.float32),
                     "q_leaf": leaf_rate[split].astype(np.float32),
                     "q": trees.correct_rates(
-                        leaf_rate[split], standardized[split], beta
+                        leaf_rate[split], standardized_low_confidence[split], beta
                     ).astype(np.float32),
                 }
             )
@@ -219,6 +267,9 @@ def run(ctx: Context) -> None:
             "beta": beta,
             "mean_d": disagreement_mean,
             "std_d": disagreement_std,
+            "scale": disagreement_scale,
+            "mean_c": low_confidence_mean,
+            "std_c": low_confidence_std,
         },
         ctx.out / "tree.joblib",
     )
@@ -255,6 +306,9 @@ def run(ctx: Context) -> None:
             "beta": beta,
             "mu_d": disagreement_mean,
             "sigma_d": disagreement_std,
+            "d_scale": disagreement_scale,
+            "mu_c": low_confidence_mean,
+            "sigma_c": low_confidence_std,
             "n_leaves_without_val": int((is_leaf & (n_val == 0)).sum()),
         }
     )

@@ -226,9 +226,8 @@ def test_failed_stage_rolls_back(
         (["data.max_per_class=0"], ["prepare"]),
         (["runtime.num_workers=-1"], ["prepare"]),
         (["graph.k=0"], ["prepare"]),
-        (["failure_regressor.n_outer_splits=1"], ["prepare"]),
-        (["failure_regressor.param_grid.max_depth=5"], ["prepare"]),
-        (["failure_regressor.n_iter=0"], ["prepare"]),
+        (["tree.d_weight=-1"], ["prepare"]),
+        (["tree.d_weight=.inf"], ["prepare"]),
         ([], ["bogus"]),
     ],
 )
@@ -260,9 +259,7 @@ def test_config_errors(
         (["groups.data=nb15_v2"], "pick it with <group>=<option>"),
         (["[groups][data]=nb15_v2"], "pick it with <group>=<option>"),
         (["seed=-1"], "seed"),
-        # The regressor's searches take seed + fold, below 2**32.
         ([f"seed={2**31}"], "seed"),
-        (["regressor=maybe"], "regressor"),
         (["data.num_cols=[num_1,num_1]"], "more than once"),
         (["loss.params.label_smoothing=1.0"], "label_smoothing"),
         (["loss=focal", "loss.params.gamma=-1"], "gamma"),
@@ -274,16 +271,17 @@ def test_config_errors_name_the_key(overrides: list[str], match: str) -> None:
         load_config(["data=synthetic_test", *overrides])
 
 
-def test_render_reads_the_regressor_only_when_asked() -> None:
-    """Check that `regressor` decides what render runs after."""
-    with_regressor = load_config(["data=synthetic_test"])
-    without_regressor = load_config(["data=synthetic_test", "regressor=false"])
-    assert plan(["render"], with_regressor) == list(STAGES)
-    # Without the regressor, render needs none of its chain.
-    skipped = {"complexity", "regress"}
-    assert plan(["render"], without_regressor) == [
-        stage for stage in STAGES if stage not in skipped
-    ]
+def test_render_runs_without_complexity() -> None:
+    """Check that complexity runs only when a target asks for it."""
+    cfg = load_config(["data=synthetic_test"])
+    assert plan(["render"], cfg) == [stage for stage in STAGES if stage != "complexity"]
+    assert "complexity" in plan(["render", "complexity"], cfg)
+
+
+@pytest.mark.parametrize("weight", ["0", "0.5", "2"])
+def test_tree_weight_accepts_any_finite_number_from_zero(weight: str) -> None:
+    """Check that d_weight validates from 0, as an int or a float."""
+    load_config(["data=synthetic_test", f"tree.d_weight={weight}"])
 
 
 @pytest.mark.parametrize(

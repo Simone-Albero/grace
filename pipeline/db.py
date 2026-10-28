@@ -118,27 +118,6 @@ CREATE TABLE IF NOT EXISTS history (
     loss REAL NOT NULL,
     PRIMARY KEY (execution_id, step)
 );
-CREATE TABLE IF NOT EXISTS estimates (
-    execution_id INTEGER NOT NULL REFERENCES executions (id),
-    node_id INTEGER NOT NULL,  -- a leaf of the tree
-    fold INTEGER,  -- outer fold that held it out; NULL for a leaf the refit predicts
-    regressor REAL NOT NULL,  -- predicted failure rate
-    PRIMARY KEY (execution_id, node_id)
-);
-CREATE TABLE IF NOT EXISTS regressor_folds (
-    execution_id INTEGER NOT NULL REFERENCES executions (id),
-    fold INTEGER NOT NULL,  -- -1: the refit on every val-labelled leaf
-    n_leaves INTEGER NOT NULL,  -- held out (fold) or trained on (refit)
-    best_score REAL,  -- inner-CV clipped R²; NULL without a search
-    params TEXT NOT NULL,  -- JSON of the chosen forest parameters
-    PRIMARY KEY (execution_id, fold)
-);
-CREATE TABLE IF NOT EXISTS importances (
-    execution_id INTEGER NOT NULL REFERENCES executions (id),
-    feature TEXT NOT NULL,
-    importance REAL NOT NULL,  -- mean over the outer folds
-    PRIMARY KEY (execution_id, feature)
-);
 CREATE TABLE IF NOT EXISTS tree_nodes (
     execution_id INTEGER NOT NULL REFERENCES executions (id),
     node_id INTEGER NOT NULL,
@@ -167,7 +146,7 @@ CREATE TABLE IF NOT EXISTS leaf_tests (
 );
 CREATE TABLE IF NOT EXISTS figures (
     execution_id INTEGER NOT NULL REFERENCES executions (id),
-    name TEXT NOT NULL,  -- e.g. regress/predicted_vs_val
+    name TEXT NOT NULL,  -- e.g. predictors/mse_ratio
     file TEXT NOT NULL,  -- relative to the execution dir
     PRIMARY KEY (execution_id, name)
 );

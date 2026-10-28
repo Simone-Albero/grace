@@ -6,7 +6,6 @@ import numpy as np
 import pandas as pd
 import pytest
 from pandas.testing import assert_frame_equal
-from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import GridSearchCV
 
 from src import baselines, tree
@@ -14,7 +13,6 @@ from src.complexity.common import weighted_group_measures
 from src.data import cap_per_class, stratified_holdout
 from src.graph import build_train_graph
 from src.ml import grid_search
-from src.regressor import fit_failure_regressor
 
 
 def test_stratified_holdout_is_stratified_and_deterministic() -> None:
@@ -101,50 +99,6 @@ def test_duplicate_points_join_inside_the_mst() -> None:
     assert len(mst) == len(points) - 1
     # Else each copy is bridged to node 0 alone, by a long edge.
     assert np.isin(mst, duplicates).all(axis=1).sum() == len(duplicates) - 1
-
-
-def test_fit_failure_regressor_passes_sample_weight_to_the_forest(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Check every forest fit, in the inner search too, is weighted."""
-    calls: list[np.ndarray | None] = []
-    original_fit = RandomForestRegressor.fit
-
-    def spy_fit(
-        self: RandomForestRegressor,
-        X: pd.DataFrame,
-        y: pd.Series,
-        sample_weight: pd.Series | None = None,
-    ) -> RandomForestRegressor:
-        calls.append(sample_weight)
-        return original_fit(self, X, y, sample_weight=sample_weight)
-
-    monkeypatch.setattr(RandomForestRegressor, "fit", spy_fit)
-
-    # 8 regions and 2 inner splits: enough for the inner search to run,
-    # not just the no-search branch of `_fit_model`.
-    X = pd.DataFrame({"a": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]})
-    y = pd.Series([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8])
-    weight = pd.Series([1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 50.0])
-
-    fit_failure_regressor(
-        X,
-        y,
-        sample_weight=weight,
-        params={},
-        param_grid={"n_estimators": [5, 10]},
-        n_outer_splits=2,
-        n_inner_splits=2,
-        n_iter=1,
-        n_jobs=1,
-        random_state=0,
-    )
-
-    # Every candidate's fit, in every inner and outer fold, plus the
-    # refit: none silently dropped the weight.
-    assert len(calls) > 3
-    assert all(call is not None for call in calls)
-    assert any(call.max() == pytest.approx(50.0) for call in calls)
 
 
 def test_tied_confidences_share_a_bin() -> None:
@@ -399,3 +353,12 @@ def test_error_gbm_is_constant_when_every_row_has_the_same_outcome() -> None:
     features = pd.DataFrame({"z_0": np.arange(10.0), "predicted": np.zeros(10, int)})
     predict = baselines.fit_error_gbm(features, np.zeros(10), random_state=0)
     assert (predict(features) == 0.0).all()
+
+
+def test_low_confidence_is_finite_and_falls_with_confidence() -> None:
+    """Check the log-odds of a wrong class: falling, finite at 1."""
+    top_probability = np.array([0.5, 0.9, 0.99, 1.0])
+    log_odds = tree.low_confidence(top_probability)
+    assert np.isfinite(log_odds).all()
+    assert (np.diff(log_odds) < 0).all()
+    assert log_odds[0] == pytest.approx(0.0)
