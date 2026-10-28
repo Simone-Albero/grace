@@ -188,6 +188,53 @@ def test_the_tree_of_a_class_draws_and_rejects_a_missing_one(
     assert client.get(f"/runs/{run_id}/trees").status_code == 422
 
 
+def test_a_node_zooms_the_map_on_its_subtree(
+    client: TestClient, root: Path, run_id: int
+) -> None:
+    """Check that `node` maps only the leaves below it, or 404s."""
+    tree = _execution(root, "tree")
+    rows = query(
+        root / "grace.db",
+        "SELECT node_id, class_id FROM tree_nodes WHERE status = 'internal' "
+        f"AND parent_id IS NOT NULL AND execution_id = {tree} LIMIT 1",
+    )
+    if not rows:
+        pytest.skip("no node below a root splits in the synthetic tree")
+    node_id, class_id = rows[0]
+    url = f"/runs/{run_id}/trees?class_id={class_id}"
+    whole = client.get(url)
+    zoomed = client.get(f"{url}&node={node_id}")
+    assert zoomed.status_code == 200 and zoomed.text.count('class="chart"') == 2
+    assert f"below node {node_id}" in zoomed.text
+    assert "below node" not in whole.text
+    # One circle per mapped leaf: the zoom drops the leaves outside.
+    circle = '"type": "circle"'
+    assert 0 < zoomed.text.count(circle) < whole.text.count(circle)
+    root_id = query(
+        root / "grace.db",
+        f"SELECT node_id FROM tree_nodes WHERE parent_id IS NULL AND "
+        f"class_id = {class_id} AND execution_id = {tree}",
+    )[0][0]
+    assert client.get(f"{url}&node={root_id}").text == whole.text
+    assert client.get(f"{url}&node=").text == whole.text
+    assert client.get(f"{url}&node=999999").status_code == 404
+    assert client.get(f"{url}&node=abc").status_code == 404
+
+
+def test_subtree_ids_collect_a_node_and_its_descendants() -> None:
+    """Check a subtree, the root and a leaf."""
+    nodes = [
+        {"node_id": 0, "parent_id": None},
+        {"node_id": 1, "parent_id": 0},
+        {"node_id": 2, "parent_id": 0},
+        {"node_id": 3, "parent_id": 1},
+        {"node_id": 4, "parent_id": 1},
+    ]
+    assert queries.subtree_ids(nodes, 1) == {1, 3, 4}
+    assert queries.subtree_ids(nodes, 0) == {0, 1, 2, 3, 4}
+    assert queries.subtree_ids(nodes, 2) == {2}
+
+
 def test_the_test_rate_colors_a_tree_only_when_evaluate_ran() -> None:
     """Check the colors a run offers, which the route accepts too."""
     assert "test_rate" in tabs.tree_colors({"tree": 1, "evaluate": 2})

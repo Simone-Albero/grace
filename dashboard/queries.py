@@ -21,6 +21,7 @@ __all__ = [
     "run_metrics",
     "runs",
     "stage_ids",
+    "subtree_ids",
     "tree_roots",
 ]
 
@@ -438,6 +439,25 @@ def class_tree(
     for row in rows:
         row["purity"] = None if row["oof_rate"] is None else 1 - row["oof_rate"]
     return rows
+
+
+def subtree_ids(nodes: Sequence[Mapping], node_id: int) -> set[int]:
+    """Collect a node and every node below it.
+
+    Args:
+        nodes: The `class_tree` rows, parents first.
+        node_id: The node at the top of the subtree.
+
+    Returns:
+        The ids of the node and its descendants.
+    """
+    below = {node_id}
+    # `class_tree` orders by depth, so a parent comes before its
+    # children and one pass reaches them all.
+    for node in nodes:
+        if node["parent_id"] in below:
+            below.add(node["node_id"])
+    return below
 
 
 def leaf_path(

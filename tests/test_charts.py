@@ -93,8 +93,8 @@ def test_tree_diagram_centers_parents_and_links_only_leaves() -> None:
     edges, marks = tree_diagram(nodes, color="purity", run_id=7)["data"]
     assert marks["x"] == [1.25, 0.5, 2, 0, 1]
     assert marks["customdata"] == [
-        None,
-        None,
+        {"node": 0},
+        {"node": 1},
         "/runs/7/leaves/2",
         "/runs/7/leaves/3",
         "/runs/7/leaves/4",
@@ -104,6 +104,23 @@ def test_tree_diagram_centers_parents_and_links_only_leaves() -> None:
     assert "purity 0.9000" in marks["text"][2]
     assert "val 4 · val rate –" in marks["text"][2]
     assert "test – · test rate –" in marks["text"][2]
+
+
+def test_tree_diagram_fades_the_nodes_outside_the_focus_and_tags_the_splits() -> None:
+    """Check the opacity, and what a click on a node carries."""
+    nodes = [
+        _node(0, None, 0, "internal"),
+        _node(1, 0, 1, "internal"),
+        _node(2, 0, 1, "leaf"),
+        _node(3, 1, 2, "leaf"),
+        _node(4, 1, 2, "leaf"),
+    ]
+    marks = tree_diagram(nodes, color="purity", run_id=7, focus={1, 3, 4})["data"][1]
+    assert marks["marker"]["opacity"] == [0.3, 1, 0.3, 1, 1]
+    assert marks["customdata"][:2] == [{"node": 0}, {"node": 1}]
+    assert marks["customdata"][2] == "/runs/7/leaves/2"
+    plain = tree_diagram(nodes, color="purity", run_id=7)["data"][1]
+    assert plain["marker"]["opacity"] == [1] * 5
 
 
 def _class_nodes() -> list[dict]:

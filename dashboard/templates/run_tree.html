@@ -15,7 +15,8 @@
 <p class="muted">The map under the tree places each leaf in the plane of the first two principal components of the
   train rows of the class, in the LDA space. A circle is centred on the mean of the leaf's train rows and its radius
   is their RMS distance from it. The tree also cuts on the disagreement of the neighbours, an axis the plane does not
-  show, so the circles of two leaves can overlap.</p>
+  show, so the circles of two leaves can overlap. Click a node that splits to map only the leaves below it, in
+  a plane fitted to them: far fewer circles overlap.</p>
 <form class="filters" hx-get="/runs/{{ run.id }}/trees" hx-target="#tree" hx-trigger="load, change"
       autocomplete="off">
   <label>class
@@ -28,6 +29,7 @@
       {% for key, label in colors.items() %}<option value="{{ key }}">{{ label }}</option>{% endfor %}
     </select>
   </label>
+  <input type="hidden" name="node" value="">
 </form>
 <div id="tree"></div>
 <h2>Predicted classes</h2>

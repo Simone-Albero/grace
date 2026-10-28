@@ -14,14 +14,14 @@
     "#ffffff": "#0b0b0b",
     // The fill steps of the circles of `leaf_map`, each swapped with its mirror,
     // like the colorscales, which the dark theme reverses.
-    "#bad7f8": "#12407a",
-    "#96c0f3": "#1e5499",
-    "#70a9ed": "#2869b7",
-    "#4c92e8": "#347dd6",
-    "#347dd6": "#4c92e8",
-    "#2869b7": "#70a9ed",
-    "#1e5499": "#96c0f3",
-    "#12407a": "#bad7f8",
+    "#f9c9c4": "#7a1d18",
+    "#f3a9a3": "#992e28",
+    "#ee8981": "#b73f37",
+    "#e86960": "#d65047",
+    "#d65047": "#e86960",
+    "#b73f37": "#ee8981",
+    "#992e28": "#f3a9a3",
+    "#7a1d18": "#f9c9c4",
   };
   const MARGIN = { l: 56, r: 16, t: 28, b: 48 };
 
@@ -40,6 +40,29 @@
       JSON.stringify(copy).replace(/#[0-9a-f]{6}/gi, (hex) => DARK_STEPS[hex.toLowerCase()] || hex)
     );
   }
+
+  // Zooms the map of the tree tab on a subtree; "" is the whole class.
+  function focusNode(value) {
+    const form = document.querySelector("form.filters input[name=node]")?.form;
+    if (!form) return;
+    form.elements.node.value = value;
+    form.dispatchEvent(new Event("change", { bubbles: true }));
+  }
+
+  document.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-node]");
+    if (button) focusNode(button.dataset.node);
+  });
+  // The ids of a tree mean nothing in another class's, so a new class starts whole.
+  document.addEventListener(
+    "change",
+    (event) => {
+      if (event.target.name === "class_id" && event.target.form?.elements.node) {
+        event.target.form.elements.node.value = "";
+      }
+    },
+    true
+  );
 
   function draw(el) {
     el._figure = el._figure || JSON.parse(el.dataset.figure);
@@ -66,8 +89,9 @@
     if (!el.dataset.ready) {
       el.dataset.ready = "1";
       el.on("plotly_click", (event) => {
-        const url = event.points[0].customdata;
-        if (typeof url === "string" && url.startsWith("/")) window.location = url;
+        const target = event.points[0].customdata;
+        if (typeof target === "string" && target.startsWith("/")) window.location = target;
+        else if (target && target.node !== undefined) focusNode(target.node);
       });
     }
   }

@@ -44,13 +44,13 @@ def confusion(
 
 @dataclass(frozen=True)
 class ClassPlane:
-    """The leaves of one predicted class as circles in a 2D plane.
+    """Leaves of a predicted class as circles in a 2D plane.
 
     Attributes:
         circles: The `(x, y, radius)` of each leaf by node id; a leaf
             that no train row reaches has none.
-        shares: The share of the class's variance in z that each of the
-            two axes holds.
+        shares: The share of the placed leaves' variance in z that each
+            of the two axes holds.
     """
 
     circles: dict[int, tuple[float, float, float]]
@@ -110,17 +110,18 @@ def _leaf_moments(
 def class_plane(
     space_dir: Path, tree_dir: Path, leaf_ids: Sequence[int]
 ) -> ClassPlane | None:
-    """Place the leaves of a class in its first two principal axes.
+    """Place leaves of a class in the first two principal axes of them.
 
-    The plane is the PCA of the class's train rows in z, so the leaves
-    show where the tree cut the space the LDA made. A leaf's circle is
+    The plane is the PCA of the leaves' train rows in z, so they show
+    where the tree cut the space the LDA made. A leaf's circle is
     centred on the mean of its train rows and its radius is their RMS
     distance from it in the plane.
 
     Args:
         space_dir: The folder of a space execution.
         tree_dir: The folder of a tree execution.
-        leaf_ids: The node ids of the leaves of the class.
+        leaf_ids: The node ids of the leaves to place: a class's, or
+            those below one of its nodes.
 
     Returns:
         The circles; None if a file is missing or the two do not have

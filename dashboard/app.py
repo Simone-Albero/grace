@@ -441,6 +441,9 @@ def create_app(db_path: Path) -> FastAPI:
         run_id: _Id,
         class_id: _ClassId,
         color: str = "purity",
+        # A string: the form sends an empty `node` for the whole class,
+        # which an int parameter would reject.
+        node: str = "",
         connection: sqlite3.Connection = Depends(db),
     ) -> HTMLResponse:
         run_context = _run_context(connection, run_id)
@@ -451,15 +454,32 @@ def create_app(db_path: Path) -> FastAPI:
         nodes = queries.class_tree(connection, ids, class_id)
         if not nodes:
             raise HTTPException(404, f"Run {run_id} has no tree of class {class_id}")
+        focus = None
+        if node:
+            focus_row = next(
+                (row for row in nodes if str(row["node_id"]) == node), None
+            )
+            if focus_row is None:
+                raise HTTPException(
+                    404, f"Run {run_id} has no node {node!r} in class {class_id}'s tree"
+                )
+            # A root's subtree is the whole class: nothing to zoom on.
+            if focus_row["parent_id"] is not None:
+                focus = queries.subtree_ids(nodes, focus_row["node_id"])
         dirs = queries.execution_dirs(run_context["run"])
         space_dir, tree_dir = root / dirs["space"], root / dirs["tree"]
-        leaf_ids = [node["node_id"] for node in nodes if node["status"] == "leaf"]
-        plane = artifacts.class_plane(space_dir, tree_dir, leaf_ids)
+        leaf_ids = [row["node_id"] for row in nodes if row["status"] == "leaf"]
+        mapped_ids = [i for i in leaf_ids if focus is None or i in focus]
+        plane = artifacts.class_plane(space_dir, tree_dir, mapped_ids)
         context = {
             "name": nodes[0]["class"],
             "n_nodes": len(nodes),
             "n_leaves": len(leaf_ids),
-            "figure": charts.tree_diagram(nodes, color=color, run_id=run_id),
+            "n_mapped": len(mapped_ids),
+            "focus_node": node if focus else None,
+            "figure": charts.tree_diagram(
+                nodes, color=color, run_id=run_id, focus=focus
+            ),
             "plane_figure": None,
             "plane_note": None,
         }

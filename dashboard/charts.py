@@ -27,7 +27,7 @@ __all__ = [
 
 import math
 import statistics
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 
 import numpy as np
 
@@ -52,20 +52,20 @@ NEUTRAL = "#898781"
 _INK = "#0b0b0b"
 _ON_DARK_FILL = "#ffffff"
 _ON_LIGHT_FILL = "#0b0b0b"
-_SEQUENTIAL = [[0, "#cde2fb"], [0.5, "#3987e5"], [1, "#0d366b"]]
+_SEQUENTIAL = [[0, "#fcd9d5"], [0.5, "#e5594f"], [1, "#6b1410"]]
 # A shape cannot take its color from a colorscale, and in the dark theme
 # the colorscales are reversed, so the circles of `leaf_map` take one of
 # these, sampled from `_SEQUENTIAL`. `dashboard.js` swaps step i with
 # step 7 - i, and a test keeps the two lists equal.
 _FILL_STEPS = [
-    "#bad7f8",
-    "#96c0f3",
-    "#70a9ed",
-    "#4c92e8",
-    "#347dd6",
-    "#2869b7",
-    "#1e5499",
-    "#12407a",
+    "#f9c9c4",
+    "#f3a9a3",
+    "#ee8981",
+    "#e86960",
+    "#d65047",
+    "#b73f37",
+    "#992e28",
+    "#7a1d18",
 ]
 # What colors the nodes of a class's tree, by the key of the node.
 TREE_COLORS = {
@@ -670,7 +670,11 @@ def _fill_step(value: float | None, low: float, high: float) -> str:
 
 
 def tree_diagram(
-    nodes: Sequence[Mapping], *, color: str, run_id: int
+    nodes: Sequence[Mapping],
+    *,
+    color: str,
+    run_id: int,
+    focus: Collection[int] | None = None,
 ) -> dict[str, object]:
     """Draw the tree of one predicted class, root on top.
 
@@ -679,11 +683,15 @@ def tree_diagram(
             class.
         color: The key of `TREE_COLORS` that colors the nodes.
         run_id: The run, for the link of each leaf to its page.
+        focus: The ids of a subtree the map shows; the nodes outside it
+            fade. None fades none.
 
     Returns:
         A node-link figure: a marker per node sized by its train rows
         and colored by `color`, squares for the leaves; the hover gives
-        the counts and rates of train, val and test.
+        the counts and rates of train, val and test. A leaf links to
+        its page, and a node that splits carries its id, for the click
+        that zooms the map on it.
     """
     positions = _tree_positions(nodes)
     by_id = {node["node_id"]: node for node in nodes}
@@ -706,13 +714,17 @@ def tree_diagram(
             (
                 f"/runs/{run_id}/leaves/{node['node_id']}"
                 if node["status"] == "leaf"
-                else None
+                else {"node": node["node_id"]}
             )
             for node in nodes
         ],
         "marker": {
             "symbol": [
                 "square" if node["status"] == "leaf" else "circle" for node in nodes
+            ],
+            "opacity": [
+                1 if focus is None or node["node_id"] in focus else 0.3
+                for node in nodes
             ],
             "size": [6 + 18 * (node["n_train"] / biggest) ** 0.5 for node in nodes],
             "color": [node[color] for node in nodes],
