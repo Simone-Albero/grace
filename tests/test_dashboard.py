@@ -187,6 +187,11 @@ def test_class_tree_sums_the_test_rows_of_the_leaves_into_each_node(
     assert top["n_test"] == sum(leaf["n_test"] for leaf in leaves) > 0
     assert top["n_test_errors"] == sum(leaf["n_test_errors"] for leaf in leaves)
     assert top["n_train"] >= sum(leaf["n_train"] for leaf in leaves)
+    assert all(
+        node["purity"] == pytest.approx(1 - node["oof_rate"])
+        for node in nodes
+        if node["n_train"]
+    )
     without_evaluate = {key: value for key, value in ids.items() if key != "evaluate"}
     with closing(queries.connect(path)) as db:
         untested_nodes = queries.class_tree(db, without_evaluate, 0)

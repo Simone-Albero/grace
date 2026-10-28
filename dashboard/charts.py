@@ -595,7 +595,8 @@ def _tree_hover(node: Mapping) -> str:
         f"node {node['node_id']} · {kind}",
         (
             f"train {_format_count(node['n_train'])} · "
-            f"oof rate {_format_rate(node['oof_rate'])}"
+            f"oof rate {_format_rate(node['oof_rate'])} · "
+            f"purity {_format_rate(node['purity'])}"
         ),
         (
             f"val {_format_count(node['n_val'])} · "

@@ -428,7 +428,8 @@ def class_tree(
         class_id: The predicted class of the root.
 
     Returns:
-        One row per node that was not pruned, parents first. A node's
+        One row per node that was not pruned, parents first, with the
+        `purity` of its train rows: the share of the class's own. A node's
         test counts are the sums over the leaves below it, and None
         when evaluate did not run.
     """
@@ -462,6 +463,10 @@ def class_tree(
         for key in ("n_test", "n_test_errors"):
             parent[key] = (parent[key] or 0) + row[key]
     _add_rates(rows)
+    # Every train row of the tree has the class as its prediction, so the
+    # out-of-fold errors are the rows of another class.
+    for row in rows:
+        row["purity"] = None if row["oof_rate"] is None else 1 - row["oof_rate"]
     return rows
 
 

@@ -63,6 +63,7 @@ def _node(node_id: int, parent_id: int | None, depth: int, status: str) -> dict:
         "status": status,
         "n_train": 10,
         "oof_rate": 0.1,
+        "purity": 0.9,
         "n_val": 4,
         "val_rate": None,
         "n_test": None,
@@ -91,6 +92,7 @@ def test_tree_diagram_centers_parents_and_links_only_leaves() -> None:
     ]
     assert len(edges["x"]) == 3 * 4
     # An unknown count reads as a dash, never as None or 0.
+    assert "purity 0.9000" in marks["text"][2]
     assert "val 4 · val rate –" in marks["text"][2]
     assert "test – · test rate –" in marks["text"][2]
 
