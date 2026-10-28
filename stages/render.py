@@ -26,6 +26,12 @@ _PREDICTORS = (
     ("binned", "Binned"),
     ("gbm", "GBM"),
 )
+_SCORES = {
+    "mse_ratio": "MSE / MSE of the val rate",
+    "binned_mse_ratio": "Binned MSE / binned MSE of the val rate",
+    "auroc": "AUROC",
+    "ap_lift": "Average precision / failure rate",
+}
 
 
 def _classification_figures(ctx: Context) -> dict[str, Figure]:
@@ -57,23 +63,18 @@ def _classification_figures(ctx: Context) -> dict[str, Figure]:
 
 
 def _predictor_figures(ctx: Context) -> dict[str, Figure]:
-    """Draw each predictor's per-sample MSE ratio and Spearman."""
+    """Draw each predictor's four scores against the test errors."""
     metrics = ctx.read("metrics", "evaluate").set_index("name")["value"]
     labels = [label for _, label in _PREDICTORS]
     colors = extended_palette(len(_PREDICTORS))
     return {
-        "predictors/mse_ratio": bar_plot(
+        f"predictors/{score}": bar_plot(
             labels,
-            [metrics[f"{key}_mse_ratio"] for key, _ in _PREDICTORS],
+            [metrics[f"{key}_{score}"] for key, _ in _PREDICTORS],
             colors=colors,
-            y_label="MSE / MSE of the val rate",
-        ),
-        "predictors/spearman": bar_plot(
-            labels,
-            [metrics[f"{key}_spearman"] for key, _ in _PREDICTORS],
-            colors=colors,
-            y_label="Spearman with the failures",
-        ),
+            y_label=y_label,
+        )
+        for score, y_label in _SCORES.items()
     }
 
 

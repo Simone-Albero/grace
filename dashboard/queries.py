@@ -45,7 +45,13 @@ PREDICTORS = {
     "binned": "Binned",
     "gbm": "GBM",
 }
-SCORES = ("mse", "mse_ratio", "spearman")
+# The scores of a predictor, each with its label.
+SCORES = {
+    "mse_ratio": "MSE ratio",
+    "binned_mse_ratio": "Binned MSE ratio",
+    "auroc": "AUROC",
+    "ap_lift": "AP / p",
+}
 
 
 def connect(path: Path) -> sqlite3.Connection:

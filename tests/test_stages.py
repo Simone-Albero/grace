@@ -164,10 +164,13 @@ def _check_evaluate(
         "binned",
         "gbm",
     ):
-        for score in ("mse", "mse_ratio", "spearman"):
+        for score in ("mse_ratio", "binned_mse_ratio", "auroc", "ap_lift"):
             assert ("evaluate", f"{predictor}_{score}") in metrics
-    # The constant val rate is the reference of every ratio.
+    # The val rate is every ratio's reference, and a random order.
     assert metrics["evaluate", "val_rate_mse_ratio"] == pytest.approx(1.0)
+    assert metrics["evaluate", "val_rate_binned_mse_ratio"] == pytest.approx(1.0)
+    assert metrics["evaluate", "val_rate_auroc"] == pytest.approx(0.5)
+    assert metrics["evaluate", "val_rate_ap_lift"] == pytest.approx(1.0)
     assert metrics["evaluate", "n_test"] == metrics["split", "n_test"]
     assert (
         _scalar(root, "SELECT COUNT(*) FROM leaf_tests") == metrics["tree", "n_leaves"]
@@ -182,7 +185,9 @@ def _check_render(root: Path, ids: Mapping[str, int]) -> None:
     expected = {
         "classification/confusion_matrix",
         "predictors/mse_ratio",
-        "predictors/spearman",
+        "predictors/binned_mse_ratio",
+        "predictors/auroc",
+        "predictors/ap_lift",
     }
     sql = f"SELECT name, file FROM figures WHERE execution_id = {ids['render']}"
     figures = dict(query(root / "grace.db", sql))

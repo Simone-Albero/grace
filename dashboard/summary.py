@@ -14,7 +14,7 @@ from collections.abc import Mapping, Sequence
 
 from dashboard import charts
 from dashboard.experiments import Experiment, SeedRun, metric_stage, summarize
-from dashboard.queries import PREDICTORS, STAGE_ORDER
+from dashboard.queries import PREDICTORS, SCORES, STAGE_ORDER
 
 # The metrics of the experiments table, with their column label.
 HEADLINE = {
@@ -22,7 +22,8 @@ HEADLINE = {
     "classify.f1_macro": "F1 macro",
     "evaluate.test_error_rate": "test error rate",
     "evaluate.tree_mse_ratio": "tree MSE ratio",
-    "evaluate.tree_spearman": "tree Spearman",
+    "evaluate.tree_auroc": "tree AUROC",
+    "evaluate.tree_ap_lift": "tree AP / p",
     "evaluate.confidence_mse_ratio": "confidence MSE ratio",
 }
 
@@ -150,16 +151,10 @@ def experiment_figures(experiment: Experiment) -> list[tuple[str, dict]]:
                 "test": "evaluate.test_error_rate",
             },
         ),
-        (
-            "Predictors, Spearman with the failures",
-            "Spearman",
-            _predictor_keys("spearman"),
-        ),
-        (
-            "Predictors, MSE over the val rate's",
-            "MSE ratio",
-            _predictor_keys("mse_ratio"),
-        ),
+        *[
+            (f"Predictors, {label}", label, _predictor_keys(score))
+            for score, label in SCORES.items()
+        ],
     ]
     figures = []
     for title, y_title, keys in families:

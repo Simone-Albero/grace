@@ -1,14 +1,13 @@
 {% extends "run_base.html" %}
 {% block content %}
-<p class="muted">Each predictor gives every test row a probability that the classifier fails on it. MSE is
-  the mean squared error of that probability against the failure; the ratio divides it by the one of the
-  constant val failure rate; Spearman correlates it with the failure. The best score is bold.</p>
+<p class="muted">Each predictor gives every test row a probability that the classifier fails on it, and
+  is scored against the failures that happened. The best score of each column is bold.</p>
 {% if scores %}
 <div class="grid">
   <section class="card">
     <h3>Scores</h3>
     <table>
-      <thead><tr><th>predictor</th>{% for s in score_names %}<th class="num">{{ "MSE ratio" if s == "mse_ratio" else s | upper if s == "mse" else s | capitalize }}</th>{% endfor %}</tr></thead>
+      <thead><tr><th>predictor</th>{% for label in score_names.values() %}<th class="num">{{ label }}</th>{% endfor %}</tr></thead>
       <tbody>
       {% for key, found in scores.items() %}
       <tr><td>{{ predictors[key] }}</td>
@@ -20,8 +19,30 @@
     <h3 style="margin-top:1rem">Test split</h3>
     <dl class="facts">{% for label, value in counts %}<dt>{{ label }}</dt><dd>{{ value | num }}</dd>{% endfor %}</dl>
   </section>
-  {{ m.chart(figures.mse_ratio, "MSE over the val rate's MSE") }}
-  {{ m.chart(figures.spearman, "Spearman with the failures") }}
+  <section class="card">
+    <h3>What the scores mean</h3>
+    <dl class="facts">
+      <dt>MSE ratio</dt>
+      <dd>The mean squared error of the probability against each row's failure (0 or 1), over that of the
+        constant val failure rate. Lower is better and below 1 beats the constant. It never reaches 0,
+        since a single failure is partly chance.</dd>
+      <dt>Binned MSE ratio</dt>
+      <dd>The rows are grouped into 10 bins of equal size by the predictor's probability. It compares each
+        bin's mean probability with its actual failure rate, over the same gap for the val rate. A row's
+        own chance drops out, but the noise of each bin's rate stays, so compare predictors within a
+        run, not across test sizes. Lower is better.</dd>
+      <dt>AUROC</dt>
+      <dd>The chance that a random failed row gets a higher probability than a random correct one. 0.5 is a
+        random order and 1 puts every failure first. It does not depend on the failure rate. Higher is
+        better.</dd>
+      <dt>AP / p</dt>
+      <dd>The average precision, i.e. the share of failures among the rows ranked above each failure,
+        averaged over the failures and divided by the failure rate p. It rewards a good top of the
+        ranking. 1 is a random order and the best is 1 / p, so compare predictors within a run. Higher
+        is better.</dd>
+    </dl>
+  </section>
+  {% for score, label in score_names.items() %}{{ m.chart(figures[score], label) }}{% endfor %}
 </div>
 {% endif %}
 {% endblock %}

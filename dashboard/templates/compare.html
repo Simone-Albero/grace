@@ -34,7 +34,7 @@
     </select>
   </label>
   <label>predictor score
-    <select name="score">{% for s in scores %}<option>{{ s }}</option>{% endfor %}</select>
+    <select name="score">{% for key, label in scores.items() %}<option value="{{ key }}"{% if key == default_score %} selected{% endif %}>{{ label }}</option>{% endfor %}</select>
   </label>
 </form>
 <div id="charts"></div>

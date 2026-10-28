@@ -58,8 +58,8 @@ def test_experiments_page(client: TestClient, experiment: dict) -> None:
     assert "<html" in restore.text
     assert "naive_bayes" in client.get("/?classifier=naive_bayes").text
     assert "matches these filters" in client.get("/?classifier=mlp").text
-    assert client.get("/?sort=tree_spearman&desc=false").status_code == 400
-    assert client.get("/?sort=evaluate.tree_spearman&desc=false").status_code == 200
+    assert client.get("/?sort=tree_auroc&desc=false").status_code == 400
+    assert client.get("/?sort=evaluate.tree_auroc&desc=false").status_code == 200
     assert client.get("/?sort=nope").status_code == 400
 
 
@@ -122,6 +122,9 @@ def test_run_overview_and_tabs(client: TestClient, run_id: int) -> None:
             "Confidence",
             "GBM",
             "MSE ratio",
+            "Binned MSE ratio",
+            "AUROC",
+            "AP / p",
         ),
     }
     for tab in _TABS:
@@ -238,16 +241,19 @@ def test_compare(client: TestClient) -> None:
     """Check that the comparison charts draw both families."""
     assert client.get("/compare").status_code == 200
     charts = client.get(
-        "/compare/charts?metric=classify.accuracy&x=classifier&color=data" "&score=mse"
+        "/compare/charts?metric=classify.accuracy&x=classifier&color=data"
+        "&score=auroc"
     )
     assert charts.status_code == 200 and charts.text.count('class="chart"') == 2
+    for score in queries.SCORES:
+        assert client.get(f"/compare/charts?score={score}").status_code == 200
     # No id: HTMX would reset the class of a swapped, id-matched div and
     # with it Plotly's js-plotly-plot, which hover and click need.
     assert 'id="chart' not in charts.text
     for name in ("Tree", "Confidence", "GBM"):
         assert name in charts.text
     assert "No run matches" in client.get("/compare/charts?classifier=mlp").text
-    queries_400 = ("metric=bogus", "metric=classify", "x=bogus")
+    queries_400 = ("metric=bogus", "metric=classify", "x=bogus", "score=mse")
     for query_string in (*queries_400, "color=bogus"):
         assert client.get(f"/compare/charts?{query_string}").status_code == 400
 

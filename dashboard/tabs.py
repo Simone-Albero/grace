@@ -25,6 +25,8 @@ _SETTINGS = {
     "tree": ("space", "crossfit", "tree"),
     "predictors": ("evaluate",),
 }
+# The scores where a higher value is the better one.
+_HIGHER_IS_BETTER = ("auroc", "ap_lift")
 # The tiles of each overview area: (stage, metric, label, kind).
 _OVERVIEW = {
     "data": [
@@ -44,7 +46,8 @@ _OVERVIEW = {
     "predictors": [
         ("evaluate", "test_error_rate", "test error rate", "score"),
         ("evaluate", "tree_mse_ratio", "tree MSE ratio", "score"),
-        ("evaluate", "tree_spearman", "tree Spearman", "score"),
+        ("evaluate", "tree_auroc", "tree AUROC", "score"),
+        ("evaluate", "tree_ap_lift", "tree AP / p", "score"),
         ("evaluate", "confidence_mse_ratio", "confidence MSE ratio", "score"),
     ],
 }
@@ -275,25 +278,12 @@ def _scores(metrics: _Metrics) -> dict[str, dict]:
 def _predictors(metrics: _Metrics) -> dict:
     """Predictor scores and their charts."""
     scores = _scores(metrics)
-    best = {
-        score: min(
-            (found[score] for found in scores.values() if found[score] is not None),
-            default=None,
-        )
-        for score in ("mse", "mse_ratio")
-    }
-    best["spearman"] = max(
-        (
-            found["spearman"]
-            for found in scores.values()
-            if found["spearman"] is not None
-        ),
-        default=None,
-    )
-    figures = {
-        score: charts.predictor_bars(scores, score)
-        for score in ("mse_ratio", "spearman")
-    }
+    best = {}
+    for score in SCORES:
+        found = [row[score] for row in scores.values() if row[score] is not None]
+        pick = max if score in _HIGHER_IS_BETTER else min
+        best[score] = pick(found, default=None)
+    figures = {score: charts.predictor_bars(scores, score) for score in SCORES}
     evaluated = metrics.get("evaluate", {})
     return {
         "scores": scores,

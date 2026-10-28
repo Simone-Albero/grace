@@ -13,6 +13,7 @@ from src.complexity.common import weighted_group_measures
 from src.data import cap_per_class, stratified_holdout
 from src.graph import build_train_graph
 from src.ml import grid_search
+from src.scores import ap_lift, auroc, binned_mse_ratio
 
 
 def test_stratified_holdout_is_stratified_and_deterministic() -> None:
@@ -362,3 +363,57 @@ def test_low_confidence_is_finite_and_falls_with_confidence() -> None:
     assert np.isfinite(log_odds).all()
     assert (np.diff(log_odds) < 0).all()
     assert log_odds[0] == pytest.approx(0.0)
+
+
+def test_a_constant_ranks_like_a_random_order() -> None:
+    """Check a constant gets 0.5, 1 and 1 on the three scores."""
+    errors = np.array([1.0, 0, 0, 0, 1, 0, 0, 0, 0, 0])
+    # Off the failure rate, since a constant that is exact has no ratio.
+    constant = np.full(10, 0.3)
+    assert auroc(constant, errors) == pytest.approx(0.5)
+    assert ap_lift(constant, errors) == pytest.approx(1.0)
+    assert binned_mse_ratio(constant, errors, constant, 5) == pytest.approx(1.0)
+
+
+def test_a_perfect_order_reaches_the_ceiling_of_the_ranking_scores() -> None:
+    """Check failures ranked first reach AUROC 1 and AP / p 1/p."""
+    errors = np.array([1.0, 1, 0, 0, 0, 0, 0, 0, 0, 0])
+    values = np.linspace(0.9, 0.1, 10)
+    assert auroc(values, errors) == 1.0
+    assert ap_lift(values, errors) == pytest.approx(1 / errors.mean())
+
+
+def test_binned_mse_ratio_is_zero_when_every_bin_rate_is_right() -> None:
+    """Check chance inside a bin is ignored, only its rate counts."""
+    errors = np.array([0.0, 0, 0, 1] * 5 + [0.0, 1, 1, 1] * 5)
+    values = np.array([0.25] * 20 + [0.75] * 20)
+    reference = np.full(40, errors.mean())
+    assert binned_mse_ratio(values, errors, reference, 2) == pytest.approx(0.0)
+    assert np.mean((values - errors) ** 2) > 0.1
+
+
+def test_binned_mse_ratio_keeps_a_dominant_lowest_value_in_its_own_bin() -> None:
+    """Check a mass point at the minimum leaves the rest a bin."""
+    values = np.repeat([0.01, 0.9], [950, 50])
+    errors = np.repeat([0.0, 1.0], [950, 50])
+    reference = np.full(1000, 0.06)
+    # Merged into one bin, the two gaps would cancel to a fifth.
+    expected = (950 * 0.01**2 + 50 * 0.1**2) / (950 * 0.06**2 + 50 * 0.94**2)
+    assert binned_mse_ratio(values, errors, reference, 10) == pytest.approx(expected)
+
+
+def test_binned_mse_ratio_is_nan_when_the_reference_fits_by_float_noise() -> None:
+    """Check a reference equal to the failure rate leaves no ratio."""
+    errors = np.array([1.0] * 100 + [0.0] * 900)
+    values = np.full(1000, 0.3)
+    assert math.isnan(binned_mse_ratio(values, errors, np.full(1000, 0.1), 10))
+
+
+def test_scores_are_nan_where_they_have_nothing_to_compare() -> None:
+    """Check no failure, or only failures, leaves a score undefined."""
+    values = np.linspace(0.1, 0.9, 10)
+    for errors in (np.zeros(10), np.ones(10)):
+        assert math.isnan(auroc(values, errors))
+    assert math.isnan(ap_lift(values, np.zeros(10)))
+    errors = np.array([0.0, 1] * 5)
+    assert math.isnan(binned_mse_ratio(values, errors, np.full(10, 0.5), 5))

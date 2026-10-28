@@ -32,7 +32,7 @@ from collections.abc import Mapping, Sequence
 import numpy as np
 
 from dashboard.artifacts import ClassPlane
-from dashboard.queries import PREDICTORS
+from dashboard.queries import PREDICTORS, SCORES
 
 _HEIGHT = 380
 # The categorical slots, in their fixed order; a ninth entity is
@@ -297,7 +297,7 @@ def predictor_bars(
     Args:
         scores: Each predictor's scores by name, as the metrics hold
             them.
-        score: The score name, e.g. "spearman".
+        score: The score name, e.g. "auroc".
 
     Returns:
         A bar figure with the predictors that have a value.
@@ -308,12 +308,12 @@ def predictor_bars(
         "x": [PREDICTORS[key] for key in shown],
         "y": [scores[key][score] for key in shown],
         "marker": {"color": [PREDICTOR_COLORS[key] for key in shown]},
-        "hovertemplate": f"%{{x}}<br>{score} %{{y:.4f}}<extra></extra>",
+        "hovertemplate": f"%{{x}}<br>{SCORES[score]} %{{y:.4f}}<extra></extra>",
     }
     layout = {
         "height": 300,
         "xaxis": {"type": "category"},
-        "yaxis": {"title": score},
+        "yaxis": {"title": SCORES[score]},
         "showlegend": False,
     }
     return {"data": [trace], "layout": layout}

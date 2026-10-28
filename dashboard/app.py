@@ -32,6 +32,8 @@ _LEAF_COLUMNS = (
     "test_rate mean_q"
 ).split()
 _MAX_LEAVES = 500
+# The predictor score the compare page opens on.
+_DEFAULT_SCORE = "auroc"
 _SORTS = ["latest", "n_seeds", *MAIN_KEYS, *summary.HEADLINE]
 # What the pages poll for while a run is going, in seconds.
 _REFRESH_SECONDS = 5
@@ -375,6 +377,7 @@ def create_app(db_path: Path) -> FastAPI:
             "metrics": names,
             "labels": {name: summary.metric_label(name) for name in names},
             "scores": queries.SCORES,
+            "default_score": _DEFAULT_SCORE,
         }
         return render(request, "compare.html", context)
 
@@ -386,7 +389,7 @@ def create_app(db_path: Path) -> FastAPI:
         metric: str = "classify.accuracy",
         x: str = "classifier",
         color: str = "",
-        score: str = "spearman",
+        score: str = _DEFAULT_SCORE,
     ) -> HTMLResponse:
         _check_choice("x", x, MAIN_KEYS)
         _check_choice("color", color, ["", *MAIN_KEYS])
@@ -401,14 +404,15 @@ def create_app(db_path: Path) -> FastAPI:
         rows = _filter_rows(all_rows, selected)
         main = _metric_traces(rows, all_rows, metric, x, color)
         predictors = _predictor_traces(rows, score, x)
+        score_label = queries.SCORES[score]
         figures = [
             (
                 summary.metric_label(metric),
                 charts.group_bars(main, x_title=x, y_title=metric.split(".")[-1]),
             ),
             (
-                f"Predictors, {score}",
-                charts.group_bars(predictors, x_title=x, y_title=score),
+                f"Predictors, {score_label}",
+                charts.group_bars(predictors, x_title=x, y_title=score_label),
             ),
         ]
         context = {

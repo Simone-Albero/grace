@@ -4,12 +4,12 @@ The only stage that reads the test labels to judge, besides classify's
 own classification metrics. Predictors: `tree` (the row's corrected
 probability), `tree_leaf` (its leaf's rate), and baselines' `val_rate`,
 `confidence`, `binned` and `gbm`. Each is scored per test row, by the
-mean squared error of its probability against the row's failure, that
-error over the one of the constant val rate, and the Spearman
-correlation of the probability with the failure. DB rows written:
+mean squared error of its probability against the row's failure over
+the one of the constant val rate (`mse_ratio`), the same over bins of
+equal size by the probability (`binned_mse_ratio`), the AUROC and the
+average precision over the failure rate (`ap_lift`). DB rows written:
 `leaf_tests` (the test rows and failures of every leaf) and metrics
-`<predictor>_mse`, `<predictor>_mse_ratio` and `<predictor>_spearman`,
-plus test_error_rate and n_test.
+`<predictor>_<score>` of those four, plus test_error_rate and n_test.
 """
 
 __all__ = ["CONFIG", "INPUTS", "FILES", "OUTPUTS", "run"]
@@ -17,7 +17,7 @@ __all__ = ["CONFIG", "INPUTS", "FILES", "OUTPUTS", "run"]
 import numpy as np
 import pandas as pd
 
-from src.scores import spearman
+from src.scores import ap_lift, auroc, binned_mse_ratio
 from stages import Context
 
 CONFIG = ()
@@ -26,6 +26,7 @@ FILES = ()
 # The stage writes DB rows only.
 OUTPUTS = ()
 _BASELINES = ("val_rate", "confidence", "binned", "gbm")
+_N_BINS = 10
 
 
 def _probabilities(ctx: Context) -> dict[str, np.ndarray]:
@@ -69,12 +70,15 @@ def run(ctx: Context) -> None:
     metrics = {"test_error_rate": float(errors.mean()), "n_test": len(errors)}
     for name, values in probabilities.items():
         mse = float(np.mean((values - errors) ** 2))
-        metrics[f"{name}_mse"] = mse
         # A constant that is exact on test leaves no ratio to take.
         metrics[f"{name}_mse_ratio"] = (
             mse / val_rate_mse if val_rate_mse > 0 else float("nan")
         )
-        metrics[f"{name}_spearman"] = spearman(values, errors)
+        metrics[f"{name}_binned_mse_ratio"] = binned_mse_ratio(
+            values, errors, probabilities["val_rate"], _N_BINS
+        )
+        metrics[f"{name}_auroc"] = auroc(values, errors)
+        metrics[f"{name}_ap_lift"] = ap_lift(values, errors)
     ctx.save_metrics(metrics)
 
     tree = ctx.split_rows("tree", "rows.parquet", "test", ["leaf", "q"])
