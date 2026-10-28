@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from dashboard import queries
+from dashboard import artifacts, charts, queries, tabs
 from dashboard.app import create_app
 from pipeline.runner import run
 from tests.helpers import BASE_URL, fast_cfg, query
@@ -114,6 +114,8 @@ def test_run_overview_and_tabs(client: TestClient, run_id: int) -> None:
             "Estimate against the raw val rate",
             "Leaf sizes, per split",
             "Tree of a class",
+            'name="color"',
+            "test rate",
         ),
         "predictors": (
             "Tree",
@@ -166,11 +168,46 @@ def test_the_tree_of_a_class_draws_and_rejects_a_missing_one(
     )
     class_id = query(root / "grace.db", sql)[0][0]
     page = client.get(f"/runs/{run_id}/trees?class_id={class_id}")
-    assert page.status_code == 200 and page.text.count('class="chart"') == 1
+    # The tree, then the map of its leaves.
+    assert page.status_code == 200 and page.text.count('class="chart"') == 2
     assert "<html" not in page.text and 'id="chart' not in page.text
+    for color in charts.TREE_COLORS:
+        recolored = client.get(
+            f"/runs/{run_id}/trees?class_id={class_id}&color={color}"
+        )
+        assert recolored.status_code == 200, color
+    assert (
+        client.get(f"/runs/{run_id}/trees?class_id={class_id}&color=nope").status_code
+        == 400
+    )
     assert client.get(f"/runs/{run_id}/trees?class_id=999999").status_code == 404
     assert client.get(f"/runs/{run_id}/trees?class_id=abc").status_code == 422
     assert client.get(f"/runs/{run_id}/trees").status_code == 422
+
+
+def test_the_test_rate_colors_a_tree_only_when_evaluate_ran() -> None:
+    """Check the colors a run offers, which the route accepts too."""
+    assert "test_rate" in tabs.tree_colors({"tree": 1, "evaluate": 2})
+    assert "test_rate" not in tabs.tree_colors({"tree": 1})
+    assert list(tabs.tree_colors({"tree": 1})) == ["purity", "oof_rate", "val_rate"]
+
+
+@pytest.mark.parametrize(
+    ("plane", "note"),
+    [(None, "The map needs"), (artifacts.ClassPlane({}, (0, 0)), "No train row has")],
+)
+def test_the_tree_of_a_class_says_why_it_has_no_map(
+    client: TestClient,
+    run_id: int,
+    monkeypatch: pytest.MonkeyPatch,
+    plane: artifacts.ClassPlane | None,
+    note: str,
+) -> None:
+    """Check that the tree still draws, and a note replaces the map."""
+    monkeypatch.setattr(artifacts, "class_plane", lambda *args: plane)
+    page = client.get(f"/runs/{run_id}/trees?class_id=0")
+    assert page.status_code == 200 and page.text.count('class="chart"') == 1
+    assert note in page.text
 
 
 def test_class_tree_sums_the_test_rows_of_the_leaves_into_each_node(

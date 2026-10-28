@@ -12,6 +12,16 @@
     "#e34948": "#e66767",
     "#0b0b0b": "#f0efec",
     "#ffffff": "#0b0b0b",
+    // The fill steps of the circles of `leaf_map`, each swapped with its mirror,
+    // like the colorscales, which the dark theme reverses.
+    "#bad7f8": "#12407a",
+    "#96c0f3": "#1e5499",
+    "#70a9ed": "#2869b7",
+    "#4c92e8": "#347dd6",
+    "#347dd6": "#4c92e8",
+    "#2869b7": "#70a9ed",
+    "#1e5499": "#96c0f3",
+    "#12407a": "#bad7f8",
   };
   const MARGIN = { l: 56, r: 16, t: 28, b: 48 };
 

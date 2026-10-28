@@ -1,6 +1,6 @@
 """The context of each tab of a run page: tiles, tables and figures."""
 
-__all__ = ["TABS", "build"]
+__all__ = ["TABS", "build", "tree_colors"]
 
 import sqlite3
 from collections.abc import Mapping, Sequence
@@ -226,6 +226,23 @@ def _classifier(
     }
 
 
+def tree_colors(ids: Mapping[str, int]) -> dict[str, str]:
+    """Return what can color a class's tree in a run, by key.
+
+    Args:
+        ids: The execution id of each done stage of the run.
+
+    Returns:
+        `charts.TREE_COLORS`, without the test rate when evaluate did
+        not run, since there is none to show.
+    """
+    return {
+        key: label
+        for key, label in charts.TREE_COLORS.items()
+        if key != "test_rate" or "evaluate" in ids
+    }
+
+
 def _tree(
     db: sqlite3.Connection, ids: Mapping[str, int], metrics: _Metrics, run_id: int
 ) -> dict:
@@ -234,6 +251,7 @@ def _tree(
     return {
         "tiles": _tiles(metrics, _TILES["tree"]),
         "roots": queries.tree_roots(db, ids["tree"], ids["prepare"]),
+        "colors": tree_colors(ids),
         "leaves": leaves,
         "figures": {
             "sizes": charts.leaf_size_bars(leaves),

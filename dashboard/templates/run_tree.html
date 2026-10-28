@@ -11,12 +11,21 @@
 </div>
 <h2>Tree of a class</h2>
 <p class="muted">A square is a leaf, a circle a node that splits; size follows the train rows and color the
-  out-of-fold error rate. Hover a node for its counts and rates, click a leaf for its page.</p>
+  measure chosen below, darker when higher in the light theme and lighter in the dark one. Hover a node for its counts and rates, click a leaf for its page.</p>
+<p class="muted">The map under the tree places each leaf in the plane of the first two principal components of the
+  train rows of the class, in the LDA space. A circle is centred on the mean of the leaf's train rows and its radius
+  is their RMS distance from it. The tree also cuts on the disagreement of the neighbours, an axis the plane does not
+  show, so the circles of two leaves can overlap.</p>
 <form class="filters" hx-get="/runs/{{ run.id }}/trees" hx-target="#tree" hx-trigger="load, change"
       autocomplete="off">
   <label>class
     <select name="class_id">
       {% for r in roots %}<option value="{{ r.class_id }}">{{ r.name }} · {{ r.n_leaves | num }} leaves</option>{% endfor %}
+    </select>
+  </label>
+  <label>color
+    <select name="color">
+      {% for key, label in colors.items() %}<option value="{{ key }}">{{ label }}</option>{% endfor %}
     </select>
   </label>
 </form>

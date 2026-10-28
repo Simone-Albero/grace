@@ -119,6 +119,78 @@ def test_confusion_pairs_rows_by_position(tmp_path: Path) -> None:
     assert artifacts.confusion(prepare, classify, 2) is None
 
 
+def _write_train_rows(
+    tmp_path: Path, points: list[list[float]], leaves: list[int]
+) -> tuple[Path, Path]:
+    """Write space's z and tree's rows, shuffled, plus a val row."""
+    space, tree = tmp_path / "space", tmp_path / "tree"
+    space.mkdir(exist_ok=True)
+    tree.mkdir(exist_ok=True)
+    order = np.random.default_rng(0).permutation(len(points))
+    columns = {
+        f"z_{i}": [points[row][i] for row in order] for i in range(len(points[0]))
+    }
+    z = pd.DataFrame({"split": "train", "row": order, **columns})
+    val_row = pd.DataFrame(
+        {"split": ["val"], "row": [0]} | {name: [99.0] for name in columns}
+    )
+    pd.concat([z, val_row]).to_parquet(space / "z.parquet")
+    rows = pd.DataFrame(
+        {"split": "train", "row": order, "leaf": [leaves[row] for row in order]}
+    )
+    val_leaf = pd.DataFrame({"split": ["val"], "row": [0], "leaf": [1]})
+    pd.concat([rows, val_leaf]).to_parquet(tree / "rows.parquet")
+    return space, tree
+
+
+def test_class_plane_centres_each_leaf_and_sizes_it_by_its_spread(
+    tmp_path: Path,
+) -> None:
+    """Check a class's PCA plane, its circles and what stays out."""
+    # Leaves 1 and 2 are the class: they split along z_0, and each
+    # spreads over z_1. Leaf 3 belongs to another class, far away.
+    points = [[-2, 1], [-2, -1], [2, 1], [2, -1], [100, 100], [100, 100]]
+    space, tree = _write_train_rows(tmp_path, points, [1, 1, 2, 2, 3, 3])
+    plane = artifacts.class_plane(space, tree, [1, 2, 7])
+    # z_0 has variance 4 and z_1 has 1; the sign of a component is free.
+    assert plane.shares == pytest.approx((0.8, 0.2))
+    assert set(plane.circles) == {1, 2}
+    (x1, y1, r1), (x2, y2, r2) = plane.circles[1], plane.circles[2]
+    assert (abs(x1), abs(x2)) == pytest.approx((2, 2))
+    assert x1 == pytest.approx(-x2)
+    assert (y1, y2) == pytest.approx((0, 0))
+    assert (r1, r2) == pytest.approx((1, 1))
+
+
+def test_class_plane_reads_again_a_folder_rewritten_in_place(
+    tmp_path: Path,
+) -> None:
+    """Check that a rewritten file is not served from the cache."""
+    space, tree = _write_train_rows(tmp_path, [[0.0], [2.0]], [1, 1])
+    before = artifacts.class_plane(space, tree, [1]).circles[1]
+    _write_train_rows(tmp_path, [[0.0], [20.0]], [1, 1])
+    after = artifacts.class_plane(space, tree, [1]).circles[1]
+    assert (before[2], after[2]) == pytest.approx((1, 10))
+
+
+def test_class_plane_with_one_axis_and_without_rows(tmp_path: Path) -> None:
+    """Check one axis, a class no train row reaches, and bad files."""
+    space, tree = _write_train_rows(
+        tmp_path, [[0.0], [2.0], [4.0], [6.0]], [1, 1, 2, 2]
+    )
+    plane = artifacts.class_plane(space, tree, [1, 2])
+    assert plane.shares == pytest.approx((1.0, 0.0))
+    assert [y for _, y, _ in plane.circles.values()] == [0, 0]
+    assert artifacts.class_plane(space, tree, [5]) == artifacts.ClassPlane({}, (0, 0))
+    assert artifacts.class_plane(space, tmp_path / "missing", [1]) is None
+    short = tmp_path / "short"
+    short.mkdir()
+    pd.DataFrame({"split": ["train"], "row": [0], "leaf": [1]}).to_parquet(
+        short / "rows.parquet"
+    )
+    assert artifacts.class_plane(space, short, [1]) is None
+
+
 def test_an_infinite_metric_is_not_a_value() -> None:
     """Check that an infinity cannot reach the statistics or the JSON."""
     (experiment,) = build(

@@ -17,7 +17,7 @@ from fastapi.templating import Jinja2Templates
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from dashboard import charts, experiments, queries, summary, tabs
+from dashboard import artifacts, charts, experiments, queries, summary, tabs
 from dashboard.experiments import MAIN_KEYS, Experiment
 from pipeline.db import explain, reap
 
@@ -436,20 +436,44 @@ def create_app(db_path: Path) -> FastAPI:
         request: Request,
         run_id: _Id,
         class_id: _ClassId,
+        color: str = "purity",
         connection: sqlite3.Connection = Depends(db),
     ) -> HTMLResponse:
-        ids = _run_context(connection, run_id)["ids"]
+        run_context = _run_context(connection, run_id)
+        ids = run_context["ids"]
+        _check_choice("color", color, tabs.tree_colors(ids))
         if "tree" not in ids:
             raise HTTPException(404, f"Run {run_id} has no done tree stage")
         nodes = queries.class_tree(connection, ids, class_id)
         if not nodes:
             raise HTTPException(404, f"Run {run_id} has no tree of class {class_id}")
+        dirs = queries.execution_dirs(run_context["run"])
+        space_dir, tree_dir = root / dirs["space"], root / dirs["tree"]
+        leaf_ids = [node["node_id"] for node in nodes if node["status"] == "leaf"]
+        plane = artifacts.class_plane(space_dir, tree_dir, leaf_ids)
         context = {
             "name": nodes[0]["class"],
             "n_nodes": len(nodes),
-            "n_leaves": sum(node["status"] == "leaf" for node in nodes),
-            "figure": charts.tree_diagram(nodes, run_id=run_id),
+            "n_leaves": len(leaf_ids),
+            "figure": charts.tree_diagram(nodes, color=color, run_id=run_id),
+            "plane_figure": None,
+            "plane_note": None,
         }
+        if plane is None:
+            context["plane_note"] = (
+                f"The map needs {space_dir / 'z.parquet'} and "
+                f"{tree_dir / 'rows.parquet'}, and they are missing or "
+                "disagree in train length."
+            )
+        elif not plane.circles:
+            context["plane_note"] = (
+                "No train row has this class as its prediction, so its leaves "
+                "have no region."
+            )
+        else:
+            context["plane_figure"] = charts.leaf_map(
+                nodes, plane, color=color, run_id=run_id
+            )
         return render(request, "_tree.html", context)
 
     @app.get("/runs/{run_id}/leaves/{node_id}", response_class=HTMLResponse)
