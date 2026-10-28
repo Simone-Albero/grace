@@ -9,7 +9,7 @@ from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi import Path as PathParam
-from fastapi import Request
+from fastapi import Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -25,6 +25,7 @@ from pipeline.db import explain, reap
 _HOSTS = ["127.0.0.1", "localhost"]
 # Ids are SQLite integers: a larger one is a 422, not an OverflowError.
 _Id = Annotated[int, PathParam(ge=0, le=2**63 - 1)]
+_ClassId = Annotated[int, Query(ge=0, le=2**63 - 1)]
 # The columns of the leaves table, in reading order.
 _LEAF_COLUMNS = (
     "node_id class depth n_train oof_rate n_val val_rate q gamma regressor n_test "
@@ -429,6 +430,27 @@ def create_app(db_path: Path) -> FastAPI:
         # The page is stale once a stage finished: reload it whole.
         headers = {} if sig == context["signature"] else {"HX-Refresh": "true"}
         return render(request, "_stages.html", context, headers=headers)
+
+    @app.get("/runs/{run_id}/trees", response_class=HTMLResponse)
+    def class_tree(
+        request: Request,
+        run_id: _Id,
+        class_id: _ClassId,
+        connection: sqlite3.Connection = Depends(db),
+    ) -> HTMLResponse:
+        ids = _run_context(connection, run_id)["ids"]
+        if "tree" not in ids:
+            raise HTTPException(404, f"Run {run_id} has no done tree stage")
+        nodes = queries.class_tree(connection, ids, class_id)
+        if not nodes:
+            raise HTTPException(404, f"Run {run_id} has no tree of class {class_id}")
+        context = {
+            "name": nodes[0]["class"],
+            "n_nodes": len(nodes),
+            "n_leaves": sum(node["status"] == "leaf" for node in nodes),
+            "figure": charts.tree_diagram(nodes, run_id=run_id),
+        }
+        return render(request, "_tree.html", context)
 
     @app.get("/runs/{run_id}/leaves/{node_id}", response_class=HTMLResponse)
     def leaf_page(

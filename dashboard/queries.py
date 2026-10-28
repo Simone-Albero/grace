@@ -5,6 +5,7 @@ __all__ = [
     "SCORES",
     "STAGE_ORDER",
     "class_metrics",
+    "class_tree",
     "classes",
     "classifier_grid",
     "connect",
@@ -260,7 +261,7 @@ def classes(db: sqlite3.Connection, prepare_id: int) -> list[dict[str, object]]:
 def class_metrics(
     db: sqlite3.Connection, prepare_id: int, classify_id: int
 ) -> list[dict[str, object]]:
-    """List the test size and classifier scores of every class.
+    """List the split sizes and classifier scores of every class.
 
     Args:
         db: A connection to grace.db.
@@ -268,12 +269,13 @@ def class_metrics(
         classify_id: The execution id of classify.
 
     Returns:
-        One row per class: id, name, `n_test`, precision, recall, f1.
+        One row per class: id, name, `n_train`, `n_test`, precision,
+        recall, f1.
     """
     return _all(
         db,
         """
-        SELECT k.class_id, k.name, k.n_test, m.precision, m.recall, m.f1
+        SELECT k.class_id, k.name, k.n_train, k.n_test, m.precision, m.recall, m.f1
         FROM classes k LEFT JOIN class_metrics m
           ON m.execution_id = ? AND m.class_id = k.class_id
         WHERE k.execution_id = ? ORDER BY k.class_id
@@ -400,6 +402,12 @@ def leaves(db: sqlite3.Connection, ids: Mapping[str, int]) -> list[dict[str, obj
         """,
         {key: ids.get(key) for key in ("prepare", "tree", "regress", "evaluate")},
     )
+    _add_rates(rows)
+    return rows
+
+
+def _add_rates(rows: Sequence[dict[str, object]]) -> None:
+    """Add the out-of-fold, val and test rates, None for 0 rows."""
     for row in rows:
         for rate, errors, count in (
             ("oof_rate", "n_train_errors", "n_train"),
@@ -407,6 +415,53 @@ def leaves(db: sqlite3.Connection, ids: Mapping[str, int]) -> list[dict[str, obj
             ("test_rate", "n_test_errors", "n_test"),
         ):
             row[rate] = row[errors] / row[count] if row[count] else None
+
+
+def class_tree(
+    db: sqlite3.Connection, ids: Mapping[str, int], class_id: int
+) -> list[dict[str, object]]:
+    """List the kept nodes of a predicted class's tree, with rates.
+
+    Args:
+        db: A connection to grace.db.
+        ids: The execution id of each done stage of the run.
+        class_id: The predicted class of the root.
+
+    Returns:
+        One row per node that was not pruned, parents first. A node's
+        test counts are the sums over the leaves below it, and None
+        when evaluate did not run.
+    """
+    rows = _all(
+        db,
+        """
+        SELECT t.node_id, t.parent_id, k.name AS class, t.depth, t.status,
+               t.n_train, t.n_train_errors, t.n_val, t.n_val_errors, t.q,
+               l.n_test, l.n_test_errors
+        FROM tree_nodes t
+        JOIN classes k ON k.execution_id = :prepare AND k.class_id = t.class_id
+        LEFT JOIN leaf_tests l
+          ON l.execution_id = :evaluate AND l.node_id = t.node_id
+        WHERE t.execution_id = :tree AND t.class_id = :class_id
+          AND t.status != 'pruned'
+        ORDER BY t.depth, t.node_id
+        """,
+        {
+            "prepare": ids["prepare"],
+            "tree": ids["tree"],
+            "evaluate": ids.get("evaluate"),
+            "class_id": class_id,
+        },
+    )
+    by_id = {row["node_id"]: row for row in rows}
+    # Deepest first, so a node is complete before it feeds its parent.
+    for row in reversed(rows):
+        parent = by_id.get(row["parent_id"])
+        if parent is None or row["n_test"] is None:
+            continue
+        for key in ("n_test", "n_test_errors"):
+            parent[key] = (parent[key] or 0) + row[key]
+    _add_rates(rows)
     return rows
 
 

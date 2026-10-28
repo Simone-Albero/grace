@@ -14,12 +14,14 @@ __all__ = [
     "grid_search",
     "group_bars",
     "importance_bars",
+    "leaf_size_bars",
     "loss_curve",
     "predictor_bars",
     "seed_strip",
     "shrinkage_scatter",
     "split_bars",
     "test_scatter",
+    "tree_diagram",
 ]
 
 import math
@@ -45,7 +47,6 @@ SERIES = [
 ]
 NEUTRAL = "#898781"
 # Tokens that `dashboard.js` swaps in the dark theme.
-_SURFACE = "#fcfcfb"
 _INK = "#0b0b0b"
 _ON_DARK_FILL = "#ffffff"
 _ON_LIGHT_FILL = "#0b0b0b"
@@ -66,31 +67,46 @@ def _stdev(values: Sequence[float]) -> float:
 
 
 def split_bars(classes: Sequence[Mapping]) -> dict[str, object]:
-    """Stack each class's rows by split, one bar per class.
+    """Draw each class's rows per split, on a log axis.
+
+    A log axis keeps a class thousands of times smaller than the largest
+    visible, and grouped bars stay honest on it where stacked ones would
+    not.
 
     Args:
         classes: The `queries.classes` rows.
 
     Returns:
-        A horizontal stacked-bar figure.
+        A horizontal grouped-bar figure, the largest class on top; the
+        hover gives the rows and the class's share of the split.
     """
-    names = [row["name"] for row in classes]
-    traces = [
-        {
-            "type": "bar",
-            "orientation": "h",
-            "name": split,
-            "y": names,
-            "x": [row[f"n_{split}"] for row in classes],
-            "marker": {"color": color, "line": {"width": 2, "color": _SURFACE}},
-            "hovertemplate": f"%{{y}} · {split}: %{{x:,}}<extra></extra>",
-        }
-        for split, color in _SPLIT_COLORS.items()
-    ]
+    ranked = sorted(
+        classes, key=lambda row: -(row["n_train"] + row["n_val"] + row["n_test"])
+    )
+    names = [row["name"] for row in ranked]
+    traces = []
+    for split, color in _SPLIT_COLORS.items():
+        counts = [row[f"n_{split}"] for row in ranked]
+        total = sum(counts) or 1
+        traces.append(
+            {
+                "type": "bar",
+                "orientation": "h",
+                "name": split,
+                "y": names,
+                "x": counts,
+                "customdata": [count / total for count in counts],
+                "marker": {"color": color},
+                "hovertemplate": (
+                    f"%{{y}} · {split}: %{{x:,}} rows (%{{customdata:.2%}} of "
+                    f"{split})<extra></extra>"
+                ),
+            }
+        )
     layout = {
-        "barmode": "stack",
-        "height": max(260, 36 * len(classes) + 120),
-        "xaxis": {"title": "rows"},
+        "barmode": "group",
+        "height": max(260, 54 * len(ranked) + 120),
+        "xaxis": {"title": "rows (log scale)", "type": "log"},
         "yaxis": {"autorange": "reversed", "type": "category"},
     }
     return {"data": traces, "layout": layout}
@@ -509,3 +525,187 @@ def test_scatter(leaves: Sequence[Mapping], *, run_id: int) -> dict[str, object]
         y_title="test failure rate of the leaf",
         run_id=run_id,
     )
+
+
+def _size_label(bin_: int) -> str:
+    """Name a power-of-two size bin: 0, 1, 2–3, 4–7, ..."""
+    return str(bin_) if bin_ < 2 else f"{2 ** (bin_ - 1)}–{2**bin_ - 1}"
+
+
+def leaf_size_bars(leaves: Sequence[Mapping]) -> dict[str, object]:
+    """Count the leaves by their rows per split, in power-of-two bins.
+
+    Args:
+        leaves: The `queries.leaves` rows.
+
+    Returns:
+        A grouped-bar figure with a series per split; test is left out
+        when no leaf has a test count. The 0 bin holds the leaves that
+        no row of the split reaches.
+    """
+    counts = {
+        split: [leaf[f"n_{split}"] for leaf in leaves if leaf[f"n_{split}"] is not None]
+        for split in _SPLIT_COLORS
+    }
+    counts = {split: values for split, values in counts.items() if values}
+    n_bins = (
+        max((max(values).bit_length() for values in counts.values()), default=0) + 1
+    )
+    labels = [_size_label(bin_) for bin_ in range(n_bins)]
+    traces = []
+    for split, values in counts.items():
+        per_bin = [0] * n_bins
+        for value in values:
+            per_bin[value.bit_length()] += 1
+        traces.append(
+            {
+                "type": "bar",
+                "name": split,
+                "x": labels,
+                "y": per_bin,
+                "marker": {"color": _SPLIT_COLORS[split]},
+                "hovertemplate": (
+                    f"{split} · %{{x}} rows: %{{y:,}} leaves<extra></extra>"
+                ),
+            }
+        )
+    layout = {
+        "barmode": "group",
+        "height": _HEIGHT,
+        "xaxis": {"title": "rows in the leaf", "type": "category"},
+        "yaxis": {"title": "leaves"},
+    }
+    return {"data": traces, "layout": layout}
+
+
+def _format_count(value: int | None) -> str:
+    """Format a row count, or a dash when it is unknown."""
+    return "–" if value is None else f"{value:,}"
+
+
+def _format_rate(value: float | None) -> str:
+    """Format a rate, or a dash when it is unknown."""
+    return "–" if value is None else f"{value:.4f}"
+
+
+def _tree_hover(node: Mapping) -> str:
+    """Format the hover of a tree node: its counts and rates."""
+    kind = "leaf" if node["status"] == "leaf" else "internal"
+    lines = [
+        f"node {node['node_id']} · {kind}",
+        (
+            f"train {_format_count(node['n_train'])} · "
+            f"oof rate {_format_rate(node['oof_rate'])}"
+        ),
+        (
+            f"val {_format_count(node['n_val'])} · "
+            f"val rate {_format_rate(node['val_rate'])}"
+        ),
+        (
+            f"test {_format_count(node['n_test'])} · "
+            f"test rate {_format_rate(node['test_rate'])}"
+        ),
+    ]
+    if kind == "leaf":
+        lines.append(f"q {_format_rate(node['q'])}")
+    return "<br>".join(lines)
+
+
+def _tree_positions(nodes: Sequence[Mapping]) -> dict[int, float]:
+    """Place each node on the x axis, keyed by its id.
+
+    The leaves take 0, 1, 2, ... in depth-first order, and a parent
+    sits at the mean of its children.
+    """
+    children: dict[int, list[int]] = {}
+    roots = []
+    for node in sorted(nodes, key=lambda node: node["node_id"]):
+        if node["parent_id"] is None:
+            roots.append(node["node_id"])
+        else:
+            children.setdefault(node["parent_id"], []).append(node["node_id"])
+    positions: dict[int, float] = {}
+    next_leaf = 0
+
+    def place(node_id: int) -> None:
+        nonlocal next_leaf
+        below = children.get(node_id, [])
+        for child in below:
+            place(child)
+        if below:
+            positions[node_id] = sum(positions[child] for child in below) / len(below)
+        else:
+            positions[node_id] = next_leaf
+            next_leaf += 1
+
+    for root in roots:
+        place(root)
+    return positions
+
+
+def tree_diagram(nodes: Sequence[Mapping], *, run_id: int) -> dict[str, object]:
+    """Draw the tree of one predicted class, root on top.
+
+    Args:
+        nodes: The `queries.class_tree` rows, the kept nodes of the
+            class.
+        run_id: The run, for the link of each leaf to its page.
+
+    Returns:
+        A node-link figure: a marker per node sized by its train rows
+        and colored by its out-of-fold rate, squares for the leaves;
+        the hover gives the counts and rates of train, val and test.
+    """
+    positions = _tree_positions(nodes)
+    by_id = {node["node_id"]: node for node in nodes}
+    edges_x: list[float | None] = []
+    edges_y: list[float | None] = []
+    for node in nodes:
+        parent = by_id.get(node["parent_id"])
+        if parent is not None:
+            edges_x += [positions[parent["node_id"]], positions[node["node_id"]], None]
+            edges_y += [parent["depth"], node["depth"], None]
+    biggest = max((node["n_train"] for node in nodes), default=1) or 1
+    marks = {
+        "type": "scatter",
+        "mode": "markers",
+        "x": [positions[node["node_id"]] for node in nodes],
+        "y": [node["depth"] for node in nodes],
+        "text": [_tree_hover(node) for node in nodes],
+        "customdata": [
+            (
+                f"/runs/{run_id}/leaves/{node['node_id']}"
+                if node["status"] == "leaf"
+                else None
+            )
+            for node in nodes
+        ],
+        "marker": {
+            "symbol": [
+                "square" if node["status"] == "leaf" else "circle" for node in nodes
+            ],
+            "size": [6 + 18 * (node["n_train"] / biggest) ** 0.5 for node in nodes],
+            "color": [node["oof_rate"] for node in nodes],
+            "colorscale": _SEQUENTIAL,
+            "cmin": 0,
+            "colorbar": {"title": "oof rate", "thickness": 12},
+            "line": {"width": 1, "color": NEUTRAL},
+        },
+        "hovertemplate": "%{text}<extra></extra>",
+    }
+    edges = {
+        "type": "scatter",
+        "mode": "lines",
+        "x": edges_x,
+        "y": edges_y,
+        "line": {"color": NEUTRAL, "width": 1},
+        "hoverinfo": "skip",
+    }
+    max_depth = max((node["depth"] for node in nodes), default=0)
+    layout = {
+        "height": max(380, 46 * (max_depth + 1) + 120),
+        "showlegend": False,
+        "xaxis": {"visible": False},
+        "yaxis": {"title": "depth", "autorange": "reversed", "dtick": 1},
+    }
+    return {"data": [edges, marks], "layout": layout}

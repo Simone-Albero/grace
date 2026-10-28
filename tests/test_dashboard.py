@@ -102,8 +102,19 @@ def test_run_overview_and_tabs(client: TestClient, run_id: int) -> None:
     assert "disabled" not in overview.text
     expected = {
         "data": ("Preprocessing", "class_1", "num_1", "train"),
-        "classifier": ("Confusion matrix", "precision", "accuracy"),
-        "tree": ("Predicted classes", "Leaves", "Estimate against the raw val rate"),
+        "classifier": (
+            "Confusion matrix",
+            "precision",
+            "accuracy",
+            "train rows after the cap",
+        ),
+        "tree": (
+            "Predicted classes",
+            "Leaves",
+            "Estimate against the raw val rate",
+            "Leaf sizes, per split",
+            "Tree of a class",
+        ),
         "predictors": (
             "Tree",
             "Confidence",
@@ -146,6 +157,42 @@ def test_tree_tab_sorts_and_a_leaf_has_its_page(
     assert client.get(f"/runs/{run_id}/leaves/999999").status_code == 404
 
 
+def test_the_tree_of_a_class_draws_and_rejects_a_missing_one(
+    client: TestClient, root: Path, run_id: int
+) -> None:
+    """Check the tree fragment, with its figure, and its 404 and 422."""
+    sql = (
+        "SELECT class_id FROM tree_nodes WHERE parent_id IS NULL "
+        f"AND execution_id = {_execution(root, 'tree')} LIMIT 1"
+    )
+    class_id = query(root / "grace.db", sql)[0][0]
+    page = client.get(f"/runs/{run_id}/trees?class_id={class_id}")
+    assert page.status_code == 200 and page.text.count('class="chart"') == 1
+    assert "<html" not in page.text and 'id="chart' not in page.text
+    assert client.get(f"/runs/{run_id}/trees?class_id=999999").status_code == 404
+    assert client.get(f"/runs/{run_id}/trees?class_id=abc").status_code == 422
+    assert client.get(f"/runs/{run_id}/trees").status_code == 422
+
+
+def test_class_tree_sums_the_test_rows_of_the_leaves_into_each_node(
+    root: Path,
+) -> None:
+    """Check a root holds the test rows of every leaf of its class."""
+    path = root / "grace.db"
+    ids = {stage: _execution(root, stage) for stage in ("prepare", "tree", "evaluate")}
+    with closing(queries.connect(path)) as db:
+        nodes = queries.class_tree(db, ids, 0)
+    (top,) = [node for node in nodes if node["parent_id"] is None]
+    leaves = [node for node in nodes if node["status"] == "leaf"]
+    assert top["n_test"] == sum(leaf["n_test"] for leaf in leaves) > 0
+    assert top["n_test_errors"] == sum(leaf["n_test_errors"] for leaf in leaves)
+    assert top["n_train"] >= sum(leaf["n_train"] for leaf in leaves)
+    without_evaluate = {key: value for key, value in ids.items() if key != "evaluate"}
+    with closing(queries.connect(path)) as db:
+        untested_nodes = queries.class_tree(db, without_evaluate, 0)
+    assert all(node["n_test"] is None for node in untested_nodes)
+
+
 def test_compare(client: TestClient) -> None:
     """Check that the comparison charts draw both families."""
     assert client.get("/compare").status_code == 200
@@ -175,6 +222,7 @@ def test_read_routes_never_write(client: TestClient, root: Path, run_id: int) ->
     urls = ["/", "/api/experiments", "/compare", "/compare/charts", f"/runs/{run_id}"]
     urls += [f"/runs/{run_id}/{tab}" for tab in _TABS]
     urls += [f"/runs/{run_id}/tree?sort=q&desc=true", _leaf_url(root, run_id)]
+    urls.append(f"/runs/{run_id}/trees?class_id=0")
     urls.append(f"/runs/{run_id}/stages?sig=x")
     for url in urls:
         assert client.get(url).status_code == 200, url

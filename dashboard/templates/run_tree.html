@@ -5,9 +5,22 @@
   Click a marker, or a leaf id, for its page.</p>
 {{ m.tiles(tiles) }}
 <div class="grid">
+  {{ m.chart(figures.sizes, "Leaf sizes, per split") }}
   {{ m.chart(figures.shrinkage, "Estimate against the raw val rate of each leaf") }}
   {{ m.chart(figures.test, "Test rate of each leaf against its estimate") }}
 </div>
+<h2>Tree of a class</h2>
+<p class="muted">A square is a leaf, a circle a node that splits; size follows the train rows and color the
+  out-of-fold error rate. Hover a node for its counts and rates, click a leaf for its page.</p>
+<form class="filters" hx-get="/runs/{{ run.id }}/trees" hx-target="#tree" hx-trigger="load, change"
+      autocomplete="off">
+  <label>class
+    <select name="class_id">
+      {% for r in roots %}<option value="{{ r.class_id }}">{{ r.name }} · {{ r.n_leaves | num }} leaves</option>{% endfor %}
+    </select>
+  </label>
+</form>
+<div id="tree"></div>
 <h2>Predicted classes</h2>
 <div class="scroll"><table>
   <thead><tr><th>class</th><th class="num">train rows</th><th class="num">out-of-fold errors</th>

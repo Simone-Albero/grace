@@ -143,20 +143,54 @@ def _data(
     }
 
 
+def _fit_notes(config: Mapping, *, has_grid: bool) -> list[str]:
+    """Say how classify reduced the rows it fit on, from its config."""
+    cap = config["data"]["max_per_class"]
+    if cap is None:
+        notes = ["No cap: every train row is fitted on."]
+    else:
+        notes = [
+            f"Each class is capped at {cap:,} train rows, sampled at random; "
+            "a smaller class is kept whole."
+        ]
+    if config["classifier"]["kind"] == "dl":
+        holdout = config["fit"]["training"]["early_stopping"]["holdout"]
+        notes.append(
+            f"{holdout:.0%} of the rows left are held out, stratified, to "
+            "stop the training on."
+        )
+    elif has_grid and config["grid_search"]["max_samples"] is not None:
+        notes.append(
+            "The grid search scores its candidates on a stratified sample of "
+            f"about {config['grid_search']['max_samples']:,} rows, when the "
+            "rows left are more; the refit uses all of them."
+        )
+    notes.append("The test rows are never capped.")
+    return notes
+
+
 def _classifier(
     db: sqlite3.Connection,
     ids: Mapping[str, int],
     metrics: _Metrics,
+    configs: Mapping[str, Mapping],
     root: Path,
     dirs: Mapping[str, str],
 ) -> dict:
-    """Scores, confusion matrix, grid search and training loss."""
+    """Scores, rows fitted, confusion matrix, grid search and loss."""
     classify_id = ids["classify"]
     class_rows = (
         queries.class_metrics(db, ids["prepare"], classify_id)
         if "prepare" in ids
         else []
     )
+    cap = configs["classify"]["data"]["max_per_class"]
+    for row in class_rows:
+        row["n_capped"] = row["n_train"] if cap is None else min(row["n_train"], cap)
+    totals = {
+        key: sum(row[key] for row in class_rows)
+        for key in ("n_train", "n_capped", "n_test")
+    }
     figures = {}
     confusion_note = None
     if class_rows:
@@ -184,6 +218,8 @@ def _classifier(
     return {
         "tiles": _tiles(metrics, _TILES["classifier"]),
         "classes": class_rows,
+        "totals": totals,
+        "fit_notes": _fit_notes(configs["classify"], has_grid=bool(grid)),
         "grid": sorted(grid, key=lambda row: -(row["mean_score"] or 0)),
         "figures": figures,
         "confusion_note": confusion_note,
@@ -193,13 +229,14 @@ def _classifier(
 def _tree(
     db: sqlite3.Connection, ids: Mapping[str, int], metrics: _Metrics, run_id: int
 ) -> dict:
-    """The tree's roots, its leaves and how the leaf estimates move."""
+    """Roots, leaves, their sizes and how their estimates move."""
     leaves = queries.leaves(db, ids)
     return {
         "tiles": _tiles(metrics, _TILES["tree"]),
         "roots": queries.tree_roots(db, ids["tree"], ids["prepare"]),
         "leaves": leaves,
         "figures": {
+            "sizes": charts.leaf_size_bars(leaves),
             "shrinkage": charts.shrinkage_scatter(leaves, run_id=run_id),
             "test": charts.test_scatter(leaves, run_id=run_id),
         },
@@ -308,7 +345,7 @@ def build(
             context.update(_data(db, ids, metrics, configs))
         case "classifier":
             dirs = queries.execution_dirs(run)
-            context.update(_classifier(db, ids, metrics, root, dirs))
+            context.update(_classifier(db, ids, metrics, configs, root, dirs))
         case "tree":
             context.update(_tree(db, ids, metrics, run["id"]))
         case "predictors":

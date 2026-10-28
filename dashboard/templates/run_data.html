@@ -14,7 +14,7 @@
     <div class="tile-label">classes</div></div>{% endif %}
 </div>
 <div class="grid">
-  {% if figures.split %}{{ m.chart(figures.split, "Rows of each class, per split") }}{% endif %}
+  {% if figures.split %}{{ m.chart(figures.split, "Rows of each class, per split (log scale)") }}{% endif %}
   {% if classes %}
   <section class="card">
     <h3>Classes</h3>
