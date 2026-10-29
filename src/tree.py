@@ -1,15 +1,16 @@
 """Regions as the leaves of a tree grown on points, cut by errors.
 
-A tree has one root per predicted class. Every node splits its rows in
-two with 2-means, and a row goes to the nearer of the two centres: the
-rule that builds the tree is the rule that routes a new row. The points
-are the rows' coordinates plus the share of nearest train rows that
-disagree with the prediction, as one more axis. The errors of the rows
-the tree grew on say how deep to cut, each leaf gets the failure rate of
-the other rows that reach it, and a per-row correction moves it with the
-classifier's own confidence. Every leaf costs a price on top of its
-expected Brier score, so that a split must pay for the leaf it adds; the
-same cost stops the growth and cuts the grown tree.
+A tree has one root per predicted class. Every node splits its rows into
+2 to `max_k` parts with k-means, and a row goes to the nearest of the
+centres: the rule that builds the tree is the rule that routes a new
+row. The points are the rows' coordinates plus the share of nearest
+train rows that disagree with the prediction, as one more axis. The
+errors of the rows the tree grew on say how deep to cut, each leaf gets
+the failure rate of the other rows that reach it, and a per-row
+correction moves it with the classifier's own confidence. Every leaf
+costs a price on top of its expected Brier score, so that a split must
+pay for the leaves it adds; the same cost picks the number of parts of a
+split, stops the growth and cuts the grown tree.
 """
 
 __all__ = [
@@ -30,6 +31,7 @@ __all__ = [
     "subtree_counts",
 ]
 
+import warnings
 from dataclasses import dataclass
 
 import numpy as np
@@ -37,9 +39,10 @@ from numpy.typing import ArrayLike
 from scipy.optimize import minimize_scalar
 from scipy.special import expit, logit
 from sklearn.cluster import KMeans
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.neighbors import NearestNeighbors
 
-# Starts of each 2-means, enough for a stable split of a small node.
+# Starts of each k-means, enough for a stable split of a small node.
 _N_INIT = 4
 # The bounds of the correction's slope; a larger one is a step function.
 _BETA_BOUND = 10.0
@@ -51,21 +54,24 @@ _NEIGHBOUR_CHUNK = 100_000
 
 @dataclass(frozen=True)
 class Tree:
-    """A forest of binary trees in arrays, children after their parent.
+    """A forest of trees in arrays, children after their parent.
+
+    The children of a node have consecutive ids.
 
     Attributes:
         parent: Each node's parent, -1 at a root.
-        left: Each node's left child, -1 without children.
-        right: Each node's right child, -1 without children.
+        first_child: The id of each node's first child, -1 without
+            children.
+        n_children: The number of each node's children, 0 at a leaf.
         class_id: The predicted class whose root the node descends from.
-        centroid: The 2-means centre of the side of its parent a node
+        centroid: The k-means centre of the part of its parent a node
             holds, shape (n_nodes, m); NaN at a root.
         root: The root of each predicted class, by class id.
     """
 
     parent: np.ndarray
-    left: np.ndarray
-    right: np.ndarray
+    first_child: np.ndarray
+    n_children: np.ndarray
     class_id: np.ndarray
     centroid: np.ndarray
     root: np.ndarray
@@ -124,36 +130,76 @@ def leaf_brier(
     )
 
 
-def _goes_right(
-    points: np.ndarray, left_centre: np.ndarray, right_centre: np.ndarray
-) -> np.ndarray:
-    """Return whether each point lies nearer the right centre."""
-    to_left = ((points - left_centre) ** 2).sum(axis=1)
-    to_right = ((points - right_centre) ** 2).sum(axis=1)
-    return to_right < to_left
+def _nearest_centre(points: np.ndarray, centres: np.ndarray) -> np.ndarray:
+    """Return which centre each point is nearest, the first on a tie."""
+    squared_distance = np.column_stack(
+        [((points - centre) ** 2).sum(axis=1) for centre in centres]
+    )
+    return squared_distance.argmin(axis=1)
 
 
-def _split_two(
-    points: np.ndarray, *, n_min: int, random_state: int
-) -> tuple[np.ndarray, np.ndarray] | None:
-    """Split points in two with 2-means, or None when they should stay.
+def _split(
+    points: np.ndarray,
+    errors: np.ndarray,
+    estimate_points: np.ndarray,
+    *,
+    n_min: int,
+    max_k: int,
+    penalty: float,
+    n_total: int,
+    random_state: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Split a node into the 2 to `max_k` parts cheapest as leaves.
+
+    Each part counts as a leaf: its `leaf_brier` plus `penalty`. A
+    number of parts that would leave one with fewer than `n_min` rows
+    is rejected, and the fewest parts win a tie.
+
+    Args:
+        points: The node's points, shape (n, m).
+        errors: Whether the classifier failed on each of them.
+        estimate_points: The node's estimation points.
+        n_min: The fewest rows of a part.
+        max_k: The most parts.
+        penalty: The price of a leaf.
+        n_total: All the rows the tree grows on, for `leaf_brier`.
+        random_state: The seed of every k-means.
 
     Returns:
-        The two centres, shape (2, m), and for every point whether it is
-        nearer the second centre; None when a side would hold fewer
-        than `n_min` points or the points are all the same.
+        The centres, shape (k, m), and the part of every point and of
+        every estimation point; None when no number of parts is allowed
+        or the points are all the same.
     """
-    if len(points) < 2 * n_min or np.ptp(points, axis=0).max() == 0:
+    if np.ptp(points, axis=0).max() == 0:
         return None
-    centres = (
-        KMeans(n_clusters=2, n_init=_N_INIT, random_state=random_state)
-        .fit(points)
-        .cluster_centers_
-    )
-    to_right = _goes_right(points, centres[0], centres[1])
-    if min(to_right.sum(), (~to_right).sum()) < n_min:
-        return None
-    return centres, to_right
+    best_cost, best_split = np.inf, None
+    for k in range(2, max_k + 1):
+        if len(points) < k * n_min:
+            break
+        # Fewer distinct points than parts leaves an empty part, which
+        # the `n_min` check below rejects.
+        with warnings.catch_warnings(action="ignore", category=ConvergenceWarning):
+            centres = (
+                KMeans(n_clusters=k, n_init=_N_INIT, random_state=random_state)
+                .fit(points)
+                .cluster_centers_
+            )
+        part_of_row = _nearest_centre(points, centres)
+        n_rows = np.bincount(part_of_row, minlength=k)
+        if n_rows.min() < n_min:
+            continue
+        estimate_part_of_row = _nearest_centre(estimate_points, centres)
+        brier = leaf_brier(
+            n_rows,
+            np.bincount(part_of_row, weights=errors, minlength=k),
+            np.bincount(estimate_part_of_row, minlength=k),
+            n_total,
+        )
+        cost = brier.sum() + k * penalty
+        if cost < best_cost:
+            best_cost = cost
+            best_split = centres, part_of_row, estimate_part_of_row
+    return best_split
 
 
 def grow_tree(
@@ -165,12 +211,13 @@ def grow_tree(
     *,
     n_classes: int,
     n_min: int,
+    max_k: int,
     penalty: float,
     random_state: int,
 ) -> tuple[Tree, np.ndarray]:
-    """Grow a tree of 2-means splits under a root per predicted class.
+    """Grow a tree of k-means splits under a root per predicted class.
 
-    A node splits while both sides keep at least `n_min` rows and its
+    A node splits while all its parts keep at least `n_min` rows and its
     `leaf_brier` is above `penalty`. The stop is exact: as a leaf a node
     costs its `leaf_brier` plus `penalty`, any cut below it at least
     twice `penalty`, so `prune_tree` keeps a node whose `leaf_brier` is
@@ -185,16 +232,18 @@ def grow_tree(
             alongside to count the rows each node would estimate on.
         estimate_predicted: Their predicted class.
         n_classes: The classes; node `c` is the root of class `c`.
-        n_min: The fewest rows of a node.
+        n_min: The fewest rows of a part of a split.
+        max_k: The most parts of a split, which takes the number of
+            parts from 2 to `max_k` that costs least as leaves.
         penalty: The price of a leaf, from `leaf_penalty`.
-        random_state: The seed of every 2-means.
+        random_state: The seed of every k-means.
 
     Returns:
         The tree and the deepest node every row reaches.
     """
     parent = [-1] * n_classes
-    left = [-1] * n_classes
-    right = [-1] * n_classes
+    first_child = [-1] * n_classes
+    n_children = [0] * n_classes
     class_id = list(range(n_classes))
     centroid = [np.full(points.shape[1], np.nan)] * n_classes
     node_of_row = np.asarray(predicted, dtype=np.int64).copy()
@@ -211,37 +260,57 @@ def grow_tree(
         n_errors = errors[rows].sum()
         if leaf_brier(len(rows), n_errors, len(estimate_rows), len(points)) <= penalty:
             continue
-        split = _split_two(points[rows], n_min=n_min, random_state=random_state)
+        split = _split(
+            points[rows],
+            errors[rows],
+            estimate_points[estimate_rows],
+            n_min=n_min,
+            max_k=max_k,
+            penalty=penalty,
+            n_total=len(points),
+            random_state=random_state,
+        )
         if split is None:
             continue
-        centres, to_right = split
-        estimate_to_right = _goes_right(
-            estimate_points[estimate_rows], centres[0], centres[1]
-        )
-        children = left, right
-        sides = (
-            (rows[~to_right], estimate_rows[~estimate_to_right]),
-            (rows[to_right], estimate_rows[estimate_to_right]),
-        )
-        for side, (members, estimate_members) in enumerate(sides):
+        centres, part_of_row, estimate_part_of_row = split
+        first_child[node], n_children[node] = len(parent), len(centres)
+        for part, centre in enumerate(centres):
             child = len(parent)
             parent.append(node)
-            left.append(-1)
-            right.append(-1)
+            first_child.append(-1)
+            n_children.append(0)
             class_id.append(class_id[node])
-            centroid.append(centres[side])
-            children[side][node] = child
+            centroid.append(centre)
+            members = rows[part_of_row == part]
             node_of_row[members] = child
-            stack.append((child, members, estimate_members))
+            stack.append((child, members, estimate_rows[estimate_part_of_row == part]))
     tree = Tree(
         parent=np.array(parent, dtype=np.int64),
-        left=np.array(left, dtype=np.int64),
-        right=np.array(right, dtype=np.int64),
+        first_child=np.array(first_child, dtype=np.int64),
+        n_children=np.array(n_children, dtype=np.int64),
         class_id=np.array(class_id, dtype=np.int64),
         centroid=np.vstack(centroid),
         root=np.arange(n_classes, dtype=np.int64),
     )
     return tree, node_of_row
+
+
+def _nearest_child(tree: Tree, nodes: np.ndarray, points: np.ndarray) -> np.ndarray:
+    """Return each node's child whose centre is nearest its point.
+
+    A tie goes to the first child, as in `_nearest_centre`, so that a
+    routed row ends where the growth put it.
+    """
+    n_children = tree.n_children[nodes]
+    first_child = tree.first_child[nodes]
+    squared_distance = np.full((len(nodes), n_children.max()), np.inf)
+    for offset in range(n_children.max()):
+        has_child = offset < n_children
+        child_centres = tree.centroid[first_child[has_child] + offset]
+        squared_distance[has_child, offset] = (
+            (points[has_child] - child_centres) ** 2
+        ).sum(axis=1)
+    return first_child + squared_distance.argmin(axis=1)
 
 
 def descend(
@@ -265,17 +334,13 @@ def descend(
     """
     node = tree.root[np.asarray(predicted, dtype=np.int64)].copy()
     while True:
-        is_movable = tree.left[node] >= 0
+        is_movable = tree.n_children[node] > 0
         if stop is not None:
             is_movable &= ~stop[node]
         active = np.flatnonzero(is_movable)
         if active.size == 0:
             return node
-        left, right = tree.left[node[active]], tree.right[node[active]]
-        to_right = _goes_right(
-            points[active], tree.centroid[left], tree.centroid[right]
-        )
-        node[active] = np.where(to_right, right, left)
+        node[active] = _nearest_child(tree, node[active], points[active])
 
 
 def subtree_counts(
@@ -318,8 +383,8 @@ def prune_tree(
     """Cut every tree where its leaves' cost is least.
 
     A leaf costs its expected Brier score, from `leaf_brier`, plus
-    `penalty`. A node stays a leaf unless its two best subtrees cost
-    strictly less, found bottom-up.
+    `penalty`. A node stays a leaf unless its best subtrees, one per
+    child, cost strictly less together, found bottom-up.
 
     Args:
         tree: The grown tree.
@@ -339,9 +404,10 @@ def prune_tree(
     best = cost.copy()
     is_leaf = np.ones(len(cost), dtype=bool)
     for node in range(len(cost) - 1, -1, -1):
-        if tree.left[node] < 0:
+        if tree.n_children[node] == 0:
             continue
-        below = best[tree.left[node]] + best[tree.right[node]]
+        first_child = tree.first_child[node]
+        below = best[first_child : first_child + tree.n_children[node]].sum()
         if below < cost[node]:
             best[node] = below
             is_leaf[node] = False
@@ -349,7 +415,8 @@ def prune_tree(
     is_kept[tree.root] = True
     for node in range(len(cost)):
         if is_kept[node] and not is_leaf[node]:
-            is_kept[tree.left[node]] = is_kept[tree.right[node]] = True
+            first_child = tree.first_child[node]
+            is_kept[first_child : first_child + tree.n_children[node]] = True
     return is_leaf & is_kept, is_kept, cost, best
 
 

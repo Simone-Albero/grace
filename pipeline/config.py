@@ -364,6 +364,10 @@ def _validate_tree(tree: DictConfig) -> None:
         f"tree.n_min {tree.n_min!r} must be an integer > 1.",
     )
     _check(
+        _is_int(tree.max_k, 2),
+        f"tree.max_k {tree.max_k!r} must be an integer > 1.",
+    )
+    _check(
         _is_int(tree.k_neighbours, 1),
         f"tree.k_neighbours {tree.k_neighbours!r} must be an integer > 0.",
     )

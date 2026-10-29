@@ -1,6 +1,6 @@
 {% extends "run_base.html" %}
 {% block content %}
-<p class="muted">Each predicted class has a tree of 2-means splits in the LDA space, grown on one half of val. A leaf is a region: its
+<p class="muted">Each predicted class has a tree of k-means splits (2 to <code>tree.max_k</code> parts) in the LDA space, grown on one half of val. A leaf is a region: its
   estimate <b>q</b> is the failure rate of the other half of val routed to it, shrunk toward its rate on the grown half.
   Click a marker, or a leaf id, for its page.</p>
 {{ m.tiles(tiles) }}

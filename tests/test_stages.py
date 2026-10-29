@@ -379,6 +379,16 @@ def test_tree_without_weight_grows_on_the_lda_space(tmp_path: Path) -> None:
     assert fitted["tree"].centroid.shape[1] == n_axes
 
 
+@pytest.mark.parametrize("max_k", [2, 3])
+def test_tree_splits_into_at_most_max_k_parts(tmp_path: Path, max_k: int) -> None:
+    """Check no node of the fitted tree has more than max_k children."""
+    run(["tree"], fast_cfg(tmp_path, f"tree.max_k={max_k}"), force=False)
+    latest = _scalar(tmp_path, "SELECT MAX(id) FROM executions WHERE stage='tree'")
+    fitted = joblib.load(tmp_path / f"artifacts/tree/{latest}/tree.joblib")
+    n_children = fitted["tree"].n_children
+    assert set(n_children) <= {0, *range(2, max_k + 1)} and n_children.max() >= 2
+
+
 def test_baselines_never_read_test_labels(tmp_path: Path) -> None:
     """Check the baselines' probabilities ignore the test labels."""
     cfg = fast_cfg(tmp_path)

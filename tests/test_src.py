@@ -1,5 +1,6 @@
 """The pure functions of src/ on toy data."""
 
+import itertools
 import math
 
 import numpy as np
@@ -226,6 +227,7 @@ def _grow(
     *,
     n_classes: int,
     n_min: int,
+    max_k: int = 2,
     errors: np.ndarray | None = None,
     estimate: tuple[np.ndarray, np.ndarray] | None = None,
     penalty: float = 0.0,
@@ -242,23 +244,26 @@ def _grow(
         estimate_predicted,
         n_classes=n_classes,
         n_min=n_min,
+        max_k=max_k,
         penalty=penalty,
         random_state=0,
     )
 
 
-def test_route_reproduces_growth_of_train_rows() -> None:
+@pytest.mark.parametrize("max_k", [2, 4])
+def test_route_reproduces_growth_of_train_rows(max_k: int) -> None:
     """Check descend ends each row where the growth put it."""
     points, predicted = _blobs()
-    grown, node_of_row = _grow(points, predicted, n_classes=2, n_min=10)
+    grown, node_of_row = _grow(points, predicted, n_classes=2, n_min=10, max_k=max_k)
     assert len(grown.parent) > 2
     assert (tree.descend(grown, points, predicted) == node_of_row).all()
 
 
-def test_no_grown_child_under_n_min() -> None:
-    """Check every split leaves n_min rows or more on each side."""
+@pytest.mark.parametrize("max_k", [2, 4])
+def test_no_grown_child_under_n_min(max_k: int) -> None:
+    """Check every split leaves n_min rows or more in each part."""
     points, predicted = _blobs()
-    grown, node_of_row = _grow(points, predicted, n_classes=2, n_min=15)
+    grown, node_of_row = _grow(points, predicted, n_classes=2, n_min=15, max_k=max_k)
     n_rows = tree.subtree_counts(grown, node_of_row, np.ones(len(points)))
     children = np.flatnonzero(grown.parent >= 0)
     assert (n_rows[children] >= 15).all()
@@ -269,16 +274,19 @@ def test_identical_points_make_a_leaf() -> None:
     """Check a node whose points are all the same is never split."""
     points = np.ones((100, 2))
     grown, _ = _grow(points, np.zeros(100, dtype=int), n_classes=1, n_min=5)
-    assert len(grown.parent) == 1 and grown.left[0] == -1
+    assert len(grown.parent) == 1 and grown.n_children[0] == 0
 
 
 def _cut_costs(grown: tree.Tree, cost: np.ndarray, node: int) -> list[float]:
     """List the cost of every cut of the subtree under `node`."""
     cuts = [cost[node]]
-    if grown.left[node] >= 0:
-        for left in _cut_costs(grown, cost, grown.left[node]):
-            for right in _cut_costs(grown, cost, grown.right[node]):
-                cuts.append(left + right)
+    if grown.n_children[node] > 0:
+        first_child = grown.first_child[node]
+        children = range(first_child, first_child + grown.n_children[node])
+        for child_costs in itertools.product(
+            *[_cut_costs(grown, cost, child) for child in children]
+        ):
+            cuts.append(sum(child_costs))
     return cuts
 
 
@@ -291,12 +299,15 @@ def _blobs_with_errors() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return points, predicted, errors
 
 
+@pytest.mark.parametrize("max_k", [2, 4])
 @pytest.mark.parametrize("leaf_cost", [0.0, 0.05])
-def test_prune_matches_brute_force(leaf_cost: float) -> None:
+def test_prune_matches_brute_force(leaf_cost: float, max_k: int) -> None:
     """Check the bottom-up cut is the cheapest, leaf prices included."""
     points, predicted, errors = _blobs_with_errors()
     penalty = tree.leaf_penalty(errors, leaf_cost)
-    grown, node_of_row = _grow(points, predicted, n_classes=2, n_min=10, errors=errors)
+    grown, node_of_row = _grow(
+        points, predicted, n_classes=2, n_min=10, max_k=max_k, errors=errors
+    )
     n_rows = tree.subtree_counts(grown, node_of_row, np.ones(len(points)))
     n_errors = tree.subtree_counts(grown, node_of_row, errors)
     is_leaf, is_kept, cost, best = tree.prune_tree(
@@ -362,14 +373,17 @@ def _count_reachable(grown: tree.Tree, is_open: np.ndarray) -> int:
     while stack:
         node = stack.pop()
         count += 1
-        if grown.left[node] >= 0 and is_open[node]:
-            stack += [grown.left[node], grown.right[node]]
+        if grown.n_children[node] > 0 and is_open[node]:
+            first_child = grown.first_child[node]
+            stack += range(first_child, first_child + grown.n_children[node])
     return count
 
 
 @pytest.mark.parametrize("leaf_cost", [0.05, 0.2, 1.0])
 def test_growth_stops_only_where_the_cut_would_have_stopped(leaf_cost: float) -> None:
     """Check the early stop cuts the same leaves, from just the nodes it admits."""
+    # Binary, since the number of parts of a k-way split depends on the
+    # price: a tree grown without the stop would not be the same tree.
     points, predicted, errors = _blobs_with_errors()
     penalty = tree.leaf_penalty(errors, leaf_cost)
     early_leaves, early, _ = _cut(
@@ -383,6 +397,55 @@ def test_growth_stops_only_where_the_cut_would_have_stopped(leaf_cost: float) ->
     brier = tree.leaf_brier(*counts, len(points))
     assert len(early.parent) == _count_reachable(full, brier > penalty)
     assert len(early.parent) < len(full.parent)
+
+
+def _aligned_groups() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return three groups of class 0 on a line, error rates apart."""
+    rng = np.random.default_rng(0)
+    points = np.vstack(
+        [
+            np.column_stack(
+                [centre + 0.5 * rng.normal(size=60), 0.5 * rng.normal(size=60)]
+            )
+            for centre in (0.0, 10.0, 20.0)
+        ]
+    )
+    rates = np.repeat([0.05, 0.5, 0.95], 60)
+    errors = (rng.random(len(points)) < rates).astype(float)
+    return points, np.zeros(len(points), dtype=int), errors
+
+
+@pytest.mark.parametrize(
+    ("leaf_cost", "n_parts"),
+    [(0.05, 3), (0.3, 2), (3.0, 0)],
+    ids=["three groups, three parts", "a dearer leaf, two", "too dear to split"],
+)
+def test_a_split_takes_the_number_of_parts_that_costs_least_as_leaves(
+    leaf_cost: float, n_parts: int
+) -> None:
+    """Check the price decides between 2 and 3 parts, or no split."""
+    points, predicted, errors = _aligned_groups()
+    grown, node_of_row = _grow(
+        points,
+        predicted,
+        n_classes=1,
+        n_min=10,
+        max_k=4,
+        errors=errors,
+        penalty=tree.leaf_penalty(errors, leaf_cost),
+    )
+    assert grown.n_children[0] == n_parts
+    if n_parts == 3:
+        n_rows = tree.subtree_counts(grown, node_of_row, np.ones(len(points)))
+        first_child = grown.first_child[0]
+        assert n_rows[first_child : first_child + 3].tolist() == [60, 60, 60]
+
+
+def test_a_binary_tree_splits_three_groups_in_two() -> None:
+    """Check max_k=2 never gives a node more than two children."""
+    points, predicted, errors = _aligned_groups()
+    grown, _ = _grow(points, predicted, n_classes=1, n_min=10, max_k=2, errors=errors)
+    assert grown.n_children.max() == 2
 
 
 def test_a_dearer_leaf_makes_a_smaller_tree() -> None:
@@ -441,7 +504,7 @@ def test_class_never_predicted_gets_an_empty_root() -> None:
     points, predicted = _blobs()
     grown, node_of_row = _grow(points, predicted, n_classes=3, n_min=10)
     n_rows = tree.subtree_counts(grown, node_of_row, np.ones(len(points)))
-    assert n_rows[grown.root[2]] == 0 and grown.left[grown.root[2]] == -1
+    assert n_rows[grown.root[2]] == 0 and grown.n_children[grown.root[2]] == 0
     is_leaf, _, _, _ = tree.prune_tree(
         grown, n_rows, n_rows * 0, n_rows / 3, penalty=0.0
     )

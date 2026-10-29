@@ -1,20 +1,21 @@
 """Regions as the leaves of a tree, and each row's failure probability.
 
 Val is halved at random, stratified by class. The tree is grown with
-2-means on the LDA space plus one axis, the share of nearest train rows
-that disagree with the predicted class (one root per predicted class),
-on the first half of val, where the classifier's errors say where to
-stop and how deep to cut: every leaf costs a price on top of its
-expected Brier score, so a split is kept only when it saves more than
-the leaf it adds. The leaves take the failure rate of the second half
-that reaches them, shrunk toward the error rate of the first half. A
-per-row correction by the classifier's confidence gives every row its
-probability. Test labels are never read. Artifacts: the tree and its
-estimates, and every val and test row's leaf, disagreement, confidence,
-leaf rate and probability. DB rows written: `tree_nodes` and metrics
-n_nodes, n_leaves, n_empty_roots, max_depth, n_grow, n_estimate,
-grow_error_rate, estimate_error_rate, fh_a, fh_b, fh_tau2, beta, mu_d,
-sigma_d, d_scale, mu_c, sigma_c and n_leaves_without_estimate.
+k-means splits of 2 to `tree.max_k` parts on the LDA space plus one
+axis, the share of nearest train rows that disagree with the predicted
+class (one root per predicted class), on the first half of val, where
+the classifier's errors say where to stop and how deep to cut: every
+leaf costs a price on top of its expected Brier score, so a split is
+kept only when it saves more than the leaves it adds. The leaves take
+the failure rate of the second half that reaches them, shrunk toward the
+error rate of the first half. A per-row correction by the classifier's
+confidence gives every row its probability. Test labels are never read.
+Artifacts: the tree and its estimates, and every val and test row's
+leaf, disagreement, confidence, leaf rate and probability. DB rows
+written: `tree_nodes` and metrics n_nodes, n_leaves, n_empty_roots,
+max_depth, n_grow, n_estimate, grow_error_rate, estimate_error_rate,
+fh_a, fh_b, fh_tau2, beta, mu_d, sigma_d, d_scale, mu_c, sigma_c and
+n_leaves_without_estimate.
 """
 
 __all__ = ["CONFIG", "INPUTS", "FILES", "OUTPUTS", "run"]
@@ -189,6 +190,7 @@ def run(ctx: Context) -> None:
         predicted["val"][~is_grow],
         n_classes=n_classes,
         n_min=cfg.tree.n_min,
+        max_k=cfg.tree.max_k,
         penalty=penalty,
         random_state=cfg.seed,
     )

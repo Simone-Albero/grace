@@ -233,19 +233,21 @@ def test_a_node_cuts_the_tree_and_the_map_down_to_its_subtree(
 
 
 def test_the_trail_of_a_deep_node_links_each_ancestor_below_the_root(
-    client: TestClient, root: Path, run_id: int
+    tmp_path: Path,
 ) -> None:
     """Check that a way up is offered for every node between root and node."""
-    tree = _execution(root, "tree")
-    rows = query(
-        root / "grace.db",
+    # A binary tree with no price on a leaf is deep enough for a node
+    # two levels down; the shared root's tree is shallower.
+    run(["render"], fast_cfg(tmp_path, "tree.max_k=2", "tree.leaf_cost=0"), force=False)
+    tree = _execution(tmp_path, "tree")
+    node_id, parent_id, class_id = query(
+        tmp_path / "grace.db",
         "SELECT node_id, parent_id, class_id FROM tree_nodes WHERE status = 'internal' "
         f"AND depth >= 2 AND execution_id = {tree} LIMIT 1",
-    )
-    if not rows:
-        pytest.skip("no internal node two levels down in the synthetic tree")
-    node_id, parent_id, class_id = rows[0]
-    page = client.get(f"/runs/{run_id}/trees?class_id={class_id}&node={node_id}")
+    )[0]
+    run_id = query(tmp_path / "grace.db", "SELECT MAX(id) FROM runs")[0][0]
+    with TestClient(create_app(tmp_path / "grace.db"), base_url=BASE_URL) as client:
+        page = client.get(f"/runs/{run_id}/trees?class_id={class_id}&node={node_id}")
     assert page.status_code == 200
     assert f'data-node="{parent_id}"' in page.text
     assert f'data-node="{node_id}"' not in page.text
