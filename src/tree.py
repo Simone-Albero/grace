@@ -7,7 +7,9 @@ are the rows' coordinates plus the share of nearest train rows that
 disagree with the prediction, as one more axis. The errors of the rows
 the tree grew on say how deep to cut, each leaf gets the failure rate of
 the other rows that reach it, and a per-row correction moves it with the
-classifier's own confidence.
+classifier's own confidence. Every leaf costs a price on top of its
+expected Brier score, so that a split must pay for the leaf it adds; the
+same cost stops the growth and cuts the grown tree.
 """
 
 __all__ = [
@@ -18,6 +20,8 @@ __all__ = [
     "fit_beta",
     "fit_fay_herriot",
     "grow_tree",
+    "leaf_brier",
+    "leaf_penalty",
     "low_confidence",
     "neighbour_disagreement",
     "node_depths",
@@ -66,6 +70,65 @@ class Tree:
     root: np.ndarray
 
 
+def leaf_penalty(errors: np.ndarray, leaf_cost: float) -> float:
+    """Return the price of one leaf, in units of the Brier score.
+
+    Args:
+        errors: The classifier's errors, 0 or 1, on the rows the tree
+            grows on.
+        leaf_cost: The share of the Brier score of the constant
+            predictor that a leaf must save to be worth keeping.
+
+    Returns:
+        `leaf_cost` times the Brier score of the constant predictor.
+    """
+    rate = float(np.mean(errors))
+    return leaf_cost * rate * (1 - rate)
+
+
+def leaf_brier(
+    n_rows: np.ndarray,
+    n_errors: np.ndarray,
+    n_estimate: np.ndarray,
+    n_total: int,
+) -> np.ndarray:
+    """Return the expected Brier score of nodes taken as leaves.
+
+    A node costs its share of the spread of the errors it hides plus the
+    noise of a rate estimated on the estimation rows that reach it.
+
+    Args:
+        n_rows: The rows the tree grew on, under each node.
+        n_errors: The classifier's errors among them.
+        n_estimate: The rows the leaf rates will be estimated on, under
+            each node; their labels are not read.
+        n_total: The rows the tree grew on.
+
+    Returns:
+        The cost of each node, without the price of a leaf.
+    """
+    n_rows = np.asarray(n_rows, dtype=np.float64)
+    n_errors = np.asarray(n_errors, dtype=np.float64)
+    # A leaf no estimation row reaches takes the fitted line, so it is
+    # costed as if one did.
+    n_estimate_floored = np.maximum(np.asarray(n_estimate, dtype=np.float64), 1.0)
+    observed = np.divide(
+        n_errors, n_rows, out=np.zeros_like(n_errors), where=n_rows > 0
+    )
+    smoothed = (n_errors + 1) / (n_rows + 2)
+    return (n_rows / n_total) * (
+        observed * (1 - observed) * n_rows / np.maximum(n_rows - 1, 1)
+        + smoothed * (1 - smoothed) / n_estimate_floored
+    )
+
+
+def _nearer_second(points: np.ndarray, centres: np.ndarray) -> np.ndarray:
+    """Return whether each point is nearer the second centre."""
+    return ((points - centres[1]) ** 2).sum(axis=1) < ((points - centres[0]) ** 2).sum(
+        axis=1
+    )
+
+
 def _split_two(
     points: np.ndarray, *, n_min: int, random_state: int
 ) -> tuple[np.ndarray, np.ndarray] | None:
@@ -83,9 +146,7 @@ def _split_two(
         .fit(points)
         .cluster_centers_
     )
-    to_right = ((points - centres[1]) ** 2).sum(axis=1) < (
-        (points - centres[0]) ** 2
-    ).sum(axis=1)
+    to_right = _nearer_second(points, centres)
     if min(to_right.sum(), (~to_right).sum()) < n_min:
         return None
     return centres, to_right
@@ -94,21 +155,33 @@ def _split_two(
 def grow_tree(
     points: np.ndarray,
     predicted: np.ndarray,
+    errors: np.ndarray,
+    estimate_points: np.ndarray,
+    estimate_predicted: np.ndarray,
     *,
     n_classes: int,
     n_min: int,
+    penalty: float,
     random_state: int,
 ) -> tuple[Tree, np.ndarray]:
     """Grow a tree of 2-means splits under a root per predicted class.
 
-    A node splits while both sides keep at least `n_min` rows. A class
-    nobody predicted keeps an empty root.
+    A node splits while both sides keep at least `n_min` rows, unless
+    its own cost leaves nothing to win: both its subtrees would cost at
+    least two leaves' price, so a node whose cost without the price is
+    no more than `penalty` is never cut below. A class nobody predicted
+    keeps an empty root.
 
     Args:
         points: The rows' points, shape (n, m).
         predicted: Each row's predicted class.
+        errors: Whether the classifier failed on each row, 0 or 1.
+        estimate_points: The points of the estimation rows, routed
+            alongside to count the rows each node would estimate on.
+        estimate_predicted: Their predicted class.
         n_classes: The classes; node `c` is the root of class `c`.
         n_min: The fewest rows of a node.
+        penalty: The price of a leaf, from `leaf_penalty`.
         random_state: The seed of every 2-means.
 
     Returns:
@@ -120,15 +193,33 @@ def grow_tree(
     class_id = list(range(n_classes))
     centroid = [np.full(points.shape[1], np.nan)] * n_classes
     node_of_row = np.asarray(predicted, dtype=np.int64).copy()
-    stack = [(root, np.flatnonzero(predicted == root)) for root in range(n_classes)]
+    stack = [
+        (
+            root,
+            np.flatnonzero(predicted == root),
+            np.flatnonzero(estimate_predicted == root),
+        )
+        for root in range(n_classes)
+    ]
     while stack:
-        node, rows = stack.pop()
+        node, rows, estimate_rows = stack.pop()
+        cost = leaf_brier(
+            len(rows), errors[rows].sum(), len(estimate_rows), len(points)
+        )
+        if cost <= penalty:
+            continue
         split = _split_two(points[rows], n_min=n_min, random_state=random_state)
         if split is None:
             continue
         centres, to_right = split
+        estimate_to_right = _nearer_second(estimate_points[estimate_rows], centres)
         children = left, right
-        for side, members in enumerate((rows[~to_right], rows[to_right])):
+        for side, (members, estimate_members) in enumerate(
+            (
+                (rows[~to_right], estimate_rows[~estimate_to_right]),
+                (rows[to_right], estimate_rows[estimate_to_right]),
+            )
+        ):
             child = len(parent)
             parent.append(node)
             left.append(-1)
@@ -137,7 +228,7 @@ def grow_tree(
             centroid.append(centres[side])
             children[side][node] = child
             node_of_row[members] = child
-            stack.append((child, members))
+            stack.append((child, members, estimate_members))
     tree = Tree(
         parent=np.array(parent, dtype=np.int64),
         left=np.array(left, dtype=np.int64),
@@ -218,13 +309,14 @@ def prune_tree(
     n_rows: np.ndarray,
     n_errors: np.ndarray,
     n_estimate: np.ndarray,
+    *,
+    penalty: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Cut every tree where its leaves' expected Brier score is least.
+    """Cut every tree where its leaves' cost is least.
 
-    A node costs the spread of the errors it hides plus the noise of a
-    rate estimated on the estimation rows that reach it. A node stays a
-    leaf unless its two best subtrees cost strictly less, found
-    bottom-up.
+    A leaf costs its expected Brier score, from `leaf_brier`, plus
+    `penalty`. A node stays a leaf unless its two best subtrees cost
+    strictly less, found bottom-up.
 
     Args:
         tree: The grown tree.
@@ -232,6 +324,7 @@ def prune_tree(
         n_errors: The classifier's errors among them.
         n_estimate: The rows the leaf rates will be estimated on, under
             every node; their labels are not read.
+        penalty: The price of a leaf, from `leaf_penalty`.
 
     Returns:
         Per node: whether it is a leaf of the cut, whether the cut keeps
@@ -239,19 +332,7 @@ def prune_tree(
         subtree.
     """
     n_rows = np.asarray(n_rows, dtype=np.float64)
-    n_errors = np.asarray(n_errors, dtype=np.float64)
-    share = n_rows / n_rows[tree.root].sum()
-    # A leaf no estimation row reaches takes the fitted line, so it is
-    # costed as if one did.
-    n_estimate_floored = np.maximum(np.asarray(n_estimate, dtype=np.float64), 1.0)
-    observed = np.divide(
-        n_errors, n_rows, out=np.zeros_like(n_errors), where=n_rows > 0
-    )
-    smoothed = (n_errors + 1) / (n_rows + 2)
-    cost = share * (
-        observed * (1 - observed) * n_rows / np.maximum(n_rows - 1, 1)
-        + smoothed * (1 - smoothed) / n_estimate_floored
-    )
+    cost = leaf_brier(n_rows, n_errors, n_estimate, n_rows[tree.root].sum()) + penalty
     best = cost.copy()
     is_leaf = np.ones(len(cost), dtype=bool)
     for node in range(len(cost) - 1, -1, -1):

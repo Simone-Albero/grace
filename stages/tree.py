@@ -179,11 +179,16 @@ def run(ctx: Context) -> None:
             for split in _PREDICTED_SPLITS
         }
 
+    penalty = trees.leaf_penalty(val_errors[is_grow], cfg.tree.leaf_cost)
     tree, node_of_row = trees.grow_tree(
         tree_points["val"][is_grow],
         predicted["val"][is_grow],
+        val_errors[is_grow],
+        tree_points["val"][~is_grow],
+        predicted["val"][~is_grow],
         n_classes=n_classes,
         n_min=cfg.tree.n_min,
+        penalty=penalty,
         random_state=cfg.seed,
     )
     n_grow = trees.subtree_counts(tree, node_of_row, np.ones(is_grow.sum()))
@@ -200,6 +205,7 @@ def run(ctx: Context) -> None:
         trees.subtree_counts(
             tree, estimate_node_of_row, np.ones(len(estimate_node_of_row))
         ),
+        penalty=penalty,
     )
     leaf_of_row = {
         split: trees.descend(tree, tree_points[split], predicted[split], stop=is_leaf)

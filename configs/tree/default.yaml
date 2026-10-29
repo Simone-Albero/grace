@@ -1,3 +1,4 @@
-n_min: 30         # fewest rows of the grown half of val in a tree node: a split that would leave fewer is not made
-k_neighbours: 30  # nearest train rows behind a row's disagreement with its predicted class
-d_weight: 1.0     # weight of the neighbour disagreement as one more axis of the tree, in units of the spread of the LDA space; 0 grows the geometric tree
+n_min: 30          # fewest rows of the grown half of val in a tree node: a split that would leave fewer is not made
+k_neighbours: 30   # nearest train rows behind a row's disagreement with its predicted class
+leaf_cost: 1.0e-4  # price of a leaf, as a share of the Brier score of the constant predictor: a split must save this much to be kept; 0 prices nothing
+d_weight: 1.0      # weight of the neighbour disagreement as one more axis of the tree, in units of the spread of the LDA space; 0 grows the geometric tree

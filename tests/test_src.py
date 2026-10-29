@@ -220,12 +220,35 @@ def _blobs(n_per_blob: int = 60) -> tuple[np.ndarray, np.ndarray]:
     return points, predicted
 
 
+def _grow(
+    points: np.ndarray,
+    predicted: np.ndarray,
+    *,
+    n_classes: int,
+    n_min: int,
+    errors: np.ndarray | None = None,
+    penalty: float = 0.0,
+) -> tuple[tree.Tree, np.ndarray]:
+    """Grow a tree with the rows themselves as the estimation rows."""
+    if errors is None:
+        errors = np.zeros(len(points))
+    return tree.grow_tree(
+        points,
+        predicted,
+        errors,
+        points,
+        predicted,
+        n_classes=n_classes,
+        n_min=n_min,
+        penalty=penalty,
+        random_state=0,
+    )
+
+
 def test_route_reproduces_growth_of_train_rows() -> None:
     """Check descend ends each row where the growth put it."""
     points, predicted = _blobs()
-    grown, node_of_row = tree.grow_tree(
-        points, predicted, n_classes=2, n_min=10, random_state=0
-    )
+    grown, node_of_row = _grow(points, predicted, n_classes=2, n_min=10)
     assert len(grown.parent) > 2
     assert (tree.descend(grown, points, predicted) == node_of_row).all()
 
@@ -233,9 +256,7 @@ def test_route_reproduces_growth_of_train_rows() -> None:
 def test_no_grown_child_under_n_min() -> None:
     """Check every split leaves n_min rows or more on each side."""
     points, predicted = _blobs()
-    grown, node_of_row = tree.grow_tree(
-        points, predicted, n_classes=2, n_min=15, random_state=0
-    )
+    grown, node_of_row = _grow(points, predicted, n_classes=2, n_min=15)
     n_rows = tree.subtree_counts(grown, node_of_row, np.ones(len(points)))
     children = np.flatnonzero(grown.parent >= 0)
     assert (n_rows[children] >= 15).all()
@@ -245,9 +266,7 @@ def test_no_grown_child_under_n_min() -> None:
 def test_identical_points_make_a_leaf() -> None:
     """Check a node whose points are all the same is never split."""
     points = np.ones((100, 2))
-    grown, _ = tree.grow_tree(
-        points, np.zeros(100, dtype=int), n_classes=1, n_min=5, random_state=0
-    )
+    grown, _ = _grow(points, np.zeros(100, dtype=int), n_classes=1, n_min=5)
     assert len(grown.parent) == 1 and grown.left[0] == -1
 
 
@@ -268,9 +287,7 @@ def test_prune_matches_brute_force() -> None:
     errors = (rng.random(len(points)) < np.where(points[:, 0] > 3, 0.6, 0.05)).astype(
         float
     )
-    grown, node_of_row = tree.grow_tree(
-        points, predicted, n_classes=2, n_min=10, random_state=0
-    )
+    grown, node_of_row = _grow(points, predicted, n_classes=2, n_min=10)
     n_rows = tree.subtree_counts(grown, node_of_row, np.ones(len(points)))
     n_errors = tree.subtree_counts(grown, node_of_row, errors)
     is_leaf, is_kept, cost, best = tree.prune_tree(grown, n_rows, n_errors, n_rows / 3)
@@ -311,9 +328,7 @@ def test_disagreement_counts_the_nearest_train_rows_of_another_class() -> None:
 def test_class_never_predicted_gets_an_empty_root() -> None:
     """Check a class nobody predicted keeps a root with no rows."""
     points, predicted = _blobs()
-    grown, node_of_row = tree.grow_tree(
-        points, predicted, n_classes=3, n_min=10, random_state=0
-    )
+    grown, node_of_row = _grow(points, predicted, n_classes=3, n_min=10)
     n_rows = tree.subtree_counts(grown, node_of_row, np.ones(len(points)))
     assert n_rows[grown.root[2]] == 0 and grown.left[grown.root[2]] == -1
     is_leaf, _, _, _ = tree.prune_tree(grown, n_rows, n_rows * 0, n_rows / 3)

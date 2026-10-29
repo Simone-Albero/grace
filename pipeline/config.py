@@ -368,6 +368,12 @@ def _validate_tree(tree: DictConfig) -> None:
         f"tree.k_neighbours {tree.k_neighbours!r} must be an integer > 0.",
     )
     _check(
+        _is_number(tree.leaf_cost)
+        and math.isfinite(tree.leaf_cost)
+        and tree.leaf_cost >= 0,
+        f"tree.leaf_cost {tree.leaf_cost!r} must be a number >= 0.",
+    )
+    _check(
         _is_number(tree.d_weight)
         and math.isfinite(tree.d_weight)
         and tree.d_weight >= 0,

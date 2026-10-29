@@ -126,7 +126,7 @@ CREATE TABLE IF NOT EXISTS tree_nodes (
     depth INTEGER NOT NULL,
     n_grow INTEGER NOT NULL,  -- grown rows (val's first half) at or below it
     n_grow_errors INTEGER NOT NULL,  -- the classifier's errors among them
-    cost REAL NOT NULL,  -- its expected Brier cost as a leaf
+    cost REAL NOT NULL,  -- its cost as a leaf: expected Brier score plus a leaf's price
     best REAL NOT NULL,  -- the least cost of its subtree
     status TEXT NOT NULL CHECK (status IN ('internal', 'leaf', 'pruned')),
     n_estimate INTEGER,  -- the same for val's other half; NULL when pruned
