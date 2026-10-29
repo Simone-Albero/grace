@@ -33,6 +33,7 @@ __all__ = [
 from dataclasses import dataclass
 
 import numpy as np
+from numpy.typing import ArrayLike
 from scipy.optimize import minimize_scalar
 from scipy.special import expit, logit
 from sklearn.cluster import KMeans
@@ -87,10 +88,10 @@ def leaf_penalty(errors: np.ndarray, leaf_cost: float) -> float:
 
 
 def leaf_brier(
-    n_rows: np.ndarray,
-    n_errors: np.ndarray,
-    n_estimate: np.ndarray,
-    n_total: int,
+    n_rows: ArrayLike,
+    n_errors: ArrayLike,
+    n_estimate: ArrayLike,
+    n_total: float,
 ) -> np.ndarray:
     """Return the expected Brier score of nodes taken as leaves.
 
@@ -102,7 +103,8 @@ def leaf_brier(
         n_errors: The classifier's errors among them.
         n_estimate: The rows the leaf rates will be estimated on, under
             each node; their labels are not read.
-        n_total: The rows the tree grew on.
+        n_total: All the rows the tree grew on, against which a node's
+            share is taken.
 
     Returns:
         The cost of each node, without the price of a leaf.
@@ -122,11 +124,13 @@ def leaf_brier(
     )
 
 
-def _nearer_second(points: np.ndarray, centres: np.ndarray) -> np.ndarray:
-    """Return whether each point is nearer the second centre."""
-    return ((points - centres[1]) ** 2).sum(axis=1) < ((points - centres[0]) ** 2).sum(
-        axis=1
-    )
+def _goes_right(
+    points: np.ndarray, left_centre: np.ndarray, right_centre: np.ndarray
+) -> np.ndarray:
+    """Return whether each point lies nearer the right centre."""
+    to_left = ((points - left_centre) ** 2).sum(axis=1)
+    to_right = ((points - right_centre) ** 2).sum(axis=1)
+    return to_right < to_left
 
 
 def _split_two(
@@ -146,7 +150,7 @@ def _split_two(
         .fit(points)
         .cluster_centers_
     )
-    to_right = _nearer_second(points, centres)
+    to_right = _goes_right(points, centres[0], centres[1])
     if min(to_right.sum(), (~to_right).sum()) < n_min:
         return None
     return centres, to_right
@@ -166,11 +170,12 @@ def grow_tree(
 ) -> tuple[Tree, np.ndarray]:
     """Grow a tree of 2-means splits under a root per predicted class.
 
-    A node splits while both sides keep at least `n_min` rows, unless
-    its own cost leaves nothing to win: both its subtrees would cost at
-    least two leaves' price, so a node whose cost without the price is
-    no more than `penalty` is never cut below. A class nobody predicted
-    keeps an empty root.
+    A node splits while both sides keep at least `n_min` rows and its
+    `leaf_brier` is above `penalty`. The stop is exact: as a leaf a node
+    costs its `leaf_brier` plus `penalty`, any cut below it at least
+    twice `penalty`, so `prune_tree` keeps a node whose `leaf_brier` is
+    at most `penalty` as a leaf. A class nobody predicted keeps an empty
+    root.
 
     Args:
         points: The rows' points, shape (n, m).
@@ -203,23 +208,22 @@ def grow_tree(
     ]
     while stack:
         node, rows, estimate_rows = stack.pop()
-        cost = leaf_brier(
-            len(rows), errors[rows].sum(), len(estimate_rows), len(points)
-        )
-        if cost <= penalty:
+        n_errors = errors[rows].sum()
+        if leaf_brier(len(rows), n_errors, len(estimate_rows), len(points)) <= penalty:
             continue
         split = _split_two(points[rows], n_min=n_min, random_state=random_state)
         if split is None:
             continue
         centres, to_right = split
-        estimate_to_right = _nearer_second(estimate_points[estimate_rows], centres)
+        estimate_to_right = _goes_right(
+            estimate_points[estimate_rows], centres[0], centres[1]
+        )
         children = left, right
-        for side, (members, estimate_members) in enumerate(
-            (
-                (rows[~to_right], estimate_rows[~estimate_to_right]),
-                (rows[to_right], estimate_rows[estimate_to_right]),
-            )
-        ):
+        sides = (
+            (rows[~to_right], estimate_rows[~estimate_to_right]),
+            (rows[to_right], estimate_rows[estimate_to_right]),
+        )
+        for side, (members, estimate_members) in enumerate(sides):
             child = len(parent)
             parent.append(node)
             left.append(-1)
@@ -267,11 +271,10 @@ def descend(
         active = np.flatnonzero(is_movable)
         if active.size == 0:
             return node
-        active_points = points[active]
         left, right = tree.left[node[active]], tree.right[node[active]]
-        to_right = ((active_points - tree.centroid[right]) ** 2).sum(axis=1) < (
-            (active_points - tree.centroid[left]) ** 2
-        ).sum(axis=1)
+        to_right = _goes_right(
+            points[active], tree.centroid[left], tree.centroid[right]
+        )
         node[active] = np.where(to_right, right, left)
 
 

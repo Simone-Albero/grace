@@ -227,17 +227,19 @@ def _grow(
     n_classes: int,
     n_min: int,
     errors: np.ndarray | None = None,
+    estimate: tuple[np.ndarray, np.ndarray] | None = None,
     penalty: float = 0.0,
 ) -> tuple[tree.Tree, np.ndarray]:
-    """Grow a tree with the rows themselves as the estimation rows."""
+    """Grow a tree; the rows themselves are the estimation rows by default."""
     if errors is None:
         errors = np.zeros(len(points))
+    estimate_points, estimate_predicted = estimate or (points, predicted)
     return tree.grow_tree(
         points,
         predicted,
         errors,
-        points,
-        predicted,
+        estimate_points,
+        estimate_predicted,
         n_classes=n_classes,
         n_min=n_min,
         penalty=penalty,
@@ -280,21 +282,130 @@ def _cut_costs(grown: tree.Tree, cost: np.ndarray, node: int) -> list[float]:
     return cuts
 
 
-def test_prune_matches_brute_force() -> None:
-    """Check the bottom-up cut is the cheapest of all cuts."""
+def _blobs_with_errors() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return `_blobs` with errors that are likelier on the right."""
     points, predicted = _blobs(80)
     rng = np.random.default_rng(1)
-    errors = (rng.random(len(points)) < np.where(points[:, 0] > 3, 0.6, 0.05)).astype(
-        float
-    )
-    grown, node_of_row = _grow(points, predicted, n_classes=2, n_min=10)
+    error_rate = np.where(points[:, 0] > 3, 0.6, 0.05)
+    errors = (rng.random(len(points)) < error_rate).astype(float)
+    return points, predicted, errors
+
+
+@pytest.mark.parametrize("leaf_cost", [0.0, 0.05])
+def test_prune_matches_brute_force(leaf_cost: float) -> None:
+    """Check the bottom-up cut is the cheapest, leaf prices included."""
+    points, predicted, errors = _blobs_with_errors()
+    penalty = tree.leaf_penalty(errors, leaf_cost)
+    grown, node_of_row = _grow(points, predicted, n_classes=2, n_min=10, errors=errors)
     n_rows = tree.subtree_counts(grown, node_of_row, np.ones(len(points)))
     n_errors = tree.subtree_counts(grown, node_of_row, errors)
-    is_leaf, is_kept, cost, best = tree.prune_tree(grown, n_rows, n_errors, n_rows / 3)
+    is_leaf, is_kept, cost, best = tree.prune_tree(
+        grown, n_rows, n_errors, n_rows / 3, penalty=penalty
+    )
     for root in grown.root:
         assert best[root] == pytest.approx(min(_cut_costs(grown, cost, root)))
     assert cost[is_leaf].sum() == pytest.approx(best[grown.root].sum())
     assert (is_leaf <= is_kept).all()
+
+
+def _estimation_rows(
+    points: np.ndarray, predicted: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return estimation rows unlike the grown ones.
+
+    There are fewer of them, they are moved, and the rows of class 1 are
+    all gone, so that its root has none and the floor of one row counts.
+    """
+    keep = (predicted == 0) & (np.arange(len(points)) % 3 == 0)
+    return points[keep] + 0.5, predicted[keep]
+
+
+def _cut(
+    points: np.ndarray,
+    predicted: np.ndarray,
+    errors: np.ndarray,
+    *,
+    is_stopped_early: bool,
+    penalty: float,
+) -> tuple[set[frozenset[int]], tree.Tree, tuple[np.ndarray, ...]]:
+    """Grow and cut a tree; return its leaves' rows, the tree and its counts."""
+    estimate = _estimation_rows(points, predicted)
+    grown, node_of_row = _grow(
+        points,
+        predicted,
+        n_classes=2,
+        n_min=10,
+        errors=errors,
+        estimate=estimate,
+        penalty=penalty if is_stopped_early else 0.0,
+    )
+    estimate_node_of_row = tree.descend(grown, *estimate)
+    counts = (
+        tree.subtree_counts(grown, node_of_row, np.ones(len(points))),
+        tree.subtree_counts(grown, node_of_row, errors),
+        tree.subtree_counts(
+            grown, estimate_node_of_row, np.ones(len(estimate_node_of_row))
+        ),
+    )
+    is_leaf, _, _, _ = tree.prune_tree(grown, *counts, penalty=penalty)
+    leaf_of_row = tree.descend(grown, points, predicted, stop=is_leaf)
+    leaves = {
+        frozenset(np.flatnonzero(leaf_of_row == leaf).tolist())
+        for leaf in np.unique(leaf_of_row)
+    }
+    return leaves, grown, counts
+
+
+def _count_reachable(grown: tree.Tree, is_open: np.ndarray) -> int:
+    """Count the nodes reached from the roots through open nodes only."""
+    stack, count = list(grown.root), 0
+    while stack:
+        node = stack.pop()
+        count += 1
+        if grown.left[node] >= 0 and is_open[node]:
+            stack += [grown.left[node], grown.right[node]]
+    return count
+
+
+@pytest.mark.parametrize("leaf_cost", [0.05, 0.2, 1.0])
+def test_growth_stops_only_where_the_cut_would_have_stopped(leaf_cost: float) -> None:
+    """Check the early stop cuts the same leaves, from just the nodes it admits."""
+    points, predicted, errors = _blobs_with_errors()
+    penalty = tree.leaf_penalty(errors, leaf_cost)
+    early_leaves, early, _ = _cut(
+        points, predicted, errors, is_stopped_early=True, penalty=penalty
+    )
+    full_leaves, full, counts = _cut(
+        points, predicted, errors, is_stopped_early=False, penalty=penalty
+    )
+    assert early_leaves == full_leaves
+    # A node splits only if its cost without the price exceeds the price.
+    brier = tree.leaf_brier(*counts, len(points))
+    assert len(early.parent) == _count_reachable(full, brier > penalty)
+    assert len(early.parent) < len(full.parent)
+
+
+def test_a_dearer_leaf_makes_a_smaller_tree() -> None:
+    """Check a larger price never keeps more leaves."""
+    points, predicted, errors = _blobs_with_errors()
+    n_leaves = []
+    for leaf_cost in (0.0, 0.2, 1.0, 100.0):
+        leaves, _, _ = _cut(
+            points,
+            predicted,
+            errors,
+            is_stopped_early=True,
+            penalty=tree.leaf_penalty(errors, leaf_cost),
+        )
+        n_leaves.append(len(leaves))
+    assert n_leaves == sorted(n_leaves, reverse=True) and n_leaves[0] > n_leaves[-1]
+
+
+def test_leaf_penalty_is_a_share_of_the_constant_predictors_brier() -> None:
+    """Check the price scales with the errors' variance, 0 with none."""
+    errors = np.array([1.0, 0.0, 0.0, 0.0])
+    assert tree.leaf_penalty(errors, 0.1) == pytest.approx(0.1 * 0.25 * 0.75)
+    assert tree.leaf_penalty(np.zeros(4), 0.1) == 0.0
 
 
 def test_tau2_never_negative_and_a_leaf_without_rows_takes_regression() -> None:
@@ -331,7 +442,9 @@ def test_class_never_predicted_gets_an_empty_root() -> None:
     grown, node_of_row = _grow(points, predicted, n_classes=3, n_min=10)
     n_rows = tree.subtree_counts(grown, node_of_row, np.ones(len(points)))
     assert n_rows[grown.root[2]] == 0 and grown.left[grown.root[2]] == -1
-    is_leaf, _, _, _ = tree.prune_tree(grown, n_rows, n_rows * 0, n_rows / 3)
+    is_leaf, _, _, _ = tree.prune_tree(
+        grown, n_rows, n_rows * 0, n_rows / 3, penalty=0.0
+    )
     assert is_leaf[grown.root[2]]
     reached = tree.descend(grown, points[:3], np.array([2, 2, 2]), stop=is_leaf)
     assert (reached == grown.root[2]).all()

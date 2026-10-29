@@ -212,6 +212,7 @@ def test_failed_stage_rolls_back(
         (["data=nope"], ["prepare"]),
         (["data.trian_frac=0.5"], ["prepare"]),
         (["tree.n_min=1"], ["prepare"]),
+        (["tree.leaf_cost=-1"], ["prepare"]),
         (["groups.data=nb15_v2"], ["prepare"]),
         (["root="], ["prepare"]),
         (["classifier.kind=xx"], ["prepare"]),
