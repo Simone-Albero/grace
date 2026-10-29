@@ -12,16 +12,13 @@
     "#e34948": "#e66767",
     "#0b0b0b": "#f0efec",
     "#ffffff": "#0b0b0b",
-    // The fill steps of the circles of `leaf_map`, each swapped with its mirror,
-    // like the colorscales, which the dark theme reverses.
-    "#f9c9c4": "#7a1d18",
-    "#f3a9a3": "#992e28",
-    "#ee8981": "#b73f37",
-    "#e86960": "#d65047",
-    "#d65047": "#e86960",
-    "#b73f37": "#ee8981",
-    "#992e28": "#f3a9a3",
-    "#7a1d18": "#f9c9c4",
+    // The diverging scale of the tree and the map, which keeps its order in
+    // the dark theme: its neutral middle goes dark and its ends brighten.
+    "#2166ac": "#5aa9f0",
+    "#92c5de": "#2c6a9a",
+    "#d9d9d9": "#4a4a47",
+    "#f4a582": "#9c4f35",
+    "#b2182b": "#f26b62",
   };
   const MARGIN = { l: 56, r: 16, t: 28, b: 48 };
 
@@ -29,10 +26,15 @@
     return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
   }
 
+  // The neutral middle of a diverging colorscale, whose order the dark theme keeps.
+  const DIVERGING_NEUTRAL = "#d9d9d9";
+
   function themed(figure) {
     if (!dark.matches) return figure;
     const copy = JSON.parse(JSON.stringify(figure), (key, value) =>
-      key === "colorscale" && Array.isArray(value)
+      key === "colorscale" &&
+      Array.isArray(value) &&
+      !value.some(([, color]) => color === DIVERGING_NEUTRAL)
         ? value.map(([at], i) => [at, value[value.length - 1 - i][1]])
         : value
     );
@@ -41,7 +43,7 @@
     );
   }
 
-  // Zooms the map of the tree tab on a subtree; "" is the whole class.
+  // Zooms the tree and the map of the tree tab on a subtree; "" is the whole class.
   function focusNode(value) {
     const form = document.querySelector("form.filters input[name=node]")?.form;
     if (!form) return;

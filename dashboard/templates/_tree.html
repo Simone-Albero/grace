@@ -1,11 +1,15 @@
 {% import "_macros.html" as m %}
-{{ m.chart(figure, "Tree of " ~ name ~ " · " ~ n_nodes | num ~ " nodes, " ~ n_leaves | num ~ " leaves", wide=True) }}
 {% if focus_node %}
-<p class="muted">The map shows the {{ n_mapped | num }} leaves below node {{ focus_node }}.
-  <button type="button" data-node="">whole class</button></p>
+<nav class="trail">
+  <button type="button" data-node="">{{ name }}</button>
+  {% for ancestor in trail %}<span>›</span><button type="button" data-node="{{ ancestor }}">node {{ ancestor }}</button>{% endfor %}
+  <span>›</span><b>node {{ focus_node }}</b>
+  <button type="button" class="reset" data-node="">Reset</button>
+</nav>
 {% endif %}
+{{ m.chart(figure, "Tree of " ~ name ~ (" below node " ~ focus_node if focus_node else "") ~ " · " ~ n_nodes | num ~ " nodes, " ~ n_leaves | num ~ " leaves", wide=True) }}
 {% if plane_figure %}
-{{ m.chart(plane_figure, "Leaves of " ~ name ~ " in the plane of its first two components", wide=True) }}
+{{ m.chart(plane_figure, "Train rows of " ~ (n_leaves | num) ~ " leaves in the plane of their first two components", wide=True) }}
 {% else %}
 <p class="muted">{{ plane_note }}</p>
 {% endif %}

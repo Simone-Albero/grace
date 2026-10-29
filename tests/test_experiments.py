@@ -143,10 +143,8 @@ def _write_train_rows(
     return space, tree
 
 
-def test_class_plane_centres_each_leaf_and_sizes_it_by_its_spread(
-    tmp_path: Path,
-) -> None:
-    """Check a class's PCA plane, its circles and what stays out."""
+def test_class_plane_places_the_sampled_rows_of_each_leaf(tmp_path: Path) -> None:
+    """Check a class's PCA plane, its points and what stays out."""
     # Leaves 1 and 2 are the class: they split along z_0, and each
     # spreads over z_1. Leaf 3 belongs to another class, far away.
     points = [[-2, 1], [-2, -1], [2, 1], [2, -1], [100, 100], [100, 100]]
@@ -154,12 +152,28 @@ def test_class_plane_centres_each_leaf_and_sizes_it_by_its_spread(
     plane = artifacts.class_plane(space, tree, [1, 2, 7])
     # z_0 has variance 4 and z_1 has 1; the sign of a component is free.
     assert plane.shares == pytest.approx((0.8, 0.2))
-    assert set(plane.circles) == {1, 2}
-    (x1, y1, r1), (x2, y2, r2) = plane.circles[1], plane.circles[2]
-    assert (abs(x1), abs(x2)) == pytest.approx((2, 2))
-    assert x1 == pytest.approx(-x2)
-    assert (y1, y2) == pytest.approx((0, 0))
-    assert (r1, r2) == pytest.approx((1, 1))
+    assert sorted(plane.leaves.tolist()) == [1, 1, 2, 2]
+    assert np.abs(plane.points) == pytest.approx(np.array([[2, 1]] * 4))
+    left = plane.points[plane.leaves == 1][:, 0]
+    right = plane.points[plane.leaves == 2][:, 0]
+    assert left.tolist() == pytest.approx([-right[0]] * 2)
+
+
+def test_class_plane_draws_the_same_count_from_every_leaf_within_its_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Check that a big leaf does not crowd out a small one."""
+    points = [[float(i), 0.0] for i in range(7)]
+    space, tree = _write_train_rows(tmp_path, points, [1, 1, 1, 1, 1, 2, 2])
+    monkeypatch.setattr(artifacts, "_MAX_POINTS", 4)
+    plane = artifacts.class_plane(space, tree, [1, 2])
+    assert np.bincount(plane.leaves).tolist() == [0, 2, 2]
+    assert artifacts.class_plane(space, tree, [1, 2]).points.tolist() == (
+        plane.points.tolist()
+    )
+    assert artifacts._points_per_leaf([3, 10, 10], 12) == 4
+    assert artifacts._points_per_leaf([3, 10, 10], 1000) == 10
+    assert artifacts._points_per_leaf([3, 10, 10], 1) == 1
 
 
 def test_class_plane_reads_again_a_folder_rewritten_in_place(
@@ -167,10 +181,10 @@ def test_class_plane_reads_again_a_folder_rewritten_in_place(
 ) -> None:
     """Check that a rewritten file is not served from the cache."""
     space, tree = _write_train_rows(tmp_path, [[0.0], [2.0]], [1, 1])
-    before = artifacts.class_plane(space, tree, [1]).circles[1]
+    before = artifacts.class_plane(space, tree, [1]).points
     _write_train_rows(tmp_path, [[0.0], [20.0]], [1, 1])
-    after = artifacts.class_plane(space, tree, [1]).circles[1]
-    assert (before[2], after[2]) == pytest.approx((1, 10))
+    after = artifacts.class_plane(space, tree, [1]).points
+    assert (np.abs(before).max(), np.abs(after).max()) == pytest.approx((1, 10))
 
 
 def test_class_plane_with_one_axis_and_without_rows(tmp_path: Path) -> None:
@@ -180,8 +194,9 @@ def test_class_plane_with_one_axis_and_without_rows(tmp_path: Path) -> None:
     )
     plane = artifacts.class_plane(space, tree, [1, 2])
     assert plane.shares == pytest.approx((1.0, 0.0))
-    assert [y for _, y, _ in plane.circles.values()] == [0, 0]
-    assert artifacts.class_plane(space, tree, [5]) == artifacts.ClassPlane({}, (0, 0))
+    assert plane.points[:, 1].tolist() == [0, 0, 0, 0]
+    empty = artifacts.class_plane(space, tree, [5])
+    assert len(empty.leaves) == 0 and empty.points.shape == (0, 2)
     assert artifacts.class_plane(space, tmp_path / "missing", [1]) is None
     short = tmp_path / "short"
     short.mkdir()

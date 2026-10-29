@@ -454,7 +454,8 @@ def create_app(db_path: Path) -> FastAPI:
         nodes = queries.class_tree(connection, ids, class_id)
         if not nodes:
             raise HTTPException(404, f"Run {run_id} has no tree of class {class_id}")
-        focus = None
+        shown = nodes
+        trail: list[int] = []
         if node:
             focus_row = next(
                 (row for row in nodes if str(row["node_id"]) == node), None
@@ -465,21 +466,21 @@ def create_app(db_path: Path) -> FastAPI:
                 )
             # A root's subtree is the whole class: nothing to zoom on.
             if focus_row["parent_id"] is not None:
-                focus = queries.subtree_ids(nodes, focus_row["node_id"])
+                shown = queries.subtree(nodes, focus_row["node_id"])
+                # The ancestors between the root and the node, each a
+                # way up.
+                trail = queries.node_path(nodes, focus_row["node_id"])[1:-1]
         dirs = queries.execution_dirs(run_context["run"])
         space_dir, tree_dir = root / dirs["space"], root / dirs["tree"]
-        leaf_ids = [row["node_id"] for row in nodes if row["status"] == "leaf"]
-        mapped_ids = [i for i in leaf_ids if focus is None or i in focus]
-        plane = artifacts.class_plane(space_dir, tree_dir, mapped_ids)
+        leaf_ids = [row["node_id"] for row in shown if row["status"] == "leaf"]
+        plane = artifacts.class_plane(space_dir, tree_dir, leaf_ids)
         context = {
             "name": nodes[0]["class"],
-            "n_nodes": len(nodes),
+            "n_nodes": len(shown),
             "n_leaves": len(leaf_ids),
-            "n_mapped": len(mapped_ids),
-            "focus_node": node if focus else None,
-            "figure": charts.tree_diagram(
-                nodes, color=color, run_id=run_id, focus=focus
-            ),
+            "focus_node": node if shown is not nodes else None,
+            "trail": trail,
+            "figure": charts.tree_diagram(shown, color=color, run_id=run_id),
             "plane_figure": None,
             "plane_note": None,
         }
@@ -489,14 +490,14 @@ def create_app(db_path: Path) -> FastAPI:
                 f"{tree_dir / 'rows.parquet'}, and they are missing or "
                 "disagree in train length."
             )
-        elif not plane.circles:
+        elif not plane.leaves.size:
             context["plane_note"] = (
                 "No train row has this class as its prediction, so its leaves "
                 "have no region."
             )
         else:
             context["plane_figure"] = charts.leaf_map(
-                nodes, plane, color=color, run_id=run_id
+                shown, plane, color=color, run_id=run_id
             )
         return render(request, "_tree.html", context)
 

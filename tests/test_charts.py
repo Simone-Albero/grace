@@ -8,8 +8,10 @@ import pytest
 
 from dashboard.artifacts import ClassPlane
 from dashboard.charts import (
-    _FILL_STEPS,
+    _DIVERGING,
+    _DIVERGING_NEUTRAL,
     NEUTRAL,
+    _color_scale,
     confusion_heatmap,
     group_bars,
     leaf_map,
@@ -106,21 +108,16 @@ def test_tree_diagram_centers_parents_and_links_only_leaves() -> None:
     assert "test – · test rate –" in marks["text"][2]
 
 
-def test_tree_diagram_fades_the_nodes_outside_the_focus_and_tags_the_splits() -> None:
-    """Check the opacity, and what a click on a node carries."""
+def test_tree_diagram_tags_the_splits_for_the_zoom() -> None:
+    """Check what a click on a split or on a leaf carries."""
     nodes = [
         _node(0, None, 0, "internal"),
         _node(1, 0, 1, "internal"),
         _node(2, 0, 1, "leaf"),
-        _node(3, 1, 2, "leaf"),
-        _node(4, 1, 2, "leaf"),
     ]
-    marks = tree_diagram(nodes, color="purity", run_id=7, focus={1, 3, 4})["data"][1]
-    assert marks["marker"]["opacity"] == [0.3, 1, 0.3, 1, 1]
-    assert marks["customdata"][:2] == [{"node": 0}, {"node": 1}]
-    assert marks["customdata"][2] == "/runs/7/leaves/2"
-    plain = tree_diagram(nodes, color="purity", run_id=7)["data"][1]
-    assert plain["marker"]["opacity"] == [1] * 5
+    marks = tree_diagram(nodes, color="purity", run_id=7)["data"][1]
+    assert marks["customdata"] == [{"node": 0}, {"node": 1}, "/runs/7/leaves/2"]
+    assert "opacity" not in marks["marker"]
 
 
 def _class_nodes() -> list[dict]:
@@ -133,62 +130,104 @@ def _class_nodes() -> list[dict]:
     ]
 
 
-def test_tree_diagram_colors_by_the_chosen_measure_on_the_scale_of_the_leaves() -> None:
-    """Check the color values, the bar title and the scale ends."""
+def test_tree_diagram_colors_by_the_chosen_measure_around_the_rate_of_the_top() -> None:
+    """Check the colors, the bar and a scale centred on the root."""
     nodes = _class_nodes()
     marker = tree_diagram(nodes, color="val_rate", run_id=1)["data"][1]["marker"]
-    assert marker["color"] == [0.3, 0.5, 0.1, None]
-    assert marker["colorbar"]["title"] == "val rate"
-    assert (marker["cmin"], marker["cmax"]) == (0, 0.5)
-    # A purity is best at 1, so its scale runs from the worst leaf
-    # up to it.
+    # The root's val rate is the middle; the two leaves that have one
+    # lie beyond the 2nd and 98th percentiles of themselves, so they
+    # take the ends.
+    assert marker["color"] == [0, 1, -1, None]
+    assert (marker["cmin"], marker["cmax"]) == (-1, 1)
+    assert [color for _, color in marker["colorscale"]] == _DIVERGING
+    bar = marker["colorbar"]
+    assert bar["title"] == "val rate"
+    assert bar["tickvals"] == [-1, -0.5, 0, 0.5, 1]
+    assert bar["ticktext"][0] == "0.1080" and bar["ticktext"][2] == "top 0.3000"
+    assert bar["ticktext"][1] == "0.2520" and bar["ticktext"][4] == "0.4920"
+    # A purity is worse below the middle: its worst leaf is red, at +1,
+    # and its bar runs the other way.
     marker = tree_diagram(nodes, color="purity", run_id=1)["data"][1]["marker"]
-    assert (marker["cmin"], marker["cmax"]) == (0.6, 1.0)
+    assert marker["color"][:2] == [0, 1] and marker["color"][3] == -1
+    assert -1 < marker["color"][2] < 0
+    assert marker["colorbar"]["tickvals"] == [-1, -0.5, 0, 0.5, 1]
+    assert marker["colorbar"]["ticktext"][4] < marker["colorbar"]["ticktext"][0]
     # With no rate to show, the scale is still a range.
     unknown = [_node(0, None, 0, "leaf", test_rate=None)]
     marker = tree_diagram(unknown, color="test_rate", run_id=1)["data"][1]["marker"]
-    assert (marker["cmin"], marker["cmax"]) == (0.0, 1.0)
+    assert marker["color"] == [None]
+    assert marker["colorbar"]["ticktext"][2] == "top 0.5000"
 
 
-def test_leaf_map_draws_the_largest_circle_first_and_shares_the_axis_scale() -> None:
-    """Check the circles, their fills, the centres and the axes."""
+def test_color_scale_keeps_its_middle_inside_and_its_ends_within_0_and_1() -> None:
+    """Check the margin around a root past every leaf, and the clamp."""
+    nodes = [
+        _node(0, None, 0, "internal", oof_rate=0.05, purity=1.0),
+        _node(1, 0, 1, "leaf", oof_rate=0.2, purity=0.8),
+        _node(2, 0, 1, "leaf", oof_rate=0.2, purity=0.8),
+    ]
+    low, middle, high = _color_scale(nodes, "oof_rate")
+    assert 0 <= low < middle < high
+    low, middle, high = _color_scale(nodes, "purity")
+    # A purity of 1 at the top is as high as it goes: no room above it.
+    assert low < middle == high == 1.0
+    # A root on the edge of 0..1 leaves the scale inside it, and still draws.
+    edge = [
+        _node(0, None, 0, "internal", oof_rate=0.0, purity=1.0),
+        _node(1, 0, 1, "leaf", oof_rate=0.0, purity=1.0),
+        _node(2, 0, 1, "leaf", oof_rate=0.2, purity=0.8),
+    ]
+    assert _color_scale(edge, "oof_rate")[0] == 0.0
+    assert _color_scale(edge, "purity")[2] == 1.0
+    for color in ("oof_rate", "purity"):
+        marker = tree_diagram(edge, color=color, run_id=1)["data"][1]["marker"]
+        assert all(-1 <= at <= 1 for at in marker["color"])
+        assert not any(text.startswith("-") for text in marker["colorbar"]["ticktext"])
+
+
+def test_leaf_map_draws_a_point_per_row_with_the_extremes_on_top() -> None:
+    """Check the points, their colors and order, and the axes."""
+    nodes = _class_nodes() + [_node(4, 0, 1, "leaf", val_rate=0.35)]
+    nodes[1]["val_rate"] = 0.6
     plane = ClassPlane(
-        {1: (0.0, 0.0, 2.0), 2: (3.0, 1.0, 3.0), 3: (-1.0, -1.0, 0.5)}, (0.75, 0.2)
+        np.array([1, 2, 2, 3, 4]),
+        np.array([[0, 0], [3, 1], [3, 2], [-1, -1], [5, 5]], dtype=float),
+        (0.75, 0.2),
     )
-    figure = leaf_map(_class_nodes(), plane, color="val_rate", run_id=9)
-    shapes = figure["layout"]["shapes"]
-    # Radius 3, 2, 0.5: leaf 2, then leaf 1, then leaf 3.
-    assert [shape["x1"] - shape["x0"] for shape in shapes] == [6, 4, 1]
-    assert shapes[0]["y0"] == -2 and shapes[0]["y1"] == 4
-    # val rate 0.1 is the lowest of the scale 0..0.5, 0.5 the
-    # highest, an unknown one has no step.
-    assert [shape["fillcolor"] for shape in shapes] == [
-        _FILL_STEPS[1],
-        _FILL_STEPS[-1],
-        NEUTRAL,
-    ]
-    (centres,) = figure["data"]
-    # The internal node has no circle, and no marker.
-    assert centres["customdata"] == [
-        "/runs/9/leaves/2",
-        "/runs/9/leaves/1",
-        "/runs/9/leaves/3",
-    ]
-    assert centres["x"] == [3.0, 0.0, -1.0]
-    assert centres["marker"]["color"] == [0.1, 0.5, None]
-    assert (centres["marker"]["cmin"], centres["marker"]["cmax"]) == (0, 0.5)
+    figure = leaf_map(nodes, plane, color="val_rate", run_id=9)
+    unknown, points = figure["data"]
+    assert points["type"] == "scattergl"
+    # Leaf 3 has no rate: neutral, beneath. Then, closest to the middle
+    # (0.3) first, leaf 4, then leaves 1 and 2 at the ends of the scale.
+    assert unknown["customdata"] == ["/runs/9/leaves/3"]
+    assert unknown["marker"]["color"] == NEUTRAL and unknown["x"] == [-1.0]
+    assert points["customdata"] == [f"/runs/9/leaves/{leaf}" for leaf in (4, 1, 2, 2)]
+    assert points["x"] == [5.0, 0.0, 3.0, 3.0]
+    colors = points["marker"]["color"]
+    assert 0 < colors[0] < 1 and colors[1:] == [1, -1, -1]
+    assert "leaf 2" in points["text"][2]
     layout = figure["layout"]
     assert layout["yaxis"]["scaleanchor"] == "x"
+    # The view frames the bulk of the points: the 1st to 99th percentile
+    # of x, widened by a fifth; a single value has no range to frame.
+    low, high = layout["xaxis"]["range"]
+    assert low < -0.9 < 4.9 < high and high - low < 20
+    one_axis = ClassPlane(np.array([1, 1]), np.array([[0.0, 0.0], [2.0, 0.0]]), (1, 0))
+    assert (
+        "range"
+        not in leaf_map(nodes, one_axis, color="val_rate", run_id=9)["layout"]["yaxis"]
+    )
     assert layout["xaxis"]["title"] == "PC 1 · 75% of the variance"
     assert layout["yaxis"]["title"] == "PC 2 · 20% of the variance"
 
 
-def test_dark_theme_swaps_each_fill_step_with_its_mirror() -> None:
-    """Check that dashboard.js knows every fill step of charts.py."""
+def test_dark_theme_keeps_the_diverging_order_and_darkens_its_middle() -> None:
+    """Check that dashboard.js knows each diverging step."""
     script = Path(__file__).parents[1] / "dashboard" / "static" / "dashboard.js"
-    swaps = dict(re.findall(r'"(#[0-9a-f]{6})": "(#[0-9a-f]{6})"', script.read_text()))
-    for step, mirror in zip(_FILL_STEPS, reversed(_FILL_STEPS), strict=True):
-        assert swaps[step] == mirror
+    text = script.read_text()
+    swaps = dict(re.findall(r'"(#[0-9a-f]{6})": "(#[0-9a-f]{6})"', text))
+    assert all(color in swaps for color in _DIVERGING)
+    assert f'DIVERGING_NEUTRAL = "{_DIVERGING_NEUTRAL}"' in text
 
 
 def test_leaf_size_bars_bin_by_powers_of_two_and_skip_an_absent_split() -> None:

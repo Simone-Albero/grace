@@ -17,11 +17,12 @@ __all__ = [
     "leaf_path",
     "leaves",
     "metrics_by_stage",
+    "node_path",
     "run",
     "run_metrics",
     "runs",
     "stage_ids",
-    "subtree_ids",
+    "subtree",
     "tree_roots",
 ]
 
@@ -441,23 +442,45 @@ def class_tree(
     return rows
 
 
-def subtree_ids(nodes: Sequence[Mapping], node_id: int) -> set[int]:
-    """Collect a node and every node below it.
+def subtree(nodes: Sequence[Mapping], node_id: int) -> list[dict[str, object]]:
+    """Cut out the subtree of a node, as a tree of its own.
 
     Args:
         nodes: The `class_tree` rows, parents first.
         node_id: The node at the top of the subtree.
 
     Returns:
-        The ids of the node and its descendants.
+        Copies of the node and of every node below it, parents first,
+        with the node as the root and every depth counted from it.
     """
+    top_depth = next(node["depth"] for node in nodes if node["node_id"] == node_id)
     below = {node_id}
+    cut = []
     # `class_tree` orders by depth, so a parent comes before its
     # children and one pass reaches them all.
     for node in nodes:
-        if node["parent_id"] in below:
+        if node["node_id"] == node_id or node["parent_id"] in below:
             below.add(node["node_id"])
-    return below
+            cut.append(dict(node, depth=node["depth"] - top_depth))
+    cut[0]["parent_id"] = None
+    return cut
+
+
+def node_path(nodes: Sequence[Mapping], node_id: int) -> list[int]:
+    """List the nodes from the root of a class's tree down to one.
+
+    Args:
+        nodes: The `class_tree` rows, parents first.
+        node_id: The node the path ends at.
+
+    Returns:
+        The node ids, the root first and `node_id` last.
+    """
+    parents = {node["node_id"]: node["parent_id"] for node in nodes}
+    path = [node_id]
+    while parents[path[-1]] is not None:
+        path.append(parents[path[-1]])
+    return path[::-1]
 
 
 def leaf_path(

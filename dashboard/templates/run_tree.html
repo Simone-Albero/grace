@@ -10,13 +10,14 @@
   {{ m.chart(figures.test, "Test rate of each leaf against its estimate") }}
 </div>
 <h2>Tree of a class</h2>
-<p class="muted">A square is a leaf, a circle a node that splits; size follows the train rows and color the
-  measure chosen below, darker when higher in the light theme and lighter in the dark one. Hover a node for its counts and rates, click a leaf for its page.</p>
-<p class="muted">The map under the tree places each leaf in the plane of the first two principal components of the
-  train rows of the class, in the LDA space. A circle is centred on the mean of the leaf's train rows and its radius
-  is their RMS distance from it. The tree also cuts on the disagreement of the neighbours, an axis the plane does not
-  show, so the circles of two leaves can overlap. Click a node that splits to map only the leaves below it, in
-  a plane fitted to them: far fewer circles overlap.</p>
+<p class="muted">A square is a leaf, a circle a node that splits; size follows the train rows. Color shows the measure
+  chosen below against the rate at the top of the tree: blue is better than it, red worse, and the ends of the scale
+  are the 2nd and 98th percentiles of the leaves. Hover a node for its counts and rates, click a leaf for its page.</p>
+<p class="muted">The map under the tree draws a sample of the train rows of each leaf, at most a thousand of them thinned to
+  the same count per leaf, in the plane of the first two principal components of the class's train rows in the LDA
+  space, each point in the color of its leaf; the view leaves out the farthest 1% on each side, and the autoscale button of the chart shows all. The tree also cuts on the disagreement of the neighbours, an axis the
+  plane does not show. Click a node that splits to cut the tree down to its subtree, with the map refitted to the
+  rows below it; Reset, or the class in the path above the tree, brings back the whole.</p>
 <form class="filters" hx-get="/runs/{{ run.id }}/trees" hx-target="#tree" hx-trigger="load, change"
       autocomplete="off">
   <label>class

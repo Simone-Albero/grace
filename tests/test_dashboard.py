@@ -6,6 +6,7 @@ from collections.abc import Iterator
 from contextlib import closing
 from pathlib import Path
 
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
@@ -188,10 +189,10 @@ def test_the_tree_of_a_class_draws_and_rejects_a_missing_one(
     assert client.get(f"/runs/{run_id}/trees").status_code == 422
 
 
-def test_a_node_zooms_the_map_on_its_subtree(
+def test_a_node_cuts_the_tree_and_the_map_down_to_its_subtree(
     client: TestClient, root: Path, run_id: int
 ) -> None:
-    """Check that `node` maps only the leaves below it, or 404s."""
+    """Check that `node` shows its subtree, with a way back, or 404s."""
     tree = _execution(root, "tree")
     rows = query(
         root / "grace.db",
@@ -206,10 +207,12 @@ def test_a_node_zooms_the_map_on_its_subtree(
     zoomed = client.get(f"{url}&node={node_id}")
     assert zoomed.status_code == 200 and zoomed.text.count('class="chart"') == 2
     assert f"below node {node_id}" in zoomed.text
-    assert "below node" not in whole.text
-    # One circle per mapped leaf: the zoom drops the leaves outside.
-    circle = '"type": "circle"'
-    assert 0 < zoomed.text.count(circle) < whole.text.count(circle)
+    assert 'class="trail"' in zoomed.text and "Reset" in zoomed.text
+    assert "below node" not in whole.text and "Reset" not in whole.text
+    # A leaf is in the tree and in the map: the zoom drops the ones
+    # outside.
+    link = f"/runs/{run_id}/leaves/"
+    assert 0 < zoomed.text.count(link) < whole.text.count(link)
     root_id = query(
         root / "grace.db",
         f"SELECT node_id FROM tree_nodes WHERE parent_id IS NULL AND "
@@ -221,18 +224,49 @@ def test_a_node_zooms_the_map_on_its_subtree(
     assert client.get(f"{url}&node=abc").status_code == 404
 
 
-def test_subtree_ids_collect_a_node_and_its_descendants() -> None:
-    """Check a subtree, the root and a leaf."""
+def test_the_trail_of_a_deep_node_links_each_ancestor_below_the_root(
+    client: TestClient, root: Path, run_id: int
+) -> None:
+    """Check that a way up is offered for every node between root and node."""
+    tree = _execution(root, "tree")
+    rows = query(
+        root / "grace.db",
+        "SELECT node_id, parent_id, class_id FROM tree_nodes WHERE status = 'internal' "
+        f"AND depth >= 2 AND execution_id = {tree} LIMIT 1",
+    )
+    if not rows:
+        pytest.skip("no internal node two levels down in the synthetic tree")
+    node_id, parent_id, class_id = rows[0]
+    page = client.get(f"/runs/{run_id}/trees?class_id={class_id}&node={node_id}")
+    assert page.status_code == 200
+    assert f'data-node="{parent_id}"' in page.text
+    assert f'data-node="{node_id}"' not in page.text
+    assert page.text.count('data-node=""') == 2
+
+
+def test_subtree_cuts_a_node_and_its_descendants_into_a_tree_of_its_own() -> None:
+    """Check the rows, the new root and depths, and a node's path."""
     nodes = [
-        {"node_id": 0, "parent_id": None},
-        {"node_id": 1, "parent_id": 0},
-        {"node_id": 2, "parent_id": 0},
-        {"node_id": 3, "parent_id": 1},
-        {"node_id": 4, "parent_id": 1},
+        {"node_id": 0, "parent_id": None, "depth": 0},
+        {"node_id": 1, "parent_id": 0, "depth": 1},
+        {"node_id": 2, "parent_id": 0, "depth": 1},
+        {"node_id": 3, "parent_id": 1, "depth": 2},
+        {"node_id": 4, "parent_id": 1, "depth": 2},
+        {"node_id": 5, "parent_id": 3, "depth": 3},
     ]
-    assert queries.subtree_ids(nodes, 1) == {1, 3, 4}
-    assert queries.subtree_ids(nodes, 0) == {0, 1, 2, 3, 4}
-    assert queries.subtree_ids(nodes, 2) == {2}
+    below = queries.subtree(nodes, 1)
+    assert [(node["node_id"], node["parent_id"], node["depth"]) for node in below] == [
+        (1, None, 0),
+        (3, 1, 1),
+        (4, 1, 1),
+        (5, 3, 2),
+    ]
+    # The rows it was given stay as they were.
+    assert nodes[1]["parent_id"] == 0 and nodes[1]["depth"] == 1
+    assert [node["node_id"] for node in queries.subtree(nodes, 2)] == [2]
+    assert len(queries.subtree(nodes, 0)) == 6
+    assert queries.node_path(nodes, 5) == [0, 1, 3, 5]
+    assert queries.node_path(nodes, 0) == [0]
 
 
 def test_the_test_rate_colors_a_tree_only_when_evaluate_ran() -> None:
@@ -244,7 +278,13 @@ def test_the_test_rate_colors_a_tree_only_when_evaluate_ran() -> None:
 
 @pytest.mark.parametrize(
     ("plane", "note"),
-    [(None, "The map needs"), (artifacts.ClassPlane({}, (0, 0)), "No train row has")],
+    [
+        (None, "The map needs"),
+        (
+            artifacts.ClassPlane(np.empty(0, dtype=int), np.empty((0, 2)), (0, 0)),
+            "No train row has",
+        ),
+    ],
 )
 def test_the_tree_of_a_class_says_why_it_has_no_map(
     client: TestClient,

@@ -27,7 +27,7 @@ __all__ = [
 
 import math
 import statistics
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 
@@ -53,20 +53,12 @@ _INK = "#0b0b0b"
 _ON_DARK_FILL = "#ffffff"
 _ON_LIGHT_FILL = "#0b0b0b"
 _SEQUENTIAL = [[0, "#fcd9d5"], [0.5, "#e5594f"], [1, "#6b1410"]]
-# A shape cannot take its color from a colorscale, and in the dark theme
-# the colorscales are reversed, so the circles of `leaf_map` take one of
-# these, sampled from `_SEQUENTIAL`. `dashboard.js` swaps step i with
-# step 7 - i, and a test keeps the two lists equal.
-_FILL_STEPS = [
-    "#f9c9c4",
-    "#f3a9a3",
-    "#ee8981",
-    "#e86960",
-    "#d65047",
-    "#b73f37",
-    "#992e28",
-    "#7a1d18",
-]
+# The tree and the map of a class color on a scale that runs from blue,
+# below the rate of the class, through this neutral to red, above it.
+# `dashboard.js` keeps its order in the dark theme, where the neutral
+# goes dark, and a test keeps the two in step.
+_DIVERGING_NEUTRAL = "#d9d9d9"
+_DIVERGING = ["#2166ac", "#92c5de", _DIVERGING_NEUTRAL, "#f4a582", "#b2182b"]
 # What colors the nodes of a class's tree, by the key of the node.
 TREE_COLORS = {
     "purity": "purity",
@@ -605,6 +597,18 @@ def _tree_hover(node: Mapping) -> str:
     return "<br>".join(lines)
 
 
+def _leaf_hover(node: Mapping) -> str:
+    """Format the hover of a point of the map: its leaf, briefly.
+
+    The map repeats it for each of thousands of points, so it is shorter
+    than the tree's.
+    """
+    return (
+        f"leaf {node['node_id']} · train {_format_count(node['n_train'])}<br>"
+        f"oof rate {_format_rate(node['oof_rate'])} · q {_format_rate(node['q'])}"
+    )
+
+
 def _tree_positions(nodes: Sequence[Mapping]) -> dict[int, float]:
     """Place each node on the x axis, keyed by its id.
 
@@ -637,61 +641,121 @@ def _tree_positions(nodes: Sequence[Mapping]) -> dict[int, float]:
     return positions
 
 
-def _color_range(nodes: Sequence[Mapping], color: str) -> tuple[float, float]:
-    """Return the ends of the color scale of a class's tree and map.
+def _color_scale(nodes: Sequence[Mapping], color: str) -> tuple[float, float, float]:
+    """Return the low end, middle and high end of a tree's color scale.
 
-    The ends come from the leaves, since a node's rate pools the rows
-    of the leaves below it and so stays within theirs; the tree and the
-    map of a class share one scale. A rate goes from 0 to its largest,
-    the purity from its smallest to 1.
+    The middle is the value at the top of the tree, the rate of the
+    class or of the subtree shown, so that a node reads as better or
+    worse than its whole. The ends are the 2nd and 98th percentiles of
+    the leaves, since a node's rate pools the rows of the leaves below
+    it and so stays within theirs, and a few extreme leaves would
+    otherwise wash out the rest; they stay within 0 and 1, where every
+    measure lives. The tree and the map share one scale.
     """
-    values = [
+    leaf_values = [
         node[color]
         for node in nodes
         if node["status"] == "leaf" and node[color] is not None
     ]
-    if not values:
-        return 0.0, 1.0
-    if color == "purity":
-        low, high = min(values), 1.0
-    else:
-        low, high = 0.0, max(values)
-    if high - low < 1e-9:
-        return (high - 1, high) if color == "purity" else (low, low + 1)
-    return low, high
+    if not leaf_values:
+        return 0.0, 0.5, 1.0
+    top = next(node[color] for node in nodes if node["parent_id"] is None)
+    middle = float(np.mean(leaf_values)) if top is None else float(top)
+    low, high = np.percentile(leaf_values, [2, 98])
+    # The middle stays inside the scale, with room on both sides.
+    margin = 0.05 * max(high - low, 1e-6)
+    low, high = min(low, middle - margin), max(high, middle + margin)
+    return max(float(low), 0.0), middle, min(float(high), 1.0)
 
 
-def _fill_step(value: float | None, low: float, high: float) -> str:
-    """Pick the fill step of a value on a scale; neutral if unknown."""
-    if value is None:
-        return NEUTRAL
-    step = int((value - low) / (high - low) * len(_FILL_STEPS))
-    return _FILL_STEPS[min(max(step, 0), len(_FILL_STEPS) - 1)]
+def _color_marker(
+    nodes: Sequence[Mapping],
+    color: str,
+    painted: Sequence[Mapping] | None = None,
+) -> dict[str, object]:
+    """Build the marker settings that color the marks by a measure.
+
+    A value is colored by its distance from the middle of the scale, as
+    a share of the way to the end on its side, square-rooted: the leaves
+    close to the middle, most of them, still show which side they are
+    on.
+
+    Args:
+        nodes: The `queries.class_tree` rows shown, which set the scale.
+        color: The key of `TREE_COLORS`.
+        painted: The node each mark takes its color from, in the order
+            of the marks; `nodes` when None.
+
+    Returns:
+        The color of each node, from -1 to 1, with its scale and its
+        bar, which is labelled with the values. A failure rate is worse
+        above the middle, so red; a purity is worse below.
+    """
+    low, middle, high = _color_scale(nodes, color)
+    # Red at the high end of the scale, which a purity has at its low
+    # one.
+    sign = -1 if color == "purity" else 1
+
+    def position(value: float | None) -> float | None:
+        if value is None:
+            return None
+        if value == middle:
+            return 0.0
+        reach = (value - middle) / ((high if value >= middle else low) - middle)
+        return sign * math.copysign(min(reach, 1.0) ** 0.5, value - middle)
+
+    def value_at(share: float) -> float:
+        end = high if share > 0 else low
+        return middle + (end - middle) * share**2
+
+    shares = [-1, -0.5, 0, 0.5, 1]
+    ticks = sorted(
+        (
+            sign * share,
+            (
+                f"top {_format_rate(middle)}"
+                if not share
+                else _format_rate(value_at(share))
+            ),
+        )
+        for share in shares
+    )
+    return {
+        "color": [
+            position(node[color]) for node in (nodes if painted is None else painted)
+        ],
+        "colorscale": [
+            [at, hex_color]
+            for at, hex_color in zip((0, 0.25, 0.5, 0.75, 1), _DIVERGING, strict=True)
+        ],
+        "cmin": -1,
+        "cmax": 1,
+        "colorbar": {
+            "title": TREE_COLORS[color],
+            "thickness": 12,
+            "tickvals": [at for at, _ in ticks],
+            "ticktext": [text for _, text in ticks],
+        },
+    }
 
 
 def tree_diagram(
-    nodes: Sequence[Mapping],
-    *,
-    color: str,
-    run_id: int,
-    focus: Collection[int] | None = None,
+    nodes: Sequence[Mapping], *, color: str, run_id: int
 ) -> dict[str, object]:
-    """Draw the tree of one predicted class, root on top.
+    """Draw the tree of a predicted class, or a subtree, root on top.
 
     Args:
         nodes: The `queries.class_tree` rows, the kept nodes of the
-            class.
+            class, or those of `queries.subtree`.
         color: The key of `TREE_COLORS` that colors the nodes.
         run_id: The run, for the link of each leaf to its page.
-        focus: The ids of a subtree the map shows; the nodes outside it
-            fade. None fades none.
 
     Returns:
         A node-link figure: a marker per node sized by its train rows
         and colored by `color`, squares for the leaves; the hover gives
         the counts and rates of train, val and test. A leaf links to
         its page, and a node that splits carries its id, for the click
-        that zooms the map on it.
+        that zooms the tree and the map on it.
     """
     positions = _tree_positions(nodes)
     by_id = {node["node_id"]: node for node in nodes}
@@ -703,7 +767,6 @@ def tree_diagram(
             edges_x += [positions[parent["node_id"]], positions[node["node_id"]], None]
             edges_y += [parent["depth"], node["depth"], None]
     biggest = max((node["n_train"] for node in nodes), default=1) or 1
-    low, high = _color_range(nodes, color)
     marks = {
         "type": "scatter",
         "mode": "markers",
@@ -722,16 +785,8 @@ def tree_diagram(
             "symbol": [
                 "square" if node["status"] == "leaf" else "circle" for node in nodes
             ],
-            "opacity": [
-                1 if focus is None or node["node_id"] in focus else 0.3
-                for node in nodes
-            ],
             "size": [6 + 18 * (node["n_train"] / biggest) ** 0.5 for node in nodes],
-            "color": [node[color] for node in nodes],
-            "colorscale": _SEQUENTIAL,
-            "cmin": low,
-            "cmax": high,
-            "colorbar": {"title": TREE_COLORS[color], "thickness": 12},
+            **_color_marker(nodes, color),
             "line": {"width": 1, "color": NEUTRAL},
         },
         "hovertemplate": "%{text}<extra></extra>",
@@ -754,75 +809,91 @@ def tree_diagram(
     return {"data": [edges, marks], "layout": layout}
 
 
+def _central_range(values: np.ndarray) -> dict[str, list[float]]:
+    """Frame the bulk of an axis's points, leaving out the far tails.
+
+    A few outliers stretch a PCA plane until the points that matter
+    crowd into one corner; the autoscale of the toolbar brings them
+    back.
+
+    Returns:
+        The `range` of the axis: the 1st to 99th percentile of the
+        values, widened by a fifth on each side; empty when they do not
+        spread.
+    """
+    low, high = np.percentile(values, [1, 99])
+    if high <= low:
+        return {}
+    pad = 0.2 * (high - low)
+    return {"range": [float(low - pad), float(high + pad)]}
+
+
 def leaf_map(
     nodes: Sequence[Mapping], plane: ClassPlane, *, color: str, run_id: int
 ) -> dict[str, object]:
-    """Draw the leaves of one predicted class as circles in a plane.
+    """Draw the train rows of a class's leaves as points in a plane.
 
     Args:
-        nodes: The `queries.class_tree` rows, the kept nodes of the
-            class.
-        plane: The circles of the leaves, from `artifacts.class_plane`.
-        color: The key of `TREE_COLORS` that colors the leaves, on the
+        nodes: The `queries.class_tree` rows shown.
+        plane: The points of the leaves' rows, from
+            `artifacts.class_plane`.
+        color: The key of `TREE_COLORS` that colors the points, on the
             scale of `tree_diagram`.
-        run_id: The run, for the link of each leaf to its page.
+        run_id: The run, for the link of each point to its leaf's page.
 
     Returns:
-        A figure with a circle per leaf that has train rows, centred on
-        their mean with their RMS distance as radius, and a marker on
-        each centre; the hover is the tree's. The axes share a scale so
-        the circles stay round.
+        A figure with a point per row drawn, in the color of its leaf;
+        the points farthest from the middle of the scale come last, so
+        that they stay on top; a leaf with no value is neutral. The
+        hover is the leaf's, and the axes share a scale so that distances
+        read true.
     """
-    low, high = _color_range(nodes, color)
-    leaves = [node for node in nodes if node["node_id"] in plane.circles]
-    # The largest first, so that the small circles stay visible.
-    leaves.sort(key=lambda node: -plane.circles[node["node_id"]][2])
-    shapes = []
-    for node in leaves:
-        x, y, radius = plane.circles[node["node_id"]]
-        shapes.append(
-            {
-                "type": "circle",
-                "xref": "x",
-                "yref": "y",
-                "x0": x - radius,
-                "x1": x + radius,
-                "y0": y - radius,
-                "y1": y + radius,
-                "fillcolor": _fill_step(node[color], low, high),
-                "opacity": 0.45,
-                "line": {"color": NEUTRAL, "width": 1},
-                "layer": "below",
-            }
-        )
-    centres = {
-        "type": "scatter",
-        "mode": "markers",
-        "x": [plane.circles[node["node_id"]][0] for node in leaves],
-        "y": [plane.circles[node["node_id"]][1] for node in leaves],
-        "text": [_tree_hover(node) for node in leaves],
-        "customdata": [f"/runs/{run_id}/leaves/{node['node_id']}" for node in leaves],
-        "marker": {
-            "size": 7,
-            "color": [node[color] for node in leaves],
-            "colorscale": _SEQUENTIAL,
-            "cmin": low,
-            "cmax": high,
-            "colorbar": {"title": TREE_COLORS[color], "thickness": 12},
-            "line": {"width": 1, "color": NEUTRAL},
-        },
-        "hovertemplate": "%{text}<extra></extra>",
-    }
+    by_id = {node["node_id"]: node for node in nodes}
+    owners = [by_id[leaf] for leaf in plane.leaves.tolist()]
+    marker = _color_marker(nodes, color, owners)
+    colors = marker["color"]
+    # The points of a leaf without a value go first, in neutral, beneath
+    # the rest; the others come farthest from the middle last, so that
+    # they stay on top.
+    unknown = [i for i, position in enumerate(colors) if position is None]
+    known = sorted(
+        (i for i, position in enumerate(colors) if position is not None),
+        key=lambda i: abs(colors[i]),
+    )
+    points = np.round(plane.points, 4)
+
+    def draw(rows: list[int], settings: dict[str, object]) -> dict[str, object]:
+        return {
+            "type": "scattergl",
+            "mode": "markers",
+            "x": points[rows, 0].tolist(),
+            "y": points[rows, 1].tolist(),
+            "text": [_leaf_hover(owners[i]) for i in rows],
+            "customdata": [
+                f"/runs/{run_id}/leaves/{owners[i]['node_id']}" for i in rows
+            ],
+            "marker": {"size": 5, "opacity": 0.8, **settings},
+            "hovertemplate": "%{text}<extra></extra>",
+        }
+
+    traces = []
+    if unknown:
+        traces.append(draw(unknown, {"color": NEUTRAL}))
+    if known:
+        traces.append(draw(known, {**marker, "color": [colors[i] for i in known]}))
     first, second = plane.shares
     layout = {
         "height": 520,
         "showlegend": False,
-        "shapes": shapes,
-        "xaxis": {"title": f"PC 1 · {first:.0%} of the variance"},
+        "xaxis": {
+            "title": f"PC 1 · {first:.0%} of the variance",
+            **_central_range(points[:, 0]),
+        },
         "yaxis": {
             "title": f"PC 2 · {second:.0%} of the variance",
             "scaleanchor": "x",
             "scaleratio": 1,
+            **_central_range(points[:, 1]),
         },
     }
-    return {"data": [centres], "layout": layout}
+    return {"data": traces, "layout": layout}
