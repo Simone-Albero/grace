@@ -10,6 +10,7 @@ __all__ = [
     "PREDICTOR_COLORS",
     "SERIES",
     "TREE_COLORS",
+    "TREE_PLANES",
     "class_score_bars",
     "confusion_heatmap",
     "grid_search",
@@ -66,6 +67,9 @@ TREE_COLORS = {
     "val_rate": "val rate",
     "test_rate": "test rate",
 }
+# The space whose principal plane the map of a class's leaves shows,
+# by key.
+TREE_PLANES = {"z": "z", "z_sd": "z + s_d"}
 # An entity keeps its color in every figure.
 _SPLIT_COLORS = {"train": SERIES[0], "val": SERIES[1], "test": SERIES[2]}
 _SCORE_COLORS = {"precision": SERIES[0], "recall": SERIES[1], "f1": SERIES[2]}
@@ -202,7 +206,7 @@ def confusion_heatmap(counts: np.ndarray, names: Sequence[str]) -> dict[str, obj
                     }
                 )
     layout = {
-        "height": max(380, 38 * len(names) + 140),
+        "height": max(480, 44 * len(names) + 160),
         "xaxis": {"title": "predicted", "type": "category"},
         "yaxis": {"title": "true", "type": "category", "autorange": "reversed"},
         "annotations": notes,

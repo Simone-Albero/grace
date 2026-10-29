@@ -184,6 +184,14 @@ def test_the_tree_of_a_class_draws_and_rejects_a_missing_one(
         client.get(f"/runs/{run_id}/trees?class_id={class_id}&color=nope").status_code
         == 400
     )
+    for plane in charts.TREE_PLANES:
+        redrawn = client.get(f"/runs/{run_id}/trees?class_id={class_id}&plane={plane}")
+        assert redrawn.status_code == 200, plane
+        assert f"first two components of {charts.TREE_PLANES[plane]}" in redrawn.text
+    assert (
+        client.get(f"/runs/{run_id}/trees?class_id={class_id}&plane=nope").status_code
+        == 400
+    )
     assert client.get(f"/runs/{run_id}/trees?class_id=999999").status_code == 404
     assert client.get(f"/runs/{run_id}/trees?class_id=abc").status_code == 422
     assert client.get(f"/runs/{run_id}/trees").status_code == 422
@@ -276,6 +284,19 @@ def test_the_test_rate_colors_a_tree_only_when_evaluate_ran() -> None:
     assert list(tabs.tree_colors({"tree": 1})) == ["purity", "oof_rate", "val_rate"]
 
 
+def test_the_map_offers_the_disagreement_axis_only_when_the_tree_has_one() -> None:
+    """Check the planes a run offers, which the route accepts too."""
+    grown = {"mu_d": 0.2, "sigma_d": 0.1, "d_scale": 2.0}
+    assert list(tabs.tree_planes(grown)) == ["z", "z_sd"]
+    assert tabs.disagreement_axis(grown) == artifacts.DisagreementAxis(0.2, 0.1, 2.0)
+    # d_weight=0 grows the tree on z alone.
+    assert list(tabs.tree_planes({**grown, "d_scale": 0.0})) == ["z"]
+    assert tabs.disagreement_axis({**grown, "sigma_d": None}) is None
+    # A `d` that never varies is standardized to zeros: the same plane.
+    assert tabs.disagreement_axis({**grown, "sigma_d": 0.0}) is None
+    assert tabs.disagreement_axis({}) is None
+
+
 @pytest.mark.parametrize(
     ("plane", "note"),
     [
@@ -294,7 +315,7 @@ def test_the_tree_of_a_class_says_why_it_has_no_map(
     note: str,
 ) -> None:
     """Check that the tree still draws, and a note replaces the map."""
-    monkeypatch.setattr(artifacts, "class_plane", lambda *args: plane)
+    monkeypatch.setattr(artifacts, "class_plane", lambda *args, **kwargs: plane)
     page = client.get(f"/runs/{run_id}/trees?class_id=0")
     assert page.status_code == 200 and page.text.count('class="chart"') == 1
     assert note in page.text

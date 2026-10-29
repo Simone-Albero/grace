@@ -14,9 +14,9 @@
   chosen below against the rate at the top of the tree: blue is better than it, red worse, and the ends of the scale
   are the 2nd and 98th percentiles of the leaves. Hover a node for its counts and rates, click a leaf for its page.</p>
 <p class="muted">The map under the tree draws a sample of the train rows of each leaf, at most a thousand of them thinned to
-  the same count per leaf, in the plane of the first two principal components of the class's train rows in the LDA
-  space, each point in the color of its leaf; the view leaves out the farthest 1% on each side, and the autoscale button of the chart shows all. The tree also cuts on the disagreement of the neighbours, an axis the
-  plane does not show. Click a node that splits to cut the tree down to its subtree, with the map refitted to the
+  the same count per leaf, in the plane of the first two principal components of the class's train rows, in the LDA
+  space z or, when picked, in z with <b>s_d</b>, the disagreement of the neighbours standardized and weighted as the
+  tree grew on it, each point in the color of its leaf; the view leaves out the farthest 1% on each side, and the autoscale button of the chart shows all. The tree also cuts on s_d, an axis the plane of z alone does not show. Click a node that splits to cut the tree down to its subtree, with the map refitted to the
   rows below it; Reset, or the class in the path above the tree, brings back the whole.</p>
 <form class="filters" hx-get="/runs/{{ run.id }}/trees" hx-target="#tree" hx-trigger="load, change"
       autocomplete="off">
@@ -30,6 +30,13 @@
       {% for key, label in colors.items() %}<option value="{{ key }}">{{ label }}</option>{% endfor %}
     </select>
   </label>
+  {% if planes | length > 1 %}
+  <label>map plane of
+    <select name="plane">
+      {% for key, label in planes.items() %}<option value="{{ key }}">{{ label }}</option>{% endfor %}
+    </select>
+  </label>
+  {% endif %}
   <input type="hidden" name="node" value="">
 </form>
 <div id="tree"></div>

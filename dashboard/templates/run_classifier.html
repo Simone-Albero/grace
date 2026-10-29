@@ -2,9 +2,9 @@
 {% block content %}
 {{ m.tiles(tiles) }}
 <div class="grid">
+  {% if figures.confusion %}{{ m.chart(figures.confusion, "Confusion matrix on test, each row a true class", wide=True) }}
+  {% elif classes %}<section class="card wide"><h3>Confusion matrix</h3><p class="note">{{ confusion_note }}</p></section>{% endif %}
   {% if figures.scores %}{{ m.chart(figures.scores, "Test scores per class") }}{% endif %}
-  {% if figures.confusion %}{{ m.chart(figures.confusion, "Confusion matrix on test, each row a true class") }}
-  {% elif classes %}<section class="card"><h3>Confusion matrix</h3><p class="note">{{ confusion_note }}</p></section>{% endif %}
   {% if figures.grid %}{{ m.chart(figures.grid, "Grid search, cross-validated score") }}{% endif %}
   {% if figures.loss %}{{ m.chart(figures.loss, "Training loss") }}{% endif %}
 </div>

@@ -1,6 +1,6 @@
 """The context of each tab of a run page: tiles, tables and figures."""
 
-__all__ = ["TABS", "build", "tree_colors"]
+__all__ = ["TABS", "build", "disagreement_axis", "tree_colors", "tree_planes"]
 
 import sqlite3
 from collections.abc import Mapping, Sequence
@@ -246,6 +246,45 @@ def tree_colors(ids: Mapping[str, int]) -> dict[str, str]:
     }
 
 
+def disagreement_axis(
+    tree_metrics: Mapping[str, float | None],
+) -> artifacts.DisagreementAxis | None:
+    """Read how the tree built its axis `s_d` from its metrics.
+
+    Args:
+        tree_metrics: The metrics of the tree execution.
+
+    Returns:
+        The axis; None when the tree was grown on z alone, or on a `d`
+        that never varied (the tree standardizes it to zeros), since
+        there is no `s_d` to add.
+    """
+    mean, std, scale = (
+        tree_metrics.get(name) for name in ("mu_d", "sigma_d", "d_scale")
+    )
+    if mean is None or std is None or not scale or std <= 1e-12:
+        return None
+    return artifacts.DisagreementAxis(mean, std, scale)
+
+
+def tree_planes(tree_metrics: Mapping[str, float | None]) -> dict[str, str]:
+    """Return what the map of a class's leaves can be drawn in, by key.
+
+    Args:
+        tree_metrics: The metrics of the tree execution.
+
+    Returns:
+        `charts.TREE_PLANES`, without `z + s_d` when the tree has no
+        `s_d`, since the two planes would be the same.
+    """
+    has_axis = disagreement_axis(tree_metrics) is not None
+    return {
+        key: label
+        for key, label in charts.TREE_PLANES.items()
+        if key != "z_sd" or has_axis
+    }
+
+
 def _tree(
     db: sqlite3.Connection, ids: Mapping[str, int], metrics: _Metrics, run_id: int
 ) -> dict:
@@ -255,6 +294,7 @@ def _tree(
         "tiles": _tiles(metrics, _TILES["tree"]),
         "roots": queries.tree_roots(db, ids["tree"], ids["prepare"]),
         "colors": tree_colors(ids),
+        "planes": tree_planes(metrics["tree"]),
         "leaves": leaves,
         "figures": {
             "sizes": charts.leaf_size_bars(leaves),

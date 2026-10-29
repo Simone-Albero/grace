@@ -441,6 +441,7 @@ def create_app(db_path: Path) -> FastAPI:
         run_id: _Id,
         class_id: _ClassId,
         color: str = "purity",
+        plane: str = "z",
         # A string: the form sends an empty `node` for the whole class,
         # which an int parameter would reject.
         node: str = "",
@@ -451,6 +452,10 @@ def create_app(db_path: Path) -> FastAPI:
         _check_choice("color", color, tabs.tree_colors(ids))
         if "tree" not in ids:
             raise HTTPException(404, f"Run {run_id} has no done tree stage")
+        tree_metrics = queries.metrics_by_stage(connection, {"tree": ids["tree"]})[
+            "tree"
+        ]
+        _check_choice("plane", plane, tabs.tree_planes(tree_metrics))
         nodes = queries.class_tree(connection, ids, class_id)
         if not nodes:
             raise HTTPException(404, f"Run {run_id} has no tree of class {class_id}")
@@ -473,7 +478,14 @@ def create_app(db_path: Path) -> FastAPI:
         dirs = queries.execution_dirs(run_context["run"])
         space_dir, tree_dir = root / dirs["space"], root / dirs["tree"]
         leaf_ids = [row["node_id"] for row in shown if row["status"] == "leaf"]
-        plane = artifacts.class_plane(space_dir, tree_dir, leaf_ids)
+        leaf_plane = artifacts.class_plane(
+            space_dir,
+            tree_dir,
+            leaf_ids,
+            disagreement=(
+                tabs.disagreement_axis(tree_metrics) if plane == "z_sd" else None
+            ),
+        )
         context = {
             "name": nodes[0]["class"],
             "n_nodes": len(shown),
@@ -483,21 +495,22 @@ def create_app(db_path: Path) -> FastAPI:
             "figure": charts.tree_diagram(shown, color=color, run_id=run_id),
             "plane_figure": None,
             "plane_note": None,
+            "plane_space": charts.TREE_PLANES[plane],
         }
-        if plane is None:
+        if leaf_plane is None:
             context["plane_note"] = (
                 f"The map needs {space_dir / 'z.parquet'} and "
                 f"{tree_dir / 'rows.parquet'}, and they are missing or "
                 "disagree in train length."
             )
-        elif not plane.leaves.size:
+        elif not leaf_plane.leaves.size:
             context["plane_note"] = (
                 "No train row has this class as its prediction, so its leaves "
                 "have no region."
             )
         else:
             context["plane_figure"] = charts.leaf_map(
-                shown, plane, color=color, run_id=run_id
+                shown, leaf_plane, color=color, run_id=run_id
             )
         return render(request, "_tree.html", context)
 

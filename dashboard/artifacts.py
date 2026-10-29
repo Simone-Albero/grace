@@ -1,6 +1,6 @@
 """What the dashboard reads from the artifact files, not the DB."""
 
-__all__ = ["ClassPlane", "class_plane", "confusion"]
+__all__ = ["ClassPlane", "DisagreementAxis", "class_plane", "confusion"]
 
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -50,14 +50,29 @@ _MAX_POINTS = 8000
 
 
 @dataclass(frozen=True)
+class DisagreementAxis:
+    """How the tree turned a row's disagreement `d` into its axis `s_d`.
+
+    Attributes:
+        mean: The mean of `d` on train.
+        std: The standard deviation of `d` on train.
+        scale: The weight of the standardized `d` among the LDA axes.
+    """
+
+    mean: float
+    std: float
+    scale: float
+
+
+@dataclass(frozen=True)
 class ClassPlane:
     """Train rows of the leaves of a class in a 2D plane.
 
     Attributes:
         leaves: The node id of the leaf each point belongs to.
         points: The `(x, y)` of each train row drawn, one per row.
-        shares: The share of the placed leaves' variance in z that each
-            of the two axes holds.
+        shares: The share of the placed leaves' variance, in z or in z
+            and `s_d`, that each of the two axes holds.
     """
 
     leaves: np.ndarray
@@ -71,6 +86,9 @@ def _leaf_stats(
 ) -> dict[int, tuple[int, np.ndarray, np.ndarray, np.ndarray]] | None:
     """Count each leaf's train rows, with their moments and a sample.
 
+    The points are the axes of z followed by the row's disagreement `d`,
+    so that a plane with or without `s_d` comes out of the same read.
+
     Cached, since reading the files takes seconds on a large dataset.
 
     Args:
@@ -81,8 +99,8 @@ def _leaf_stats(
             artifacts, is read again.
 
     Returns:
-        The `(n_rows, mean, covariance, sample)` in z of each leaf that
-        has train rows, by node id, the sample being at most
+        The `(n_rows, mean, covariance, sample)` in z and `d` of each
+        leaf that has train rows, by node id, the sample being at most
         `_ROWS_PER_LEAF` rows drawn at random; None if the two files do
         not have the same train length.
     """
@@ -90,7 +108,7 @@ def _leaf_stats(
     z = pd.read_parquet(space_dir / "z.parquet", filters=train_only)
     z = z.sort_values("row")
     tree_rows = pd.read_parquet(
-        tree_dir / "rows.parquet", columns=["row", "leaf"], filters=train_only
+        tree_dir / "rows.parquet", columns=["row", "leaf", "d"], filters=train_only
     ).sort_values("row")
     if len(z) != len(tree_rows):
         return None
@@ -98,7 +116,7 @@ def _leaf_stats(
         (name for name in z.columns if name.startswith("z_")),
         key=lambda name: int(name[2:]),
     )
-    points = z[z_columns].to_numpy()
+    points = np.column_stack([z[z_columns].to_numpy(), tree_rows["d"].to_numpy()])
     row_leaves = tree_rows["leaf"].to_numpy()
     order = np.argsort(row_leaves, kind="stable")
     node_ids, starts, sizes = np.unique(
@@ -144,26 +162,58 @@ def _points_per_leaf(sample_sizes: Sequence[int], budget: int) -> int:
     return low
 
 
+def _space_transform(
+    n_axes: int, disagreement: DisagreementAxis | None
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build the map from the cached points, z then `d`, to a space.
+
+    The space is the one whose principal plane the map draws: z, or z
+    and `s_d`.
+
+    Args:
+        n_axes: The number of axes of z.
+        disagreement: How the tree built `s_d`; None to leave it out.
+
+    Returns:
+        The offset to subtract from a point and the matrix to multiply
+        it by, which keeps z and turns `d` into `s_d` or drops it.
+    """
+    offset = np.zeros(n_axes + 1)
+    if disagreement is None:
+        return offset, np.eye(n_axes + 1)[:, :n_axes]
+    weights = np.eye(n_axes + 1)
+    offset[-1] = disagreement.mean
+    weights[-1, -1] = disagreement.scale / disagreement.std
+    return offset, weights
+
+
 def class_plane(
-    space_dir: Path, tree_dir: Path, leaf_ids: Sequence[int]
+    space_dir: Path,
+    tree_dir: Path,
+    leaf_ids: Sequence[int],
+    *,
+    disagreement: DisagreementAxis | None = None,
 ) -> ClassPlane | None:
     """Place a sample of the leaves' train rows in their PCA plane.
 
     The plane is the first two principal axes of the leaves' train rows
-    in z, so it shows where the tree cut the space the LDA made. Each
-    leaf contributes a random sample of its rows, thinned to the same
-    count per leaf so that the whole stays within `_MAX_POINTS`.
+    in z, or in z with the axis `s_d` the tree also cut on, so it shows
+    where the tree cut the space. Each leaf contributes a random sample
+    of its rows, thinned to the same count per leaf so that the whole
+    stays within `_MAX_POINTS`.
 
     Args:
         space_dir: The folder of a space execution.
         tree_dir: The folder of a tree execution.
         leaf_ids: The node ids of the leaves to place: a class's, or
             those below one of its nodes.
+        disagreement: How the tree built `s_d`, to add it to the axes
+            of z; None for z alone.
 
     Returns:
         The points; None if a file is missing or the two do not have
         the same train length. The points are empty when no leaf has a
-        train row. With a single LDA axis the y of every point is 0.
+        train row. With one LDA axis and no `s_d`, the y of every point is 0.
     """
     files = (space_dir / "z.parquet", tree_dir / "rows.parquet")
     if not all(file.is_file() for file in files):
@@ -178,11 +228,22 @@ def class_plane(
     leaf_stats = _leaf_stats(space_dir, tree_dir, stamp)
     if leaf_stats is None:
         return None
-    leaves = {
+    selected = {
         node_id: leaf_stats[node_id] for node_id in leaf_ids if node_id in leaf_stats
     }
-    if not leaves:
+    if not selected:
         return ClassPlane(np.empty(0, dtype=np.int64), np.empty((0, 2)), (0.0, 0.0))
+    n_axes = len(next(iter(selected.values()))[1]) - 1
+    offset, weights = _space_transform(n_axes, disagreement)
+    leaves = {
+        node_id: (
+            n_rows,
+            (leaf_mean - offset) @ weights,
+            weights.T @ leaf_cov @ weights,
+            (sample - offset) @ weights,
+        )
+        for node_id, (n_rows, leaf_mean, leaf_cov, sample) in selected.items()
+    }
     n_class_rows = sum(n_rows for n_rows, _, _, _ in leaves.values())
     mean = (
         sum(n_rows * leaf_mean for n_rows, leaf_mean, _, _ in leaves.values())
