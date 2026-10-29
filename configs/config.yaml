@@ -9,7 +9,6 @@ groups:                    # the option of each group, configs/<group>/<option>.
   fit: default             # how a DL classifier is trained: epochs, early stopping
   complexity: default
   grid_search: default
-  crossfit: default
   tree: default
 
 seed: 42

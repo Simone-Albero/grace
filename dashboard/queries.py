@@ -35,7 +35,7 @@ from pathlib import Path
 # a test keeps the two equal, since importing the runner here would load
 # every stage's dependencies.
 STAGE_ORDER = (
-    "split prepare space classify crossfit tree complexity baselines evaluate render"
+    "split prepare space classify tree complexity baselines evaluate render"
 ).split()
 # The failure predictors, each with its label; its scores are the
 # `evaluate` metrics `<key>_<score>`.
@@ -325,16 +325,17 @@ def tree_roots(
         prepare_id: The execution id of prepare, for the class names.
 
     Returns:
-        One row per class: id, name, the train rows and out-of-fold
-        errors at its root, its leaves and the depth of its cut.
+        One row per class: id, name, the grown rows and the
+        classifier's errors among them at its root, its leaves and the
+        depth of its cut.
     """
     return _all(
         db,
         """
         SELECT k.class_id, k.name,
-               SUM(CASE WHEN t.parent_id IS NULL THEN t.n_train END) AS n_train,
-               SUM(CASE WHEN t.parent_id IS NULL THEN t.n_train_errors END)
-                 AS n_train_errors,
+               SUM(CASE WHEN t.parent_id IS NULL THEN t.n_grow END) AS n_grow,
+               SUM(CASE WHEN t.parent_id IS NULL THEN t.n_grow_errors END)
+                 AS n_grow_errors,
                SUM(t.status = 'leaf') AS n_leaves,
                MAX(CASE WHEN t.status != 'pruned' THEN t.depth END) AS depth
         FROM tree_nodes t
@@ -355,7 +356,7 @@ def leaves(db: sqlite3.Connection, ids: Mapping[str, int]) -> list[dict[str, obj
 
     Returns:
         One row per leaf, with None where a stage did not run or a
-        count is 0: the out-of-fold, val and test rates, the tree's
+        count is 0: the grow, estimate and test rates, the tree's
         rate `q` and the mean corrected probability of the leaf's test
         rows.
     """
@@ -363,8 +364,8 @@ def leaves(db: sqlite3.Connection, ids: Mapping[str, int]) -> list[dict[str, obj
         db,
         """
         SELECT t.node_id, t.class_id, k.name AS class, t.depth,
-               t.n_train, t.n_train_errors, t.n_val, t.n_val_errors, t.q, t.gamma,
-               l.n_test, l.n_test_errors, l.mean_q
+               t.n_grow, t.n_grow_errors, t.n_estimate, t.n_estimate_errors,
+               t.q, t.gamma, l.n_test, l.n_test_errors, l.mean_q
         FROM tree_nodes t
         JOIN classes k ON k.execution_id = :prepare AND k.class_id = t.class_id
         LEFT JOIN leaf_tests l
@@ -379,11 +380,11 @@ def leaves(db: sqlite3.Connection, ids: Mapping[str, int]) -> list[dict[str, obj
 
 
 def _add_rates(rows: Sequence[dict[str, object]]) -> None:
-    """Add the out-of-fold, val and test rates, None for 0 rows."""
+    """Add the grow, estimate and test rates, None for 0 rows."""
     for row in rows:
         for rate, errors, count in (
-            ("oof_rate", "n_train_errors", "n_train"),
-            ("val_rate", "n_val_errors", "n_val"),
+            ("grow_rate", "n_grow_errors", "n_grow"),
+            ("estimate_rate", "n_estimate_errors", "n_estimate"),
             ("test_rate", "n_test_errors", "n_test"),
         ):
             row[rate] = row[errors] / row[count] if row[count] else None
@@ -401,15 +402,15 @@ def class_tree(
 
     Returns:
         One row per node that was not pruned, parents first, with the
-        `purity` of its train rows: the share of the class's own. A node's
-        test counts are the sums over the leaves below it, and None
-        when evaluate did not run.
+        `purity` of its grown rows: the share of the class's own. A
+        node's test counts are the sums over the leaves below it, and
+        None when evaluate did not run.
     """
     rows = _all(
         db,
         """
         SELECT t.node_id, t.parent_id, k.name AS class, t.depth, t.status,
-               t.n_train, t.n_train_errors, t.n_val, t.n_val_errors, t.q,
+               t.n_grow, t.n_grow_errors, t.n_estimate, t.n_estimate_errors, t.q,
                l.n_test, l.n_test_errors
         FROM tree_nodes t
         JOIN classes k ON k.execution_id = :prepare AND k.class_id = t.class_id
@@ -435,10 +436,10 @@ def class_tree(
         for key in ("n_test", "n_test_errors"):
             parent[key] = (parent[key] or 0) + row[key]
     _add_rates(rows)
-    # Every train row of the tree has the class as its prediction, so the
-    # out-of-fold errors are the rows of another class.
+    # Every grown row of the tree has the class as its prediction, so
+    # the errors are the rows of another class.
     for row in rows:
-        row["purity"] = None if row["oof_rate"] is None else 1 - row["oof_rate"]
+        row["purity"] = None if row["grow_rate"] is None else 1 - row["grow_rate"]
     return rows
 
 
@@ -506,8 +507,8 @@ def leaf_path(
           SELECT t.node_id, t.parent_id FROM tree_nodes t
           JOIN path p ON t.node_id = p.parent_id WHERE t.execution_id = :tree
         )
-        SELECT t.node_id, t.depth, t.status, t.n_train, t.n_train_errors,
-               t.n_val, t.n_val_errors
+        SELECT t.node_id, t.depth, t.status, t.n_grow, t.n_grow_errors,
+               t.n_estimate, t.n_estimate_errors
         FROM tree_nodes t JOIN path USING (node_id)
         WHERE t.execution_id = :tree ORDER BY t.depth
         """,

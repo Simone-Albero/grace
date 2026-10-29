@@ -4,10 +4,10 @@ A tree has one root per predicted class. Every node splits its rows in
 two with 2-means, and a row goes to the nearer of the two centres: the
 rule that builds the tree is the rule that routes a new row. The points
 are the rows' coordinates plus the share of nearest train rows that
-disagree with the prediction, as one more axis. The out-of-fold errors
-of train then say how deep to cut, each leaf gets the failure rate of
-the validation rows that reach it, and a per-row correction moves it
-with the classifier's own confidence.
+disagree with the prediction, as one more axis. The errors of the rows
+the tree grew on say how deep to cut, each leaf gets the failure rate of
+the other rows that reach it, and a per-row correction moves it with the
+classifier's own confidence.
 """
 
 __all__ = [
@@ -217,23 +217,21 @@ def prune_tree(
     tree: Tree,
     n_rows: np.ndarray,
     n_errors: np.ndarray,
-    *,
-    n_train: int,
-    n_val: int,
+    n_estimate: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Cut every tree where its leaves' expected Brier score is least.
 
     A node costs the spread of the errors it hides plus the noise of a
-    rate estimated on the validation rows it should receive, which are
-    its share of train times `n_val`. A node stays a leaf unless its two
-    best subtrees cost strictly less, found bottom-up.
+    rate estimated on the estimation rows that reach it. A node stays a
+    leaf unless its two best subtrees cost strictly less, found
+    bottom-up.
 
     Args:
         tree: The grown tree.
-        n_rows: The train rows under every node.
-        n_errors: The out-of-fold errors among them.
-        n_train: The train rows.
-        n_val: The validation rows.
+        n_rows: The rows the tree grew on, under every node.
+        n_errors: The classifier's errors among them.
+        n_estimate: The rows the leaf rates will be estimated on, under
+            every node; their labels are not read.
 
     Returns:
         Per node: whether it is a leaf of the cut, whether the cut keeps
@@ -242,15 +240,17 @@ def prune_tree(
     """
     n_rows = np.asarray(n_rows, dtype=np.float64)
     n_errors = np.asarray(n_errors, dtype=np.float64)
-    share = n_rows / n_train
-    expected_val = np.maximum(n_rows * n_val / n_train, _RATE_EPS)
+    share = n_rows / n_rows[tree.root].sum()
+    # A leaf no estimation row reaches takes the fitted line, so it is
+    # costed as if one did.
+    n_estimate_floored = np.maximum(np.asarray(n_estimate, dtype=np.float64), 1.0)
     observed = np.divide(
         n_errors, n_rows, out=np.zeros_like(n_errors), where=n_rows > 0
     )
     smoothed = (n_errors + 1) / (n_rows + 2)
     cost = share * (
         observed * (1 - observed) * n_rows / np.maximum(n_rows - 1, 1)
-        + smoothed * (1 - smoothed) / expected_val
+        + smoothed * (1 - smoothed) / n_estimate_floored
     )
     best = cost.copy()
     is_leaf = np.ones(len(cost), dtype=bool)
@@ -291,7 +291,7 @@ def _tau_squared(
 def fit_fay_herriot(
     errors: np.ndarray, counts: np.ndarray, covariate: np.ndarray
 ) -> tuple[float, float, float]:
-    """Fit the Fay-Herriot model of the leaves' validation rates.
+    """Fit the Fay-Herriot model of the leaves' observed rates.
 
     Each leaf's rate is the line `a + b * covariate` plus a spread of
     variance `tau²` that the line misses, observed with the binomial
@@ -299,9 +299,9 @@ def fit_fay_herriot(
     covariate value, has no slope.
 
     Args:
-        errors: Each leaf's validation errors.
-        counts: Each leaf's validation rows, all above 0.
-        covariate: Each leaf's out-of-fold rate.
+        errors: Each leaf's errors among its estimation rows.
+        counts: Each leaf's estimation rows, all above 0.
+        covariate: Each leaf's error rate on the rows the tree grew on.
 
     Returns:
         The intercept, the slope and `tau²`, never negative.
@@ -347,19 +347,19 @@ def shrink_rates(
     slope: float,
     tau2: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Move each leaf's validation rate toward the fitted line.
+    """Move each leaf's observed rate toward the fitted line.
 
     Args:
-        errors: Each leaf's validation errors.
-        counts: Each leaf's validation rows; 0 is allowed.
-        covariate: Each leaf's out-of-fold rate.
+        errors: Each leaf's errors among its estimation rows.
+        counts: Each leaf's estimation rows; 0 is allowed.
+        covariate: Each leaf's error rate on the rows the tree grew on.
         intercept: The line's intercept.
         slope: The line's slope.
         tau2: The spread the line misses.
 
     Returns:
-        Each leaf's rate and the weight its own validation rate got,
-        NaN for a leaf without validation rows, which takes the line.
+        Each leaf's rate and the weight its own observed rate got, NaN
+        for a leaf without estimation rows, which takes the line.
     """
     errors = np.asarray(errors, dtype=np.float64)
     counts = np.asarray(counts, dtype=np.float64)
@@ -389,9 +389,9 @@ def neighbour_disagreement(
     index: NearestNeighbors,
     y_train: np.ndarray,
     predicted: np.ndarray,
+    points: np.ndarray,
     *,
     n_neighbours: int,
-    points: np.ndarray | None = None,
 ) -> np.ndarray:
     """Return the share of nearest train rows of another class.
 
@@ -399,28 +399,23 @@ def neighbour_disagreement(
         index: The fitted index of the train points.
         y_train: The train labels.
         predicted: Each row's predicted class.
+        points: The rows' points.
         n_neighbours: The neighbours.
-        points: The rows' points; None queries the train rows
-            themselves, each without itself.
 
     Returns:
         Share of the `n_neighbours` nearest train rows not labelled as
         predicted.
     """
-    if points is None:
-        # Queried without points, the index leaves each row out.
-        neighbours = index.kneighbors(n_neighbors=n_neighbours, return_distance=False)
-    else:
-        neighbours = np.vstack(
-            [
-                index.kneighbors(
-                    points[start : start + _NEIGHBOUR_CHUNK],
-                    n_neighbors=n_neighbours,
-                    return_distance=False,
-                )
-                for start in range(0, len(points), _NEIGHBOUR_CHUNK)
-            ]
-        )
+    neighbours = np.vstack(
+        [
+            index.kneighbors(
+                points[start : start + _NEIGHBOUR_CHUNK],
+                n_neighbors=n_neighbours,
+                return_distance=False,
+            )
+            for start in range(0, len(points), _NEIGHBOUR_CHUNK)
+        ]
+    )
     return (y_train[neighbours] != np.asarray(predicted)[:, None]).mean(axis=1)
 
 
@@ -460,7 +455,7 @@ def correct_rates(
 def fit_beta(
     leaf_rate: np.ndarray, standardized: np.ndarray, errors: np.ndarray
 ) -> float:
-    """Fit the slope of the correction on validation rows.
+    """Fit the slope of the correction on estimation rows.
 
     Args:
         leaf_rate: Each row's leaf rate.

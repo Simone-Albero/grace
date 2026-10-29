@@ -63,8 +63,8 @@ _DIVERGING = ["#2166ac", "#92c5de", _DIVERGING_NEUTRAL, "#f4a582", "#b2182b"]
 # What colors the nodes of a class's tree, by the key of the node.
 TREE_COLORS = {
     "purity": "purity",
-    "oof_rate": "train rate (out-of-fold)",
-    "val_rate": "val rate",
+    "grow_rate": "grow rate",
+    "estimate_rate": "estimate rate",
     "test_rate": "test rate",
 }
 # The space whose principal plane the map of a class's leaves shows,
@@ -72,6 +72,8 @@ TREE_COLORS = {
 TREE_PLANES = {"z": "z", "z_sd": "z + s_d"}
 # An entity keeps its color in every figure.
 _SPLIT_COLORS = {"train": SERIES[0], "val": SERIES[1], "test": SERIES[2]}
+# The same for the rows a leaf counts: the two halves of val, then test.
+_SUBSET_COLORS = {"grow": SERIES[0], "estimate": SERIES[1], "test": SERIES[2]}
 _SCORE_COLORS = {"precision": SERIES[0], "recall": SERIES[1], "f1": SERIES[2]}
 PREDICTOR_COLORS = dict(zip(PREDICTORS, SERIES))
 # Most classes that get a numbered cell.
@@ -474,22 +476,22 @@ def _leaf_scatter(
 
 
 def shrinkage_scatter(leaves: Sequence[Mapping], *, run_id: int) -> dict[str, object]:
-    """Draw each leaf's estimate against its raw val failure rate.
+    """Draw each leaf's estimate against its raw estimate-half rate.
 
     Args:
         leaves: The `queries.leaves` rows.
         run_id: The run, for the link of each marker to its leaf.
 
     Returns:
-        A figure of the leaves with val rows, sized by them; the points
-        off the diagonal are the ones the shrinkage moved.
+        A figure of the leaves with estimate rows, sized by them; the
+        points off the diagonal are the ones the shrinkage moved.
     """
     return _leaf_scatter(
         leaves,
-        x_key="val_rate",
+        x_key="estimate_rate",
         y_key="q",
-        size_key="n_val",
-        x_title="val failure rate of the leaf",
+        size_key="n_estimate",
+        x_title="failure rate of the leaf on the estimate half",
         y_title="estimate q",
         run_id=run_id,
     )
@@ -522,39 +524,42 @@ def _size_label(bin_: int) -> str:
 
 
 def leaf_size_bars(leaves: Sequence[Mapping]) -> dict[str, object]:
-    """Count the leaves by their rows per split, in power-of-two bins.
+    """Count the leaves by their rows per subset, in power-of-two bins.
 
     Args:
         leaves: The `queries.leaves` rows.
 
     Returns:
-        A grouped-bar figure with a series per split; test is left out
-        when no leaf has a test count. The 0 bin holds the leaves that
-        no row of the split reaches.
+        A grouped-bar figure with a series per subset of rows: the grow
+        and estimate halves of val, and test, left out when no leaf has
+        a test count. The 0 bin holds the leaves that no row of the
+        subset reaches.
     """
     counts = {
-        split: [leaf[f"n_{split}"] for leaf in leaves if leaf[f"n_{split}"] is not None]
-        for split in _SPLIT_COLORS
+        subset: [
+            leaf[f"n_{subset}"] for leaf in leaves if leaf[f"n_{subset}"] is not None
+        ]
+        for subset in _SUBSET_COLORS
     }
-    counts = {split: values for split, values in counts.items() if values}
+    counts = {subset: values for subset, values in counts.items() if values}
     n_bins = (
         max((max(values).bit_length() for values in counts.values()), default=0) + 1
     )
     labels = [_size_label(bin_) for bin_ in range(n_bins)]
     traces = []
-    for split, values in counts.items():
+    for subset, values in counts.items():
         per_bin = [0] * n_bins
         for value in values:
             per_bin[value.bit_length()] += 1
         traces.append(
             {
                 "type": "bar",
-                "name": split,
+                "name": subset,
                 "x": labels,
                 "y": per_bin,
-                "marker": {"color": _SPLIT_COLORS[split]},
+                "marker": {"color": _SUBSET_COLORS[subset]},
                 "hovertemplate": (
-                    f"{split} · %{{x}} rows: %{{y:,}} leaves<extra></extra>"
+                    f"{subset} · %{{x}} rows: %{{y:,}} leaves<extra></extra>"
                 ),
             }
         )
@@ -583,13 +588,13 @@ def _tree_hover(node: Mapping) -> str:
     lines = [
         f"node {node['node_id']} · {kind}",
         (
-            f"train {_format_count(node['n_train'])} · "
-            f"oof rate {_format_rate(node['oof_rate'])} · "
+            f"grow {_format_count(node['n_grow'])} · "
+            f"grow rate {_format_rate(node['grow_rate'])} · "
             f"purity {_format_rate(node['purity'])}"
         ),
         (
-            f"val {_format_count(node['n_val'])} · "
-            f"val rate {_format_rate(node['val_rate'])}"
+            f"estimate {_format_count(node['n_estimate'])} · "
+            f"estimate rate {_format_rate(node['estimate_rate'])}"
         ),
         (
             f"test {_format_count(node['n_test'])} · "
@@ -608,8 +613,8 @@ def _leaf_hover(node: Mapping) -> str:
     than the tree's.
     """
     return (
-        f"leaf {node['node_id']} · train {_format_count(node['n_train'])}<br>"
-        f"oof rate {_format_rate(node['oof_rate'])} · q {_format_rate(node['q'])}"
+        f"leaf {node['node_id']} · grow {_format_count(node['n_grow'])}<br>"
+        f"grow rate {_format_rate(node['grow_rate'])} · q {_format_rate(node['q'])}"
     )
 
 
@@ -755,11 +760,11 @@ def tree_diagram(
         run_id: The run, for the link of each leaf to its page.
 
     Returns:
-        A node-link figure: a marker per node sized by its train rows
+        A node-link figure: a marker per node sized by its grown rows
         and colored by `color`, squares for the leaves; the hover gives
-        the counts and rates of train, val and test. A leaf links to
-        its page, and a node that splits carries its id, for the click
-        that zooms the tree and the map on it.
+        the counts and rates of the grow half, the estimate half and
+        test. A leaf links to its page, and a node that splits carries
+        its id, for the click that zooms the tree and the map on it.
     """
     positions = _tree_positions(nodes)
     by_id = {node["node_id"]: node for node in nodes}
@@ -770,7 +775,7 @@ def tree_diagram(
         if parent is not None:
             edges_x += [positions[parent["node_id"]], positions[node["node_id"]], None]
             edges_y += [parent["depth"], node["depth"], None]
-    biggest = max((node["n_train"] for node in nodes), default=1) or 1
+    biggest = max((node["n_grow"] for node in nodes), default=1) or 1
     marks = {
         "type": "scatter",
         "mode": "markers",
@@ -789,7 +794,7 @@ def tree_diagram(
             "symbol": [
                 "square" if node["status"] == "leaf" else "circle" for node in nodes
             ],
-            "size": [6 + 18 * (node["n_train"] / biggest) ** 0.5 for node in nodes],
+            "size": [6 + 18 * (node["n_grow"] / biggest) ** 0.5 for node in nodes],
             **_color_marker(nodes, color),
             "line": {"width": 1, "color": NEUTRAL},
         },

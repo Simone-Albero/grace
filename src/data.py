@@ -7,6 +7,7 @@ __all__ = [
     "cap_per_class",
     "drop_nans",
     "drop_rare_classes",
+    "halve",
     "ml_split",
     "stratified_holdout",
 ]
@@ -164,6 +165,33 @@ def stratified_holdout(
         stratify=rows[label_col],
     )
     return fit, holdout
+
+
+def halve(labels: np.ndarray, *, random_state: int) -> np.ndarray:
+    """Pick one stratified half of the rows.
+
+    The same labels and seed always pick the same half, so two stages
+    that call it agree on which rows are in it.
+
+    Args:
+        labels: The rows' class ids.
+        random_state: The seed of the pick.
+
+    Returns:
+        Whether each row is in the first half, the smaller one when the
+        count is odd.
+
+    Raises:
+        ValueError: A class has fewer than two rows, so it could not be
+            on both halves.
+    """
+    rows = pd.DataFrame({"label": labels})
+    first, _ = stratified_holdout(
+        rows, holdout_frac=0.5, label_col="label", random_state=random_state
+    )
+    is_first = np.zeros(len(rows), dtype=bool)
+    is_first[first.index] = True
+    return is_first
 
 
 class LogTransformer(BaseEstimator, TransformerMixin):

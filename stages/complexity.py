@@ -1,19 +1,19 @@
-"""F/N/ND/T/G complexity descriptors of each leaf and class, on train.
+"""F/N/ND/T/G complexity descriptors of each leaf and class of the tree.
 
-A leaf holds train rows of several classes, so it is measured as its
+The rows are the val rows the tree grew on, with their true labels. A
+leaf holds rows of several classes, so it is measured as its
 (leaf, class) populations, each against the nearest populations of
 another class, and a leaf's descriptors are the means of its
 populations' measures, weighted by their rows. A population under
 `complexity.min_population` rows is left out and is nobody's rival.
 DB rows written: `complexity` (one row per scope, id and measure) and
-metrics n_measures, n_populations and n_unmeasured_rows.
+metrics n_measures, n_populations, n_unmeasured_rows and n_graph_rows.
 """
 
 __all__ = ["CONFIG", "INPUTS", "FILES", "OUTPUTS", "run"]
 
 import logging
 from collections.abc import Mapping
-from pathlib import Path
 
 import joblib
 import numpy as np
@@ -26,14 +26,14 @@ from src.complexity.common import (
     weighted_group_measures,
 )
 from src.complexity.measure import compute_population_complexity
-from src.graph import TrainGraph, nearest_neighbors
+from src.graph import RowGraph, build_row_graph, nearest_neighbors, subsample_indices
 from src.grouping import RowsBy
 from src.space import Space
 from stages import LABEL, Context
 
 logger = logging.getLogger(__name__)
 
-CONFIG = ("complexity", "graph.k", "seed")
+CONFIG = ("complexity", "graph", "seed")
 INPUTS = ("prepare", "space", "tree")
 FILES = ()
 # The stage writes DB rows only.
@@ -45,9 +45,9 @@ def _draw_sample(
     cfg: DictConfig,
     *,
     space: Space,
-    train: pd.DataFrame,
+    grown: pd.DataFrame,
     population: np.ndarray,
-    train_graph: TrainGraph,
+    graph: RowGraph,
     graph_rows: np.ndarray,
     cap: int | None,
     n_jobs: int,
@@ -56,7 +56,7 @@ def _draw_sample(
 
     Returns:
         Up to `cap` rows of every population but -1 (the unmeasured),
-        in train order, with their nearest graph nodes.
+        in row order, with their nearest graph nodes.
     """
     by_population = RowsBy(population)
     rng = np.random.default_rng(cfg.seed)
@@ -72,14 +72,14 @@ def _draw_sample(
     is_measured_node = population[graph_rows] >= 0
     if np.array_equal(rows, graph_rows[is_measured_node]):
         return MeasuredSample(
-            train_graph.points[is_measured_node],
+            graph.points[is_measured_node],
             population[rows],
-            train_graph.knn_idx[is_measured_node],
-            train_graph.knn_dist[is_measured_node],
+            graph.knn_idx[is_measured_node],
+            graph.knn_dist[is_measured_node],
         )
-    points = space.embed(train.iloc[rows])
+    points = space.embed(grown.iloc[rows])
     neighbors, neighbor_dist = nearest_neighbors(
-        train_graph.points,
+        graph.points,
         graph_rows,
         points,
         rows,
@@ -92,7 +92,7 @@ def _draw_sample(
 def _measure(
     cfg: DictConfig,
     *,
-    train_graph: TrainGraph,
+    graph: RowGraph,
     graph_rows: np.ndarray,
     population: np.ndarray,
     sample: MeasuredSample,
@@ -102,7 +102,7 @@ def _measure(
     """Return the complexity measures of every population, by id."""
     ids, counts = np.unique(population[population >= 0], return_counts=True)
     return compute_population_complexity(
-        train_graph,
+        graph,
         population[graph_rows],
         sample,
         population_class=population_class,
@@ -136,35 +136,35 @@ def _long_rows(
     return pd.DataFrame(rows)
 
 
-def _load_train_graph(
-    space_dir: Path, space: Space, train: pd.DataFrame
-) -> tuple[TrainGraph, np.ndarray]:
-    """Load the train graph of space and the train rows it covers."""
-    with np.load(space_dir / "graph.npz") as stored:
-        graph_arrays = {name: stored[name] for name in stored.files}
-    graph_rows = graph_arrays["rows"]
-    train_graph = TrainGraph(
-        space.embed(train.iloc[graph_rows]),
-        graph_arrays["knn_idx"],
-        graph_arrays["knn_dist"],
-        graph_arrays["mst"],
+def _build_graph(
+    cfg: DictConfig, space: Space, grown: pd.DataFrame, *, n_jobs: int
+) -> tuple[RowGraph, np.ndarray]:
+    """Return a graph of grown rows, sampled uniformly, and its rows."""
+    graph_rows = np.sort(
+        subsample_indices(
+            len(grown), max_samples=cfg.graph.max_samples, random_state=cfg.seed
+        )
     )
-    return train_graph, graph_rows
+    graph = build_row_graph(
+        space.embed(grown.iloc[graph_rows]), k=cfg.graph.k, n_jobs=n_jobs
+    )
+    return graph, graph_rows
 
 
 def _compute_population_centroids(
-    space: Space, train: pd.DataFrame, population: np.ndarray
+    space: Space, grown: pd.DataFrame, population: np.ndarray
 ) -> dict[int, np.ndarray]:
     """Return the exact centroid of every measured population.
 
-    Train is embedded in chunks, as a whole it may not fit in memory.
+    The rows are embedded in chunks, as a whole they may not fit in
+    memory.
     """
     sums = None
-    for start in range(0, len(train), _CENTROID_ROWS):
+    for start in range(0, len(grown), _CENTROID_ROWS):
         chunk_population = population[start : start + _CENTROID_ROWS]
         is_measured = chunk_population >= 0
         points = space.embed(
-            train.iloc[start : start + _CENTROID_ROWS][is_measured]
+            grown.iloc[start : start + _CENTROID_ROWS][is_measured]
         ).astype(np.float64)
         chunk_sums = pd.DataFrame(points).groupby(chunk_population[is_measured]).sum()
         sums = chunk_sums if sums is None else sums.add(chunk_sums, fill_value=0.0)
@@ -174,22 +174,20 @@ def _compute_population_centroids(
 
 
 def run(ctx: Context) -> None:
-    """Measure every leaf and class of the train split.
+    """Measure every leaf and class of the grown half of val.
 
     Args:
         ctx: The stage context.
     """
     cfg = ctx.cfg
-    space_dir = ctx.inputs["space"].dir
-    space = joblib.load(space_dir / "space.joblib")
-    train = pd.read_parquet(ctx.inputs["prepare"].dir / "train.parquet")
-    train_graph, graph_rows = _load_train_graph(space_dir, space, train)
-    leaf = (
-        ctx.split_rows("tree", "rows.parquet", "train", ["leaf"])["leaf"]
-        .to_numpy()
-        .astype(np.int64)
-    )
-    label = train[LABEL].to_numpy(dtype=np.int64)
+    space = joblib.load(ctx.inputs["space"].dir / "space.joblib")
+    val = pd.read_parquet(ctx.inputs["prepare"].dir / "val.parquet")
+    tree_rows = ctx.split_rows("tree", "rows.parquet", "val", ["grow", "leaf"])
+    is_grow = tree_rows["grow"].to_numpy()
+    grown = val[is_grow].reset_index(drop=True)
+    graph, graph_rows = _build_graph(cfg, space, grown, n_jobs=ctx.runtime.n_jobs)
+    leaf = tree_rows["leaf"].to_numpy()[is_grow].astype(np.int64)
+    label = grown[LABEL].to_numpy(dtype=np.int64)
     n_classes = int(label.max()) + 1
 
     # One id per (leaf, class); a thin population is -1: its rows stay
@@ -206,29 +204,29 @@ def run(ctx: Context) -> None:
     if not population_class:
         raise ValueError(
             "No (leaf, class) population has complexity.min_population="
-            f"{cfg.complexity.min_population} train rows: lower it or grow "
+            f"{cfg.complexity.min_population} rows: lower it or grow "
             "bigger leaves with a smaller tree.n_min."
         )
 
-    graph_is_sample = len(graph_rows) < len(train)
+    graph_is_sample = len(graph_rows) < len(grown)
     population_sample = _draw_sample(
         cfg,
         space=space,
-        train=train,
+        grown=grown,
         population=population,
-        train_graph=train_graph,
+        graph=graph,
         graph_rows=graph_rows,
         cap=cfg.complexity.max_sample_per_population if graph_is_sample else None,
         n_jobs=ctx.runtime.n_jobs,
     )
     population_measures = _measure(
         cfg,
-        train_graph=train_graph,
+        graph=graph,
         graph_rows=graph_rows,
         population=population,
         sample=population_sample,
         population_class=population_class,
-        centroids=_compute_population_centroids(space, train, population),
+        centroids=_compute_population_centroids(space, grown, population),
     )
     leaf_measures = weighted_group_measures(
         population_measures,
@@ -242,16 +240,16 @@ def run(ctx: Context) -> None:
     label_sample = _draw_sample(
         cfg,
         space=space,
-        train=train,
+        grown=grown,
         population=label,
-        train_graph=train_graph,
+        graph=graph,
         graph_rows=graph_rows,
         cap=cfg.complexity.max_sample_per_class if graph_is_sample else None,
         n_jobs=ctx.runtime.n_jobs,
     )
     class_measures = _measure(
         cfg,
-        train_graph=train_graph,
+        graph=graph,
         graph_rows=graph_rows,
         population=label,
         sample=label_sample,
@@ -270,5 +268,6 @@ def run(ctx: Context) -> None:
             "n_measures": rows["measure"].nunique(),
             "n_populations": len(population_class),
             "n_unmeasured_rows": int((population < 0).sum()),
+            "n_graph_rows": len(graph_rows),
         }
     )

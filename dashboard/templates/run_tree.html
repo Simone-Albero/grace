@@ -1,20 +1,20 @@
 {% extends "run_base.html" %}
 {% block content %}
-<p class="muted">Each predicted class has a tree of 2-means splits in the LDA space. A leaf is a region: its
-  estimate <b>q</b> is the failure rate of the val rows routed to it, shrunk toward its out-of-fold rate.
+<p class="muted">Each predicted class has a tree of 2-means splits in the LDA space, grown on one half of val. A leaf is a region: its
+  estimate <b>q</b> is the failure rate of the other half of val routed to it, shrunk toward its rate on the grown half.
   Click a marker, or a leaf id, for its page.</p>
 {{ m.tiles(tiles) }}
 <div class="grid">
   {{ m.chart(figures.sizes, "Leaf sizes, per split") }}
-  {{ m.chart(figures.shrinkage, "Estimate against the raw val rate of each leaf") }}
+  {{ m.chart(figures.shrinkage, "Estimate against the raw rate of each leaf on the estimate half") }}
   {{ m.chart(figures.test, "Test rate of each leaf against its estimate") }}
 </div>
 <h2>Tree of a class</h2>
-<p class="muted">A square is a leaf, a circle a node that splits; size follows the train rows. Color shows the measure
+<p class="muted">A square is a leaf, a circle a node that splits; size follows the grown rows. Color shows the measure
   chosen below against the rate at the top of the tree: blue is better than it, red worse, and the ends of the scale
   are the 2nd and 98th percentiles of the leaves. Hover a node for its counts and rates, click a leaf for its page.</p>
-<p class="muted">The map under the tree draws a sample of the train rows of each leaf, at most a thousand of them thinned to
-  the same count per leaf, in the plane of the first two principal components of the class's train rows, in the LDA
+<p class="muted">The map under the tree draws a sample of the grown rows of each leaf, at most a thousand of them thinned to
+  the same count per leaf, in the plane of the first two principal components of the class's grown rows, in the LDA
   space z or, when picked, in z with <b>s_d</b>, the disagreement of the neighbours standardized and weighted as the
   tree grew on it, each point in the color of its leaf; the view leaves out the farthest 1% on each side, and the autoscale button of the chart shows all. The tree also cuts on s_d, an axis the plane of z alone does not show. Click a node that splits to cut the tree down to its subtree, with the map refitted to the
   rows below it; Reset, or the class in the path above the tree, brings back the whole.</p>
@@ -42,11 +42,11 @@
 <div id="tree"></div>
 <h2>Predicted classes</h2>
 <div class="scroll"><table>
-  <thead><tr><th>class</th><th class="num">train rows</th><th class="num">out-of-fold errors</th>
+  <thead><tr><th>class</th><th class="num">grown rows</th><th class="num">errors among them</th>
     <th class="num">leaves</th><th class="num">depth of the cut</th></tr></thead>
   <tbody>
   {% for r in roots %}
-  <tr><td>{{ r.name }}</td><td class="num">{{ r.n_train | num }}</td><td class="num">{{ r.n_train_errors | num }}</td>
+  <tr><td>{{ r.name }}</td><td class="num">{{ r.n_grow | num }}</td><td class="num">{{ r.n_grow_errors | num }}</td>
     <td class="num">{{ r.n_leaves | num }}</td><td class="num">{{ r.depth | num }}</td></tr>
   {% endfor %}
   </tbody>

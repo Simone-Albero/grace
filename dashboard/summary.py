@@ -147,7 +147,7 @@ def experiment_figures(experiment: Experiment) -> list[tuple[str, dict]]:
             "Failure rate",
             "error rate",
             {
-                "val": "tree.val_error_rate",
+                "val": "baselines.val_error_rate",
                 "test": "evaluate.test_error_rate",
             },
         ),

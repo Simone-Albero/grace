@@ -112,7 +112,7 @@ def test_run_overview_and_tabs(client: TestClient, run_id: int) -> None:
         "tree": (
             "Predicted classes",
             "Leaves",
-            "Estimate against the raw val rate",
+            "Estimate against the raw rate",
             "Leaf sizes, per split",
             "Tree of a class",
             'name="color"',
@@ -281,7 +281,11 @@ def test_the_test_rate_colors_a_tree_only_when_evaluate_ran() -> None:
     """Check the colors a run offers, which the route accepts too."""
     assert "test_rate" in tabs.tree_colors({"tree": 1, "evaluate": 2})
     assert "test_rate" not in tabs.tree_colors({"tree": 1})
-    assert list(tabs.tree_colors({"tree": 1})) == ["purity", "oof_rate", "val_rate"]
+    assert list(tabs.tree_colors({"tree": 1})) == [
+        "purity",
+        "grow_rate",
+        "estimate_rate",
+    ]
 
 
 def test_the_map_offers_the_disagreement_axis_only_when_the_tree_has_one() -> None:
@@ -303,7 +307,7 @@ def test_the_map_offers_the_disagreement_axis_only_when_the_tree_has_one() -> No
         (None, "The map needs"),
         (
             artifacts.ClassPlane(np.empty(0, dtype=int), np.empty((0, 2)), (0, 0)),
-            "No train row has",
+            "No grown row has",
         ),
     ],
 )
@@ -333,11 +337,11 @@ def test_class_tree_sums_the_test_rows_of_the_leaves_into_each_node(
     leaves = [node for node in nodes if node["status"] == "leaf"]
     assert top["n_test"] == sum(leaf["n_test"] for leaf in leaves) > 0
     assert top["n_test_errors"] == sum(leaf["n_test_errors"] for leaf in leaves)
-    assert top["n_train"] >= sum(leaf["n_train"] for leaf in leaves)
+    assert top["n_grow"] >= sum(leaf["n_grow"] for leaf in leaves)
     assert all(
-        node["purity"] == pytest.approx(1 - node["oof_rate"])
+        node["purity"] == pytest.approx(1 - node["grow_rate"])
         for node in nodes
-        if node["n_train"]
+        if node["n_grow"]
     )
     without_evaluate = {key: value for key, value in ids.items() if key != "evaluate"}
     with closing(queries.connect(path)) as db:

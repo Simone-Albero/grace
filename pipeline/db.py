@@ -124,15 +124,15 @@ CREATE TABLE IF NOT EXISTS tree_nodes (
     parent_id INTEGER,  -- NULL at a root, the root of a predicted class
     class_id INTEGER NOT NULL,  -- the predicted class of the root above it
     depth INTEGER NOT NULL,
-    n_train INTEGER NOT NULL,  -- train rows at or below it
-    n_train_errors INTEGER NOT NULL,  -- their out-of-fold errors
+    n_grow INTEGER NOT NULL,  -- grown rows (val's first half) at or below it
+    n_grow_errors INTEGER NOT NULL,  -- the classifier's errors among them
     cost REAL NOT NULL,  -- its expected Brier cost as a leaf
     best REAL NOT NULL,  -- the least cost of its subtree
     status TEXT NOT NULL CHECK (status IN ('internal', 'leaf', 'pruned')),
-    n_val INTEGER,  -- validation rows at or below it; NULL when pruned
-    n_val_errors INTEGER,  -- NULL when pruned
+    n_estimate INTEGER,  -- the same for val's other half; NULL when pruned
+    n_estimate_errors INTEGER,  -- NULL when pruned
     q REAL,  -- the leaf's failure rate; NULL unless a leaf
-    gamma REAL,  -- the weight of the leaf's own val rate; NULL without val rows
+    gamma REAL,  -- the weight of the leaf's own estimate rate; NULL without rows
     PRIMARY KEY (execution_id, node_id)
 );
 CREATE TABLE IF NOT EXISTS leaf_tests (

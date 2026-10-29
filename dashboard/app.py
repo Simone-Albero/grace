@@ -28,7 +28,7 @@ _Id = Annotated[int, PathParam(ge=0, le=2**63 - 1)]
 _ClassId = Annotated[int, Query(ge=0, le=2**63 - 1)]
 # The columns of the leaves table, in reading order.
 _LEAF_COLUMNS = (
-    "node_id class depth n_train oof_rate n_val val_rate q gamma n_test "
+    "node_id class depth n_grow grow_rate n_estimate estimate_rate q gamma n_test "
     "test_rate mean_q"
 ).split()
 _MAX_LEAVES = 500
@@ -501,11 +501,11 @@ def create_app(db_path: Path) -> FastAPI:
             context["plane_note"] = (
                 f"The map needs {space_dir / 'z.parquet'} and "
                 f"{tree_dir / 'rows.parquet'}, and they are missing or "
-                "disagree in train length."
+                "disagree in val length."
             )
         elif not leaf_plane.leaves.size:
             context["plane_note"] = (
-                "No train row has this class as its prediction, so its leaves "
+                "No grown row has this class as its prediction, so its leaves "
                 "have no region."
             )
         else:

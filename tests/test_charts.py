@@ -53,11 +53,11 @@ def test_predictor_bars_keep_the_predictors_with_a_value() -> None:
     assert trace["x"] == ["Tree", "GBM"] and trace["y"] == [0.9, 0.8]
 
 
-def test_shrinkage_scatter_drops_a_leaf_without_val_rows_and_links_the_rest() -> None:
-    """Check only leaves with a val rate are drawn, each linked."""
+def test_shrinkage_scatter_links_only_the_leaves_with_estimate_rows() -> None:
+    """Check only leaves with an estimate rate are drawn, and linked."""
     leaves = [
-        {"node_id": 3, "class": "a", "n_val": 40, "val_rate": 0.1, "q": 0.12},
-        {"node_id": 4, "class": "a", "n_val": 0, "val_rate": None, "q": 0.2},
+        {"node_id": 3, "class": "a", "n_estimate": 40, "estimate_rate": 0.1, "q": 0.12},
+        {"node_id": 4, "class": "a", "n_estimate": 0, "estimate_rate": None, "q": 0.2},
     ]
     points = shrinkage_scatter(leaves, run_id=7)["data"][1]
     assert points["x"] == [0.1] and points["y"] == [0.12]
@@ -72,11 +72,11 @@ def _node(
         "parent_id": parent_id,
         "depth": depth,
         "status": status,
-        "n_train": 10,
-        "oof_rate": 0.1,
+        "n_grow": 10,
+        "grow_rate": 0.1,
         "purity": 0.9,
-        "n_val": 4,
-        "val_rate": None,
+        "n_estimate": 4,
+        "estimate_rate": None,
         "n_test": None,
         "test_rate": None,
         "q": 0.2,
@@ -104,7 +104,7 @@ def test_tree_diagram_centers_parents_and_links_only_leaves() -> None:
     assert len(edges["x"]) == 3 * 4
     # An unknown count reads as a dash, never as None or 0.
     assert "purity 0.9000" in marks["text"][2]
-    assert "val 4 · val rate –" in marks["text"][2]
+    assert "estimate 4 · estimate rate –" in marks["text"][2]
     assert "test – · test rate –" in marks["text"][2]
 
 
@@ -121,27 +121,27 @@ def test_tree_diagram_tags_the_splits_for_the_zoom() -> None:
 
 
 def _class_nodes() -> list[dict]:
-    """A root over three leaves, two of them with a val rate."""
+    """A root over three leaves, two of them with an estimate rate."""
     return [
-        _node(0, None, 0, "internal", oof_rate=0.2, purity=0.8, val_rate=0.3),
-        _node(1, 0, 1, "leaf", oof_rate=0.4, purity=0.6, val_rate=0.5),
-        _node(2, 0, 1, "leaf", oof_rate=0.1, purity=0.9, val_rate=0.1),
-        _node(3, 0, 1, "leaf", oof_rate=0.0, purity=1.0, val_rate=None),
+        _node(0, None, 0, "internal", grow_rate=0.2, purity=0.8, estimate_rate=0.3),
+        _node(1, 0, 1, "leaf", grow_rate=0.4, purity=0.6, estimate_rate=0.5),
+        _node(2, 0, 1, "leaf", grow_rate=0.1, purity=0.9, estimate_rate=0.1),
+        _node(3, 0, 1, "leaf", grow_rate=0.0, purity=1.0, estimate_rate=None),
     ]
 
 
 def test_tree_diagram_colors_by_the_chosen_measure_around_the_rate_of_the_top() -> None:
     """Check the colors, the bar and a scale centred on the root."""
     nodes = _class_nodes()
-    marker = tree_diagram(nodes, color="val_rate", run_id=1)["data"][1]["marker"]
-    # The root's val rate is the middle; the two leaves that have one
-    # lie beyond the 2nd and 98th percentiles of themselves, so they
+    marker = tree_diagram(nodes, color="estimate_rate", run_id=1)["data"][1]["marker"]
+    # The root's estimate rate is the middle; the two leaves that have
+    # one lie beyond the 2nd and 98th percentiles of themselves, so they
     # take the ends.
     assert marker["color"] == [0, 1, -1, None]
     assert (marker["cmin"], marker["cmax"]) == (-1, 1)
     assert [color for _, color in marker["colorscale"]] == _DIVERGING
     bar = marker["colorbar"]
-    assert bar["title"] == "val rate"
+    assert bar["title"] == "estimate rate"
     assert bar["tickvals"] == [-1, -0.5, 0, 0.5, 1]
     assert bar["ticktext"][0] == "0.1080" and bar["ticktext"][2] == "top 0.3000"
     assert bar["ticktext"][1] == "0.2520" and bar["ticktext"][4] == "0.4920"
@@ -162,24 +162,24 @@ def test_tree_diagram_colors_by_the_chosen_measure_around_the_rate_of_the_top() 
 def test_color_scale_keeps_its_middle_inside_and_its_ends_within_0_and_1() -> None:
     """Check the margin around a root past every leaf, and the clamp."""
     nodes = [
-        _node(0, None, 0, "internal", oof_rate=0.05, purity=1.0),
-        _node(1, 0, 1, "leaf", oof_rate=0.2, purity=0.8),
-        _node(2, 0, 1, "leaf", oof_rate=0.2, purity=0.8),
+        _node(0, None, 0, "internal", grow_rate=0.05, purity=1.0),
+        _node(1, 0, 1, "leaf", grow_rate=0.2, purity=0.8),
+        _node(2, 0, 1, "leaf", grow_rate=0.2, purity=0.8),
     ]
-    low, middle, high = _color_scale(nodes, "oof_rate")
+    low, middle, high = _color_scale(nodes, "grow_rate")
     assert 0 <= low < middle < high
     low, middle, high = _color_scale(nodes, "purity")
     # A purity of 1 at the top is as high as it goes: no room above it.
     assert low < middle == high == 1.0
     # A root on the edge of 0..1 leaves the scale inside it, and still draws.
     edge = [
-        _node(0, None, 0, "internal", oof_rate=0.0, purity=1.0),
-        _node(1, 0, 1, "leaf", oof_rate=0.0, purity=1.0),
-        _node(2, 0, 1, "leaf", oof_rate=0.2, purity=0.8),
+        _node(0, None, 0, "internal", grow_rate=0.0, purity=1.0),
+        _node(1, 0, 1, "leaf", grow_rate=0.0, purity=1.0),
+        _node(2, 0, 1, "leaf", grow_rate=0.2, purity=0.8),
     ]
-    assert _color_scale(edge, "oof_rate")[0] == 0.0
+    assert _color_scale(edge, "grow_rate")[0] == 0.0
     assert _color_scale(edge, "purity")[2] == 1.0
-    for color in ("oof_rate", "purity"):
+    for color in ("grow_rate", "purity"):
         marker = tree_diagram(edge, color=color, run_id=1)["data"][1]["marker"]
         assert all(-1 <= at <= 1 for at in marker["color"])
         assert not any(text.startswith("-") for text in marker["colorbar"]["ticktext"])
@@ -187,14 +187,14 @@ def test_color_scale_keeps_its_middle_inside_and_its_ends_within_0_and_1() -> No
 
 def test_leaf_map_draws_a_point_per_row_with_the_extremes_on_top() -> None:
     """Check the points, their colors and order, and the axes."""
-    nodes = _class_nodes() + [_node(4, 0, 1, "leaf", val_rate=0.35)]
-    nodes[1]["val_rate"] = 0.6
+    nodes = _class_nodes() + [_node(4, 0, 1, "leaf", estimate_rate=0.35)]
+    nodes[1]["estimate_rate"] = 0.6
     plane = ClassPlane(
         np.array([1, 2, 2, 3, 4]),
         np.array([[0, 0], [3, 1], [3, 2], [-1, -1], [5, 5]], dtype=float),
         (0.75, 0.2),
     )
-    figure = leaf_map(nodes, plane, color="val_rate", run_id=9)
+    figure = leaf_map(nodes, plane, color="estimate_rate", run_id=9)
     unknown, points = figure["data"]
     assert points["type"] == "scattergl"
     # Leaf 3 has no rate: neutral, beneath. Then, closest to the middle
@@ -215,7 +215,9 @@ def test_leaf_map_draws_a_point_per_row_with_the_extremes_on_top() -> None:
     one_axis = ClassPlane(np.array([1, 1]), np.array([[0.0, 0.0], [2.0, 0.0]]), (1, 0))
     assert (
         "range"
-        not in leaf_map(nodes, one_axis, color="val_rate", run_id=9)["layout"]["yaxis"]
+        not in leaf_map(nodes, one_axis, color="estimate_rate", run_id=9)["layout"][
+            "yaxis"
+        ]
     )
     assert layout["xaxis"]["title"] == "PC 1 · 75% of the variance"
     assert layout["yaxis"]["title"] == "PC 2 · 20% of the variance"
@@ -230,19 +232,19 @@ def test_dark_theme_keeps_the_diverging_order_and_darkens_its_middle() -> None:
     assert f'DIVERGING_NEUTRAL = "{_DIVERGING_NEUTRAL}"' in text
 
 
-def test_leaf_size_bars_bin_by_powers_of_two_and_skip_an_absent_split() -> None:
+def test_leaf_size_bars_bin_by_powers_of_two_and_skip_an_absent_subset() -> None:
     """Check the 0, 1 and 2-3 bins, and test left out without counts."""
     leaves = [
-        {"n_train": 0, "n_val": 1, "n_test": None},
-        {"n_train": 3, "n_val": 2, "n_test": None},
-        {"n_train": 2, "n_val": 0, "n_test": None},
+        {"n_grow": 0, "n_estimate": 1, "n_test": None},
+        {"n_grow": 3, "n_estimate": 2, "n_test": None},
+        {"n_grow": 2, "n_estimate": 0, "n_test": None},
     ]
     figure = leaf_size_bars(leaves)
-    by_split = {trace["name"]: trace for trace in figure["data"]}
-    assert list(by_split) == ["train", "val"]
-    assert by_split["train"]["x"] == ["0", "1", "2–3"]
-    assert by_split["train"]["y"] == [1, 0, 2]
-    assert by_split["val"]["y"] == [1, 1, 1]
+    by_subset = {trace["name"]: trace for trace in figure["data"]}
+    assert list(by_subset) == ["grow", "estimate"]
+    assert by_subset["grow"]["x"] == ["0", "1", "2–3"]
+    assert by_subset["grow"]["y"] == [1, 0, 2]
+    assert by_subset["estimate"]["y"] == [1, 1, 1]
 
 
 def test_split_bars_use_a_log_axis_with_the_largest_class_first() -> None:

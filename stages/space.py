@@ -1,10 +1,8 @@
-"""The space distances are measured in, and the k-NN graph of train.
+"""The space distances are measured in, and every row's LDA projection.
 
-Artifacts: the fitted space, the graph arrays (the rows of the graph,
-its k-NN lists and its minimum spanning tree), the LDA fitted on the
-train labels and every row projected by it (`z.parquet`, one column per
-discriminant direction). DB rows written: metrics n_graph_rows and
-n_components.
+Artifacts: the fitted space, the LDA fitted on the train labels and
+every row projected by it (`z.parquet`, one column per discriminant
+direction). DB rows written: metric n_components.
 """
 
 __all__ = ["CONFIG", "INPUTS", "FILES", "OUTPUTS", "run"]
@@ -16,15 +14,14 @@ import numpy as np
 import pandas as pd
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 
-from src.graph import build_train_graph, subsample_indices
 from src.space import Space
 from stages import LABEL, SPLITS, Context
 
-CONFIG = ("space", "graph", "seed")
+CONFIG = ("space",)
 # Split gives the feature kinds; prepare, the splits.
 INPUTS = ("split", "prepare")
 FILES = ()
-OUTPUTS = ("space.joblib", "graph.npz", "lda.joblib", "z.parquet")
+OUTPUTS = ("space.joblib", "lda.joblib", "z.parquet")
 _EMBED_ROWS = 500_000
 
 
@@ -62,7 +59,7 @@ def _projection_table(projected: Mapping[str, np.ndarray]) -> pd.DataFrame:
 
 
 def run(ctx: Context) -> None:
-    """Fit the space and the LDA on train, graph a sample, project all.
+    """Fit the space and the LDA on train, project all.
 
     Args:
         ctx: The stage context.
@@ -72,22 +69,12 @@ def run(ctx: Context) -> None:
     prepare_dir = ctx.inputs["prepare"].dir
     train = pd.read_parquet(prepare_dir / "train.parquet")
 
-    graph_rows = np.sort(
-        subsample_indices(
-            len(train), max_samples=cfg.graph.max_samples, random_state=cfg.seed
-        )
-    )
     space = Space.fit(
         train,
         num_cols=num_cols,
         cat_cols=cat_cols,
         top_k=cfg.space.top_k,
         cat_cost=cfg.space.cat_cost,
-    )
-    train_graph = build_train_graph(
-        space.embed(train.iloc[graph_rows]),
-        k=cfg.graph.k,
-        n_jobs=ctx.runtime.n_jobs,
     )
 
     lda = LinearDiscriminantAnalysis().fit(
@@ -108,13 +95,4 @@ def run(ctx: Context) -> None:
     joblib.dump(space, ctx.out / "space.joblib")
     joblib.dump(lda, ctx.out / "lda.joblib")
     _projection_table(projected).to_parquet(ctx.out / "z.parquet", index=False)
-    np.savez(
-        ctx.out / "graph.npz",
-        rows=graph_rows,
-        knn_idx=train_graph.knn_idx,
-        knn_dist=train_graph.knn_dist,
-        mst=train_graph.mst_edges,
-    )
-    ctx.save_metrics(
-        {"n_graph_rows": len(graph_rows), "n_components": projected["train"].shape[1]}
-    )
+    ctx.save_metrics({"n_components": projected["train"].shape[1]})

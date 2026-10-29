@@ -144,7 +144,6 @@ def validate(cfg: DictConfig) -> None:
     _validate_loss(cfg)
     _validate_grid_search(cfg.grid_search)
     _validate_space(cfg)
-    _validate_crossfit(cfg.crossfit)
     _validate_tree(cfg.tree)
     _validate_runtime(cfg.runtime)
 
@@ -355,14 +354,6 @@ def _validate_space(cfg: DictConfig) -> None:
     _check(
         _is_number(cat_cost) and cat_cost > 0,
         f"space.cat_cost {cat_cost!r} must be a number > 0.",
-    )
-
-
-def _validate_crossfit(crossfit: DictConfig) -> None:
-    """Check the `crossfit` section."""
-    _check(
-        _is_int(crossfit.n_folds, 2),
-        f"crossfit.n_folds {crossfit.n_folds!r} must be an integer > 1.",
     )
 
 

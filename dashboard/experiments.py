@@ -119,8 +119,8 @@ def _variants(configs: Mapping[str, Mapping]) -> dict[str, str]:
 def _finite(value: float | None) -> float | None:
     """Return `value`, or None if it is infinite or NaN.
 
-    SQLite keeps an infinity (the ATC threshold can be one), which JSON
-    cannot carry and the statistics cannot average.
+    SQLite keeps an infinity, which JSON cannot carry and the statistics
+    cannot average.
     """
     return value if value is not None and math.isfinite(value) else None
 

@@ -42,7 +42,7 @@ def confusion(
     return np.bincount(cells, minlength=n_classes**2).reshape(n_classes, n_classes)
 
 
-# The train rows kept per leaf, and the most points one map draws: a
+# The grown rows kept per leaf, and the most points one map draws: a
 # leaf keeps its rows up to the first, and the map thins every leaf to
 # the same count to fit the second.
 _ROWS_PER_LEAF = 1000
@@ -54,8 +54,8 @@ class DisagreementAxis:
     """How the tree turned a row's disagreement `d` into its axis `s_d`.
 
     Attributes:
-        mean: The mean of `d` on train.
-        std: The standard deviation of `d` on train.
+        mean: The mean of `d` on the rows the tree grew on.
+        std: The standard deviation of `d` on them.
         scale: The weight of the standardized `d` among the LDA axes.
     """
 
@@ -70,7 +70,7 @@ class ClassPlane:
 
     Attributes:
         leaves: The node id of the leaf each point belongs to.
-        points: The `(x, y)` of each train row drawn, one per row.
+        points: The `(x, y)` of each grown row drawn, one per row.
         shares: The share of the placed leaves' variance, in z or in z
             and `s_d`, that each of the two axes holds.
     """
@@ -84,10 +84,11 @@ class ClassPlane:
 def _leaf_stats(
     space_dir: Path, tree_dir: Path, stamp: tuple[int, ...]
 ) -> dict[int, tuple[int, np.ndarray, np.ndarray, np.ndarray]] | None:
-    """Count each leaf's train rows, with their moments and a sample.
+    """Count each leaf's grown rows, with their moments and a sample.
 
-    The points are the axes of z followed by the row's disagreement `d`,
-    so that a plane with or without `s_d` comes out of the same read.
+    The grown rows are the half of val the tree grew on. The points are
+    the axes of z followed by the row's disagreement `d`, so that a
+    plane with or without `s_d` comes out of the same read.
 
     Cached, since reading the files takes seconds on a large dataset.
 
@@ -100,15 +101,17 @@ def _leaf_stats(
 
     Returns:
         The `(n_rows, mean, covariance, sample)` in z and `d` of each
-        leaf that has train rows, by node id, the sample being at most
+        leaf that has grown rows, by node id, the sample being at most
         `_ROWS_PER_LEAF` rows drawn at random; None if the two files do
-        not have the same train length.
+        not have the same val length.
     """
-    train_only = [("split", "==", "train")]
-    z = pd.read_parquet(space_dir / "z.parquet", filters=train_only)
+    val_only = [("split", "==", "val")]
+    z = pd.read_parquet(space_dir / "z.parquet", filters=val_only)
     z = z.sort_values("row")
     tree_rows = pd.read_parquet(
-        tree_dir / "rows.parquet", columns=["row", "leaf", "d"], filters=train_only
+        tree_dir / "rows.parquet",
+        columns=["row", "grow", "leaf", "d"],
+        filters=val_only,
     ).sort_values("row")
     if len(z) != len(tree_rows):
         return None
@@ -116,8 +119,10 @@ def _leaf_stats(
         (name for name in z.columns if name.startswith("z_")),
         key=lambda name: int(name[2:]),
     )
+    is_grow = tree_rows["grow"].to_numpy()
     points = np.column_stack([z[z_columns].to_numpy(), tree_rows["d"].to_numpy()])
-    row_leaves = tree_rows["leaf"].to_numpy()
+    points = points[is_grow]
+    row_leaves = tree_rows["leaf"].to_numpy()[is_grow]
     order = np.argsort(row_leaves, kind="stable")
     node_ids, starts, sizes = np.unique(
         row_leaves[order], return_index=True, return_counts=True
@@ -194,9 +199,9 @@ def class_plane(
     *,
     disagreement: DisagreementAxis | None = None,
 ) -> ClassPlane | None:
-    """Place a sample of the leaves' train rows in their PCA plane.
+    """Place a sample of the leaves' grown rows in their PCA plane.
 
-    The plane is the first two principal axes of the leaves' train rows
+    The plane is the first two principal axes of the leaves' grown rows
     in z, or in z with the axis `s_d` the tree also cut on, so it shows
     where the tree cut the space. Each leaf contributes a random sample
     of its rows, thinned to the same count per leaf so that the whole
@@ -212,8 +217,9 @@ def class_plane(
 
     Returns:
         The points; None if a file is missing or the two do not have
-        the same train length. The points are empty when no leaf has a
-        train row. With one LDA axis and no `s_d`, the y of every point is 0.
+        the same val length. The points are empty when no leaf has a
+        grown row. With one LDA axis and no `s_d`, the y of every point
+        is 0.
     """
     files = (space_dir / "z.parquet", tree_dir / "rows.parquet")
     if not all(file.is_file() for file in files):

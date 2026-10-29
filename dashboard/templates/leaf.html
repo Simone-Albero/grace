@@ -14,13 +14,13 @@
     <h3>From the root of {{ leaf["class"] }}</h3>
     <div class="scroll"><table>
       <thead><tr><th class="num">depth</th><th class="num">node</th><th>status</th>
-        <th class="num">train rows</th><th class="num">out-of-fold errors</th>
-        <th class="num">val rows</th><th class="num">val errors</th></tr></thead>
+        <th class="num">grown rows</th><th class="num">errors among them</th>
+        <th class="num">estimate rows</th><th class="num">estimate errors</th></tr></thead>
       <tbody>
       {% for n in path %}
       <tr><td class="num">{{ n.depth }}</td><td class="num">{{ n.node_id }}</td><td>{{ n.status }}</td>
-        <td class="num">{{ n.n_train | num }}</td><td class="num">{{ n.n_train_errors | num }}</td>
-        <td class="num">{{ n.n_val | num }}</td><td class="num">{{ n.n_val_errors | num }}</td></tr>
+        <td class="num">{{ n.n_grow | num }}</td><td class="num">{{ n.n_grow_errors | num }}</td>
+        <td class="num">{{ n.n_estimate | num }}</td><td class="num">{{ n.n_estimate_errors | num }}</td></tr>
       {% endfor %}
       </tbody>
     </table></div>
@@ -37,6 +37,6 @@
     {% endfor %}
     </tbody>
   </table></div>
-  {% else %}<p class="note">Needs the finished <b>complexity</b> stage, and a leaf with a population of enough train rows.</p>{% endif %}
+  {% else %}<p class="note">Needs the finished <b>complexity</b> stage, and a leaf with a population of enough grown rows.</p>{% endif %}
 </section>
 {% endblock %}

@@ -120,13 +120,13 @@ def test_confusion_pairs_rows_by_position(tmp_path: Path) -> None:
     assert artifacts.confusion(prepare, classify, 2) is None
 
 
-def _write_train_rows(
+def _write_grown_rows(
     tmp_path: Path,
     points: Sequence[Sequence[float]],
     leaves: Sequence[int],
     disagreement: Sequence[float] | None = None,
 ) -> tuple[Path, Path]:
-    """Write space's z and tree's rows, shuffled, plus a val row."""
+    """Write space's z and tree's rows, shuffled, plus a test row."""
     if disagreement is None:
         disagreement = [0.0] * len(points)
     space, tree = tmp_path / "space", tmp_path / "tree"
@@ -136,21 +136,24 @@ def _write_train_rows(
     columns = {
         f"z_{i}": [points[row][i] for row in order] for i in range(len(points[0]))
     }
-    z = pd.DataFrame({"split": "train", "row": order, **columns})
-    val_row = pd.DataFrame(
-        {"split": ["val"], "row": [0]} | {name: [99.0] for name in columns}
+    z = pd.DataFrame({"split": "val", "row": order, **columns})
+    test_row = pd.DataFrame(
+        {"split": ["test"], "row": [0]} | {name: [99.0] for name in columns}
     )
-    pd.concat([z, val_row]).to_parquet(space / "z.parquet")
+    pd.concat([z, test_row]).to_parquet(space / "z.parquet")
     rows = pd.DataFrame(
         {
-            "split": "train",
+            "split": "val",
             "row": order,
+            "grow": True,
             "leaf": [leaves[row] for row in order],
             "d": [disagreement[row] for row in order],
         }
     )
-    val_leaf = pd.DataFrame({"split": ["val"], "row": [0], "leaf": [1], "d": [0.5]})
-    pd.concat([rows, val_leaf]).to_parquet(tree / "rows.parquet")
+    test_leaf = pd.DataFrame(
+        {"split": ["test"], "row": [0], "grow": [False], "leaf": [1], "d": [0.5]}
+    )
+    pd.concat([rows, test_leaf]).to_parquet(tree / "rows.parquet")
     return space, tree
 
 
@@ -159,7 +162,7 @@ def test_class_plane_places_the_sampled_rows_of_each_leaf(tmp_path: Path) -> Non
     # Leaves 1 and 2 are the class: they split along z_0, and each
     # spreads over z_1. Leaf 3 belongs to another class, far away.
     points = [[-2, 1], [-2, -1], [2, 1], [2, -1], [100, 100], [100, 100]]
-    space, tree = _write_train_rows(tmp_path, points, [1, 1, 2, 2, 3, 3])
+    space, tree = _write_grown_rows(tmp_path, points, [1, 1, 2, 2, 3, 3])
     plane = artifacts.class_plane(space, tree, [1, 2, 7])
     # z_0 has variance 4 and z_1 has 1; the sign of a component is free.
     assert plane.shares == pytest.approx((0.8, 0.2))
@@ -177,7 +180,7 @@ def test_class_plane_adds_the_standardized_disagreement_as_an_axis(
     # z barely varies, while d is 0.2 or 0.8: mean 0.5, std 0.3, and a
     # scale of 3 puts s_d at -3 or 3, the axis the plane has to find.
     points = [[0.0], [0.1], [0.0], [0.1]]
-    space, tree = _write_train_rows(
+    space, tree = _write_grown_rows(
         tmp_path, points, [1, 1, 2, 2], disagreement=[0.2, 0.2, 0.8, 0.8]
     )
     axis = artifacts.DisagreementAxis(mean=0.5, std=0.3, scale=3.0)
@@ -196,7 +199,7 @@ def test_class_plane_draws_the_same_count_from_every_leaf_within_its_budget(
 ) -> None:
     """Check that a big leaf does not crowd out a small one."""
     points = [[float(i), 0.0] for i in range(7)]
-    space, tree = _write_train_rows(tmp_path, points, [1, 1, 1, 1, 1, 2, 2])
+    space, tree = _write_grown_rows(tmp_path, points, [1, 1, 1, 1, 1, 2, 2])
     monkeypatch.setattr(artifacts, "_MAX_POINTS", 4)
     plane = artifacts.class_plane(space, tree, [1, 2])
     assert np.bincount(plane.leaves).tolist() == [0, 2, 2]
@@ -212,16 +215,16 @@ def test_class_plane_reads_again_a_folder_rewritten_in_place(
     tmp_path: Path,
 ) -> None:
     """Check that a rewritten file is not served from the cache."""
-    space, tree = _write_train_rows(tmp_path, [[0.0], [2.0]], [1, 1])
+    space, tree = _write_grown_rows(tmp_path, [[0.0], [2.0]], [1, 1])
     before = artifacts.class_plane(space, tree, [1]).points
-    _write_train_rows(tmp_path, [[0.0], [20.0]], [1, 1])
+    _write_grown_rows(tmp_path, [[0.0], [20.0]], [1, 1])
     after = artifacts.class_plane(space, tree, [1]).points
     assert (np.abs(before).max(), np.abs(after).max()) == pytest.approx((1, 10))
 
 
 def test_class_plane_with_one_axis_and_without_rows(tmp_path: Path) -> None:
-    """Check one axis, a class no train row reaches, and bad files."""
-    space, tree = _write_train_rows(
+    """Check one axis, a class no grown row reaches, and bad files."""
+    space, tree = _write_grown_rows(
         tmp_path, [[0.0], [2.0], [4.0], [6.0]], [1, 1, 2, 2]
     )
     plane = artifacts.class_plane(space, tree, [1, 2])
@@ -232,9 +235,9 @@ def test_class_plane_with_one_axis_and_without_rows(tmp_path: Path) -> None:
     assert artifacts.class_plane(space, tmp_path / "missing", [1]) is None
     short = tmp_path / "short"
     short.mkdir()
-    pd.DataFrame({"split": ["train"], "row": [0], "leaf": [1], "d": [0.0]}).to_parquet(
-        short / "rows.parquet"
-    )
+    pd.DataFrame(
+        {"split": ["val"], "row": [0], "grow": [True], "leaf": [1], "d": [0.0]}
+    ).to_parquet(short / "rows.parquet")
     assert artifacts.class_plane(space, short, [1]) is None
 
 

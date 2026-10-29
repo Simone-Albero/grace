@@ -211,7 +211,6 @@ def test_failed_stage_rolls_back(
     [
         (["data=nope"], ["prepare"]),
         (["data.trian_frac=0.5"], ["prepare"]),
-        (["crossfit.n_folds=1"], ["prepare"]),
         (["tree.n_min=1"], ["prepare"]),
         (["groups.data=nb15_v2"], ["prepare"]),
         (["root="], ["prepare"]),

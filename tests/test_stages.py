@@ -11,10 +11,9 @@ import pandas as pd
 import pytest
 from pandas.testing import assert_frame_equal
 
-import stages.classify as classify_stage
-import stages.crossfit as crossfit_stage
 import stages.tree as tree_stage
 from pipeline.runner import STAGES, _config_slice, run
+from src.data import halve
 from stages import SPLITS
 from tests.helpers import fast_cfg, query
 
@@ -38,7 +37,6 @@ def test_outputs(root: Path) -> None:
     assert _scalar(root, "SELECT COUNT(*) FROM class_metrics") == 10
     assert ("classify", "accuracy") in metrics
     _check_space(root, metrics, ids)
-    _check_crossfit(root, metrics, ids)
     _check_tree(root, metrics, ids)
     _check_complexity(root, metrics)
     _check_baselines(root, metrics, ids)
@@ -86,11 +84,20 @@ def _check_tree(
     root: Path, metrics: Mapping[tuple[str, str], float], ids: Mapping[str, int]
 ) -> None:
     rows = pd.read_parquet(root / f"artifacts/tree/{ids['tree']}/rows.parquet")
-    for split in SPLITS:
+    for split in ("val", "test"):
         picked = rows[rows["split"] == split]
         assert picked["row"].tolist() == list(
             range(int(metrics["split", f"n_{split}"]))
         )
+    # The grown half is the stratified half the gbm also fits on.
+    val_labels = pd.read_parquet(
+        root / f"artifacts/prepare/{ids['prepare']}/val.parquet", columns=["label"]
+    )["label"].to_numpy()
+    is_grow = rows.loc[rows["split"] == "val", "grow"].to_numpy()
+    assert np.array_equal(is_grow, halve(val_labels, random_state=42))
+    assert not rows.loc[rows["split"] == "test", "grow"].any()
+    assert metrics["tree", "n_grow"] == is_grow.sum()
+    assert metrics["tree", "n_estimate"] == (~is_grow).sum()
     assert rows[["q_leaf", "q", "confidence"]].stack().between(0, 1).all()
     for name in ("d_scale", "mu_c", "sigma_c"):
         assert ("tree", name) in metrics
@@ -110,29 +117,19 @@ def _check_tree(
     leaves = pd.DataFrame(
         query(
             root / "grace.db",
-            "SELECT node_id, n_train, n_val, q FROM tree_nodes "
+            "SELECT node_id, n_grow, n_estimate, q FROM tree_nodes "
             f"WHERE execution_id = {ids['tree']} AND status = 'leaf'",
         ),
-        columns=["node_id", "n_train", "n_val", "q"],
+        columns=["node_id", "n_grow", "n_estimate", "q"],
     )
     assert len(leaves) == metrics["tree", "n_leaves"]
     assert leaves["q"].notna().all()
-    assert leaves["n_val"].sum() == metrics["split", "n_val"]
-    assert leaves["n_train"].sum() == metrics["split", "n_train"]
+    assert leaves["n_estimate"].sum() == metrics["tree", "n_estimate"]
+    assert leaves["n_grow"].sum() == metrics["tree", "n_grow"]
+    assert metrics["tree", "n_grow"] + metrics["tree", "n_estimate"] == (
+        metrics["split", "n_val"]
+    )
     assert set(rows.loc[rows["split"] == "test", "leaf"]) <= set(leaves["node_id"])
-
-
-def _check_crossfit(
-    root: Path, metrics: Mapping[tuple[str, str], float], ids: Mapping[str, int]
-) -> None:
-    oof = pd.read_parquet(root / f"artifacts/crossfit/{ids['crossfit']}/oof.parquet")
-    n_train = int(metrics["split", "n_train"])
-    assert oof["row"].tolist() == list(range(n_train))
-    assert metrics["crossfit", "n_folds"] == oof["fold"].nunique()
-    probabilities = oof.filter(like="proba_")
-    assert probabilities.shape[1] == 10
-    assert np.allclose(probabilities.sum(axis=1), 1, atol=1e-4)
-    assert 0 < metrics["crossfit", "oof_error_rate"] < 1
 
 
 def _check_baselines(
@@ -150,7 +147,7 @@ def _check_baselines(
     assert scores["val_rate"].iloc[0] == pytest.approx(
         metrics["baselines", "val_error_rate"], abs=1e-6
     )
-    assert metrics["baselines", "n_gbm_rows"] == metrics["split", "n_train"]
+    assert metrics["baselines", "n_gbm_rows"] == metrics["tree", "n_grow"]
 
 
 def _check_evaluate(
@@ -328,76 +325,6 @@ def test_mlp_trains_on_a_one_row_last_batch(root: Path) -> None:
     assert n_train % batch_size == 1
 
 
-def test_crossfit_predicts_every_train_row_once(root: Path) -> None:
-    """Check every train row has one out-of-fold prediction."""
-    execution = _scalar(root, "SELECT id FROM executions WHERE stage = 'crossfit'")
-    oof = pd.read_parquet(root / f"artifacts/crossfit/{execution}/oof.parquet")
-    n_train = _scalar(
-        root,
-        "SELECT value FROM metrics JOIN executions ON executions.id = execution_id "
-        "WHERE stage = 'split' AND name = 'n_train'",
-    )
-    assert oof["row"].is_unique and len(oof) == n_train
-    sizes = oof["fold"].value_counts()
-    assert sizes.max() - sizes.min() <= 10
-
-
-def test_crossfit_refits_with_the_best_grid_params(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Check every fold refits with the grid's chosen parameters."""
-    cfg = fast_cfg(tmp_path, "classifier=logistic_regression")
-    run(["classify"], cfg, force=False)
-    chosen = json.loads(
-        _scalar(tmp_path, "SELECT params FROM classifier_grid WHERE best = 1")
-    )
-    seen = []
-    build = crossfit_stage.ml.build_pipeline
-
-    def spy(name, params, num_cols, cat_cols):
-        seen.append(dict(params))
-        return build(name, params, num_cols, cat_cols)
-
-    monkeypatch.setattr(crossfit_stage.ml, "build_pipeline", spy)
-    run(["crossfit"], cfg, force=False)
-    assert len(seen) == cfg.crossfit.n_folds
-    assert all(params["C"] == chosen["C"] for params in seen)
-
-
-def test_crossfit_dl_stops_on_its_own_fold_holdout(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Check a DL fold never fits or stops on the rows it predicts."""
-    cfg = fast_cfg(tmp_path, "classifier=mlp", "fit.training.epochs=1")
-    run(["classify"], cfg, force=False)
-    fits, held = [], []
-    fit = crossfit_stage.dl.fit_classifier
-    predict = crossfit_stage._predict_fold
-
-    def fit_spy(rows, **kwargs):
-        fits.append(set(rows.index))
-        return fit(rows, **kwargs)
-
-    def predict_spy(ctx, model, rows, **kwargs):
-        held.append(set(rows.index))
-        return predict(ctx, model, rows, **kwargs)
-
-    monkeypatch.setattr(crossfit_stage.dl, "fit_classifier", fit_spy)
-    monkeypatch.setattr(crossfit_stage, "_predict_fold", predict_spy)
-    run(["crossfit"], cfg, force=False)
-    assert len(fits) == len(held) == cfg.crossfit.n_folds
-    assert all(not (fit_rows & held_rows) for fit_rows, held_rows in zip(fits, held))
-    assert set().union(*held) == set(range(len(set().union(*held))))
-
-
-@pytest.mark.parametrize("classifier", ["naive_bayes", "mlp"])
-def test_crossfit_keys_cover_classify_keys(classifier: str) -> None:
-    """Check crossfit's cache key holds all classify trains on."""
-    cfg = fast_cfg(Path("unused"), f"classifier={classifier}")
-    classify_keys = set(classify_stage.config_keys(cfg)) - {"grid_search"}
-    assert classify_keys <= set(crossfit_stage.config_keys(cfg))
-
-
 def test_tree_never_reads_test_labels(tmp_path: Path) -> None:
     """Check the tree and its probabilities ignore the test labels."""
     cfg = fast_cfg(tmp_path)
@@ -409,7 +336,7 @@ def test_tree_never_reads_test_labels(tmp_path: Path) -> None:
         nodes = pd.DataFrame(
             query(
                 tmp_path / "grace.db",
-                "SELECT node_id, status, n_val, q FROM tree_nodes "
+                "SELECT node_id, status, n_estimate, q FROM tree_nodes "
                 f"WHERE execution_id = {latest} ORDER BY node_id",
             )
         )
@@ -423,20 +350,20 @@ def test_tree_never_reads_test_labels(tmp_path: Path) -> None:
     assert_frame_equal(second_nodes, first_nodes)
 
 
-def test_tree_standardizes_with_the_train_statistics() -> None:
-    """Check val and test are scaled by train's mean and std alone."""
+def test_tree_standardizes_with_the_grown_half_statistics() -> None:
+    """Check val and test are scaled by the grown half's statistics."""
     values = {
-        "train": np.array([1.0, 2.0, 3.0, 4.0]),
-        "val": np.array([10.0, 20.0]),
+        "val": np.array([1.0, 2.0, 3.0, 4.0, 100.0, 200.0]),
         "test": np.array([0.0]),
     }
-    scaled, mean, std = tree_stage._standardize(values)
-    assert mean == pytest.approx(2.5) and std == pytest.approx(values["train"].std())
+    is_grow = np.array([True, True, True, True, False, False])
+    scaled, mean, std = tree_stage._standardize(values, is_grow)
+    assert mean == pytest.approx(2.5) and std == pytest.approx(values["val"][:4].std())
     assert scaled["val"] == pytest.approx((values["val"] - 2.5) / std)
-    values["val"] = values["val"] * 7
-    assert tree_stage._standardize(values)[1:] == (mean, std)
+    values["val"][4:] *= 7
+    assert tree_stage._standardize(values, is_grow)[1:] == (mean, std)
     flat, _, flat_std = tree_stage._standardize(
-        {"train": np.full(4, 3.0), "val": np.array([1.0, 2.0])}
+        {"val": np.array([3.0, 3.0, 1.0, 2.0])}, np.array([True, True, False, False])
     )
     assert flat_std == 0.0 and (flat["val"] == 0).all()
 

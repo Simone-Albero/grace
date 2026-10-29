@@ -6,11 +6,11 @@ val failure rate; `confidence`, the isotonic calibration on val of one
 minus the top class probability; `binned`, the val failure rate of the
 row's bin of equal-mass confidence within its predicted class (one bin
 per 150 val rows, at least one per class); and `gbm`, a gradient
-boosting classifier trained on the out-of-fold errors of train from the
+boosting classifier trained on the errors of one half of val from the
 row's coordinates, confidence and predicted class, then calibrated
-isotonically on val. No test label is read. Artifact: the probabilities
-of every val and test row. DB rows written: metrics val_error_rate,
-n_bins and n_gbm_rows.
+isotonically on the other half. The halves are the tree's. No test label
+is read. Artifact: the probabilities of every val and test row. DB rows
+written: metrics val_error_rate, n_bins and n_gbm_rows.
 """
 
 __all__ = ["CONFIG", "INPUTS", "FILES", "OUTPUTS", "run"]
@@ -26,10 +26,11 @@ from src.baselines import (
     estimate_group_rates,
     fit_error_gbm,
 )
+from src.data import halve
 from stages import Context
 
 CONFIG = ("seed",)
-INPUTS = ("prepare", "space", "classify", "crossfit")
+INPUTS = ("prepare", "space", "classify")
 FILES = ()
 OUTPUTS = ("scores.parquet",)
 _SPLITS = ("val", "test")
@@ -57,7 +58,6 @@ def run(ctx: Context) -> None:
         ctx: The stage context.
     """
     seed = ctx.cfg.seed
-    out_of_fold = ctx.split_rows("crossfit", "oof.parquet", "train")
     predictions = {
         split: ctx.split_rows("classify", "predictions.parquet", split)
         for split in _SPLITS
@@ -89,16 +89,20 @@ def run(ctx: Context) -> None:
         "test": group_rate.loc[test_group].to_numpy(),
     }
 
-    # Out-of-fold errors of train teach the gbm; val calibrates it.
-    train_features = _features(ctx, "train", out_of_fold)
-    train_errors = (ctx.labels("train") != out_of_fold["y_pred"].to_numpy()).astype(int)
-    predict_failure = fit_error_gbm(train_features, train_errors, random_state=seed)
-    raw_gbm = {
-        split: predict_failure(_features(ctx, split, predictions[split]))
-        for split in _SPLITS
-    }
+    # The errors of one half of val teach the gbm; the other half
+    # calibrates it.
+    in_fit_half = halve(ctx.labels("val"), random_state=seed)
+    features = {split: _features(ctx, split, predictions[split]) for split in _SPLITS}
+    predict_failure = fit_error_gbm(
+        features["val"][in_fit_half],
+        val_errors[in_fit_half].astype(int),
+        random_state=seed,
+    )
+    raw_gbm = {split: predict_failure(features[split]) for split in _SPLITS}
     gbm = {
-        split: calibrate_isotonic(raw_gbm["val"], val_errors, split_scores)
+        split: calibrate_isotonic(
+            raw_gbm["val"][~in_fit_half], val_errors[~in_fit_half], split_scores
+        )
         for split, split_scores in raw_gbm.items()
     }
 
@@ -132,6 +136,6 @@ def run(ctx: Context) -> None:
         {
             "val_error_rate": val_error_rate,
             "n_bins": len(np.unique(val_group)),
-            "n_gbm_rows": len(train_features),
+            "n_gbm_rows": int(in_fit_half.sum()),
         }
     )

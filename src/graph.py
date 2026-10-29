@@ -1,6 +1,6 @@
-"""k-NN search, k-NN graph and approximate MST of the train sample."""
+"""k-NN search, k-NN graph and approximate MST of a sample of rows."""
 
-__all__ = ["TrainGraph", "build_train_graph", "nearest_neighbors", "subsample_indices"]
+__all__ = ["RowGraph", "build_row_graph", "nearest_neighbors", "subsample_indices"]
 
 import logging
 import os
@@ -184,8 +184,8 @@ def _build_approx_mst(
 
 
 @dataclass(frozen=True)
-class TrainGraph:
-    """A uniform sample of train with its k-NN graph and MST.
+class RowGraph:
+    """A uniform sample of rows with its k-NN graph and MST.
 
     Every population is measured against it.
 
@@ -202,7 +202,7 @@ class TrainGraph:
     mst_edges: np.ndarray
 
 
-def build_train_graph(points: np.ndarray, *, k: int, n_jobs: int) -> TrainGraph:
+def build_row_graph(points: np.ndarray, *, k: int, n_jobs: int) -> RowGraph:
     """Return the k-NN graph and the approximate MST of a point cloud.
 
     Args:
@@ -222,7 +222,7 @@ def build_train_graph(points: np.ndarray, *, k: int, n_jobs: int) -> TrainGraph:
     knn_idx, knn_dist = _build_knn_graph(points, k=k, n_jobs=n_jobs)
     logger.info("Building approximate MST over the k-NN graph...")
     mst_edges = _build_approx_mst(knn_idx, knn_dist, points)
-    return TrainGraph(points, knn_idx, knn_dist, mst_edges)
+    return RowGraph(points, knn_idx, knn_dist, mst_edges)
 
 
 def subsample_indices(

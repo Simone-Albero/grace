@@ -1,1 +1,0 @@
-n_folds: 5    # stratified folds of train: every row is predicted by a model that never saw it

@@ -2,7 +2,7 @@
 
 The failure rate of a group of val rows (equal-mass confidence bins,
 over all rows or within each predicted class), the isotonic calibration
-of a score on val, and a gradient boosting fit on out-of-fold errors.
+of a score on val, and a gradient boosting fit on failures.
 """
 
 __all__ = [

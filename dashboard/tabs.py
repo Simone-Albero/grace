@@ -22,7 +22,7 @@ _SETTINGS = {
     "overview": (),
     "data": ("split", "prepare"),
     "classifier": ("classify",),
-    "tree": ("space", "crossfit", "tree"),
+    "tree": ("space", "tree"),
     "predictors": ("evaluate",),
 }
 # The scores where a higher value is the better one.
@@ -68,11 +68,11 @@ _TILES = {
     ],
     "tree": [
         ("space", "n_components", "LDA components", "count"),
-        ("crossfit", "oof_error_rate", "out-of-fold error rate", "score"),
+        ("tree", "grow_error_rate", "error rate of the grown half", "score"),
         ("tree", "n_nodes", "nodes grown", "count"),
         ("tree", "n_leaves", "leaves", "count"),
         ("tree", "max_depth", "depth of the cut", "count"),
-        ("tree", "n_leaves_without_val", "leaves without val rows", "count"),
+        ("tree", "n_leaves_without_estimate", "leaves without estimate rows", "count"),
         ("tree", "beta", "β of the correction", "score"),
         ("tree", "fh_tau2", "τ² of the shrinkage", "score"),
     ],

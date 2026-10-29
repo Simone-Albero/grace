@@ -13,7 +13,7 @@ from src.complexity.feature import compute_f_measures
 from src.complexity.geometry import compute_geometry_measures
 from src.complexity.neighborhood import compute_n_measures
 from src.complexity.network import compute_network_measures
-from src.graph import TrainGraph
+from src.graph import RowGraph
 
 
 def _nearest_rivals(
@@ -39,7 +39,7 @@ def _nearest_rivals(
 
 
 def compute_population_complexity(
-    train_graph: TrainGraph,
+    graph: RowGraph,
     graph_population: np.ndarray,
     sample: MeasuredSample,
     *,
@@ -54,12 +54,12 @@ def compute_population_complexity(
     """Return every complexity family for each population.
 
     Args:
-        train_graph: The graph of the train rows.
+        graph: The graph of the rows.
         graph_population: The population id of every graph node.
         sample: The sampled rows with their graph neighbours.
         population_class: The class of every population id.
         centroids: The centroid of every population id.
-        sizes: The train rows of every population id.
+        sizes: The rows of every population id.
         top_k_clusters: The nearest rivals per population.
         silhouette_max_samples: The silhouette subsample cap.
         silhouette_min_per_cluster: The silhouette floor per cluster.
@@ -83,12 +83,8 @@ def compute_population_complexity(
     rivals = _nearest_rivals(ids, classes, centroid_distances, top_k=top_k_clusters)
 
     feature_overlap = compute_f_measures(sample.X, sample.population, rivals)
-    neighborhood = compute_n_measures(
-        sample, graph_population, train_graph.mst_edges, rivals
-    )
-    network = compute_network_measures(
-        sample, graph_population, train_graph.knn_idx, rivals
-    )
+    neighborhood = compute_n_measures(sample, graph_population, graph.mst_edges, rivals)
+    network = compute_network_measures(sample, graph_population, graph.knn_idx, rivals)
     dimensionality = compute_t_measures(sample.X, sample.population, sizes)
     geometry = compute_geometry_measures(
         sample.X,

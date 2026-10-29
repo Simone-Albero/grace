@@ -1,2 +1,2 @@
-max_samples: 50000    # train rows in the graph: a uniform sample above this, the whole split below (the build is quadratic)
+max_samples: 50000    # rows in the graph of complexity: a uniform sample of the grown half of val above this, the whole half below (the build is quadratic)
 k: 30                 # neighbours each row looks for in the graph

@@ -10,8 +10,8 @@ from sklearn.model_selection import GridSearchCV
 
 from src import baselines, tree
 from src.complexity.common import weighted_group_measures
-from src.data import cap_per_class, stratified_holdout
-from src.graph import build_train_graph
+from src.data import cap_per_class, halve, stratified_holdout
+from src.graph import build_row_graph
 from src.ml import grid_search
 from src.scores import ap_lift, auroc, binned_mse_ratio
 
@@ -43,6 +43,17 @@ def test_stratified_holdout_rejects_a_split_too_small_for_its_classes() -> None:
     rows = pd.DataFrame({"label": np.repeat([0, 1, 2], 10), "x": np.arange(30)})
     with pytest.raises(ValueError, match="holdout_frac"):
         stratified_holdout(rows, holdout_frac=0.05, label_col="label", random_state=0)
+
+
+def test_halve_takes_one_stratified_half_by_seed() -> None:
+    """Check each class is halved, the same seed picks the same half."""
+    labels = np.repeat([0, 1, 2], [40, 20, 10])
+    first = halve(labels, random_state=0)
+    assert np.bincount(labels[first]).tolist() == [20, 10, 5]
+    assert np.array_equal(first, halve(labels, random_state=0))
+    assert not np.array_equal(first, halve(labels, random_state=1))
+    with pytest.raises(ValueError, match="holdout_frac"):
+        halve(np.array([0, 0, 0, 0, 1]), random_state=0)
 
 
 def test_cap_per_class_keeps_small_classes_whole() -> None:
@@ -96,7 +107,7 @@ def test_duplicate_points_join_inside_the_mst() -> None:
     rng = np.random.default_rng(0)
     points = np.vstack([rng.normal(size=(50, 4)), np.tile(rng.normal(size=4), (10, 1))])
     duplicates = np.arange(50, 60)
-    mst = build_train_graph(points, k=3, n_jobs=1).mst_edges
+    mst = build_row_graph(points, k=3, n_jobs=1).mst_edges
     assert len(mst) == len(points) - 1
     # Else each copy is bridged to node 0 alone, by a long edge.
     assert np.isin(mst, duplicates).all(axis=1).sum() == len(duplicates) - 1
@@ -262,16 +273,14 @@ def test_prune_matches_brute_force() -> None:
     )
     n_rows = tree.subtree_counts(grown, node_of_row, np.ones(len(points)))
     n_errors = tree.subtree_counts(grown, node_of_row, errors)
-    is_leaf, is_kept, cost, best = tree.prune_tree(
-        grown, n_rows, n_errors, n_train=len(points), n_val=50
-    )
+    is_leaf, is_kept, cost, best = tree.prune_tree(grown, n_rows, n_errors, n_rows / 3)
     for root in grown.root:
         assert best[root] == pytest.approx(min(_cut_costs(grown, cost, root)))
     assert cost[is_leaf].sum() == pytest.approx(best[grown.root].sum())
     assert (is_leaf <= is_kept).all()
 
 
-def test_tau2_never_negative_and_no_val_leaf_takes_regression() -> None:
+def test_tau2_never_negative_and_a_leaf_without_rows_takes_regression() -> None:
     """Check tau2 is not negative and an unseen leaf takes the line."""
     counts = np.array([40.0, 60.0, 50.0, 80.0])
     errors = np.array([4.0, 6.0, 5.0, 8.0])
@@ -290,20 +299,16 @@ def test_tau2_never_negative_and_no_val_leaf_takes_regression() -> None:
     assert 0.0 <= rate[1] <= 1.0 and 0.0 < weight[1] < 1.0
 
 
-def test_disagreement_excludes_self() -> None:
-    """Check a train row is never its own neighbour."""
+def test_disagreement_counts_the_nearest_train_rows_of_another_class() -> None:
+    """Check a row's own train row counts among its neighbours."""
     points = np.arange(10.0)[:, None]
     labels = np.arange(10)
     index = tree.build_neighbours(points, n_jobs=1)
-    own = tree.neighbour_disagreement(index, labels, labels, n_neighbours=3)
-    assert (own == 1.0).all()
-    other = tree.neighbour_disagreement(
-        index, labels, labels, n_neighbours=3, points=points
-    )
-    assert (other < 1.0).all()
+    shares = tree.neighbour_disagreement(index, labels, labels, points, n_neighbours=3)
+    assert shares == pytest.approx(2 / 3)
 
 
-def test_class_never_predicted_oof_gets_an_empty_root() -> None:
+def test_class_never_predicted_gets_an_empty_root() -> None:
     """Check a class nobody predicted keeps a root with no rows."""
     points, predicted = _blobs()
     grown, node_of_row = tree.grow_tree(
@@ -311,9 +316,7 @@ def test_class_never_predicted_oof_gets_an_empty_root() -> None:
     )
     n_rows = tree.subtree_counts(grown, node_of_row, np.ones(len(points)))
     assert n_rows[grown.root[2]] == 0 and grown.left[grown.root[2]] == -1
-    is_leaf, _, _, _ = tree.prune_tree(
-        grown, n_rows, n_rows * 0, n_train=len(points), n_val=50
-    )
+    is_leaf, _, _, _ = tree.prune_tree(grown, n_rows, n_rows * 0, n_rows / 3)
     assert is_leaf[grown.root[2]]
     reached = tree.descend(grown, points[:3], np.array([2, 2, 2]), stop=is_leaf)
     assert (reached == grown.root[2]).all()
