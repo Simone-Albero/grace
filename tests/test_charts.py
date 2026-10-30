@@ -77,9 +77,12 @@ def _node(
         "purity": 0.9,
         "n_estimate": 4,
         "estimate_rate": None,
+        "n_val": 14,
+        "val_rate": 0.1,
         "n_test": None,
         "test_rate": None,
         "q": 0.2,
+        "pred_rate": 0.2,
     } | overrides
 
 
@@ -102,10 +105,17 @@ def test_tree_diagram_centers_parents_and_links_only_leaves() -> None:
         "/runs/7/leaves/4",
     ]
     assert len(edges["x"]) == 3 * 4
-    # An unknown count reads as a dash, never as None or 0.
-    assert "purity 0.9000" in marks["text"][2]
-    assert "estimate 4 · estimate rate –" in marks["text"][2]
-    assert "test – · test rate –" in marks["text"][2]
+    # A row per split, with its rows and rate; an unknown count reads as
+    # a dash, never as None or 0.
+    leaf_text = marks["text"][2].split("<br>")
+    assert leaf_text == [
+        "node 2 · leaf",
+        "val: 14 rows · rate 0.1000 (grow 10, estimate 4)",
+        "test: – rows · rate –",
+        "purity (grow) 0.9000",
+        "predicted rate 0.2000",
+    ]
+    assert "predicted rate, leaves' mean 0.2000" in marks["text"][0]
 
 
 def test_tree_diagram_tags_the_splits_for_the_zoom() -> None:
@@ -121,80 +131,107 @@ def test_tree_diagram_tags_the_splits_for_the_zoom() -> None:
 
 
 def _class_nodes() -> list[dict]:
-    """A root over three leaves, two of them with an estimate rate."""
+    """A root over three leaves, two of them with a val rate."""
     return [
-        _node(0, None, 0, "internal", grow_rate=0.2, purity=0.8, estimate_rate=0.3),
-        _node(1, 0, 1, "leaf", grow_rate=0.4, purity=0.6, estimate_rate=0.5),
-        _node(2, 0, 1, "leaf", grow_rate=0.1, purity=0.9, estimate_rate=0.1),
-        _node(3, 0, 1, "leaf", grow_rate=0.0, purity=1.0, estimate_rate=None),
+        _node(0, None, 0, "internal", val_rate=0.3, purity=0.8, pred_rate=0.25),
+        _node(1, 0, 1, "leaf", val_rate=0.5, purity=0.6, pred_rate=0.4),
+        _node(2, 0, 1, "leaf", val_rate=0.1, purity=0.9, pred_rate=0.2),
+        _node(3, 0, 1, "leaf", val_rate=None, purity=1.0, pred_rate=0.05),
     ]
 
 
 def test_tree_diagram_colors_by_the_chosen_measure_around_the_rate_of_the_top() -> None:
     """Check the colors, the bar and a scale centred on the root."""
     nodes = _class_nodes()
-    marker = tree_diagram(nodes, color="estimate_rate", run_id=1)["data"][1]["marker"]
-    # The root's estimate rate is the middle; the two leaves that have
-    # one lie beyond the 2nd and 98th percentiles of themselves, so they
+    marker = tree_diagram(nodes, color="val_rate", run_id=1)["data"][1]["marker"]
+    # The root's val rate is the middle; the two leaves that have one
+    # lie beyond the 2nd and 98th percentiles of themselves, so they
     # take the ends.
     assert marker["color"] == [0, 1, -1, None]
     assert (marker["cmin"], marker["cmax"]) == (-1, 1)
     assert [color for _, color in marker["colorscale"]] == _DIVERGING
     bar = marker["colorbar"]
-    assert bar["title"] == "estimate rate"
+    assert bar["title"] == "val rate"
     assert bar["tickvals"] == [-1, -0.5, 0, 0.5, 1]
     assert bar["ticktext"][0] == "0.1080" and bar["ticktext"][2] == "top 0.3000"
     assert bar["ticktext"][1] == "0.2520" and bar["ticktext"][4] == "0.4920"
-    # A purity is worse below the middle: its worst leaf is red, at +1,
-    # and its bar runs the other way.
+    # A purity sits on the scale of its complement: its worst leaf is
+    # the red one, above the middle, and its bar reads in purities.
     marker = tree_diagram(nodes, color="purity", run_id=1)["data"][1]["marker"]
-    assert marker["color"][:2] == [0, 1] and marker["color"][3] == -1
-    assert -1 < marker["color"][2] < 0
+    assert 0 < marker["color"][1] < 1 and marker["color"][2:] == [-1, -1]
+    assert -1 < marker["color"][0] < 0
     assert marker["colorbar"]["tickvals"] == [-1, -0.5, 0, 0.5, 1]
-    assert marker["colorbar"]["ticktext"][4] < marker["colorbar"]["ticktext"][0]
+    assert marker["colorbar"]["ticktext"][0] == "0.8920"
+    assert marker["colorbar"]["ticktext"][2] == "top 0.7000"
+    assert marker["colorbar"]["ticktext"][4] == "0.5080"
     # With no rate to show, the scale is still a range.
-    unknown = [_node(0, None, 0, "leaf", test_rate=None)]
+    unknown = [_node(0, None, 0, "leaf", val_rate=None, test_rate=None)]
     marker = tree_diagram(unknown, color="test_rate", run_id=1)["data"][1]["marker"]
     assert marker["color"] == [None]
     assert marker["colorbar"]["ticktext"][2] == "top 0.5000"
 
 
+def test_each_measure_colors_the_nodes_differently_on_the_same_scale() -> None:
+    """Check that a change of measure moves the colors, not the scale."""
+    nodes = _class_nodes()
+    nodes[1]["test_rate"] = 0.1
+    nodes[2]["test_rate"] = 0.45
+    markers = {
+        color: tree_diagram(nodes, color=color, run_id=1)["data"][1]["marker"]
+        for color in ("pred_rate", "val_rate", "test_rate", "purity")
+    }
+    colors = [tuple(marker["color"]) for marker in markers.values()]
+    assert len(set(colors)) == len(colors)
+    rate_bars = [markers[color]["colorbar"]["ticktext"] for color in markers]
+    assert rate_bars[0] == rate_bars[1] == rate_bars[2] != rate_bars[3]
+
+
 def test_color_scale_keeps_its_middle_inside_and_its_ends_within_0_and_1() -> None:
     """Check the margin around a root past every leaf, and the clamp."""
     nodes = [
-        _node(0, None, 0, "internal", grow_rate=0.05, purity=1.0),
-        _node(1, 0, 1, "leaf", grow_rate=0.2, purity=0.8),
-        _node(2, 0, 1, "leaf", grow_rate=0.2, purity=0.8),
+        _node(0, None, 0, "internal", val_rate=0.05),
+        _node(1, 0, 1, "leaf", val_rate=0.2),
+        _node(2, 0, 1, "leaf", val_rate=0.2),
     ]
-    low, middle, high = _color_scale(nodes, "grow_rate")
+    low, middle, high = _color_scale(nodes)
     assert 0 <= low < middle < high
-    low, middle, high = _color_scale(nodes, "purity")
-    # A purity of 1 at the top is as high as it goes: no room above it.
-    assert low < middle == high == 1.0
     # A root on the edge of 0..1 leaves the scale inside it, and still draws.
     edge = [
-        _node(0, None, 0, "internal", grow_rate=0.0, purity=1.0),
-        _node(1, 0, 1, "leaf", grow_rate=0.0, purity=1.0),
-        _node(2, 0, 1, "leaf", grow_rate=0.2, purity=0.8),
+        _node(0, None, 0, "internal", val_rate=0.0, purity=1.0),
+        _node(1, 0, 1, "leaf", val_rate=0.0, purity=1.0),
+        _node(2, 0, 1, "leaf", val_rate=0.2, purity=0.8),
     ]
-    assert _color_scale(edge, "grow_rate")[0] == 0.0
-    assert _color_scale(edge, "purity")[2] == 1.0
-    for color in ("grow_rate", "purity"):
+    assert _color_scale(edge)[0] == 0.0
+    top = [_node(0, None, 0, "internal", val_rate=1.0), *edge[1:]]
+    assert _color_scale(top)[2] == 1.0
+    for color in ("val_rate", "purity", "pred_rate"):
         marker = tree_diagram(edge, color=color, run_id=1)["data"][1]["marker"]
         assert all(-1 <= at <= 1 for at in marker["color"])
         assert not any(text.startswith("-") for text in marker["colorbar"]["ticktext"])
 
 
+def test_a_class_with_one_val_rate_does_not_saturate_the_other_measures() -> None:
+    """Check a predicted rate near a rate of 0 reads as near the middle."""
+    nodes = [
+        _node(0, None, 0, "internal", val_rate=0.0, pred_rate=0.002),
+        _node(1, 0, 1, "leaf", val_rate=0.0, pred_rate=0.002),
+        _node(2, 0, 1, "leaf", val_rate=0.0, pred_rate=0.2),
+    ]
+    marker = tree_diagram(nodes, color="pred_rate", run_id=1)["data"][1]["marker"]
+    assert 0 < marker["color"][1] < 0.5 and marker["color"][2] == 1
+    assert marker["colorbar"]["ticktext"][4] == "0.0100"
+
+
 def test_leaf_map_draws_a_point_per_row_with_the_extremes_on_top() -> None:
     """Check the points, their colors and order, and the axes."""
-    nodes = _class_nodes() + [_node(4, 0, 1, "leaf", estimate_rate=0.35)]
-    nodes[1]["estimate_rate"] = 0.6
+    nodes = _class_nodes() + [_node(4, 0, 1, "leaf", val_rate=0.35)]
+    nodes[1]["val_rate"] = 0.6
     plane = ClassPlane(
         np.array([1, 2, 2, 3, 4]),
         np.array([[0, 0], [3, 1], [3, 2], [-1, -1], [5, 5]], dtype=float),
         (0.75, 0.2),
     )
-    figure = leaf_map(nodes, plane, color="estimate_rate", run_id=9)
+    figure = leaf_map(nodes, plane, color="val_rate", run_id=9)
     unknown, points = figure["data"]
     assert points["type"] == "scattergl"
     # Leaf 3 has no rate: neutral, beneath. Then, closest to the middle
@@ -215,9 +252,7 @@ def test_leaf_map_draws_a_point_per_row_with_the_extremes_on_top() -> None:
     one_axis = ClassPlane(np.array([1, 1]), np.array([[0.0, 0.0], [2.0, 0.0]]), (1, 0))
     assert (
         "range"
-        not in leaf_map(nodes, one_axis, color="estimate_rate", run_id=9)["layout"][
-            "yaxis"
-        ]
+        not in leaf_map(nodes, one_axis, color="val_rate", run_id=9)["layout"]["yaxis"]
     )
     assert layout["xaxis"]["title"] == "PC 1 · 75% of the variance"
     assert layout["yaxis"]["title"] == "PC 2 · 20% of the variance"

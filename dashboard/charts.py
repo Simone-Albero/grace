@@ -62,10 +62,10 @@ _DIVERGING_NEUTRAL = "#d9d9d9"
 _DIVERGING = ["#2166ac", "#92c5de", _DIVERGING_NEUTRAL, "#f4a582", "#b2182b"]
 # What colors the nodes of a class's tree, by the key of the node.
 TREE_COLORS = {
-    "purity": "purity",
-    "grow_rate": "grow rate",
-    "estimate_rate": "estimate rate",
+    "pred_rate": "predicted rate",
+    "val_rate": "val rate",
     "test_rate": "test rate",
+    "purity": "purity",
 }
 # The space whose principal plane the map of a class's leaves shows,
 # by key.
@@ -583,27 +583,26 @@ def _format_rate(value: float | None) -> str:
 
 
 def _tree_hover(node: Mapping) -> str:
-    """Format the hover of a tree node: its counts and rates."""
+    """Format the hover of a tree node: its rows and rates by split."""
     kind = "leaf" if node["status"] == "leaf" else "internal"
-    lines = [
-        f"node {node['node_id']} · {kind}",
-        (
-            f"grow {_format_count(node['n_grow'])} · "
-            f"grow rate {_format_rate(node['grow_rate'])} · "
-            f"purity {_format_rate(node['purity'])}"
-        ),
-        (
-            f"estimate {_format_count(node['n_estimate'])} · "
-            f"estimate rate {_format_rate(node['estimate_rate'])}"
-        ),
-        (
-            f"test {_format_count(node['n_test'])} · "
-            f"test rate {_format_rate(node['test_rate'])}"
-        ),
-    ]
-    if kind == "leaf":
-        lines.append(f"q {_format_rate(node['q'])}")
-    return "<br>".join(lines)
+    predicted = "predicted rate" if kind == "leaf" else "predicted rate, leaves' mean"
+    return "<br>".join(
+        [
+            f"node {node['node_id']} · {kind}",
+            (
+                f"val: {_format_count(node['n_val'])} rows · "
+                f"rate {_format_rate(node['val_rate'])} "
+                f"(grow {_format_count(node['n_grow'])}, "
+                f"estimate {_format_count(node['n_estimate'])})"
+            ),
+            (
+                f"test: {_format_count(node['n_test'])} rows · "
+                f"rate {_format_rate(node['test_rate'])}"
+            ),
+            f"purity (grow) {_format_rate(node['purity'])}",
+            f"{predicted} {_format_rate(node['pred_rate'])}",
+        ]
+    )
 
 
 def _leaf_hover(node: Mapping) -> str:
@@ -613,8 +612,9 @@ def _leaf_hover(node: Mapping) -> str:
     than the tree's.
     """
     return (
-        f"leaf {node['node_id']} · grow {_format_count(node['n_grow'])}<br>"
-        f"grow rate {_format_rate(node['grow_rate'])} · q {_format_rate(node['q'])}"
+        f"leaf {node['node_id']} · val {_format_count(node['n_val'])} rows<br>"
+        f"val rate {_format_rate(node['val_rate'])} · "
+        f"predicted rate {_format_rate(node['pred_rate'])}"
     )
 
 
@@ -650,29 +650,33 @@ def _tree_positions(nodes: Sequence[Mapping]) -> dict[int, float]:
     return positions
 
 
-def _color_scale(nodes: Sequence[Mapping], color: str) -> tuple[float, float, float]:
+def _color_scale(nodes: Sequence[Mapping]) -> tuple[float, float, float]:
     """Return the low end, middle and high end of a tree's color scale.
 
-    The middle is the value at the top of the tree, the rate of the
-    class or of the subtree shown, so that a node reads as better or
-    worse than its whole. The ends are the 2nd and 98th percentiles of
-    the leaves, since a node's rate pools the rows of the leaves below
-    it and so stays within theirs, and a few extreme leaves would
-    otherwise wash out the rest; they stay within 0 and 1, where every
-    measure lives. The tree and the map share one scale.
+    The scale is the failure rate of val, the same for every measure
+    that colors the tree, so that a color means one rate whichever
+    measure is chosen and a change of measure moves the colors. The
+    middle is the val rate at the top of the tree, the class or the
+    subtree shown, so that a node reads as better or worse than its
+    whole. The ends are the 2nd and 98th percentiles of the leaves,
+    since a node's rate pools the rows of the leaves below it and so
+    stays within theirs, and a few extreme leaves would otherwise wash
+    out the rest; they stay within 0 and 1, where every measure lives.
     """
     leaf_values = [
-        node[color]
+        node["val_rate"]
         for node in nodes
-        if node["status"] == "leaf" and node[color] is not None
+        if node["status"] == "leaf" and node["val_rate"] is not None
     ]
     if not leaf_values:
         return 0.0, 0.5, 1.0
-    top = next(node[color] for node in nodes if node["parent_id"] is None)
+    top = next(node["val_rate"] for node in nodes if node["parent_id"] is None)
     middle = float(np.mean(leaf_values)) if top is None else float(top)
     low, high = np.percentile(leaf_values, [2, 98])
-    # The middle stays inside the scale, with room on both sides.
-    margin = 0.05 * max(high - low, 1e-6)
+    # The middle stays inside the scale, with room on both sides, and a
+    # class whose leaves all share one rate still gets a range: a
+    # measure that departs a little from it must not read as the end.
+    margin = max(0.05 * (high - low), 0.01)
     low, high = min(low, middle - margin), max(high, middle + margin)
     return max(float(low), 0.0), middle, min(float(high), 1.0)
 
@@ -698,37 +702,41 @@ def _color_marker(
     Returns:
         The color of each node, from -1 to 1, with its scale and its
         bar, which is labelled with the values. A failure rate is worse
-        above the middle, so red; a purity is worse below.
+        above the middle, so red; a purity is the share of rows that are
+        not failures, and sits on the same scale as its complement.
     """
-    low, middle, high = _color_scale(nodes, color)
-    # Red at the high end of the scale, which a purity has at its low
-    # one.
-    sign = -1 if color == "purity" else 1
+    low, middle, high = _color_scale(nodes)
+    is_purity = color == "purity"
+
+    def complement(value: float) -> float:
+        """Swap a purity and its rate, which is its own inverse."""
+        return 1 - value if is_purity else value
 
     def position(value: float | None) -> float | None:
         if value is None:
             return None
-        if value == middle:
+        rate = complement(value)
+        if rate == middle:
             return 0.0
-        reach = (value - middle) / ((high if value >= middle else low) - middle)
-        return sign * math.copysign(min(reach, 1.0) ** 0.5, value - middle)
+        reach = (rate - middle) / ((high if rate >= middle else low) - middle)
+        return math.copysign(min(reach, 1.0) ** 0.5, rate - middle)
 
     def value_at(share: float) -> float:
         end = high if share > 0 else low
-        return middle + (end - middle) * share**2
+        return complement(middle + (end - middle) * share**2)
 
     shares = [-1, -0.5, 0, 0.5, 1]
-    ticks = sorted(
+    ticks = [
         (
-            sign * share,
+            share,
             (
-                f"top {_format_rate(middle)}"
+                f"top {_format_rate(value_at(0))}"
                 if not share
                 else _format_rate(value_at(share))
             ),
         )
         for share in shares
-    )
+    ]
     return {
         "color": [
             position(node[color]) for node in (nodes if painted is None else painted)
@@ -762,9 +770,10 @@ def tree_diagram(
     Returns:
         A node-link figure: a marker per node sized by its grown rows
         and colored by `color`, squares for the leaves; the hover gives
-        the counts and rates of the grow half, the estimate half and
-        test. A leaf links to its page, and a node that splits carries
-        its id, for the click that zooms the tree and the map on it.
+        the rows and rate of val (and its two halves) and of test, the
+        purity and the predicted rate. A leaf links to its page, and a
+        node that splits carries its id, for the click that zooms the
+        tree and the map on it.
     """
     positions = _tree_positions(nodes)
     by_id = {node["node_id"]: node for node in nodes}
@@ -840,7 +849,7 @@ def _central_range(values: np.ndarray) -> dict[str, list[float]]:
 def leaf_map(
     nodes: Sequence[Mapping], plane: ClassPlane, *, color: str, run_id: int
 ) -> dict[str, object]:
-    """Draw the train rows of a class's leaves as points in a plane.
+    """Draw the grown val rows of a class's leaves as points in a plane.
 
     Args:
         nodes: The `queries.class_tree` rows shown.

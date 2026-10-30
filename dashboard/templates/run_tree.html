@@ -11,8 +11,11 @@
 </div>
 <h2>Tree of a class</h2>
 <p class="muted">A square is a leaf, a circle a node that splits; size follows the grown rows. Color shows the measure
-  chosen below against the rate at the top of the tree: blue is better than it, red worse, and the ends of the scale
-  are the 2nd and 98th percentiles of the leaves. Hover a node for its counts and rates, click a leaf for its page.</p>
+  chosen below on one scale for all of them, the failure rate of val: the middle is the val rate at the top of the tree,
+  blue is below it and red above, and the ends are the 2nd and 98th percentiles of the leaves. The <b>predicted rate</b>
+  is the leaf's <b>q</b>, and a node that splits takes the mean of its leaves' weighted by their val rows; <b>purity</b>
+  is the share of grown rows the classifier got right, red where it is low. Hover a node for its rows and rates in val
+  (both halves) and test, click a leaf for its page.</p>
 <p class="muted">The map under the tree draws a sample of the grown rows of each leaf, at most a thousand of them thinned to
   the same count per leaf, in the plane of the first two principal components of the class's grown rows, in the LDA
   space z or, when picked, in z with <b>s_d</b>, the disagreement of the neighbours standardized and weighted as the

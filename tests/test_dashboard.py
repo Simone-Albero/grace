@@ -284,9 +284,9 @@ def test_the_test_rate_colors_a_tree_only_when_evaluate_ran() -> None:
     assert "test_rate" in tabs.tree_colors({"tree": 1, "evaluate": 2})
     assert "test_rate" not in tabs.tree_colors({"tree": 1})
     assert list(tabs.tree_colors({"tree": 1})) == [
+        "pred_rate",
+        "val_rate",
         "purity",
-        "grow_rate",
-        "estimate_rate",
     ]
 
 
@@ -344,6 +344,20 @@ def test_class_tree_sums_the_test_rows_of_the_leaves_into_each_node(
         node["purity"] == pytest.approx(1 - node["grow_rate"])
         for node in nodes
         if node["n_grow"]
+    )
+    # Val pools both halves; a node predicts the mean of its leaves' q,
+    # weighted by their val rows.
+    assert all(
+        node["n_val"] == node["n_grow"] + node["n_estimate"]
+        and node["n_val_errors"] == node["n_grow_errors"] + node["n_estimate_errors"]
+        for node in nodes
+    )
+    assert top["n_val"] == sum(leaf["n_val"] for leaf in leaves)
+    assert all(leaf["pred_rate"] == leaf["q"] for leaf in leaves)
+    weighted = [leaf for leaf in leaves if leaf["q"] is not None and leaf["n_val"]]
+    assert top["pred_rate"] == pytest.approx(
+        sum(leaf["q"] * leaf["n_val"] for leaf in weighted)
+        / sum(leaf["n_val"] for leaf in weighted)
     )
     without_evaluate = {key: value for key, value in ids.items() if key != "evaluate"}
     with closing(queries.connect(path)) as db:

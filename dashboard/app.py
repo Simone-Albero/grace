@@ -440,7 +440,7 @@ def create_app(db_path: Path) -> FastAPI:
         request: Request,
         run_id: _Id,
         class_id: _ClassId,
-        color: str = "purity",
+        color: str = "pred_rate",
         plane: str = "z",
         # A string: the form sends an empty `node` for the whole class,
         # which an int parameter would reject.

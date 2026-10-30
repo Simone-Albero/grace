@@ -66,7 +66,7 @@ class DisagreementAxis:
 
 @dataclass(frozen=True)
 class ClassPlane:
-    """Train rows of the leaves of a class in a 2D plane.
+    """Grown val rows of the leaves of a class in a 2D plane.
 
     Attributes:
         leaves: The node id of the leaf each point belongs to.

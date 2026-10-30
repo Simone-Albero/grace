@@ -402,9 +402,12 @@ def class_tree(
 
     Returns:
         One row per node that was not pruned, parents first, with the
-        `purity` of its grown rows: the share of the class's own. A
-        node's test counts are the sums over the leaves below it, and
-        None when evaluate did not run.
+        `purity` of its grown rows: the share of the class's own. The
+        val counts and `val_rate` pool both halves of val. A node's test
+        counts are the sums over the leaves below it, and None when
+        evaluate did not run. `pred_rate` is a leaf's `q`, and a node's
+        mean of the `q` of the leaves below it, weighted by their val
+        rows.
     """
     rows = _all(
         db,
@@ -428,18 +431,40 @@ def class_tree(
         },
     )
     by_id = {row["node_id"]: row for row in rows}
+    for row in rows:
+        row["n_val"] = row["n_grow"] + row["n_estimate"]
+        row["n_val_errors"] = row["n_grow_errors"] + row["n_estimate_errors"]
+    # What a node's predicted rate pools: the leaves' `q` weighted by
+    # the val rows each one holds.
+    q_mass = {row["node_id"]: 0.0 for row in rows}
+    q_rows = {row["node_id"]: 0 for row in rows}
     # Deepest first, so a node is complete before it feeds its parent.
     for row in reversed(rows):
+        node_id = row["node_id"]
+        if row["status"] == "leaf" and row["q"] is not None:
+            q_mass[node_id], q_rows[node_id] = row["q"] * row["n_val"], row["n_val"]
         parent = by_id.get(row["parent_id"])
-        if parent is None or row["n_test"] is None:
+        if parent is None:
+            continue
+        q_mass[parent["node_id"]] += q_mass[node_id]
+        q_rows[parent["node_id"]] += q_rows[node_id]
+        if row["n_test"] is None:
             continue
         for key in ("n_test", "n_test_errors"):
             parent[key] = (parent[key] or 0) + row[key]
     _add_rates(rows)
-    # Every grown row of the tree has the class as its prediction, so
-    # the errors are the rows of another class.
     for row in rows:
+        # Every grown row of the tree has the class as its prediction,
+        # so the errors are the rows of another class.
         row["purity"] = None if row["grow_rate"] is None else 1 - row["grow_rate"]
+        row["val_rate"] = row["n_val_errors"] / row["n_val"] if row["n_val"] else None
+        node_id = row["node_id"]
+        if row["status"] == "leaf":
+            row["pred_rate"] = row["q"]
+        else:
+            row["pred_rate"] = (
+                q_mass[node_id] / q_rows[node_id] if q_rows[node_id] else None
+            )
     return rows
 
 
