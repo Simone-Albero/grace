@@ -193,13 +193,13 @@ function setModels(models) {
   $("model").value = state.model;
 }
 
-/** Tiles, classes per split with inline bars, dropped classes, features. @param {object} data response of /split */
+/** Tiles, classes per split with inline bars, dropped classes and columns, features. @param {object} data response of /split */
 function renderSplit(data) {
   const s = data.summary;
   const totals = ["train", "val", "test"].map((k) => data.classes.reduce((a, c) => a + c[k], 0));
   fill("sp-tiles",
     tile("rows read", num(s.n_raw)),
-    tile("rows kept", num(s.n_kept), `${num(s.n_incomplete)} incomplete, ${num(s.n_rare)} in rare classes`),
+    tile("rows kept", num(s.n_kept), `${num(s.n_rare)} in rare classes`),
     tile("classes", num(s.n_classes), `${data.dropped_classes.length} dropped`),
     ["train", "val", "test"].map((k, i) => tile(k, num(totals[i]), pct(totals[i] / s.n_kept))));
   const top = Math.max(...data.classes.map((c) => c.train + c.val + c.test), 1);
@@ -211,6 +211,7 @@ function renderSplit(data) {
         num(c.train), num(c.val), num(c.test)];
     })));
   fill("sp-dropped", data.dropped_classes.map((c) => h("span", { class: "chip" }, `${c.label} (${num(c.n_rows)})`)));
+  fill("sp-constant", data.dropped_columns.map((c) => h("span", { class: "chip" }, c)));
   fill("sp-features",
     h("h3", {}, `numeric (${data.features.num.length})`),
     h("div", { class: "chips" }, data.features.num.map((c) => h("span", { class: "chip" }, c))),

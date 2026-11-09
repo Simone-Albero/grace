@@ -43,6 +43,8 @@ def test_split(client):
     data = _get(client, "/api/toy/split")
     assert set(data) >= {"run", "summary", "classes", "dropped_classes", "features"}
     assert len(data["classes"]) == 9
+    assert data["dropped_columns"] == ["flat"]
+    assert "flat" not in data["features"]["num"]
     assert set(data["features"]) == {"num", "cat"}
 
 

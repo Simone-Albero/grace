@@ -4,7 +4,7 @@ import pytest
 import yaml
 from conftest import ROOT
 
-from src.config import dataset_names, load_config, model_names
+from src.config import DATASET_DIR, dataset_names, load_config, model_names
 
 
 @pytest.mark.parametrize("dataset", dataset_names())
@@ -68,3 +68,26 @@ def test_a_missing_yaml_path_is_named_as_given(tmp_path):
     missing = tmp_path / "nope.yaml"
     with pytest.raises(FileNotFoundError, match=f"{missing}$"):
         load_config("synthetic_test", method=str(missing))
+
+
+def test_max_per_class_must_be_null_or_positive(tmp_path):
+    raw = yaml.safe_load((DATASET_DIR / "synthetic_test.yaml").read_text())
+    for cap in (0, -3):
+        path = tmp_path / "capped.yaml"
+        path.write_text(yaml.safe_dump({**raw, "max_per_class": cap}))
+        with pytest.raises(ValueError, match="max_per_class"):
+            load_config(str(path))
+    path.write_text(yaml.safe_dump({**raw, "max_per_class": None}))
+    assert load_config(str(path)).max_per_class is None
+
+
+def test_unknown_top_level_keys_fail(tmp_path):
+    raw = yaml.safe_load((ROOT / "configs/method/default.yaml").read_text())
+    path = tmp_path / "old.yaml"
+    path.write_text(yaml.safe_dump({**raw, "balance": "undersample"}))
+    with pytest.raises(ValueError, match="balance"):
+        load_config("synthetic_test", method=str(path))
+    raw = yaml.safe_load((DATASET_DIR / "synthetic_test.yaml").read_text())
+    path.write_text(yaml.safe_dump({**raw, "max_per_klass": 5}))
+    with pytest.raises(ValueError, match="max_per_klass"):
+        load_config(str(path))

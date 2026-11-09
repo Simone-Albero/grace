@@ -46,10 +46,10 @@ def split(cfg: DatasetConfig) -> dict[str, Any]:
         cfg: The dataset.
 
     Returns:
-        run; summary {n_raw, n_incomplete, n_rare, n_kept, n_classes};
+        run; summary {n_raw, n_rare, n_kept, n_classes, n_constant};
         classes [{label, train, val, test}] sorted by label;
-        dropped_classes [{label, n_rows}]; features {num: [...], cat:
-        [...]}.
+        dropped_classes [{label, n_rows}]; dropped_columns [column];
+        features {num: [...], cat: [...]}.
     """
     with closing(_connect(cfg)) as conn:
         run = _latest_run(conn, "split", cfg)
@@ -62,7 +62,13 @@ def split(cfg: DatasetConfig) -> dict[str, Any]:
                 _rows(conn, "split", "split_class_counts", run),
                 key=lambda r: r["label"],
             ),
-            "dropped_classes": _rows(conn, "split", "dropped_classes", run),
+            "dropped_classes": _rows(
+                conn, "split", "dropped_classes", run, missing_ok=True
+            ),
+            "dropped_columns": [
+                row["column"]
+                for row in _rows(conn, "split", "dropped_columns", run, missing_ok=True)
+            ],
             "features": {
                 kind: [f["column"] for f in features if f["kind"] == kind]
                 for kind in ("num", "cat")
@@ -385,11 +391,14 @@ def _rows(
     stage: str,
     table: str,
     run: Mapping[str, Any],
+    missing_ok: bool = False,
     **where: Any,
 ) -> list[dict[str, Any]]:
     """Return the rows of a table logged by a run, without run_id.
 
-    A missing table means the stage never logged it: LookupError.
+    A missing table means the stage never logged it: LookupError, or no
+    rows when missing_ok, for a table that db.log_table skips when a
+    run has nothing to log in it.
     """
     filters = "".join(f' AND "{k}" = ?' for k in where)
     try:
@@ -398,6 +407,8 @@ def _rows(
             (run["id"], *where.values()),
         ).fetchall()
     except sqlite3.OperationalError as e:
+        if missing_ok and "no such table" in str(e):
+            return []
         raise LookupError(f"run {stage} first") from e
     return [{k: _json_value(r[k]) for k in r.keys() if k != "run_id"} for r in rows]
 

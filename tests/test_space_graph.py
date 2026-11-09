@@ -1,22 +1,79 @@
 """src.space and src.graph on hand-made points."""
 
+import hashlib
 import math
 
 import numpy as np
+import polars as pl
 import pytest
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 
 from src.graph import build_graph, nearest_neighbors, sample_rows
-from src.space import embed, fit_space, scale_for_metric
+from src.space import (
+    HASH_SALT,
+    TopNHashEncoder,
+    embed,
+    fit_space,
+    hash_bucket,
+    scale_for_metric,
+    signed_log1p,
+)
+
+
+def test_signed_log1p():
+    x = np.array([-3.0, 0.0, math.e - 1])
+    np.testing.assert_allclose(signed_log1p(x), [-math.log(4), 0.0, 1.0])
+
+
+def test_hash_bucket_is_the_salted_blake2b():
+    digest = hashlib.blake2b(f"{HASH_SALT}|col|val".encode(), digest_size=8)
+    expected = int.from_bytes(digest.digest(), "little") % 7
+    assert hash_bucket("col", "val", 7) == expected
+    assert 0 <= hash_bucket("other", "val", 7) < 7
+
+
+def test_top_n_hash_encoder_codes():
+    train = pl.Series("c", ["a", "a", "b", "b", "c", None, "a"])
+    encoder = TopNHashEncoder("c", top_n=2, hash_buckets=5).fit(train)
+    codes = encoder.transform(pl.Series("c", ["a", "b", "c", None, "zzz"]))
+    assert codes.dtype == np.int32
+    assert codes.tolist() == [
+        1,
+        2,
+        3 + hash_bucket("c", "c", 5),
+        0,
+        3 + hash_bucket("c", "zzz", 5),
+    ]
+
+
+def test_top_n_hash_encoder_on_a_column_without_values():
+    encoder = TopNHashEncoder("c", top_n=2, hash_buckets=5)
+    encoder.fit(pl.Series("c", [None, None], dtype=pl.String))
+    for values in ([None, None], []):
+        codes = encoder.transform(pl.Series("c", values, dtype=pl.String))
+        assert codes.dtype == np.int32
+        assert codes.tolist() == [0] * len(values)
+
+
+def test_top_n_hash_encoder_ties_and_no_buckets():
+    encoder = TopNHashEncoder("c", top_n=1, hash_buckets=0)
+    encoder.fit(pl.Series("c", ["b", "a"]))
+    assert encoder.transform(pl.Series("c", ["a", "b"])).tolist() == [1, 0]
+
+
+def _fit(train: pl.DataFrame, cat_cols=("c",), **overrides):
+    options = dict(top_n=16, hash_buckets=0, top_k=1, cat_cost=3.0, metric="euclidean")
+    options.update(overrides)
+    return fit_space(train, ["n"], list(cat_cols), **options)
 
 
 def test_space_slots_and_mismatch_cost():
-    cat = np.array([[1], [1], [2], [3]])
-    space = fit_space(cat, top_k=1, cat_cost=3.0)
+    train = pl.DataFrame({"n": [0.0] * 4, "c": ["a", "a", "b", "c"]})
+    space = _fit(train)
     assert [k.tolist() for k in space.kept] == [[1]]
     assert space.weight == pytest.approx(math.sqrt(1.5))
-    points = embed(space, np.zeros((4, 1)), cat)
+    points = embed(space, train)
     assert points.shape == (4, 1 + 2)
     assert points.dtype == np.float64
     np.testing.assert_allclose(points[0], [0.0, space.weight, 0.0])
@@ -25,12 +82,21 @@ def test_space_slots_and_mismatch_cost():
     assert np.sum((points[2] - points[3]) ** 2) == 0.0
 
 
-def test_space_top_k_zero_and_no_categorical():
-    cat = np.array([[1, 5], [2, 5]])
-    assert embed(fit_space(cat, 0, 1.0), np.ones((2, 3)), cat).shape == (2, 5)
-    none = np.empty((2, 0), dtype=np.int64)
-    points = embed(fit_space(none, 16, 1.0), np.ones((2, 3)), none)
-    np.testing.assert_array_equal(points, np.ones((2, 3)))
+def test_space_numbers_are_robust_scaled_and_missing_ones_sit_on_the_median():
+    train = pl.DataFrame({"n": [0.0, 1.0, 2.0, 3.0, 4.0, None, float("inf")]})
+    space = _fit(train, cat_cols=())
+    logged = np.log1p(np.arange(5.0))
+    q25, q50, q75 = np.percentile(logged, [25, 50, 75])
+    points = embed(space, train)
+    np.testing.assert_allclose(points[:5, 0], (logged - q50) / (q75 - q25))
+    np.testing.assert_array_equal(points[5:, 0], [0.0, 0.0])
+
+
+def test_space_top_k_zero_and_cosine():
+    train = pl.DataFrame({"n": [1.0, 2.0], "c": ["x", "y"]})
+    assert embed(_fit(train, top_k=0), train).shape == (2, 2)
+    space = _fit(train, top_k=2, cat_cost=1.0, metric="cosine")
+    np.testing.assert_allclose(np.linalg.norm(embed(space, train), axis=1), 1.0)
 
 
 def test_scale_for_metric():

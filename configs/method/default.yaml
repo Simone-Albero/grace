@@ -1,6 +1,5 @@
 # Parameters of the method, shared by every dataset and classifier (src.config.MethodConfig).
 distance: euclidean      # euclidean | cosine: metric of the graph, the regions and the complexity measures
-balance: undersample     # train: undersample every class to the smallest one | none
 
 space:                   # the euclidean space regions live in (src.space)
   top_k: 16              # most frequent codes of each categorical column with their own one-hot slot; the rest share one

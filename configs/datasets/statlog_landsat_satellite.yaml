@@ -51,13 +51,14 @@ num_cols:
 
 cat_cols: []
 
-split:  # stratified by class, after dropping non-finite rows and rare classes
+split:  # stratified by class, after dropping the rare classes and the constant columns
   train: 0.4
   val: 0.15  # the ATC threshold is fitted here; no classifier trains on it
   test: 0.45  # every failure rate is measured here
 
 min_class_count: 100  # classes with fewer rows are dropped
-top_n: 32  # most frequent values of a categorical column that keep their own code
+max_per_class: 10000  # most train rows per class the classifier is fitted on (null = all); every split stays whole
+top_n: 32  # most frequent values of a categorical column with their own code (space) and one-hot column (classifier)
 hash_buckets: 64  # the other values are hashed into this many codes
 seed: 42
 output_dir: resources/processed/statlog_landsat_satellite

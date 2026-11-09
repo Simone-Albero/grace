@@ -35,10 +35,13 @@
       <p class="empty">Select a dataset.</p>
       <div id="sp-tiles" class="tiles"></div>
       <div class="card"><h2>Classes per split</h2>
-        <p class="note">Stratified by class, after dropping rows with a missing or infinite value and the classes
-          under min_class_count.</p>
+        <p class="note">Stratified by class, after dropping the classes under min_class_count. Rows with a missing or
+          infinite value are kept: the classifier imputes them, the region space puts them on the train median.</p>
         <div id="sp-classes" class="table-wrap"></div></div>
       <div class="card"><h2>Dropped classes</h2><div id="sp-dropped" class="chips"></div></div>
+      <div class="card"><h2>Dropped columns</h2>
+        <p class="note">Configured columns with a single value over the kept rows.</p>
+        <div id="sp-constant" class="chips"></div></div>
       <div class="card"><h2>Features</h2><div id="sp-features"></div></div>
     </section>
 

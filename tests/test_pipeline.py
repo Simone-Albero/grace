@@ -10,7 +10,7 @@ from conftest import MODEL, STAGE_ORDER, Workspace, make_workspace
 
 from main import main
 from src.complexity.measure import MEASURES
-from src.prepare import LABEL
+from src.data import LABEL
 
 
 def _rows(workspace: Workspace, sql: str) -> list[tuple]:
@@ -29,19 +29,35 @@ def test_every_run_is_ok(done):
     assert [r[2] for r in runs] == [None] * 3 + [MODEL] * 3
 
 
-def test_split_drops_the_rare_class_and_prepares_every_split(done):
+def test_split_drops_the_rare_class_and_the_constant_column_only(done):
     classes = json.loads((done.output_dir / "classes.json").read_text())
     assert "class_10" not in classes and len(classes) == 9
     dropped = _rows(done, "SELECT label FROM dropped_classes")
     assert dropped == [("class_10",)]
-    sizes = {
-        name: _read(done, f"{name}.parquet").height for name in ("train", "val", "test")
-    }
-    (n_kept,) = _rows(done, "SELECT n_kept FROM split_summary")[0]
-    assert sum(sizes.values()) == n_kept
-    train = _read(done, "train.parquet")
+    assert _rows(done, "SELECT column FROM dropped_columns") == [("flat",)]
+    splits = [_read(done, f"{name}.parquet") for name in ("train", "val", "test")]
+    n_raw, n_rare, n_kept = _rows(
+        done, "SELECT n_raw, n_rare, n_kept FROM split_summary"
+    )[0]
+    assert sum(split.height for split in splits) == n_kept == n_raw - n_rare
+    numbers = pl.concat(splits).select(pl.selectors.starts_with("num_"))
+    assert numbers.select(pl.any_horizontal(pl.all().is_infinite().any())).item()
+    assert numbers.null_count().sum_horizontal().item() > 0
+    train = splits[0]
+    assert "flat" not in train.columns
+    assert train["cat_1"].dtype == pl.String
     assert train.columns[-1] == LABEL
     assert set(train[LABEL].unique().to_list()) == set(range(9))
+
+
+def test_train_fits_on_the_capped_train_and_predicts_every_row(done):
+    n_train, n_fit, max_per_class = _rows(
+        done, "SELECT n_train, n_fit, max_per_class FROM train_stats"
+    )[0]
+    per_class = _read(done, "train.parquet")[LABEL].value_counts()["count"]
+    assert max_per_class == 300
+    assert n_train == per_class.sum()
+    assert n_fit == per_class.clip(upper_bound=max_per_class).sum() < n_train
 
 
 def test_assignments_cover_every_row_and_train_keeps_its_class(done):
@@ -118,6 +134,16 @@ def test_a_stage_without_its_input_fails_and_is_logged(tmp_path, synthetic_csv):
     with pytest.raises(FileNotFoundError, match="run split first"):
         workspace.run("train")
     assert _rows(workspace, "SELECT stage, status FROM runs") == [("train", "failed")]
+
+
+def test_split_refuses_rows_without_a_label(tmp_path, synthetic_csv):
+    csv = tmp_path / "unlabelled.csv"
+    rows = pl.read_csv(synthetic_csv, infer_schema=False)
+    unlabelled = pl.when(pl.int_range(pl.len()) < 2).then(None).otherwise("label")
+    rows.with_columns(unlabelled.alias("label")).write_csv(csv)
+    workspace = make_workspace(tmp_path, csv)
+    with pytest.raises(ValueError, match="2 rows .* have no label"):
+        workspace.run("split")
 
 
 def test_model_stages_need_a_model(done):

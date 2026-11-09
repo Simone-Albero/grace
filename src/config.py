@@ -19,7 +19,7 @@ __all__ = [
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
 
@@ -34,7 +34,6 @@ MODEL_DIR = CONFIG_DIR / "models"
 METHOD_DIR = CONFIG_DIR / "method"
 
 DISTANCES = ("euclidean", "cosine")
-BALANCES = ("undersample", "none")
 
 
 @dataclass(frozen=True)
@@ -171,7 +170,6 @@ class MethodConfig:
 
     Attributes:
         distance: One of DISTANCES.
-        balance: One of BALANCES.
         space: The region space.
         graph: The k-NN graph of train.
         clustering: The per-class clustering.
@@ -180,7 +178,6 @@ class MethodConfig:
     """
 
     distance: str
-    balance: str
     space: SpaceConfig
     graph: GraphConfig
     clustering: ClusteringConfig
@@ -199,10 +196,14 @@ class DatasetConfig:
         num_cols: The numeric columns.
         cat_cols: The categorical columns.
         split: The split shares.
-        min_class_count: Classes with fewer clean rows are dropped.
-        top_n: The categorical values with their own code.
+        min_class_count: Classes with fewer rows are dropped.
+        max_per_class: The most train rows per class the classifier is
+            fitted on; None fits it on all of train.
+        top_n: The most frequent values of a categorical column with
+            their own code in the space and their own one-hot column in
+            the classifier.
         hash_buckets: The codes the other categorical values are
-            hashed into.
+            hashed into in the space.
         seed: The seed of every stage.
         output_dir: The folder of every file of every stage.
         db_path: The SQLite file.
@@ -217,6 +218,7 @@ class DatasetConfig:
     cat_cols: tuple[str, ...]
     split: SplitConfig
     min_class_count: int
+    max_per_class: int | None
     top_n: int
     hash_buckets: int
     seed: int
@@ -260,6 +262,12 @@ def _check(condition: bool, message: str) -> None:
         raise ValueError(message)
 
 
+def _check_keys(raw: Mapping[str, Any], config: type, path: Path) -> None:
+    known = {field.name for field in fields(config)} - {"method", "model"}
+    unknown = sorted(set(raw) - known)
+    _check(not unknown, f"unknown keys in {path}: {unknown}")
+
+
 def _validate_split(split: SplitConfig) -> None:
     shares = {"train": split.train, "val": split.val, "test": split.test}
     for name, share in shares.items():
@@ -272,10 +280,6 @@ def _validate_method(method: MethodConfig) -> None:
     _check(
         method.distance in DISTANCES,
         f"distance must be one of {DISTANCES}, got {method.distance!r}",
-    )
-    _check(
-        method.balance in BALANCES,
-        f"balance must be one of {BALANCES}, got {method.balance!r}",
     )
     clustering = method.clustering
     _check(
@@ -347,9 +351,12 @@ def load_method_config(name_or_path: str = "default") -> MethodConfig:
         The method config.
 
     Raises:
-        ValueError: When a value is out of its range or unknown.
+        ValueError: When a key is unknown, or a value unknown or out of
+            its range.
     """
-    raw = _yaml(_path(name_or_path, METHOD_DIR))
+    path = _path(name_or_path, METHOD_DIR)
+    raw = _yaml(path)
+    _check_keys(raw, MethodConfig, path)
     regressor = dict(raw["regressor"])
     if regressor["measures"] is not None:
         regressor["measures"] = tuple(regressor["measures"])
@@ -357,7 +364,6 @@ def load_method_config(name_or_path: str = "default") -> MethodConfig:
     clustering["params"] = clustering.get("params") or {}
     method = MethodConfig(
         distance=raw["distance"],
-        balance=raw["balance"],
         space=SpaceConfig(**raw["space"]),
         graph=GraphConfig(**raw["graph"]),
         clustering=ClusteringConfig(**clustering),
@@ -384,11 +390,19 @@ def load_config(
 
     Raises:
         FileNotFoundError: When a yaml does not exist.
-        ValueError: When a value is out of its range or unknown.
+        ValueError: When a key is unknown, or a value unknown or out of
+            its range.
     """
-    raw = _yaml(_path(dataset, DATASET_DIR))
+    path = _path(dataset, DATASET_DIR)
+    raw = _yaml(path)
+    _check_keys(raw, DatasetConfig, path)
     split = SplitConfig(**raw["split"])
     _validate_split(split)
+    max_per_class = raw["max_per_class"]
+    _check(
+        max_per_class is None or max_per_class >= 1,
+        f"max_per_class must be null or >= 1, got {max_per_class}",
+    )
     return DatasetConfig(
         name=raw["name"],
         path=Path(raw["path"]),
@@ -397,6 +411,7 @@ def load_config(
         cat_cols=tuple(raw["cat_cols"] or ()),
         split=split,
         min_class_count=raw["min_class_count"],
+        max_per_class=max_per_class,
         top_n=raw["top_n"],
         hash_buckets=raw["hash_buckets"],
         seed=raw["seed"],

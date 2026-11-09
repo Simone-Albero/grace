@@ -1,45 +1,38 @@
 """src.models, src.evaluation and src.baselines on hand-made data."""
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import pytest
 
 from src.baselines import atc_rate, atc_threshold, failure_rates, mcp_rate
 from src.evaluation import classification_metrics, confusion, rate_scores
-from src.models import (
-    MODELS,
-    CappedCategoryEncoder,
-    build_pipeline,
-    predict_proba,
-    undersample,
-)
+from src.models import MODELS, build_pipeline, predict_proba
+from src.preprocessing import Features
+
+FEATURES = Features(num=("a", "b"), cat=("c",))
 
 
-def test_undersample():
-    labels = np.array([0] * 5 + [1] * 2 + [2] * 3)
-    kept = undersample(labels, seed=0)
-    assert kept.tolist() == sorted(kept.tolist())
-    assert np.bincount(labels[kept]).tolist() == [2, 2, 2]
-    np.testing.assert_array_equal(kept, undersample(labels, seed=0))
-
-
-def _toy(n: int = 90) -> tuple[pd.DataFrame, np.ndarray]:
+def _toy(n: int = 90) -> tuple[pl.DataFrame, np.ndarray]:
+    """Three classes; a separates them, c half does, a few a missing."""
     rng = np.random.default_rng(0)
     y = np.arange(n) % 3
-    frame = pd.DataFrame(
+    a_values = y + rng.normal(0, 0.3, n)
+    a_values[:3] = [np.nan, np.inf, np.nan]
+    frame = pl.DataFrame(
         {
-            "a": y + rng.normal(0, 0.3, n),
+            "a": a_values,
             "b": rng.normal(0, 1, n),
-            "c": (y * 2 + rng.integers(0, 2, n)).astype(np.int32),
+            "c": [f"v{code}" for code in y * 2 + rng.integers(0, 2, n)],
         }
     )
     return frame, y
 
 
 @pytest.mark.parametrize("name", sorted(MODELS))
-def test_every_model_gives_probabilities(name):
+def test_every_model_gives_probabilities_despite_missing_numbers(name):
     X, y = _toy()
-    model = build_pipeline(name, {}, ["a", "b"], ["c"], seed=0).fit(X, y)
+    model = build_pipeline(name, {}, FEATURES, top_n=4, seed=0).fit(X, y)
+    assert ("impute" in model.named_steps) is not MODELS[name].nan_ok
     proba = predict_proba(model, X, 3)
     assert proba.shape == (90, 3)
     np.testing.assert_allclose(proba.sum(axis=1), 1.0, atol=1e-6)
@@ -47,29 +40,23 @@ def test_every_model_gives_probabilities(name):
 
 
 def test_build_pipeline_seed_and_params():
-    model = build_pipeline("random_forest", {"n_estimators": 5}, ["a"], [], seed=7)
+    model = build_pipeline("random_forest", {"n_estimators": 5}, FEATURES, 4, seed=7)
     assert model.named_steps["classifier"].random_state == 7
     assert model.named_steps["classifier"].n_estimators == 5
-    model = build_pipeline("random_forest", {"random_state": 1}, ["a"], [], seed=7)
+    model = build_pipeline("random_forest", {"random_state": 1}, FEATURES, 4, seed=7)
     assert model.named_steps["classifier"].random_state == 1
     with pytest.raises(ValueError, match="nope"):
-        build_pipeline("nope", {}, ["a"], [], seed=0)
+        build_pipeline("nope", {}, FEATURES, 4, seed=0)
 
 
-def test_predict_proba_checks_the_classes():
+def test_predict_proba_checks_the_classes_and_spans_chunks(monkeypatch):
     X, y = _toy()
-    model = build_pipeline("naive_bayes", {}, ["a", "b"], ["c"], seed=0).fit(X, y)
+    model = build_pipeline("naive_bayes", {}, FEATURES, 4, seed=0).fit(X, y)
+    whole = predict_proba(model, X, 3)
+    monkeypatch.setattr("src.models._CHUNK_ROWS", 7)
+    np.testing.assert_array_equal(predict_proba(model, X, 3), whole)
     with pytest.raises(ValueError):
         predict_proba(model, X, 4)
-
-
-def test_capped_category_encoder():
-    encoder = CappedCategoryEncoder(max_cardinality=1)
-    out = encoder.fit(pd.DataFrame({"c": [1, 1, 2]})).transform(
-        pd.DataFrame({"c": [1, 2, 3]})
-    )
-    assert isinstance(out["c"].dtype, pd.CategoricalDtype)
-    assert out["c"].isna().tolist() == [False, True, True]
 
 
 def test_classification_metrics_and_confusion():

@@ -17,7 +17,6 @@ __all__ = [
     "model_file",
     "need",
     "predictions_file",
-    "preprocessor_file",
     "read_classes",
     "read_split",
     "regions_file",
@@ -54,7 +53,7 @@ def need(path: Path, stage: str) -> Path:
 
 
 def split_file(cfg: DatasetConfig, name: str) -> Path:
-    """Return the file of the prepared rows of one split (stage split).
+    """Return the file of the rows of one split (stage split).
 
     Args:
         cfg: The dataset config.
@@ -76,18 +75,6 @@ def classes_file(cfg: DatasetConfig) -> Path:
         The JSON path; the file is a list of names indexed by code.
     """
     return cfg.output_dir / "classes.json"
-
-
-def preprocessor_file(cfg: DatasetConfig) -> Path:
-    """Return the file of the fitted Preprocessor (stage split).
-
-    Args:
-        cfg: The dataset config.
-
-    Returns:
-        The joblib path of the src.prepare.Preprocessor.
-    """
-    return cfg.output_dir / "preprocessor.joblib"
 
 
 def regions_file(cfg: DatasetConfig) -> Path:
@@ -248,7 +235,7 @@ def _model(cfg: DatasetConfig) -> str:
 
 
 def read_split(cfg: DatasetConfig, name: str) -> pl.DataFrame:
-    """Return the prepared rows of one split.
+    """Return the rows of one split.
 
     Args:
         cfg: The dataset config.

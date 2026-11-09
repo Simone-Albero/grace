@@ -1,34 +1,16 @@
-"""src.data and src.prepare on hand-made frames."""
-
-import hashlib
-import math
+"""src.data and src.preprocessing on hand-made frames."""
 
 import numpy as np
 import polars as pl
-import pytest
 
-from src.data import SPLITS, drop_incomplete, drop_rare_classes, stratified_split
-from src.prepare import (
-    HASH_SALT,
-    LABEL,
-    Preprocessor,
-    TopNHashEncoder,
-    hash_bucket,
-    signed_log1p,
+from src.data import (
+    SPLITS,
+    cap_per_class,
+    constant_columns,
+    drop_rare_classes,
+    stratified_split,
 )
-
-
-def test_drop_incomplete_drops_nulls_nan_and_inf():
-    df = pl.DataFrame(
-        {
-            "a": [1.0, float("nan"), float("inf"), 2.0, 3.0, -float("inf")],
-            "c": ["x", "y", "z", None, "w", "v"],
-            "y": ["p", "p", "q", "q", "q", "p"],
-        }
-    )
-    kept = drop_incomplete(df, ["a"])
-    assert kept["a"].to_list() == [1.0, 3.0]
-    assert kept["c"].to_list() == ["x", "w"]
+from src.preprocessing import Features, Preprocessor, feature_cols
 
 
 def test_drop_rare_classes_keeps_order_and_the_class_at_the_floor():
@@ -69,62 +51,57 @@ def test_stratified_split_depends_on_the_seed_only():
     assert not first["train"].equals(other["train"])
 
 
-def test_signed_log1p():
-    x = np.array([-3.0, 0.0, math.e - 1])
-    np.testing.assert_allclose(signed_log1p(x), [-math.log(4), 0.0, 1.0])
-
-
-def test_hash_bucket_is_the_salted_blake2b():
-    digest = hashlib.blake2b(f"{HASH_SALT}|col|val".encode(), digest_size=8)
-    expected = int.from_bytes(digest.digest(), "little") % 7
-    assert hash_bucket("col", "val", 7) == expected
-    assert 0 <= hash_bucket("other", "val", 7) < 7
-
-
-def test_top_n_hash_encoder_codes():
-    train = pl.Series("c", ["a", "a", "b", "b", "c", None, "a"])
-    encoder = TopNHashEncoder("c", top_n=2, hash_buckets=5).fit(train)
-    codes = encoder.transform(pl.Series("c", ["a", "b", "c", None, "zzz"]))
-    assert codes.dtype == np.int32
-    assert codes.tolist() == [
-        1,
-        2,
-        3 + hash_bucket("c", "c", 5),
-        0,
-        3 + hash_bucket("c", "zzz", 5),
-    ]
-
-
-def test_top_n_hash_encoder_ties_and_no_buckets():
-    encoder = TopNHashEncoder("c", top_n=1, hash_buckets=0)
-    encoder.fit(pl.Series("c", ["b", "a"]))
-    assert encoder.transform(pl.Series("c", ["a", "b"])).tolist() == [1, 0]
-
-
-@pytest.fixture
-def raw() -> pl.DataFrame:
-    return pl.DataFrame(
+def test_constant_columns_count_null_as_a_value():
+    rows = pl.DataFrame(
         {
-            "n": [0.0, 1.0, 2.0, 3.0, 4.0],
-            "c": ["x", "x", "y", "z", "x"],
-            "y": ["dog", "cat", "dog", "cat", "dog"],
+            "same": [1.0, 1.0, 1.0],
+            "nulls": [None, None, None],
+            "mixed": [None, 2.0, 2.0],
+            "text": ["a", "a", "a"],
+            "varied": [1.0, 2.0, 3.0],
         }
     )
+    assert constant_columns(rows, rows.columns) == ["same", "nulls", "text"]
+    assert constant_columns(rows, ["varied", "same"]) == ["same"]
 
 
-def test_preprocessor_columns_codes_and_scaling(raw):
-    prep = Preprocessor(["n"], ["c"], "y", top_n=1, hash_buckets=0).fit(raw)
-    out = prep.transform(raw)
-    assert out.columns == ["n", "c", LABEL]
-    assert prep.classes_ == ("cat", "dog")
-    assert out[LABEL].to_list() == [1, 0, 1, 0, 1]
-    assert out["c"].to_list() == [1, 1, 0, 0, 1]
-    logged = np.log1p(raw["n"].to_numpy())
-    q25, q50, q75 = np.percentile(logged, [25, 50, 75])
-    np.testing.assert_allclose(out["n"].to_numpy(), (logged - q50) / (q75 - q25))
+def test_cap_per_class_keeps_order_and_small_classes():
+    rows = _frame({"a": 50, "b": 3})
+    capped = cap_per_class(rows, "y", 10, seed=0)
+    assert capped["y"].value_counts().sort("y")["count"].to_list() == [10, 3]
+    values = capped["v"].to_list()
+    assert values == sorted(values)
+    assert set(values) >= {50, 51, 52}
+    assert capped.equals(cap_per_class(rows, "y", 10, seed=0))
+    assert not capped.equals(cap_per_class(rows, "y", 10, seed=1))
 
 
-def test_preprocessor_rejects_an_unseen_class(raw):
-    prep = Preprocessor(["n"], ["c"], "y", top_n=1, hash_buckets=0).fit(raw)
-    with pytest.raises(ValueError, match="bird"):
-        prep.transform(raw.with_columns(pl.lit("bird").alias("y")))
+def test_feature_cols_keep_the_present_ones_in_order():
+    features = feature_cols(["c", "b", "label"], ["a", "b"], ["c", "d"])
+    assert features == Features(num=("b",), cat=("c",))
+
+
+def test_preprocessor_z_scores_and_one_hot_with_other():
+    train = pl.DataFrame(
+        {
+            "n": [1.0, 3.0, float("inf"), None],
+            "c": ["x", "x", "y", None],
+        }
+    )
+    preprocessor = Preprocessor(Features(num=("n",), cat=("c",)), top_n=1)
+    preprocessor.fit(train)
+    assert preprocessor.levels_ == {"c": ["x"]}
+    out = preprocessor.transform(
+        pl.DataFrame({"n": [2.0, float("nan")], "c": ["z", "x"]})
+    )
+    assert out.shape == (2, 3)
+    assert out[0, 0] == 0.0
+    assert np.isnan(out[1, 0])
+    np.testing.assert_array_equal(out[:, 1:], [[0.0, 1.0], [1.0, 0.0]])
+
+
+def test_preprocessor_without_levels_puts_everything_in_other():
+    train = pl.DataFrame({"n": [0.0, 0.0], "c": ["x", "y"]})
+    preprocessor = Preprocessor(Features(num=("n",), cat=("c",)), top_n=0)
+    out = preprocessor.fit(train).transform(train)
+    np.testing.assert_array_equal(out, [[0.0, 1.0], [0.0, 1.0]])

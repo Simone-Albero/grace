@@ -16,9 +16,9 @@ from src.clustering import centroids
 from src.complexity.common import MeasuredSample
 from src.complexity.measure import compute_population_complexity
 from src.config import DatasetConfig
+from src.data import LABEL
 from src.graph import Graph, nearest_neighbors
-from src.prepare import LABEL
-from src.space import embed, scale_for_metric
+from src.space import embed
 from stages.paths import (
     assignments_file,
     complexity_file,
@@ -67,12 +67,7 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
         raise ValueError(
             "the regions were built on another train split: run regions again"
         )
-    codes = (
-        train.select(cfg.cat_cols).to_numpy().reshape(train.height, len(cfg.cat_cols))
-    )
-    points = scale_for_metric(
-        embed(space, train.select(cfg.num_cols).to_numpy(), codes), method.distance
-    )
+    points = embed(space, train)
     sampled = len(graph.rows) < train.height
     caps = {
         "region": method.complexity.max_sample_per_region if sampled else None,

@@ -11,8 +11,8 @@ import polars as pl
 from src import db
 from src.baselines import atc_rate, atc_threshold, failure_rates, mcp_rate
 from src.config import DatasetConfig
+from src.data import LABEL
 from src.evaluation import rate_scores
-from src.prepare import LABEL
 from stages.paths import (
     assignments_file,
     failures_file,

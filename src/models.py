@@ -1,67 +1,39 @@
-"""Classifiers: registry, pipeline, balancing and probabilities.
+"""Classifiers: registry, pipeline and probabilities.
 
-A pipeline takes a pandas frame of prepared columns (numeric, then
-categorical codes) and puts in front of the classifier the categorical
-strategy of its ModelSpec:
-- "onehot": one-hot of the codes, unknown codes all zero;
-- "drop_cat": the categorical columns dropped;
-- "native_sklearn": codes as pandas categories, the 255 most frequent
-  kept (the rest NaN), read by the classifier as categorical;
-- "native_xgb": codes as pandas categories, all kept,
-  enable_categorical;
-- None: the frame passed as it is, codes as numbers.
+Every pipeline is preprocessing.Preprocessor (z-score and one-hot), a
+median imputer for a classifier that cannot read NaN, then the
+classifier. It takes the polars rows of a split file.
 """
 
 from __future__ import annotations
 
-__all__ = [
-    "CappedCategoryEncoder",
-    "MODELS",
-    "build_pipeline",
-    "predict_proba",
-    "undersample",
-]
+__all__ = ["MODELS", "ModelSpec", "build_pipeline", "predict_proba"]
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-import pandas as pd
-from sklearn.base import BaseEstimator, ClassifierMixin, TransformerMixin
+import polars as pl
+from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.compose import ColumnTransformer
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
+from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.naive_bayes import GaussianNB
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder
 from sklearn.svm import LinearSVC
 from sklearn.tree import DecisionTreeClassifier
 from xgboost import XGBClassifier
 
-# Each categorical strategy: the encoder of the categorical columns
-# (None drops them) and the params that make a classifier read pandas
-# categories.
-_ENCODINGS: dict[str, tuple[Callable[[], Any] | None, dict[str, Any] | None]] = {
-    "onehot": (
-        lambda: OneHotEncoder(handle_unknown="ignore", sparse_output=False),
-        None,
-    ),
-    "drop_cat": (None, None),
-    # HistGradientBoosting takes at most 255 categories per column.
-    "native_sklearn": (
-        lambda: CappedCategoryEncoder(255),
-        {"categorical_features": "from_dtype"},
-    ),
-    "native_xgb": (
-        lambda: CappedCategoryEncoder(None),
-        {"enable_categorical": True, "tree_method": "hist"},
-    ),
-}
+from src.preprocessing import Features, Preprocessor
+
+# Rows per predict_proba call: the one-hot matrix of a whole test split
+# may not fit in memory.
+_CHUNK_ROWS = 100_000
 
 
 class CalibratedLinearSVC(BaseEstimator, ClassifierMixin):
@@ -107,51 +79,6 @@ class CalibratedLinearSVC(BaseEstimator, ClassifierMixin):
         return self.calibrated_.predict_proba(X)
 
 
-class CappedCategoryEncoder(BaseEstimator, TransformerMixin):
-    """Cast columns to pandas categories of their most frequent values.
-
-    Attributes:
-        max_cardinality: The most categories per column (the rest NaN);
-            None keeps every value seen by fit.
-        categories_: The kept values of every column, set by fit.
-    """
-
-    def __init__(self, max_cardinality: int | None = None) -> None:
-        self.max_cardinality = max_cardinality
-
-    def fit(self, X: pd.DataFrame, y: object = None) -> CappedCategoryEncoder:
-        """Learn the kept values of every column.
-
-        Args:
-            X: The categorical columns.
-            y: Ignored.
-
-        Returns:
-            self.
-        """
-        self.categories_ = {}
-        for column in X.columns:
-            counts = X[column].value_counts()
-            n_kept = (
-                len(counts) if self.max_cardinality is None else self.max_cardinality
-            )
-            self.categories_[column] = counts.nlargest(n_kept).index
-        return self
-
-    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        """Return the columns as categoricals over the kept values."""
-        encoded = X.copy()
-        for column, kept in self.categories_.items():
-            encoded[column] = pd.Categorical(
-                encoded[column].where(encoded[column].isin(kept)), kept
-            )
-        return encoded
-
-    def get_feature_names_out(self, input_features: object = None) -> np.ndarray:
-        """Return the column names, unchanged."""
-        return np.array(list(self.categories_))
-
-
 @dataclass(frozen=True)
 class ModelSpec:
     """How to build one classifier.
@@ -159,70 +86,52 @@ class ModelSpec:
     Attributes:
         factory: Takes the params, returns an unfitted classifier with
             the scikit-learn API.
-        categorical: A key of _ENCODINGS; None passes the frame through.
+        nan_ok: Whether the classifier reads NaN; otherwise the
+            pipeline imputes the train median.
     """
 
     factory: Callable[..., Any]
-    categorical: str | None
+    nan_ok: bool
 
 
 MODELS: dict[str, ModelSpec] = {
-    "logistic_regression": ModelSpec(LogisticRegression, "onehot"),
-    "lda": ModelSpec(LinearDiscriminantAnalysis, "onehot"),
-    "linear_svc": ModelSpec(CalibratedLinearSVC, "onehot"),
-    "knn": ModelSpec(KNeighborsClassifier, "onehot"),
-    "mlp": ModelSpec(MLPClassifier, "onehot"),
-    "decision_tree": ModelSpec(DecisionTreeClassifier, None),
-    "random_forest": ModelSpec(RandomForestClassifier, None),
-    "hist_gradient_boosting": ModelSpec(
-        HistGradientBoostingClassifier, "native_sklearn"
-    ),
-    "xgboost": ModelSpec(XGBClassifier, "native_xgb"),
-    "naive_bayes": ModelSpec(GaussianNB, "drop_cat"),
+    "logistic_regression": ModelSpec(LogisticRegression, nan_ok=False),
+    "lda": ModelSpec(LinearDiscriminantAnalysis, nan_ok=False),
+    "linear_svc": ModelSpec(CalibratedLinearSVC, nan_ok=False),
+    "knn": ModelSpec(KNeighborsClassifier, nan_ok=False),
+    "mlp": ModelSpec(MLPClassifier, nan_ok=False),
+    "naive_bayes": ModelSpec(GaussianNB, nan_ok=False),
+    "decision_tree": ModelSpec(DecisionTreeClassifier, nan_ok=True),
+    "random_forest": ModelSpec(RandomForestClassifier, nan_ok=True),
+    "hist_gradient_boosting": ModelSpec(HistGradientBoostingClassifier, nan_ok=True),
+    "xgboost": ModelSpec(XGBClassifier, nan_ok=True),
 }
-
-
-def undersample(labels: np.ndarray, seed: int) -> np.ndarray:
-    """Return rows that cut every class to the size of the smallest.
-
-    Args:
-        labels: The class code of every row.
-        seed: The seed of the draw within each class.
-
-    Returns:
-        The kept positions, ascending.
-    """
-    rng = np.random.default_rng(seed)
-    smallest = np.bincount(labels)[np.unique(labels)].min()
-    kept = [
-        rng.choice(np.flatnonzero(labels == code), smallest, replace=False)
-        for code in np.unique(labels)
-    ]
-    return np.sort(np.concatenate(kept))
 
 
 def build_pipeline(
     name: str,
     params: Mapping[str, Any],
-    num_cols: Sequence[str],
-    cat_cols: Sequence[str],
+    features: Features,
+    top_n: int,
     seed: int,
 ) -> Pipeline:
-    """Build an unfitted pipeline: categorical encoding, classifier.
+    """Build an unfitted pipeline: preprocessing, imputer, classifier.
 
-    The classifier gets params, plus random_state=seed when it takes one
-    and params does not set it; list values become tuples (MLP layer
-    sizes).
+    The imputer (median of train) is there only when the classifier
+    cannot read NaN. The classifier gets params, plus random_state=seed
+    when it takes one and params does not set it; list values become
+    tuples (MLP layer sizes).
 
     Args:
         name: A key of MODELS.
         params: The classifier kwargs.
-        num_cols: The numeric columns of the input frame.
-        cat_cols: The categorical code columns of the input frame.
+        features: The input columns.
+        top_n: The kept values of each categorical column.
         seed: The default random_state.
 
     Returns:
-        The pipeline, steps "encode" and "classifier".
+        The pipeline, steps "preprocess", "impute" (if any) and
+        "classifier".
 
     Raises:
         ValueError: When name is not a key of MODELS.
@@ -233,29 +142,20 @@ def build_pipeline(
     params = {k: tuple(v) if isinstance(v, list) else v for k, v in params.items()}
     if "random_state" in spec.factory().get_params() and "random_state" not in params:
         params["random_state"] = seed
-    if spec.categorical is None:
-        return Pipeline(
-            [("encode", "passthrough"), ("classifier", spec.factory(**params))]
-        )
-    encoder, native = _ENCODINGS[spec.categorical]
-    steps = [("num", "passthrough", list(num_cols))]
-    if encoder is not None and cat_cols:
-        steps.append(("cat", encoder(), list(cat_cols)))
-    encode = ColumnTransformer(steps, remainder="drop", verbose_feature_names_out=False)
-    if native is not None:
-        # A categorical dtype survives only in a DataFrame.
-        encode.set_output(transform="pandas")
-        params = native | params
-    return Pipeline([("encode", encode), ("classifier", spec.factory(**params))])
+    steps = [("preprocess", Preprocessor(features, top_n))]
+    if not spec.nan_ok:
+        steps.append(("impute", SimpleImputer(strategy="median")))
+    steps.append(("classifier", spec.factory(**params)))
+    return Pipeline(steps)
 
 
-def predict_proba(model: Pipeline, X: pd.DataFrame, n_classes: int) -> np.ndarray:
+def predict_proba(model: Pipeline, rows: pl.DataFrame, n_classes: int) -> np.ndarray:
     """Return the class probabilities of every row.
 
     Args:
         model: A pipeline fitted on class codes 0..n_classes-1, all
             present.
-        X: The prepared rows.
+        rows: The rows of a split file.
         n_classes: The number of classes.
 
     Returns:
@@ -265,7 +165,9 @@ def predict_proba(model: Pipeline, X: pd.DataFrame, n_classes: int) -> np.ndarra
         ValueError: When the model returns another number of columns or
             a non-finite probability.
     """
-    proba = model.predict_proba(X)
+    proba = np.vstack(
+        [model.predict_proba(chunk) for chunk in rows.iter_slices(_CHUNK_ROWS)]
+    )
     if proba.shape[1] != n_classes or not np.isfinite(proba).all():
         raise ValueError(
             f"expected {n_classes} finite probability columns, "

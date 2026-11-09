@@ -8,6 +8,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import polars as pl
 import pytest
 import yaml
 
@@ -61,7 +62,9 @@ def write_dataset_yaml(folder: Path, csv: Path, name: str = "toy") -> Path:
     base.update(
         name=name,
         path=str(csv),
+        num_cols=[*base["num_cols"], "flat"],
         min_class_count=600,
+        max_per_class=300,
         top_n=16,
         hash_buckets=16,
         output_dir=str(folder / "out"),
@@ -93,7 +96,10 @@ def write_method_yaml(folder: Path) -> Path:
 
 @pytest.fixture(scope="session")
 def synthetic_csv(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """A 12000-row synthetic CSV; class_10 keeps 500 rows, too few."""
+    """A 12000-row synthetic CSV; class_10 keeps 500 rows, too few.
+
+    A constant column, flat, is added for stage split to drop.
+    """
     csv = tmp_path_factory.mktemp("data") / "synthetic.csv"
     subprocess.run(
         [sys.executable, str(ROOT / "generate_synthetic.py"), "--rows", "12000"]
@@ -101,6 +107,8 @@ def synthetic_csv(tmp_path_factory: pytest.TempPathFactory) -> Path:
         check=True,
         capture_output=True,
     )
+    rows = pl.read_csv(csv, infer_schema=False)
+    rows.with_columns(pl.lit("1").alias("flat")).write_csv(csv)
     return csv
 
 
