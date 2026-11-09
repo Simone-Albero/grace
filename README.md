@@ -3,7 +3,8 @@
 Where a trained classifier fails, estimated without the labels of the rows in question: each class of
 train is clustered into regions, every val and test row is routed to the nearest region without its
 label, each region is described by 45 data-complexity descriptors, and a Random Forest learns each
-region's test failure rate from them, next to two confidence baselines (MCP and ATC).
+region's test failure rate from them, next to three baselines (MCP, ATC and a model of the classifier's errors)
+and to the mean of its estimate with each of them.
 
 ```
 make generate                                                    # resources/raw_data/synthetic/synthetic_test.csv
@@ -46,19 +47,22 @@ Stages (each writes its files into the dataset's `output_dir` and its rows into 
   `top_n` most frequent values of each categorical column plus one for the rest, and the train median for a missing
   number when the classifier cannot read it), and predicts val and test whole. Writes `models/<model>.joblib`,
   `pred_<model>_{val,test}.parquet`. Reads the val and test labels only to score the predictions.
-- `failures`: counts the test errors of each region (its failure rate) and the two baselines on the same rows: MCP,
-  the mean of 1 − confidence, and ATC, the share of rows under a confidence threshold fitted on val. A region with
-  fewer than `regressor.min_eval_support` test rows is not *used*: no predictor is scored on it. Writes
-  `failures_<model>.parquet`. Reads the test labels (the rates) and the val labels (the ATC threshold).
+- `failures`: counts the test errors of each region (its failure rate) and the three baselines on the same rows:
+  MCP, the mean of 1 − confidence; ATC, the share of rows under a confidence threshold fitted on val; and meta, the
+  mean P(error) of a HistGradientBoostingClassifier (`error_model`) fitted on val (a uniform sample of at most
+  `max_samples` rows) to predict the classifier's errors from the row's columns, the classifier's probabilities,
+  its confidence and its predicted class, as the post-hoc error predictors of the literature do. A region with fewer than `regressor.min_eval_support` test rows
+  is not *used*: no predictor is scored on it. Writes `failures_<model>.parquet`. Reads the test labels (the rates)
+  and the val labels (the ATC threshold and the errors meta learns).
 - `regress`: a Random Forest from each used region's descriptors and its class's (`region_<m>` and `class_<m>` for
   the `regressor.measures`) to its test failure rate, under nested cross-validation (a randomized search inside each
   outer fold), so every region's estimate comes from a forest that never saw it; TreeSHAP of that same forest
   explains it. A final refit on every region is kept. The estimates are scored (Spearman, R², MAE, MSE) against the
-  observed rates next to MCP and ATC. Writes `regress_<model>_estimates.parquet`,
+  observed rates next to each baseline and to `rf+<baseline>`, the mean of the estimate and that baseline. Writes `regress_<model>_estimates.parquet`,
   `regress_<model>_contributions.parquet`, `regress_<model>.joblib`. Reads the test labels through the rates of
   `failures`.
 
-No classifier trains on val. The test labels fit nothing but the regressor, which learns each region's rate from the
+The studied classifier never trains on val; only meta, the model of its errors, does. The test labels fit nothing but the regressor, which learns each region's rate from the
 other regions' rates and is scored out of fold.
 
 Measured on synthetic_test (69,500 rows, 9 classes after the rare one is dropped) with random_forest: about a
@@ -74,7 +78,7 @@ Configs:
 - `configs/models/`: ten classifiers, `name` (a key of `MODELS` in `src/models.py`) and `params`.
 - `configs/method/default.yaml`: the method, shared by every dataset and model: `distance` (`euclidean` or
   `cosine`), `space`, `graph`, `clustering` (`name`: `kmeans`, `birch`, `spectral` or `hdbscan`),
-  `complexity` and `regressor`, each key commented. Another method is a copy of it passed as `--method <path>`.
+  `complexity`, `regressor` and `error_model`, each key commented. Another method is a copy of it passed as `--method <path>`.
 
 `src/config.py` loads the three into frozen dataclasses and validates them before any stage reads data.
 

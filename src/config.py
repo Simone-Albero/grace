@@ -165,6 +165,20 @@ class RegressorConfig:
 
 
 @dataclass(frozen=True)
+class ErrorModelConfig:
+    """The meta baseline, a model of the errors (`src.baselines`).
+
+    Attributes:
+        params: The kwargs of its classifier, baselines.ERROR_MODEL.
+        max_samples: The val rows it is fitted on, a uniform sample
+            above this.
+    """
+
+    params: Mapping[str, Any]
+    max_samples: int
+
+
+@dataclass(frozen=True)
 class MethodConfig:
     """Parameters of the method, shared by every dataset.
 
@@ -175,6 +189,7 @@ class MethodConfig:
         clustering: The per-class clustering.
         complexity: The descriptors.
         regressor: The failure regressor.
+        error_model: The meta baseline.
     """
 
     distance: str
@@ -183,6 +198,7 @@ class MethodConfig:
     clustering: ClusteringConfig
     complexity: ComplexityConfig
     regressor: RegressorConfig
+    error_model: ErrorModelConfig
 
 
 @dataclass(frozen=True)
@@ -308,6 +324,7 @@ def _validate_method(method: MethodConfig) -> None:
         "clustering.hardness_k": clustering.hardness_k,
         "complexity.top_k_clusters": method.complexity.top_k_clusters,
         "regressor.n_iter": method.regressor.n_iter,
+        "error_model.max_samples": method.error_model.max_samples,
     }
     for key, value in positive.items():
         _check(value >= 1, f"{key} must be >= 1, got {value}")
@@ -369,6 +386,10 @@ def load_method_config(name_or_path: str = "default") -> MethodConfig:
         clustering=ClusteringConfig(**clustering),
         complexity=ComplexityConfig(**raw["complexity"]),
         regressor=RegressorConfig(**regressor),
+        error_model=ErrorModelConfig(
+            params=raw["error_model"]["params"] or {},
+            max_samples=raw["error_model"]["max_samples"],
+        ),
     )
     _validate_method(method)
     return method

@@ -324,6 +324,16 @@ const SCORE_COLUMNS = [
   { key: "mse", label: "MSE", format: (v) => dec(v, 4) },
 ];
 
+/** The baselines of stage failures: column key and display name. */
+const BASELINES = [["mcp", "MCP"], ["atc", "ATC"], ["meta", "Meta"]];
+
+/** Every predictor of stage regress: key, display name, bar color. */
+const PREDICTORS = [
+  ["rf", "RF", "var(--accent)"],
+  ...BASELINES.map(([key, name], i) => [key, name, `var(--series-${i + 2})`]),
+  ...BASELINES.map(([key, name], i) => [`rf+${key}`, `RF+${name}`, `var(--series-${i + 5})`]),
+];
+
 /** Tiles, baseline scores and scatters, rate by class, regions table. @param {object} data response of /failures */
 function renderFailures(data) {
   setModels(data.models);
@@ -334,13 +344,13 @@ function renderFailures(data) {
     tile("ATC threshold", dec(s.atc_threshold)));
   sortable($("fl-scores"), SCORE_COLUMNS, data.scores);
   const used = data.regions.filter((r) => r.used);
-  const pair = ["mcp", "atc"].map((key) => {
+  const pair = BASELINES.map(([key, name]) => {
     const el = h("div", {});
     scatter(el, used.map((r) => ({
       x: r[key], y: r.failure_rate,
-      tip: `region ${r.region} (${r.class}): ${key.toUpperCase()} ${dec(r[key])}, observed ${dec(r.failure_rate)}, ${num(r.n_eval)} rows`,
-    })), { xLabel: key.toUpperCase(), yLabel: "observed failure rate", diagonal: true, max: 1, width: 560 });
-    return h("div", {}, h("h3", {}, key.toUpperCase()), el);
+      tip: `region ${r.region} (${r.class}): ${name} ${dec(r[key])}, observed ${dec(r.failure_rate)}, ${num(r.n_eval)} rows`,
+    })), { xLabel: name, yLabel: "observed failure rate", diagonal: true, max: 1, width: 560 });
+    return h("div", {}, h("h3", {}, name), el);
   });
   fill("fl-scatter", pair);
   const withRows = data.regions.filter((r) => r.n_eval > 0);
@@ -358,6 +368,7 @@ function renderFailures(data) {
     { key: "failure_rate", label: "failure rate", format: (v) => pct(v) },
     { key: "mcp", label: "MCP", format: (v) => pct(v) },
     { key: "atc", label: "ATC", format: (v) => pct(v) },
+    { key: "meta", label: "Meta", format: (v) => pct(v) },
     { key: "used", label: "used", format: (v) => (v ? "yes" : "no") },
   ], data.regions);
 }
@@ -368,13 +379,11 @@ function renderRegress(data) {
   const by = Object.fromEntries(data.scores.map((s) => [s.predictor, s]));
   fill("rr-tiles",
     tile("regions", num(data.estimates.length)),
-    ...["rf", "mcp", "atc"].map((p) => tile(`${p.toUpperCase()} Spearman ρ`, dec(by[p]?.spearman), `MAE ${dec(by[p]?.mae)}`)));
+    ...PREDICTORS.slice(0, 1 + BASELINES.length).map(([key, name]) => tile(`${name} Spearman ρ`, dec(by[key]?.spearman), `MAE ${dec(by[key]?.mae)}`)));
   const metrics = ["spearman", "r2", "mae"];
-  groupedBars($("rr-scores"), metrics, [
-    { name: "RF", color: "var(--accent)", values: metrics.map((k) => by.rf?.[k]) },
-    { name: "MCP", color: "var(--series-2)", values: metrics.map((k) => by.mcp?.[k]) },
-    { name: "ATC", color: "var(--series-3)", values: metrics.map((k) => by.atc?.[k]) },
-  ]);
+  groupedBars($("rr-scores"), metrics, PREDICTORS.map(([key, name, color]) => (
+    { name, color, values: metrics.map((k) => by[key]?.[k]) })));
+  sortable($("rr-score-table"), SCORE_COLUMNS, data.scores);
   scatter($("rr-scatter"), data.estimates.map((e) => ({
     x: e.predicted, y: e.observed, id: e.region, selected: e.region === state.region,
     tip: `region ${e.region} (${e.class}): estimated ${dec(e.predicted)}, observed ${dec(e.observed)}, fold ${e.fold}`,

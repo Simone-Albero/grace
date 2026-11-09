@@ -74,13 +74,21 @@ def test_train(client):
 
 def test_failures(client):
     data = _get(client, f"/api/toy/failures?model={MODEL}")
-    assert {s["predictor"] for s in data["scores"]} == {"mcp", "atc"}
+    assert {s["predictor"] for s in data["scores"]} == {"mcp", "atc", "meta"}
     assert set(data["stats"]) >= {"n_regions", "n_used", "atc_threshold"}
 
 
 def test_regress_and_region(client):
     data = _get(client, f"/api/toy/regress?model={MODEL}")
-    assert {s["predictor"] for s in data["scores"]} == {"rf", "mcp", "atc"}
+    assert {s["predictor"] for s in data["scores"]} == {
+        "rf",
+        "mcp",
+        "atc",
+        "meta",
+        "rf+mcp",
+        "rf+atc",
+        "rf+meta",
+    }
     region = data["estimates"][0]["region"]
     detail = _get(client, f"/api/toy/regress/region?model={MODEL}&region={region}")
     assert detail["region"]["region"] == region

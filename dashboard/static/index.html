@@ -94,8 +94,10 @@
       <p class="empty">Select a dataset and a model.</p>
       <div id="fl-tiles" class="tiles"></div>
       <div class="card"><h2>Baselines against the observed rate</h2>
-        <p class="note">Test failure rate of every used region against MCP (mean of 1 − confidence) and ATC (share
-          of rows under a confidence threshold fitted on val). Dashed: y = x.</p>
+        <p class="note">Test failure rate of every used region against MCP (mean of 1 − confidence), ATC (share
+          of rows under a confidence threshold fitted on val) and Meta (mean P(error) of a gradient boosting
+          fitted on val to predict the classifier's errors from the row and the classifier's output). Dashed:
+          y = x.</p>
         <div id="fl-scores" class="table-wrap"></div>
         <div id="fl-scatter" class="pair"></div></div>
       <div class="card"><h2>Failure rate by class</h2>
@@ -109,9 +111,10 @@
       <p class="empty">Select a dataset and a model.</p>
       <div id="rr-tiles" class="tiles"></div>
       <div class="card"><h2>Scores</h2>
-        <p class="note">The Random Forest estimates come from outer folds that never saw the region; MCP and ATC
-          are scored on the same regions.</p>
-        <div id="rr-scores"></div></div>
+        <p class="note">The Random Forest estimates come from outer folds that never saw the region; MCP, ATC and
+          Meta are scored on the same regions. RF+X is the mean of the RF estimate and baseline X.</p>
+        <div id="rr-scores"></div>
+        <div id="rr-score-table" class="table-wrap"></div></div>
       <div class="card"><h2>Estimated against observed</h2>
         <p class="note">Click a region for its explanation.</p>
         <div id="rr-scatter"></div></div>

@@ -4,7 +4,15 @@ import numpy as np
 import polars as pl
 import pytest
 
-from src.baselines import atc_rate, atc_threshold, failure_rates, mcp_rate
+from src.baselines import (
+    atc_rate,
+    atc_threshold,
+    error_inputs,
+    error_probability,
+    failure_rates,
+    mcp_rate,
+    meta_rate,
+)
 from src.evaluation import classification_metrics, confusion, rate_scores
 from src.models import MODELS, build_pipeline, predict_proba
 from src.preprocessing import Features
@@ -114,6 +122,72 @@ def test_atc_threshold():
     ties = atc_threshold(np.array([0.5, 0.5, 0.9]), np.array([False, True, True]))
     assert ties == 0.5
     assert atc_threshold(np.array([0.5, 0.6]), np.array([False, False])) == np.inf
+
+
+def _classifier_output(n: int, wrong: np.ndarray) -> pl.DataFrame:
+    """Two classes, confidence 0.8 on every row, whatever wrong is."""
+    pred = np.zeros(n, dtype=np.int64)
+    return pl.DataFrame(
+        {
+            "row": np.arange(n),
+            "label": np.where(wrong, 1, 0),
+            "pred": pred,
+            "confidence": np.full(n, 0.8),
+            "proba_0": np.full(n, 0.8),
+            "proba_1": np.full(n, 0.2),
+        }
+    )
+
+
+def test_error_inputs_append_the_classifier_output():
+    rows, _ = _toy(6)
+    inputs, features = error_inputs(rows, _classifier_output(6, np.zeros(6)), FEATURES)
+    assert features == Features(
+        num=("a", "b", "proba_0", "proba_1", "confidence"), cat=("c", "pred")
+    )
+    assert set(inputs.columns) == {*features.num, *features.cat}
+    assert inputs["pred"].dtype == pl.String
+
+
+def test_meta_learns_where_the_classifier_fails():
+    # The classifier is wrong exactly where a > 0, whatever its
+    # confidence: only the row's columns tell meta where it fails.
+    rng = np.random.default_rng(0)
+    n = 2000
+    a = rng.normal(size=n)
+    rows = pl.DataFrame({"a": a, "b": rng.normal(size=n), "c": ["x"] * n})
+    wrong = a > 0
+    inputs, features = error_inputs(rows, _classifier_output(n, wrong), FEATURES)
+    half = n // 2
+    probability = error_probability(
+        inputs[:half],
+        wrong[:half],
+        inputs[half:],
+        features,
+        params={"max_iter": 50},
+        max_samples=800,
+        top_n=5,
+        seed=0,
+    )
+    region = wrong[half:].astype(int)
+    rate = meta_rate(probability, region, np.array([0, 1, 2]))
+    assert rate[0] < 0.1 and rate[1] > 0.9 and np.isnan(rate[2])
+
+
+def test_meta_without_errors_to_learn_is_constant():
+    rows, _ = _toy(6)
+    inputs, features = error_inputs(rows, _classifier_output(6, np.zeros(6)), FEATURES)
+    probability = error_probability(
+        inputs,
+        np.zeros(6, bool),
+        inputs,
+        features,
+        params={},
+        max_samples=6,
+        top_n=5,
+        seed=0,
+    )
+    np.testing.assert_array_equal(probability, np.zeros(6))
 
 
 def test_averages_skip_classes_absent_from_truth_and_predictions():

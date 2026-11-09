@@ -11,6 +11,7 @@ import numpy as np
 import polars as pl
 
 from src import db
+from src.baselines import BASELINES
 from src.config import DatasetConfig
 from src.evaluation import rate_scores
 from src.regressor import fit_failure_regressor, region_descriptors
@@ -32,19 +33,21 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     X = regressor.region_descriptors of the used regions with
     regressor.measures, without its all-NaN columns; y = failure_rate.
     regressor.fit_failure_regressor with the regressor config and seed.
-    The estimates are scored against the observed rates, next to MCP
-    and ATC on the same regions.
+    The estimates are scored against the observed rates, next to each
+    of baselines.BASELINES on the same regions and to the mean of the
+    estimate and each baseline ("rf+<baseline>").
 
     Writes to output_dir: regress_<model>_estimates.parquet (region,
-    class, observed, predicted, fold, base, mcp, atc),
+    class, observed, predicted, fold, base, mcp, atc, meta, rf+mcp,
+    rf+atc, rf+meta),
     regress_<model>_contributions.parquet (region, descriptor, value,
     contribution) and regress_<model>.joblib (the refit forest and its
     descriptor names).
     Logs: estimates (region, class name, observed, predicted, fold,
     base), contributions (region, descriptor, value, contribution),
     regressor_folds (FailureRegressor.folds), importances (descriptor,
-    mdi, mean_abs_shap), regress_scores (predictor "rf" | "mcp" | "atc",
-    spearman, r2, mae, mse).
+    mdi, mean_abs_shap), regress_scores (predictor "rf", a baseline or
+    "rf+<baseline>", spearman, r2, mae, mse).
 
     Raises:
         ValueError: When cfg.model is None, or regressor.measures names
@@ -90,8 +93,11 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
             "predicted": fitted.predicted,
             "fold": fitted.fold,
             "base": fitted.base,
-            "mcp": failures["mcp"],
-            "atc": failures["atc"],
+            **{name: failures[name] for name in BASELINES},
+            **{
+                f"rf+{name}": (fitted.predicted + failures[name].to_numpy()) / 2
+                for name in BASELINES
+            },
         }
     )
     estimates.write_parquet(estimates_file(cfg))
@@ -104,9 +110,12 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
         }
     ).with_columns(pl.col("value").fill_nan(None))
     contributions.write_parquet(contributions_file(cfg))
+    columns = {"rf": "predicted"} | {
+        name: name for name in (*BASELINES, *(f"rf+{b}" for b in BASELINES))
+    }
     scores = [
         {"predictor": name, **rate_scores(estimates[column].to_numpy(), observed)}
-        for name, column in (("rf", "predicted"), ("mcp", "mcp"), ("atc", "atc"))
+        for name, column in columns.items()
     ]
     print(
         "[regress] spearman "

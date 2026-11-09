@@ -1,16 +1,38 @@
-"""Failure rates per region: observed, and from confidence alone.
+"""Failure rates per region: observed, and from the classifier's output.
 
-MCP and ATC read only the classifier's maximum probability. The observed
-rate is the target of every predictor; it needs the test labels.
+MCP and ATC read only the classifier's maximum probability. Meta is a
+model of the classifier's errors, fitted on labelled rows (val): it
+reads the row's columns next to the classifier's probabilities, its
+confidence and its predicted class, as the post-hoc error predictors
+of the literature do (Risk Advisor, RED). The observed rate is the
+target of every predictor; it needs the test labels.
 """
 
 from __future__ import annotations
 
-__all__ = ["atc_rate", "atc_threshold", "failure_rates", "mcp_rate"]
+__all__ = [
+    "BASELINES",
+    "ERROR_MODEL",
+    "atc_rate",
+    "atc_threshold",
+    "error_inputs",
+    "error_probability",
+    "failure_rates",
+    "mcp_rate",
+    "meta_rate",
+]
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from typing import Any
 
 import numpy as np
+import polars as pl
+
+from src.models import build_pipeline, predict_proba
+from src.preprocessing import Features
+
+BASELINES = ("mcp", "atc", "meta")  # the column of each in failures_<model>
+ERROR_MODEL = "hist_gradient_boosting"  # the key of models.MODELS of meta
 
 
 def failure_rates(
@@ -86,6 +108,93 @@ def atc_rate(
     """
     below = (confidence < threshold).astype(np.float64)
     return _by_region(below, region, regions, np.mean)
+
+
+def error_inputs(
+    rows: pl.DataFrame, predictions: pl.DataFrame, features: Features
+) -> tuple[pl.DataFrame, Features]:
+    """Put the classifier's output next to the columns of the rows.
+
+    Args:
+        rows: The rows of a split file.
+        predictions: Their pred_<model>_<split>.parquet, row by row.
+        features: The input columns of rows.
+
+    Returns:
+        The columns of features, then proba_0..proba_{K-1} and
+        confidence (numbers) and pred (its class code, as text); and the
+        features naming them.
+    """
+    outputs = [column for column in predictions.columns if column.startswith("proba_")]
+    outputs.append("confidence")
+    inputs = pl.concat(
+        [
+            rows.select(*features.num, *features.cat),
+            predictions.select(*outputs, pl.col("pred").cast(pl.String)),
+        ],
+        how="horizontal",
+    )
+    return inputs, Features(num=(*features.num, *outputs), cat=(*features.cat, "pred"))
+
+
+def error_probability(
+    fit_rows: pl.DataFrame,
+    fit_error: np.ndarray,
+    rows: pl.DataFrame,
+    features: Features,
+    *,
+    params: Mapping[str, Any],
+    max_samples: int,
+    top_n: int,
+    seed: int,
+) -> np.ndarray:
+    """Fit meta on labelled rows and return its P(error) on other rows.
+
+    Meta is the pipeline of models.build_pipeline(ERROR_MODEL), fitted
+    unweighted on a uniform draw of at most max_samples fit_rows, so
+    that its probabilities stay calibrated and their mean over a region
+    estimates the region's failure rate.
+
+    Args:
+        fit_rows: The labelled rows, from error_inputs.
+        fit_error: Whether the classifier got each of them wrong.
+        rows: The rows to score, from error_inputs.
+        features: The input columns, from error_inputs.
+        params: The kwargs of the classifier.
+        max_samples: The most fit_rows it is fitted on.
+        top_n: The kept values of each categorical column.
+        seed: The default random_state.
+
+    Returns:
+        P(error) of every row of rows; the share of wrong fit_rows for
+        all of them when the classifier got all or none wrong.
+    """
+    fit_error = np.asarray(fit_error, dtype=bool)
+    if fit_error.all() or not fit_error.any():
+        return np.full(rows.height, fit_error.mean())
+    if fit_rows.height > max_samples:
+        rng = np.random.default_rng(seed)
+        drawn = np.sort(rng.choice(fit_rows.height, max_samples, replace=False))
+        fit_rows, fit_error = fit_rows[drawn], fit_error[drawn]
+    model = build_pipeline(ERROR_MODEL, params, features, top_n, seed)
+    model.fit(fit_rows, fit_error.astype(np.int64))
+    return predict_proba(model, rows, 2)[:, 1]
+
+
+def meta_rate(
+    probability: np.ndarray, region: np.ndarray, regions: np.ndarray
+) -> np.ndarray:
+    """Return the mean P(error) of meta over the rows of every region.
+
+    Args:
+        probability: From error_probability, one per row.
+        region: The region of every row.
+        regions: The regions to report, in output order.
+
+    Returns:
+        One value per region; NaN when it has no row.
+    """
+    return _by_region(probability, region, regions, np.mean)
 
 
 def _by_region(
