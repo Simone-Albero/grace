@@ -1,10 +1,15 @@
 """Failure rates per region: observed, and from the classifier's output.
 
-MCP and ATC read only the classifier's maximum probability. Meta is a
-model of the classifier's errors, fitted on labelled rows (val): it
-reads the row's columns next to the classifier's probabilities, its
-confidence and its predicted class, as the post-hoc error predictors
-of the literature do (Risk Advisor, RED). The observed rate is the
+MCP and ATC read only the classifier's maximum probability; mcp_cal
+and atc_cal read the probability of its predicted class after
+bias-corrected temperature scaling (BCTS, Alexandari et al. 2020)
+fitted on val: one temperature for its overconfidence, one bias per
+class for a prior other than the one it was fitted on (max_per_class
+balances train). Meta is a model of the classifier's errors, fitted on
+labelled rows (val): it reads the row's columns next to the
+classifier's probabilities, its confidence and its predicted class, as
+the post-hoc error predictors of the literature do (Risk Advisor,
+RED). The observed rate is the
 target of every predictor; it needs the test labels.
 """
 
@@ -15,9 +20,11 @@ __all__ = [
     "ERROR_MODEL",
     "atc_rate",
     "atc_threshold",
+    "bcts_confidence",
     "error_inputs",
     "error_probability",
     "failure_rates",
+    "fit_bcts",
     "mcp_rate",
     "meta_rate",
 ]
@@ -27,11 +34,14 @@ from typing import Any
 
 import numpy as np
 import polars as pl
+from scipy.optimize import minimize
+from scipy.special import log_softmax, softmax
 
 from src.models import build_pipeline, predict_proba
 from src.preprocessing import Features
 
-BASELINES = ("mcp", "atc", "meta")  # the column of each in failures_<model>
+# The column of each baseline in failures_<model>.
+BASELINES = ("mcp", "atc", "mcp_cal", "atc_cal", "meta")
 ERROR_MODEL = "hist_gradient_boosting"  # the key of models.MODELS of meta
 
 
@@ -108,6 +118,62 @@ def atc_rate(
     """
     below = (confidence < threshold).astype(np.float64)
     return _by_region(below, region, regions, np.mean)
+
+
+def fit_bcts(proba: np.ndarray, label: np.ndarray) -> tuple[float, np.ndarray]:
+    """Fit bias-corrected temperature scaling on labelled rows (val).
+
+    The calibrated probabilities are softmax(log(proba) / temperature +
+    bias); temperature and bias minimise their mean negative
+    log-likelihood of label (L-BFGS-B, analytic gradient). A
+    probability is clipped to 1e-12 before its log.
+
+    Args:
+        proba: The class probabilities, shape (n, K).
+        label: The class codes, 0..K-1.
+
+    Returns:
+        The temperature, > 0, and the bias, shape (K,); the bias is
+        defined up to a constant.
+    """
+    logits = np.log(np.clip(proba, 1e-12, 1))
+    rows = np.arange(len(label))
+
+    def loss(theta: np.ndarray) -> tuple[float, np.ndarray]:
+        temperature, bias = np.exp(theta[0]), theta[1:]
+        log_p = log_softmax(logits / temperature + bias, axis=1)
+        nll = -log_p[rows, label].mean()
+        # d nll / d logit = p - onehot(label).
+        residual = np.exp(log_p)
+        residual[rows, label] -= 1
+        grad_log_t = -(residual * logits).sum(axis=1).mean() / temperature
+        return nll, np.concatenate([[grad_log_t], residual.mean(axis=0)])
+
+    start = np.zeros(1 + proba.shape[1])
+    theta = minimize(loss, start, jac=True, method="L-BFGS-B").x
+    return float(np.exp(theta[0])), theta[1:]
+
+
+def bcts_confidence(
+    proba: np.ndarray, pred: np.ndarray, temperature: float, bias: np.ndarray
+) -> np.ndarray:
+    """Return the calibrated probability of the predicted class.
+
+    The bias may move the argmax; the predicted class stays the
+    classifier's, so the errors are still its own.
+
+    Args:
+        proba: The class probabilities, shape (n, K).
+        pred: The class the classifier predicted for each row.
+        temperature: From fit_bcts.
+        bias: From fit_bcts.
+
+    Returns:
+        One probability per row.
+    """
+    logits = np.log(np.clip(proba, 1e-12, 1))
+    calibrated = softmax(logits / temperature + bias, axis=1)
+    return calibrated[np.arange(len(pred)), pred]
 
 
 def error_inputs(

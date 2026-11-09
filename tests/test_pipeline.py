@@ -105,10 +105,12 @@ def test_failures_count_every_test_row(done):
     assert failures["n_error"].sum() == (test["label"] != test["pred"]).sum()
     (n_used,) = _rows(done, "SELECT n_used FROM failure_stats")[0]
     assert n_used == failures["used"].sum() > 0
-    meta = failures.filter(pl.col("n_eval") > 0)["meta"]
-    assert meta.is_between(0, 1).all()
-    (baselines,) = zip(*_rows(done, "SELECT predictor FROM baseline_scores"))
-    assert set(baselines) == {"mcp", "atc", "meta"}
+    baselines = ("mcp", "atc", "mcp_cal", "atc_cal", "meta")
+    with_rows = failures.filter(pl.col("n_eval") > 0)
+    for name in baselines:
+        assert with_rows[name].is_between(0, 1).all()
+    (scored,) = zip(*_rows(done, "SELECT predictor FROM baseline_scores"))
+    assert set(scored) == set(baselines)
 
 
 def test_regress_estimates_every_used_region(done):
@@ -118,7 +120,8 @@ def test_regress_estimates_every_used_region(done):
     contributions = _read(done, f"regress_{MODEL}_contributions.parquet")
     assert set(contributions["region"].to_list()) == set(estimates["region"].to_list())
     scores = dict(_rows(done, "SELECT predictor, spearman FROM regress_scores"))
-    assert set(scores) == {"rf", "mcp", "atc", "meta", "rf+mcp", "rf+atc", "rf+meta"}
+    baselines = {"mcp", "atc", "mcp_cal", "atc_cal", "meta"}
+    assert set(scores) == {"rf", *baselines, *(f"rf+{b}" for b in baselines)}
     assert scores["rf"] > 0
     np.testing.assert_allclose(
         estimates["rf+atc"], (estimates["predicted"] + estimates["atc"]) / 2

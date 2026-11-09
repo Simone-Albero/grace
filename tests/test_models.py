@@ -7,9 +7,11 @@ import pytest
 from src.baselines import (
     atc_rate,
     atc_threshold,
+    bcts_confidence,
     error_inputs,
     error_probability,
     failure_rates,
+    fit_bcts,
     mcp_rate,
     meta_rate,
 )
@@ -122,6 +124,31 @@ def test_atc_threshold():
     ties = atc_threshold(np.array([0.5, 0.5, 0.9]), np.array([False, True, True]))
     assert ties == 0.5
     assert atc_threshold(np.array([0.5, 0.6]), np.array([False, False])) == np.inf
+
+
+def test_bcts_corrects_the_prior():
+    # A classifier fitted on balanced classes says 0.5 everywhere, but
+    # 80% of the rows are class 0: the bias must move it to 0.8.
+    proba = np.full((1000, 2), 0.5)
+    label = (np.arange(1000) >= 800).astype(int)
+    temperature, bias = fit_bcts(proba, label)
+    pred = np.array([0, 1])
+    confidence = bcts_confidence(proba[:2], pred, temperature, bias)
+    np.testing.assert_allclose(confidence, [0.8, 0.2], atol=1e-4)
+
+
+def test_bcts_softens_an_overconfident_classifier():
+    # Always 0.99 sure of the right class, which it gets right 70% of
+    # the time: the calibrated confidence must fall to about 0.7.
+    n = 2000
+    label = np.arange(n) % 2
+    pred = np.where(np.arange(n) // 2 % 10 < 7, label, 1 - label)
+    proba = np.full((n, 2), 0.01)
+    proba[np.arange(n), pred] = 0.99
+    temperature, bias = fit_bcts(proba, label)
+    assert temperature > 1
+    confidence = bcts_confidence(proba, pred, temperature, bias)
+    np.testing.assert_allclose(confidence, 0.7, atol=1e-3)
 
 
 def _classifier_output(n: int, wrong: np.ndarray) -> pl.DataFrame:

@@ -7,6 +7,8 @@ from fastapi.testclient import TestClient
 
 from dashboard.app import create_app
 
+BASELINES = {"mcp", "atc", "mcp_cal", "atc_cal", "meta"}
+
 
 @pytest.fixture(scope="module")
 def client(done, tmp_path_factory) -> TestClient:
@@ -74,21 +76,14 @@ def test_train(client):
 
 def test_failures(client):
     data = _get(client, f"/api/toy/failures?model={MODEL}")
-    assert {s["predictor"] for s in data["scores"]} == {"mcp", "atc", "meta"}
-    assert set(data["stats"]) >= {"n_regions", "n_used", "atc_threshold"}
+    assert {s["predictor"] for s in data["scores"]} == BASELINES
+    assert set(data["stats"]) >= {"n_regions", "n_used", "atc_threshold", "temperature"}
 
 
 def test_regress_and_region(client):
     data = _get(client, f"/api/toy/regress?model={MODEL}")
-    assert {s["predictor"] for s in data["scores"]} == {
-        "rf",
-        "mcp",
-        "atc",
-        "meta",
-        "rf+mcp",
-        "rf+atc",
-        "rf+meta",
-    }
+    pairs = {f"rf+{name}" for name in BASELINES}
+    assert {s["predictor"] for s in data["scores"]} == {"rf", *BASELINES, *pairs}
     region = data["estimates"][0]["region"]
     detail = _get(client, f"/api/toy/regress/region?model={MODEL}&region={region}")
     assert detail["region"]["region"] == region

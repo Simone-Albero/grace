@@ -13,9 +13,11 @@ from src.baselines import (
     BASELINES,
     atc_rate,
     atc_threshold,
+    bcts_confidence,
     error_inputs,
     error_probability,
     failure_rates,
+    fit_bcts,
     mcp_rate,
     meta_rate,
 )
@@ -40,20 +42,22 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     Reads regions.parquet, the val and test rows of assignments.parquet
     and pred_<model>_{val,test}.parquet (rows must line up by position),
     and the val and test split files. The failure rate is counted on
-    test only; the ATC threshold and meta (baselines.error_probability
-    on baselines.error_inputs, error_model, top_n, seed) are
-    fitted on val. A region is used when it has at least
-    regressor.min_eval_support test rows; MCP, ATC and meta are scored
-    (evaluation.rate_scores) against the observed rates of the used
-    regions.
+    test only. Fitted on val: the ATC threshold on the confidence, the
+    BCTS calibration (baselines.fit_bcts) and a second ATC threshold on
+    the calibrated confidence, and meta (baselines.error_probability on
+    baselines.error_inputs, error_model, top_n, seed). A region is used
+    when it has at least regressor.min_eval_support test rows; each of
+    baselines.BASELINES is scored (evaluation.rate_scores) against the
+    observed rates of the used regions.
 
     Writes to output_dir: failures_<model>.parquet (region, class,
-    n_eval, n_error, failure_rate, used, mcp, atc, meta), one row per
-    region in the order of regions.parquet.
+    n_eval, n_error, failure_rate, used, then one column per baseline),
+    one row per region in the order of regions.parquet.
     Logs: failures (the same rows, class as name), baseline_scores
-    (predictor "mcp" | "atc" | "meta", spearman, r2, mae, mse),
-    failure_stats (one row: n_regions, n_used, n_empty, n_small,
-    error_rate, error_rate_used, atc_threshold).
+    (predictor: a baseline, spearman, r2, mae, mse), failure_stats (one
+    row: n_regions, n_used, n_empty, n_small, error_rate,
+    error_rate_used, atc_threshold, atc_cal_threshold, temperature),
+    calibration (class, bias: the BCTS bias, minus its mean).
 
     Raises:
         ValueError: When cfg.model is None, the predictions do not line
@@ -95,6 +99,20 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
             f"no region has min_eval_support={cfg.method.regressor.min_eval_support} "
             f"test rows (most: {n_eval.max()})"
         )
+    proba_cols = [column for column in val.columns if column.startswith("proba_")]
+    temperature, bias = fit_bcts(
+        val.select(proba_cols).to_numpy(), val["label"].to_numpy()
+    )
+    calibrated = {
+        split: bcts_confidence(
+            frame.select(proba_cols).to_numpy(),
+            frame["pred"].to_numpy(),
+            temperature,
+            bias,
+        )
+        for split, frame in predictions.items()
+    }
+    cal_threshold = atc_threshold(calibrated["val"], ~val_error)
     features = feature_cols(rows["val"].columns, cfg.num_cols, cfg.cat_cols)
     val_inputs, inputs = error_inputs(rows["val"], val, features)
     test_inputs, _ = error_inputs(rows["test"], test, features)
@@ -120,6 +138,8 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
             "used": used,
             "mcp": mcp_rate(confidence, region["test"], ids),
             "atc": atc_rate(confidence, region["test"], ids, threshold),
+            "mcp_cal": mcp_rate(calibrated["test"], region["test"], ids),
+            "atc_cal": atc_rate(calibrated["test"], region["test"], ids, cal_threshold),
             "meta": meta_rate(error_probability_test, region["test"], ids),
         }
     )
@@ -161,6 +181,17 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
                 "error_rate": float(error.mean()),
                 "error_rate_used": float(n_error[used].sum() / n_eval[used].sum()),
                 "atc_threshold": threshold,
+                "atc_cal_threshold": cal_threshold,
+                "temperature": temperature,
             }
+        ],
+    )
+    db.log_table(
+        conn,
+        run_id,
+        "calibration",
+        [
+            {"class": name, "bias": float(value)}
+            for name, value in zip(classes, bias - bias.mean())
         ],
     )

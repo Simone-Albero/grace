@@ -231,9 +231,10 @@ def failures(cfg: DatasetConfig, model: str) -> dict[str, Any]:
     Returns:
         run; models [models with an ok failures run]; stats {n_regions,
         n_used, n_empty, n_small, error_rate, error_rate_used,
-        atc_threshold}; scores [{predictor, spearman, r2, mae, mse}];
-        regions [{region, class, n_eval, n_error, failure_rate, used,
-        mcp, atc, meta}].
+        atc_threshold, atc_cal_threshold, temperature}; scores
+        [{predictor, spearman, r2, mae, mse}]; regions [{region, class,
+        n_eval, n_error, failure_rate, used, mcp, atc, mcp_cal, atc_cal,
+        meta}].
     """
     with closing(_connect(cfg)) as conn:
         run = _latest_run(conn, "failures", cfg, model)
@@ -258,9 +259,10 @@ def regress(cfg: DatasetConfig, model: str) -> dict[str, Any]:
 
     Returns:
         run; models [models with an ok regress run]; scores [{predictor,
-        spearman, r2, mae, mse}] (rf, mcp, atc, meta, rf+mcp, rf+atc,
-        rf+meta); estimates [{region, class, observed, predicted, fold,
-        base, mcp, atc, meta, rf+mcp, rf+atc, rf+meta}]; importances
+        spearman, r2, mae, mse}] (rf, each of baselines.BASELINES and
+        each rf+<baseline>); estimates [{region, class, observed,
+        predicted, fold, base, the baselines, the rf+<baseline>}];
+        importances
         [{descriptor, mdi, mean_abs_shap}] by mdi descending; folds
         [{fold, n_regions, spearman, r2, mae, best_score, params}].
     """

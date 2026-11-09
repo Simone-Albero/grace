@@ -38,8 +38,8 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     estimate and each baseline ("rf+<baseline>").
 
     Writes to output_dir: regress_<model>_estimates.parquet (region,
-    class, observed, predicted, fold, base, mcp, atc, meta, rf+mcp,
-    rf+atc, rf+meta),
+    class, observed, predicted, fold, base, then each baseline, then
+    each rf+<baseline>),
     regress_<model>_contributions.parquet (region, descriptor, value,
     contribution) and regress_<model>.joblib (the refit forest and its
     descriptor names).
