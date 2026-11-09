@@ -1,0 +1,3 @@
+name: naive_bayes
+params:
+  var_smoothing: 1.0e-9

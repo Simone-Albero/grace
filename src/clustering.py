@@ -1,345 +1,77 @@
-"""Per-class clustering at the granularity of least hardness loss."""
+"""Regions: each class of train clustered at its least-loss granularity.
+
+A finer partition hides less of the spread of its rows' hardness inside
+each region's mean, but leaves each region fewer test rows to measure
+its failure rate on. The granularity loss adds the two; the candidate of
+least loss wins. Hardness is kDN: the share of a row's nearest graph
+nodes of another class.
+"""
+
+from __future__ import annotations
 
 __all__ = [
     "ALGORITHMS",
-    "KdnNodes",
-    "assign_nearest_centroid",
+    "assign_nearest",
+    "candidate_grid",
+    "centroids",
     "cluster_class",
-    "cluster_size_balance",
-    "compute_centroids",
-    "compute_kdn",
+    "fit_hdbscan",
+    "fit_kmeans",
     "granularity_loss",
-    "kmeans_levels",
-    "level_counts",
-    "random_voronoi",
-    "subsample_indices",
+    "kdn",
+    "merge_small_clusters",
+    "n_clusters_grid",
+    "takes_n_clusters",
+    "tunable_params",
 ]
 
+import inspect
 import itertools
-import logging
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from functools import partial
-from inspect import signature
+from typing import Any
 
 import hdbscan
 import numpy as np
 from sklearn.cluster import Birch, KMeans, SpectralClustering
 from sklearn.metrics import pairwise_distances
 from sklearn.neighbors import NearestNeighbors
-from tqdm import tqdm
 
-from src.space import l2_normalize
+from src.graph import sample_rows
+from src.space import scale_for_metric
 
-logger = logging.getLogger(__name__)
-
-_ASSIGN_ROWS = 50_000
-_PREDICT_CHUNK = 200_000
-_GRANULARITY_LEVELS = 7
-
-
-@dataclass(frozen=True)
-class KdnNodes:
-    """The graph nodes in the clustering space.
-
-    The nodes are a uniform sample of train, where kDN counts
-    neighbours.
-
-    Attributes:
-        X: The node points, shape (n_nodes, d).
-        y: The class of every node.
-        row_ids: The train row position of every node.
-    """
-
-    X: np.ndarray
-    y: np.ndarray
-    row_ids: np.ndarray
+FitFn = Callable[..., np.ndarray]
+RESERVED = ("n_clusters", "max_fit_samples", "random_state")
+GRANULARITY_LEVELS = 7
+_ROUTE_ROWS = 50_000  # rows routed at once
 
 
-def compute_kdn(
-    X: np.ndarray, *, row_ids: np.ndarray, labels: np.ndarray, nodes: KdnNodes, k: int
-) -> np.ndarray:
-    """Return the share of each row's k nearest nodes of another class.
-
-    The row's own node is excluded.
-
-    Args:
-        X: The rows to score, shape (n, d).
-        row_ids: Each row's id in the numbering of `nodes.row_ids`, so
-            a row that is itself a node skips that node.
-        labels: Each row's own class.
-        nodes: The graph nodes the neighbours are drawn from.
-        k: The neighbours counted, capped at the node count minus one.
-
-    Returns:
-        Each row's kDN, in [0, 1].
-
-    Raises:
-        ValueError: Fewer than two nodes, so none is left once a row's
-            own copy is excluded.
-    """
-    labels = np.asarray(labels)
-    effective_k = min(k, nodes.X.shape[0] - 1)
-    if effective_k < 1:
-        raise ValueError(
-            f"compute_kdn: {nodes.X.shape[0]} node(s) leave no "
-            "neighbour once a row's own copy is excluded."
-        )
-    index = NearestNeighbors(n_neighbors=effective_k + 1).fit(nodes.X)
-    _, neighbor_positions = index.kneighbors(X)
-    neighbor_ids = nodes.row_ids[neighbor_positions]
-    neighbor_labels = nodes.y[neighbor_positions]
-
-    self_mask = neighbor_ids == row_ids[:, np.newaxis]
-    has_self = self_mask.any(axis=1)
-    # Drop the row's own node when it has one, else the farthest
-    # neighbour, so every row keeps exactly `effective_k` votes.
-    drop = np.where(has_self, self_mask.argmax(axis=1), effective_k)
-    keep = np.ones((len(X), effective_k + 1), dtype=bool)
-    keep[np.arange(len(X)), drop] = False
-
-    kept_labels = neighbor_labels[keep].reshape(len(X), effective_k)
-    return (kept_labels != labels[:, np.newaxis]).sum(axis=1) / effective_k
-
-
-def cluster_size_balance(labels: np.ndarray) -> float:
-    """Return the normalized entropy of the cluster sizes.
-
-    Args:
-        labels: The cluster label of every row.
-
-    Returns:
-        A value in [0, 1], 1 for equal sizes and 0 below two clusters.
-    """
-    _, counts = np.unique(labels, return_counts=True)
-    n_clusters = counts.size
-    if n_clusters < 2:
-        return 0.0
-    shares = counts / counts.sum()
-    entropy = float(-(shares * np.log(shares)).sum())
-    return entropy / float(np.log(n_clusters))
-
-
-def subsample_indices(
-    n_rows: int, *, max_samples: int, random_state: int
-) -> np.ndarray:
-    """Return the indices of a random subsample of `n_rows` rows.
-
-    Args:
-        n_rows: The number of rows to sample from.
-        max_samples: The most rows kept; all of them when `n_rows` is
-            not above it.
-        random_state: The seed of the draw.
-
-    Returns:
-        The indices, ascending when all rows are kept.
-    """
-    if n_rows <= max_samples:
-        return np.arange(n_rows)
-    rng = np.random.default_rng(random_state)
-    return rng.choice(n_rows, size=max_samples, replace=False)
-
-
-def _subsample_features(
-    X: np.ndarray,
-    *,
-    max_samples: int,
-    random_state: int,
-) -> np.ndarray:
-    """Return a random subsample of X, unchanged when small enough."""
-    rows = subsample_indices(
-        X.shape[0], max_samples=max_samples, random_state=random_state
-    )
-    return X[rows]
-
-
-def assign_nearest_centroid(
-    X: np.ndarray,
-    centroids: Mapping[int, np.ndarray],
-    *,
-    metric: str,
-) -> np.ndarray:
-    """Assign each row to the nearest centroid.
-
-    Args:
-        X: The points, shape (n, d).
-        centroids: The centroid vector of every cluster id.
-        metric: A `pairwise_distances` metric, such as `euclidean`.
-
-    Returns:
-        The cluster id of every row.
-    """
-    items = [(int(label), centroid) for label, centroid in centroids.items()]
-    centroid_ids = np.array([label for label, _ in items], dtype=np.int64)
-    centroid_matrix = np.array(
-        [np.asarray(centroid, dtype=np.float64) for _, centroid in items],
-        dtype=np.float64,
-    )
-    assigned = np.empty(len(X), dtype=np.int64)
-    for start in range(0, len(X), _ASSIGN_ROWS):
-        batch = X[start : start + _ASSIGN_ROWS]
-        distances = pairwise_distances(batch, centroid_matrix, metric=metric)
-        assigned[start : start + _ASSIGN_ROWS] = centroid_ids[distances.argmin(axis=1)]
-    return assigned
-
-
-def compute_centroids(
-    X: np.ndarray, labels: np.ndarray, *, metric: str
-) -> dict[int, np.ndarray]:
-    """Return the mean feature vector of every label.
-
-    Args:
-        X: The points, shape (n, d).
-        labels: The cluster label of every row.
-        metric: `cosine` renormalizes each mean to a unit direction.
-
-    Returns:
-        The centroid by label.
-    """
-    centroids = {}
-    for label in np.unique(labels):
-        centroid = X[labels == label].mean(axis=0)
-        # Under cosine a region's centre is a direction: the mean of the
-        # unit vectors it was clustered on, renormalized.
-        if metric == "cosine":
-            centroid = l2_normalize(centroid[np.newaxis])[0]
-        centroids[int(label)] = centroid
-    return centroids
-
-
-def _merge_small_clusters(
-    X: np.ndarray, labels: np.ndarray, *, min_size: float, metric: str
-) -> tuple[np.ndarray, int, int]:
-    """Fold noise and small clusters into the nearest survivor.
-
-    Every cluster under `min_size` rows is small.
-
-    Returns:
-        The merged labels, the number of clusters absorbed and the
-        number of rows moved.
-    """
-    ids, counts = np.unique(labels[labels != -1], return_counts=True)
-    small_ids = ids[counts < min_size]
-    absorbed = np.isin(labels, small_ids) | (labels == -1)
-    n_merged_clusters = int(small_ids.size)
-    n_merged = int(absorbed.sum())
-    if not absorbed.any():
-        return labels, 0, 0
-
-    survivor_mask = ~absorbed
-    if not survivor_mask.any():
-        # No cluster reaches the floor: the class becomes one region.
-        return (
-            np.zeros(labels.shape[0], dtype=labels.dtype),
-            n_merged_clusters,
-            n_merged,
-        )
-
-    centroids = compute_centroids(
-        X[survivor_mask], labels[survivor_mask], metric=metric
-    )
-    merged = labels.copy()
-    merged[absorbed] = assign_nearest_centroid(X[absorbed], centroids, metric=metric)
-    return merged, n_merged_clusters, n_merged
-
-
-def _fit_hdbscan(
-    X: np.ndarray,
-    *,
-    min_cluster_size: int = 50,
-    min_samples: int | None = None,
-    cluster_selection_method: str = "leaf",
-    max_fit_samples: int,
-    random_state: int,
-) -> np.ndarray:
-    """Fit HDBSCAN (Euclidean) and label every row, noise as -1.
-
-    Above `max_fit_samples` rows the model is fitted on a subsample and
-    the rest is labelled by `hdbscan.approximate_predict`.
-
-    Args:
-        X: The points, shape (n, d).
-        min_cluster_size: The smallest cluster HDBSCAN keeps.
-        min_samples: The neighbours behind a core distance; `None` uses
-            `min_cluster_size`.
-        cluster_selection_method: `leaf` or `eom`.
-        max_fit_samples: The most rows the model is fitted on.
-        random_state: The seed of the subsample.
-
-    Returns:
-        The labels, shape (n,).
-    """
-    n_rows = X.shape[0]
-
-    clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=min_cluster_size,
-        min_samples=min_samples,
-        cluster_selection_method=cluster_selection_method,
-        metric="euclidean",
-        prediction_data=True,
-    )
-
-    if n_rows > max_fit_samples:
-        X_sub = _subsample_features(
-            X, max_samples=max_fit_samples, random_state=random_state
-        )
-        clusterer.fit(X_sub)
-        labels = np.concatenate(
-            [
-                hdbscan.approximate_predict(
-                    clusterer, X[start : start + _PREDICT_CHUNK]
-                )[0]
-                for start in range(0, n_rows, _PREDICT_CHUNK)
-            ]
-        )
-    else:
-        clusterer.fit(X)
-        labels = clusterer.labels_
-
-    return labels
-
-
-def _clamp_clusters(n_clusters: int, n_rows: int, max_fit_samples: int) -> int:
-    """Bound `n_clusters` by the rows the model is fitted on.
-
-    The sweep scored its grid on those rows, so a larger count was never
-    tried.
-    """
-    return max(2, min(int(n_clusters), min(n_rows, max_fit_samples) - 1))
-
-
-def _fit_kmeans(
+def fit_kmeans(
     X: np.ndarray,
     *,
     n_clusters: int = 8,
     max_fit_samples: int,
     random_state: int,
 ) -> np.ndarray:
-    """Fit K-means on at most `max_fit_samples` rows, label every row.
+    """Return KMeans labels, fitted on at most max_fit_samples rows.
 
     Args:
         X: The points, shape (n, d).
-        n_clusters: The number of clusters, clamped to the rows fitted.
-        max_fit_samples: The most rows the model is fitted on.
-        random_state: The seed of the subsample and the k-means start.
+        n_clusters: Clamped to [2, min(n, max_fit_samples) - 1].
+        max_fit_samples: The most rows the fit sees (graph.sample_rows).
+        random_state: The seed of the sample and of KMeans.
 
     Returns:
-        The labels, shape (n,).
+        The label of every row, >= 0.
     """
-    n_rows = X.shape[0]
-    n_clusters = _clamp_clusters(n_clusters, n_rows, max_fit_samples)
-    X = np.ascontiguousarray(X, dtype=np.float64)
+    n_clusters = _clamp(n_clusters, len(X), max_fit_samples)
     model = KMeans(n_clusters=n_clusters, random_state=random_state)
-    if n_rows > max_fit_samples:
-        X_sub = _subsample_features(
-            X, max_samples=max_fit_samples, random_state=random_state
-        )
-        model.fit(X_sub)
-        return model.predict(X)
-    return model.fit_predict(X)
+    if len(X) <= max_fit_samples:
+        return model.fit_predict(X)
+    return model.fit(X[sample_rows(len(X), max_fit_samples, random_state)]).predict(X)
 
 
-def _fit_birch(
+def fit_birch(
     X: np.ndarray,
     *,
     n_clusters: int = 8,
@@ -348,40 +80,29 @@ def _fit_birch(
     max_fit_samples: int,
     random_state: int,
 ) -> np.ndarray:
-    """Fit BIRCH with `n_clusters` (agglomerative on CF-tree leaves).
+    """Return Birch labels, fitted on at most max_fit_samples rows.
 
     Args:
         X: The points, shape (n, d).
-        n_clusters: The number of clusters, clamped to the rows fitted.
-        threshold: The radius a subcluster may span in the CF tree.
-        branching_factor: The most subclusters per CF-tree node.
-        max_fit_samples: The most rows the model is fitted on.
-        random_state: The seed of the subsample.
+        n_clusters: Clamped as in fit_kmeans.
+        threshold: Birch's subcluster radius.
+        branching_factor: Birch's most subclusters per node.
+        max_fit_samples: The most rows the fit sees.
+        random_state: The seed of the sample.
 
     Returns:
-        The labels, shape (n,).
+        The label of every row, >= 0.
     """
-    n_rows = X.shape[0]
-    n_clusters = _clamp_clusters(n_clusters, n_rows, max_fit_samples)
-    X = np.ascontiguousarray(X, dtype=np.float64)
-    clusterer = Birch(
-        threshold=threshold,
-        branching_factor=branching_factor,
-        n_clusters=n_clusters,
+    n_clusters = _clamp(n_clusters, len(X), max_fit_samples)
+    model = Birch(
+        threshold=threshold, branching_factor=branching_factor, n_clusters=n_clusters
     )
-    if n_rows > max_fit_samples:
-        X_sub = _subsample_features(
-            X, max_samples=max_fit_samples, random_state=random_state
-        )
-        clusterer.fit(X_sub)
-        labels = clusterer.predict(X)
-    else:
-        clusterer.fit(X)
-        labels = clusterer.labels_
-    return labels
+    if len(X) <= max_fit_samples:
+        return model.fit_predict(X)
+    return model.fit(X[sample_rows(len(X), max_fit_samples, random_state)]).predict(X)
 
 
-def _fit_spectral(
+def fit_spectral(
     X: np.ndarray,
     *,
     n_clusters: int = 8,
@@ -389,435 +110,422 @@ def _fit_spectral(
     max_fit_samples: int,
     random_state: int,
 ) -> np.ndarray:
-    """Cluster spectrally on the k-NN graph, labelling every row.
+    """Return spectral labels, fitted on at most max_fit_samples rows.
 
-    Above `max_fit_samples` rows the model is fitted on a subsample and
-    the rest takes the label of its nearest sampled row.
+    The affinity is a k-NN graph. Rows outside the fitted sample take
+    the label of their nearest sampled row.
 
     Args:
         X: The points, shape (n, d).
-        n_clusters: The number of clusters, clamped to the rows fitted.
-        n_neighbors: The neighbours of the affinity graph.
-        max_fit_samples: The most rows the model is fitted on.
-        random_state: The seed of the subsample, the ARPACK start vector
-            and the k-means label assignment.
+        n_clusters: Clamped as in fit_kmeans.
+        n_neighbors: Neighbours of the affinity graph.
+        max_fit_samples: The most rows the fit sees.
+        random_state: The seed of the sample and of the embedding.
 
     Returns:
-        The labels, shape (n,).
+        The label of every row, >= 0.
     """
-    n_rows = X.shape[0]
-    n_clusters = _clamp_clusters(n_clusters, n_rows, max_fit_samples)
-    X = np.ascontiguousarray(X, dtype=np.float64)
+    n_clusters = _clamp(n_clusters, len(X), max_fit_samples)
     model = SpectralClustering(
         n_clusters=n_clusters,
         affinity="nearest_neighbors",
-        n_neighbors=int(n_neighbors),
+        n_neighbors=n_neighbors,
         assign_labels="kmeans",
-        random_state=random_state,
         eigen_solver="arpack",
+        random_state=random_state,
     )
-    if n_rows <= max_fit_samples:
+    if len(X) <= max_fit_samples:
         return model.fit_predict(X)
+    sample = X[sample_rows(len(X), max_fit_samples, random_state)]
+    labels = model.fit_predict(sample)
+    nearest = NearestNeighbors(n_neighbors=1).fit(sample).kneighbors(X)[1]
+    return labels[nearest.ravel()]
 
-    X_sub = _subsample_features(
-        X, max_samples=max_fit_samples, random_state=random_state
+
+def fit_hdbscan(
+    X: np.ndarray,
+    *,
+    min_cluster_size: int = 50,
+    min_samples: int | None = None,
+    cluster_selection_method: str = "leaf",
+    max_fit_samples: int,
+    random_state: int,
+) -> np.ndarray:
+    """Return HDBSCAN labels, fitted on at most max_fit_samples rows.
+
+    Rows outside the fitted sample are labelled by approximate_predict.
+
+    Args:
+        X: The points, shape (n, d).
+        min_cluster_size: HDBSCAN's smallest cluster.
+        min_samples: HDBSCAN's core neighbours; None is
+            min_cluster_size.
+        cluster_selection_method: "leaf" or "eom".
+        max_fit_samples: The most rows the fit sees.
+        random_state: The seed of the sample.
+
+    Returns:
+        The label of every row; -1 is noise.
+    """
+    model = hdbscan.HDBSCAN(
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+        cluster_selection_method=cluster_selection_method,
+        prediction_data=True,
     )
-    sub_labels = model.fit_predict(X_sub)
-    nearest = NearestNeighbors(n_neighbors=1, algorithm="auto").fit(X_sub)
-    _, nearest_sample = nearest.kneighbors(X, n_neighbors=1, return_distance=True)
-    return sub_labels[nearest_sample.ravel()]
+    if len(X) <= max_fit_samples:
+        return model.fit_predict(X)
+    model.fit(X[sample_rows(len(X), max_fit_samples, random_state)])
+    return hdbscan.approximate_predict(model, X)[0]
 
 
-ALGORITHMS: dict[str, Callable[..., np.ndarray]] = {
-    "kmeans": _fit_kmeans,
-    "hdbscan": _fit_hdbscan,
-    "birch": _fit_birch,
-    "spectral": _fit_spectral,
+ALGORITHMS: dict[str, FitFn] = {
+    "kmeans": fit_kmeans,
+    "birch": fit_birch,
+    "spectral": fit_spectral,
+    "hdbscan": fit_hdbscan,
 }
 
 
-def granularity_loss(
-    labels: np.ndarray,
-    hardness: np.ndarray,
-    *,
-    n_class: int,
-    eval_rows_per_train_row: float,
-) -> float:
-    """Return the squared error of reading hardness off region rates.
-
-    The loss is the sum of two terms: `within` is the hardness variance
-    a group's mean hides, `noise` the sampling noise of a rate measured
-    on the val rows the group will receive, at its full-population
-    size. A finer partition lowers the first and raises the second.
+def tunable_params(algorithm: FitFn) -> tuple[str, ...]:
+    """Return the parameters of a fit function a config may set.
 
     Args:
-        labels: The group label of every row.
-        hardness: Each row's hardness, such as its kDN.
-        n_class: The full population size the groups are scaled to.
-        eval_rows_per_train_row: Evaluation rows per train row.
+        algorithm: A value of ALGORITHMS.
 
     Returns:
-        The loss, `within` plus `noise`.
+        Its keyword-only parameter names except RESERVED, in signature
+        order.
     """
-    ids, counts = np.unique(labels, return_counts=True)
-    scale = n_class / labels.shape[0]
-    weight = counts / counts.sum()
-    groups = [hardness[labels == cluster] for cluster in ids]
-    mean_hardness = np.array([group.mean() for group in groups])
-    variance = np.array(
-        [group.var(ddof=1) if group.size > 1 else np.nan for group in groups]
-    )
-    # A one-row region stands for about `scale` rows of the class whose
-    # spread is unknown, not zero: it takes the spread of the regions
-    # that have one.
-    known = ~np.isnan(variance)
-    pooled = (
-        np.average(variance[known], weights=counts[known])
-        if known.any()
-        else hardness.var(ddof=1)
-    )
-    within = float((weight * np.where(known, variance, pooled)).sum())
-    noise = float(
-        (
-            weight
-            * np.maximum(mean_hardness * (1 - mean_hardness), 1e-3)
-            / np.maximum(counts * scale * eval_rows_per_train_row, 1e-9)
-        ).sum()
-    )
-    return within + noise
-
-
-def _score_candidates(
-    X_sub: np.ndarray,
-    fit: Callable[..., np.ndarray],
-    candidates: Sequence[Mapping[str, object]],
-    *,
-    label: object,
-    hardness: np.ndarray,
-    n_class: int,
-    scaled_floor: float,
-    eval_rows_per_train_row: float,
-    metric: str,
-) -> list[tuple[dict[str, object], np.ndarray]]:
-    """Fit and score every candidate on the subsample.
-
-    A candidate whose fit fails is skipped and logged, except on a
-    TypeError, which is a configuration error and stops the sweep.
-
-    Returns:
-        The summary and merged labels of each candidate that fitted.
-
-    Raises:
-        RuntimeError: If every candidate failed to fit.
-    """
-    scored: list[tuple[dict[str, object], np.ndarray]] = []
-    failures: list[tuple[Mapping[str, object], Exception]] = []
-
-    for combo in tqdm(candidates, desc="Granularity"):
-        try:
-            labels = fit(X_sub, **combo)
-        except TypeError:
-            # A call the algorithm cannot take is a configuration error,
-            # not a degenerate candidate: stop the sweep, do not pick
-            # among the survivors.
-            raise
-        except Exception as exc:
-            failures.append((combo, exc))
-            continue
-
-        labels, n_merged_clusters, n_merged = _merge_small_clusters(
-            X_sub, labels, min_size=scaled_floor, metric=metric
-        )
-        loss = granularity_loss(
-            labels,
-            hardness,
-            n_class=n_class,
-            eval_rows_per_train_row=eval_rows_per_train_row,
-        )
-        entry = {
-            "combo": combo,
-            "n_clusters": int(np.unique(labels).size),
-            "n_merged_clusters": n_merged_clusters,
-            "n_merged": n_merged,
-            "loss": loss,
-        }
-        scored.append((entry, labels))
-
-    if failures:
-        first_combo, first_exc = failures[0]
-        logger.warning(
-            "_score_candidates: %d of %d candidates failed and were skipped "
-            "(first: %s, %r)",
-            len(failures),
-            len(failures) + len(scored),
-            first_combo,
-            first_exc,
-        )
-
-    if not scored:
-        raise RuntimeError(
-            f"All {len(candidates)} candidate(s) failed to cluster class {label}."
-        ) from failures[0][1]
-    return scored
-
-
-def _select_granularity(
-    X: np.ndarray,
-    fit: Callable[..., np.ndarray],
-    candidates: Sequence[Mapping[str, object]],
-    *,
-    row_ids: np.ndarray,
-    label: object,
-    nodes: KdnNodes,
-    hardness_k: int,
-    eval_rows_per_train_row: float,
-    min_cluster_floor: int,
-    max_clusters: int,
-    metric: str,
-    max_fit_samples: int,
-    random_state: int,
-) -> tuple[dict[str, object], np.ndarray | None]:
-    """Return the scored entry of least loss and its labels.
-
-    The candidates are keyword arguments of `fit`. The labels are None
-    when the class was subsampled, since they then cover only the
-    sample.
-    """
-    scored_rows = subsample_indices(
-        X.shape[0], max_samples=max_fit_samples, random_state=random_state
-    )
-    X_sub = X[scored_rows]
-    n_class = X.shape[0]
-    scale = n_class / X_sub.shape[0]
-    scaled_floor = min_cluster_floor / scale
-    hardness = compute_kdn(
-        X_sub,
-        row_ids=row_ids[scored_rows],
-        labels=np.full(X_sub.shape[0], label),
-        nodes=nodes,
-        k=hardness_k,
+    return tuple(
+        name
+        for name, parameter in inspect.signature(algorithm).parameters.items()
+        if parameter.kind is inspect.Parameter.KEYWORD_ONLY and name not in RESERVED
     )
 
-    scored = _score_candidates(
-        X_sub,
-        fit,
-        candidates,
-        label=label,
-        hardness=hardness,
-        n_class=n_class,
-        scaled_floor=scaled_floor,
-        eval_rows_per_train_row=eval_rows_per_train_row,
-        metric=metric,
-    )
 
-    eligible = [
-        (entry, labels)
-        for entry, labels in scored
-        if entry["n_clusters"] <= max_clusters
-    ]
-    if not eligible:
-        raise ValueError(
-            f"No candidate partition of max_clusters={max_clusters} or fewer survives "
-            "merging undersized regions. Raise clustering.max_regions or tighten the "
-            "clustering grid."
-        )
-
-    best_entry, best_labels = min(eligible, key=lambda pair: pair[0]["loss"])
-
-    # Without subsampling, the sweep's fit of the winner is the refit.
-    subsampled = n_class > max_fit_samples
-    return best_entry, None if subsampled else best_labels
-
-
-def level_counts(n_rows: int, min_cluster_floor: int) -> list[int]:
-    """Return the group count of each granularity level.
-
-    Level 0 targets `min_cluster_floor` rows per group, and each
-    further level doubles that target, coarsening the partition.
+def takes_n_clusters(algorithm: FitFn) -> bool:
+    """Return whether a fit function takes n_clusters.
 
     Args:
-        n_rows: The rows the groups partition.
-        min_cluster_floor: The target group size of the finest level.
+        algorithm: A value of ALGORITHMS.
 
     Returns:
-        One count per level, finest first, each at least 2.
+        Whether n_clusters is one of its parameters.
     """
-    return [
-        max(2, round(n_rows / (min_cluster_floor * 2**level)))
-        for level in range(_GRANULARITY_LEVELS)
-    ]
+    return "n_clusters" in inspect.signature(algorithm).parameters
 
 
-def _n_clusters_grid(
-    n_class: int, min_cluster_floor: int, max_n_clusters: int
-) -> list[int]:
-    """Return the distinct level counts, capped at `max_n_clusters`."""
-    counts = {
-        min(max_n_clusters, count) for count in level_counts(n_class, min_cluster_floor)
-    }
-    return sorted(counts)
+def kdn(neighbor_labels: np.ndarray, label: int) -> np.ndarray:
+    """Return the kDN hardness of rows of one class.
+
+    Args:
+        neighbor_labels: The class of each row's nearest graph nodes,
+            shape (n, k), k >= 1.
+        label: The class of the rows.
+
+    Returns:
+        The share of each row's neighbours of another class, in [0, 1].
+    """
+    return (neighbor_labels != label).mean(axis=1)
 
 
-def kmeans_levels(
-    X: np.ndarray,
-    *,
-    min_cluster_floor: int,
-    max_fit_samples: int,
-    metric: str,
-    random_state: int,
-) -> list[np.ndarray]:
-    """Cluster X at every granularity level, merging undersized groups.
+def centroids(
+    X: np.ndarray, labels: np.ndarray, metric: str
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the mean point of every label, unit length under cosine.
 
     Args:
         X: The points, shape (n, d).
-        min_cluster_floor: The finest level's target group size; also
-            the merge floor for undersized clusters.
-        max_fit_samples: The most rows K-means is fitted on.
-        metric: `euclidean` or `cosine`, the merge's nearest-centroid
-            metric.
-        random_state: The seed of K-means and its subsample.
+        labels: The label of every row; -1 rows are ignored.
+        metric: "euclidean" or "cosine".
 
     Returns:
-        The merged labels of every level, finest first.
+        The labels, ascending, and their centroids, shape (m, d).
     """
-    level_labels = []
-    for n_clusters in level_counts(X.shape[0], min_cluster_floor):
-        labels = _fit_kmeans(
-            X,
-            n_clusters=n_clusters,
-            max_fit_samples=max_fit_samples,
-            random_state=random_state,
-        )
-        merged, _, _ = _merge_small_clusters(
-            X, labels, min_size=min_cluster_floor, metric=metric
-        )
-        level_labels.append(merged)
-    return level_labels
+    ids = np.unique(labels[labels != -1])
+    centers = np.stack([X[labels == i].mean(axis=0) for i in ids])
+    return ids, scale_for_metric(centers, metric)
 
 
-def random_voronoi(
-    X: np.ndarray,
-    n_cells: int,
-    *,
-    min_cluster_floor: int,
-    metric: str,
-    rng: np.random.Generator,
+def merge_small_clusters(
+    X: np.ndarray, labels: np.ndarray, min_size: float, metric: str
 ) -> np.ndarray:
-    """Partition X into Voronoi cells of random rows, small ones merged.
+    """Move noise and small clusters to the nearest surviving centroid.
+
+    A cluster is small with fewer than min_size rows.
+
+    Ids are not renumbered. When no cluster has min_size rows, every row
+    gets label 0.
 
     Args:
         X: The points, shape (n, d).
-        n_cells: The cells before merging, capped at the row count.
-        min_cluster_floor: The merge floor for undersized cells.
-        metric: `euclidean` or `cosine`.
-        rng: The generator drawing the rows that centre the cells.
+        labels: The label of every row; -1 is noise.
+        min_size: The fewest rows a cluster keeps.
+        metric: The distance between rows and centroids.
 
     Returns:
-        The merged cell label of every row.
+        The new labels, all >= 0.
     """
-    center_rows = rng.choice(X.shape[0], size=min(n_cells, X.shape[0]), replace=False)
-    centroids = dict(enumerate(X[center_rows]))
-    labels = assign_nearest_centroid(X, centroids, metric=metric)
-    merged, _, _ = _merge_small_clusters(
-        X, labels, min_size=min_cluster_floor, metric=metric
-    )
+    ids, counts = np.unique(labels[labels != -1], return_counts=True)
+    absorbed = np.isin(labels, ids[counts < min_size]) | (labels == -1)
+    if not absorbed.any():
+        return labels.copy()
+    if absorbed.all():
+        return np.zeros_like(labels)
+    survivors, centers = centroids(X[~absorbed], labels[~absorbed], metric)
+    merged = labels.copy()
+    merged[absorbed] = survivors[assign_nearest(X[absorbed], centers, metric)]
     return merged
+
+
+def granularity_loss(
+    labels: np.ndarray, hardness: np.ndarray, scale: float, eval_ratio: float
+) -> float:
+    """Return the loss of a partition of a class's scored rows.
+
+    With w_c = n_c / N over the clusters c of the N scored rows, h_c
+    their mean hardness and v_c its variance (ddof=1; the n_c-weighted
+    mean of the known v_c for a single-row cluster, or of all rows when
+    none is known):
+        within = Σ w_c · v_c
+        noise = Σ w_c · max(h_c (1 - h_c), 1e-3)
+                / max(n_c · scale · eval_ratio, 1e-9)
+    and the loss is within + noise. n_c · scale · eval_ratio estimates
+    the test rows the region will receive.
+
+    Args:
+        labels: The final label of every scored row, all >= 0.
+        hardness: The kDN of every scored row.
+        scale: Rows of the class per scored row (n_class / N).
+        eval_ratio: Test rows per train row.
+
+    Returns:
+        The loss, >= 0.
+    """
+    clusters, sizes = np.unique(labels, return_counts=True)
+    weights = sizes / len(labels)
+    means = np.array([hardness[labels == c].mean() for c in clusters])
+    variances = np.array(
+        [
+            hardness[labels == c].var(ddof=1) if n > 1 else np.nan
+            for c, n in zip(clusters, sizes)
+        ]
+    )
+    known = ~np.isnan(variances)
+    if known.any():
+        pooled = np.average(variances[known], weights=sizes[known])
+    else:
+        pooled = hardness.var(ddof=1) if len(hardness) > 1 else 0.0
+    within = np.sum(weights * np.where(known, variances, pooled))
+    spread = np.maximum(means * (1 - means), 1e-3)
+    noise = np.sum(weights * spread / np.maximum(sizes * scale * eval_ratio, 1e-9))
+    return float(within + noise)
+
+
+def n_clusters_grid(n_rows: int, floor: float, max_n: int) -> list[int]:
+    """Return the n_clusters candidates of a class.
+
+    Args:
+        n_rows: The rows of the class.
+        floor: The rows of the finest cluster.
+        max_n: The most clusters.
+
+    Returns:
+        Sorted distinct values min(max_n, max(2, round(n_rows / (floor ·
+        2**l)))) for l in range(GRANULARITY_LEVELS).
+    """
+    return sorted(
+        {
+            min(max_n, max(2, round(n_rows / (floor * 2**level))))
+            for level in range(GRANULARITY_LEVELS)
+        }
+    )
+
+
+def candidate_grid(
+    algorithm: FitFn, params: Mapping[str, Any], n_clusters: Sequence[int]
+) -> list[dict[str, Any]]:
+    """Return every parameter combination to try.
+
+    A list-valued param is swept, any other value fixed; when algorithm
+    takes n_clusters, it is swept last over n_clusters.
+
+    Args:
+        algorithm: The fit function.
+        params: The configured params.
+        n_clusters: The n_clusters candidates (ignored when algorithm
+            takes none).
+
+    Returns:
+        The combinations, in product order of params then n_clusters.
+    """
+    grid = {k: v if isinstance(v, list) else [v] for k, v in params.items()}
+    if takes_n_clusters(algorithm):
+        grid["n_clusters"] = list(n_clusters)
+    return [
+        dict(zip(grid, combination))
+        for combination in itertools.product(*grid.values())
+    ]
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """One scored combination of the grid of a class.
+
+    Attributes:
+        params: The combination.
+        n_clusters: The clusters after the merge.
+        loss: Its granularity loss.
+    """
+
+    params: dict[str, Any]
+    n_clusters: int
+    loss: float
+
+
+@dataclass(frozen=True)
+class ClassClustering:
+    """The chosen partition of one class.
+
+    Attributes:
+        labels: The label of every row of the class, >= 0, gaps
+            allowed.
+        params: The winning combination.
+        loss: Its loss on the scored rows.
+        candidates: Every combination that fitted, in grid order.
+    """
+
+    labels: np.ndarray
+    params: dict[str, Any]
+    loss: float
+    candidates: list[Candidate]
 
 
 def cluster_class(
     X: np.ndarray,
+    scored: np.ndarray,
+    hardness: np.ndarray,
     *,
-    row_ids: np.ndarray,
-    label: int,
-    algorithm: str,
-    params: Mapping[str, object],
-    nodes: KdnNodes,
+    algorithm: FitFn,
+    params: Mapping[str, Any],
     max_fit_samples: int,
-    max_clusters: int,
     min_cluster_floor: int,
-    hardness_k: int,
-    eval_rows_per_train_row: float,
+    max_clusters: int,
+    eval_ratio: float,
     metric: str,
-    random_state: int,
-) -> tuple[np.ndarray, int, int, float]:
+    seed: int,
+) -> ClassClustering:
     """Cluster one class at the granularity of least loss.
 
-    List-valued `params` are swept and the others fixed; `n_clusters`
-    is swept too when the algorithm takes it.
+    Every combination of candidate_grid (n_clusters from n_clusters_grid
+    with max_n = max(2, min(max_fit_samples // min_cluster_floor,
+    max_clusters))) is fitted on X[scored], merged with floor
+    min_cluster_floor · len(scored) / len(X), and scored by
+    granularity_loss. A fit that raises anything but TypeError is
+    skipped. The least loss among those with at most max_clusters
+    clusters wins (ties: the first). When scored is every row, its
+    labels are kept; otherwise algorithm is refit on X and merged with
+    min_cluster_floor.
 
     Args:
-        X: The class's points, shape (n, d).
-        row_ids: The class's row positions in the train split.
-        label: The class label.
-        algorithm: The key of `ALGORITHMS`.
-        params: The algorithm's keyword parameters.
-        nodes: The graph nodes the kDN hardness is counted on.
-        max_fit_samples: The most rows a candidate is fitted on.
-        max_clusters: The most clusters the class may keep.
-        min_cluster_floor: The finest candidate is about the class size
-            over this; also the merge floor for undersized clusters.
-            A refit keeps only the `max_clusters` largest clusters.
-        hardness_k: The neighbours behind the kDN hardness.
-        eval_rows_per_train_row: Evaluation rows per train row.
-        metric: `euclidean` or `cosine`.
-        random_state: The seed.
+        X: The points of the class, shape (n, d).
+        scored: The rows the candidates are scored on (graph.sample_rows
+            of n with max_fit_samples).
+        hardness: The kDN of every scored row.
+        algorithm: A value of ALGORITHMS.
+        params: Its configured params.
+        max_fit_samples: Passed to algorithm.
+        min_cluster_floor: The merge floor on the whole class.
+        max_clusters: The most clusters of the class.
+        eval_ratio: Test rows per train row.
+        metric: The distance of the merge.
+        seed: Passed to algorithm as random_state.
 
     Returns:
-        The cluster labels, the merged cluster count, the merged row
-        count and the loss of the chosen granularity.
+        The chosen partition.
 
     Raises:
-        ValueError: If no candidate of at most `max_clusters` clusters
-            survives the merge of undersized clusters.
-        RuntimeError: If every candidate fails to fit.
+        RuntimeError: When every combination fails.
+        ValueError: When no combination has at most max_clusters
+            clusters.
     """
-    fit_fn = ALGORITHMS[algorithm]
-    fixed = {
-        name: value for name, value in params.items() if not isinstance(value, list)
-    }
-    grid = {name: value for name, value in params.items() if isinstance(value, list)}
-    if "n_clusters" in signature(fit_fn).parameters:
-        max_n_clusters = max(2, min(max_fit_samples // min_cluster_floor, max_clusters))
-        grid["n_clusters"] = _n_clusters_grid(
-            X.shape[0], min_cluster_floor, max_n_clusters
-        )
-    fit = partial(
-        fit_fn, max_fit_samples=max_fit_samples, random_state=random_state, **fixed
+    n_rows = len(X)
+    max_n = max(2, min(max_fit_samples // min_cluster_floor, max_clusters))
+    grid = candidate_grid(
+        algorithm, params, n_clusters_grid(n_rows, min_cluster_floor, max_n)
     )
-    candidates = [
-        dict(zip(grid, values)) for values in itertools.product(*grid.values())
+    sample = X[scored]
+    scale = n_rows / len(scored)
+    candidates, candidate_labels = [], []
+    for combination in grid:
+        try:
+            labels = algorithm(
+                sample,
+                max_fit_samples=max_fit_samples,
+                random_state=seed,
+                **combination,
+            )
+        # A TypeError is a bad param: a config error, which every other
+        # candidate would repeat, not a candidate that failed to fit.
+        except TypeError:
+            raise
+        except Exception as e:
+            print(f"[regions] skipped {combination}: {e}", flush=True)
+            continue
+        labels = merge_small_clusters(sample, labels, min_cluster_floor / scale, metric)
+        loss = granularity_loss(labels, hardness, scale, eval_ratio)
+        candidates.append(Candidate(combination, len(np.unique(labels)), loss))
+        candidate_labels.append(labels)
+    if not candidates:
+        raise RuntimeError(f"every one of the {len(grid)} clustering candidates failed")
+    allowed = [
+        i
+        for i, candidate in enumerate(candidates)
+        if candidate.n_clusters <= max_clusters
     ]
-    best, best_labels = _select_granularity(
-        X,
-        fit,
-        candidates,
-        row_ids=row_ids,
-        label=label,
-        nodes=nodes,
-        hardness_k=hardness_k,
-        eval_rows_per_train_row=eval_rows_per_train_row,
-        min_cluster_floor=min_cluster_floor,
-        max_clusters=max_clusters,
-        metric=metric,
-        max_fit_samples=max_fit_samples,
-        random_state=random_state,
+    if not allowed:
+        raise ValueError(
+            f"no candidate has at most max_clusters={max_clusters} clusters, "
+            f"least: {min(c.n_clusters for c in candidates)}"
+        )
+    best = min(allowed, key=lambda i: candidates[i].loss)
+    chosen = candidates[best]
+    if len(scored) == n_rows:
+        labels = candidate_labels[best]
+    else:
+        labels = algorithm(
+            X, max_fit_samples=max_fit_samples, random_state=seed, **chosen.params
+        )
+        labels = merge_small_clusters(X, labels, min_cluster_floor, metric)
+    return ClassClustering(labels, chosen.params, chosen.loss, candidates)
+
+
+def assign_nearest(points: np.ndarray, centers: np.ndarray, metric: str) -> np.ndarray:
+    """Return the index of the nearest center of every point.
+
+    Args:
+        points: Shape (n, d).
+        centers: Shape (m, d).
+        metric: "euclidean" or "cosine".
+
+    Returns:
+        Indices into centers (ties: the first), int64.
+    """
+    # In chunks: a split against every centre may not fit in memory.
+    return np.concatenate(
+        [
+            pairwise_distances(
+                points[start : start + _ROUTE_ROWS], centers, metric=metric
+            )
+            .argmin(axis=1)
+            .astype(np.int64)
+            for start in range(0, len(points), _ROUTE_ROWS)
+        ]
+        or [np.empty(0, dtype=np.int64)]
     )
-    if best_labels is not None:
-        return best_labels, best["n_merged_clusters"], best["n_merged"], best["loss"]
-    refit_labels = fit(X, **best["combo"])
-    # The refit labels rows the sweep never saw (hdbscan routes them by
-    # approximate_predict), so a cluster under the scaled floor there
-    # can clear the full one here. Only the `max_clusters` largest are
-    # kept, by rank, so that ties at the cut do not drop them all.
-    cluster_ids, cluster_sizes = np.unique(
-        refit_labels[refit_labels != -1], return_counts=True
-    )
-    over_cap = cluster_ids[np.argsort(-cluster_sizes, kind="stable")[max_clusters:]]
-    refit_labels = np.where(np.isin(refit_labels, over_cap), -1, refit_labels)
-    # Refit on the full class: the sweep's merge counts described the
-    # scored subsample, at a floor scaled down to match it, so they
-    # don't describe this.
-    final_labels, n_merged_clusters, n_merged = _merge_small_clusters(
-        X, refit_labels, min_size=min_cluster_floor, metric=metric
-    )
-    return final_labels, n_merged_clusters + over_cap.size, n_merged, best["loss"]
+
+
+def _clamp(n_clusters: int, n_rows: int, max_fit_samples: int) -> int:
+    """Bound n_clusters by the rows the model is fitted on."""
+    return max(2, min(int(n_clusters), min(n_rows, max_fit_samples) - 1))

@@ -1,323 +1,82 @@
-"""Raw-table cleaning, stratified split, class sampling, encoders."""
+"""Clean and split the raw rows: polars frames in, polars frames out."""
 
-__all__ = [
-    "LogTransformer",
-    "TopNHashEncoder",
-    "build_preprocessor",
-    "drop_nans",
-    "drop_rare_classes",
-    "ml_split",
-    "stratified_holdout",
-    "subsample_per_class",
-    "undersample_classes",
-]
+from __future__ import annotations
 
-import hashlib
-import math
+__all__ = ["SPLITS", "drop_incomplete", "drop_rare_classes", "stratified_split"]
 
-import numpy as np
-import pandas as pd
-from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.compose import ColumnTransformer
-from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import RobustScaler
+from collections.abc import Mapping, Sequence
+
+import polars as pl
+
+SPLITS = ("train", "val", "test")
 
 
-def drop_nans(rows: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-    """Drop the rows with a NaN or infinite value in `cols`.
+def drop_incomplete(rows: pl.DataFrame, num_cols: Sequence[str]) -> pl.DataFrame:
+    """Drop the rows with a null or a non-finite number.
 
     Args:
-        rows: The table to clean.
-        cols: The columns checked for NaN and infinite values.
+        rows: The raw rows; num_cols are Float64, every other column
+            text.
+        num_cols: The numeric columns, where NaN and ±inf count as
+            missing.
 
     Returns:
-        The remaining rows, with their index.
+        The complete rows, in their original order.
     """
-    return rows.replace([np.inf, -np.inf], np.nan).dropna(subset=cols)
+    finite = [pl.col(c).is_finite() for c in num_cols]
+    return rows.drop_nulls().filter(*finite) if finite else rows.drop_nulls()
 
 
 def drop_rare_classes(
-    rows: pd.DataFrame, label_col: str, *, min_count: int
-) -> pd.DataFrame:
-    """Drop the rows of every class with fewer than `min_count` rows.
+    rows: pl.DataFrame, label_col: str, min_count: int
+) -> tuple[pl.DataFrame, list[str]]:
+    """Drop every class with fewer than min_count rows.
 
     Args:
-        rows: The table to filter.
-        label_col: The label column.
-        min_count: The fewest rows a class keeps to stay.
+        rows: The rows.
+        label_col: The class column.
+        min_count: The fewest rows a class keeps (a class with exactly
+            min_count rows stays).
 
     Returns:
-        The rows of the remaining classes, with their index.
+        The rows of the kept classes, in their original order, and the
+        dropped class names, sorted.
     """
     counts = rows[label_col].value_counts()
-    return rows[~rows[label_col].isin(counts[counts < min_count].index)]
+    rare = counts.filter(pl.col("count") < min_count)[label_col].to_list()
+    return rows.filter(~pl.col(label_col).is_in(rare)), sorted(rare)
 
 
-def _stratified_sample(
-    rows: pd.DataFrame,
-    label_col: str,
-    per_group: int,
-    *,
-    random_state: int,
-) -> pd.DataFrame:
-    """Sample up to `per_group` rows per label, keeping the index."""
-    return rows.groupby(rows[label_col].values, group_keys=False).apply(
-        lambda group: group.sample(
-            n=min(len(group), per_group), random_state=random_state
-        )
-    )
+def stratified_split(
+    rows: pl.DataFrame, label_col: str, shares: Mapping[str, float], seed: int
+) -> dict[str, pl.DataFrame]:
+    """Split the rows into train, val and test, stratified by class.
 
-
-def subsample_per_class(
-    rows: pd.DataFrame, n_samples: int, *, random_state: int, label_col: str
-) -> pd.DataFrame:
-    """Sample up to `n_samples // n_classes` rows from every class.
+    Within each class the rows are ranked by a hash of their position
+    seeded by seed; the first ceil(train · n) ranks go to train, the
+    next up to ceil((train + val) · n) to val, the rest to test. So
+    every split holds each class in proportion, and the result depends
+    on the seed only.
 
     Args:
-        rows: The table to sample.
-        n_samples: The target total, shared evenly by the classes.
-        random_state: The seed of the sampling.
-        label_col: The label column.
+        rows: The rows.
+        label_col: The class column.
+        shares: The share of each of SPLITS; they sum to 1.
+        seed: The hash seed.
 
     Returns:
-        The sampled rows, with their index.
+        One frame per name of SPLITS, disjoint, together every row of
+        rows, each in the original row order.
     """
-    per_class = n_samples // rows[label_col].nunique()
-    return _stratified_sample(rows, label_col, per_class, random_state=random_state)
-
-
-def undersample_classes(
-    rows: pd.DataFrame, label_col: str, *, random_state: int
-) -> pd.DataFrame:
-    """Sample every class down to the size of the smallest.
-
-    Args:
-        rows: The table to balance.
-        label_col: The label column.
-        random_state: The seed of the sampling.
-
-    Returns:
-        The balanced rows, with their index.
-    """
-    min_count = rows[label_col].value_counts().min()
-    return _stratified_sample(rows, label_col, min_count, random_state=random_state)
-
-
-def ml_split(
-    rows: pd.DataFrame,
-    *,
-    train_frac: float,
-    val_frac: float,
-    test_frac: float,
-    random_state: int,
-    label_col: str,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Split a table into stratified train, validation and test sets.
-
-    Args:
-        rows: The table to split.
-        train_frac: The share of the rows for train.
-        val_frac: The share for validation.
-        test_frac: The share for test.
-        random_state: The seed of the splits.
-        label_col: The label column, which stratifies both splits.
-
-    Returns:
-        The train, validation and test rows.
-    """
-    train, rest = train_test_split(
-        rows, train_size=train_frac, random_state=random_state, stratify=rows[label_col]
+    rank = pl.col("_position").hash(seed).rank("ordinal").over(label_col)
+    share = (rank - 1) / pl.len().over(label_col)
+    train, val = shares["train"], shares["train"] + shares["val"]
+    split = (
+        pl.when(share < train)
+        .then(pl.lit("train"))
+        .when(share < val)
+        .then(pl.lit("val"))
+        .otherwise(pl.lit("test"))
     )
-    val, test = train_test_split(
-        rest,
-        train_size=val_frac / (val_frac + test_frac),
-        random_state=random_state,
-        stratify=rest[label_col],
-    )
-    return train, val, test
-
-
-def stratified_holdout(
-    rows: pd.DataFrame, *, holdout_frac: float, label_col: str, random_state: int
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Split a table into a fit part and a stratified holdout.
-
-    Args:
-        rows: The table to split.
-        holdout_frac: The share of rows held out.
-        label_col: The label column, which stratifies the split.
-        random_state: The seed of the split.
-
-    Returns:
-        The fit rows and the holdout rows.
-
-    Raises:
-        ValueError: A class has fewer than two rows, or either side of
-            the split would hold fewer rows than there are classes, so
-            stratification could not keep every class on both sides.
-    """
-    counts = rows[label_col].value_counts()
-    n_holdout = math.ceil(holdout_frac * len(rows))
-    n_fit = len(rows) - n_holdout
-    if counts.min() < 2 or n_fit < len(counts) or n_holdout < len(counts):
-        raise ValueError(
-            f"{len(rows)} rows of {len(counts)} classes (smallest {counts.min()}) "
-            f"split by holdout_frac={holdout_frac} into {n_fit} fit and {n_holdout} "
-            "holdout row(s) cannot keep every class on both sides: lower holdout_frac "
-            "or give it more rows."
-        )
-    fit, holdout = train_test_split(
-        rows,
-        test_size=holdout_frac,
-        random_state=random_state,
-        stratify=rows[label_col],
-    )
-    return fit, holdout
-
-
-class LogTransformer(BaseEstimator, TransformerMixin):
-    """A signed log1p, which compresses a skewed column.
-
-    It keeps the order of negatives. It is stateless, so it has no
-    fitted attributes.
-    """
-
-    def fit(self, X: pd.DataFrame, y: object = None) -> "LogTransformer":
-        """Return the transformer, which has nothing to learn.
-
-        Args:
-            X: The features, ignored.
-            y: The labels, ignored.
-
-        Returns:
-            The transformer itself.
-        """
-        return self
-
-    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        """Apply sign(x) * log1p(|x|) to every value.
-
-        Args:
-            X: The numerical features.
-
-        Returns:
-            The transformed features, shaped like `X`.
-        """
-        return np.sign(X) * np.log1p(np.abs(X))
-
-
-# Part of every bucket: changing it re-buckets every unseen value.
-_HASH_KEY = "cat-encoder-v1"
-
-
-class TopNHashEncoder(BaseEstimator, TransformerMixin):
-    """An encoder of categoricals: 0 missing, 1..top_n frequent, hashes.
-
-    Attributes:
-        top_n: The most frequent values of a column that get an id.
-        hash_buckets: The buckets the other values hash into; 0 sends
-            them to the missing id.
-        columns_: The fitted column names.
-        category_maps_: By column, the id of each frequent value.
-    """
-
-    def __init__(self, *, top_n: int = 256, hash_buckets: int = 1024) -> None:
-        self.top_n = top_n
-        self.hash_buckets = hash_buckets
-
-    def _hash_bucket(self, col: str, value: object, n_buckets: int) -> int:
-        """Return the stable bucket index of a category value."""
-        text = "NA" if pd.isna(value) else str(value)
-        digest = hashlib.blake2b(
-            f"{_HASH_KEY}|{col}|{text}".encode(), digest_size=8
-        ).digest()
-        return int.from_bytes(digest, byteorder="little") % n_buckets
-
-    def fit(self, X: pd.DataFrame, y: object = None) -> "TopNHashEncoder":
-        """Learn the top-N categories of every column.
-
-        Args:
-            X: The categorical features.
-            y: The labels, ignored.
-
-        Returns:
-            The fitted encoder.
-        """
-        X = pd.DataFrame(X)
-        self.columns_ = list(X.columns)
-        self.category_maps_ = {
-            col: {
-                cat: i + 1
-                for i, cat in enumerate(
-                    X[col].value_counts(dropna=True).nlargest(self.top_n).index
-                )
-            }
-            for col in self.columns_
-        }
-        return self
-
-    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
-        """Encode every column into category ids, hash buckets or 0.
-
-        Args:
-            X: The categorical features; the fitted columns it lacks
-                are skipped.
-
-        Returns:
-            The int32 ids, indexed like `X`.
-        """
-        X = pd.DataFrame(X)
-        hashed_start = 1 + self.top_n
-        out = {}
-        for col in self.columns_:
-            if col not in X.columns:
-                continue
-            category_map = self.category_maps_[col]
-            column = X[col]
-            codes = column.map(category_map)
-            if self.hash_buckets > 0:
-                unseen = codes.isna() & column.notna()
-                hash_map = {
-                    value: hashed_start
-                    + self._hash_bucket(col, value, self.hash_buckets)
-                    for value in column[unseen].unique()
-                }
-                codes = codes.where(~unseen, column.map(hash_map))
-            codes = codes.fillna(0)
-            out[col] = codes.to_numpy(dtype=np.int32)
-        return pd.DataFrame(out, index=X.index)
-
-
-def build_preprocessor(
-    num_cols: list[str], cat_cols: list[str], *, top_n: int, hash_buckets: int
-) -> ColumnTransformer:
-    """Return the encoders prepare fits on the feature columns.
-
-    Signed log with robust scaling, top-N categories with hash codes.
-
-    Args:
-        num_cols: The numerical feature names.
-        cat_cols: The categorical feature names.
-        top_n: The categories kept per column.
-        hash_buckets: The buckets the other categories hash into.
-
-    Returns:
-        The unfitted transformer, with steps "num" and "cat" for the
-        non-empty column lists and plain output column names.
-    """
-    transformers = []
-    if num_cols:
-        numerical = Pipeline(
-            [("log_transformer", LogTransformer()), ("scaler", RobustScaler())]
-        )
-        transformers.append(("num", numerical, num_cols))
-    if cat_cols:
-        encoder = TopNHashEncoder(top_n=top_n, hash_buckets=hash_buckets)
-        categorical = Pipeline([("top_n_encoder", encoder)])
-        transformers.append(("cat", categorical, cat_cols))
-    return ColumnTransformer(
-        transformers=transformers,
-        remainder="drop",
-        verbose_feature_names_out=False,
-    )
+    assigned = rows.with_row_index("_position").select(split.alias("split"))["split"]
+    return {name: rows.filter(assigned == name) for name in SPLITS}

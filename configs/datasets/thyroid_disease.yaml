@@ -1,0 +1,40 @@
+name: thyroid_disease
+path: resources/raw_data/thyroid_disease/thyroid_disease.csv
+label_col: class
+
+num_cols:
+  - age
+  - sex
+  - on_thyroxine
+  - query_on_thyroxine
+  - on_antithyroid_medication
+  - sick
+  - pregnant
+  - thyroid_surgery
+  - I131_treatment
+  - query_hypothyroid
+  - query_hyperthyroid
+  - lithium
+  - goitre
+  - tumor
+  - hypopituitary
+  - psych
+  - TSH
+  - T3
+  - TT4
+  - T4U
+  - FTI
+
+cat_cols: []
+
+split:  # stratified by class, after dropping non-finite rows and rare classes
+  train: 0.4
+  val: 0.15  # the ATC threshold is fitted here; no classifier trains on it
+  test: 0.45  # every failure rate is measured here
+
+min_class_count: 100  # classes with fewer rows are dropped
+top_n: 32  # most frequent values of a categorical column that keep their own code
+hash_buckets: 64  # the other values are hashed into this many codes
+seed: 42
+output_dir: resources/processed/thyroid_disease
+db_path: resources/processed/grace.db

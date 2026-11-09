@@ -1,589 +1,436 @@
-"""Read-only queries of the dashboard on grace.db."""
+"""Read-only queries: db tables and parquet files to JSON-able dicts.
+
+Every function raises LookupError("run <stage> first") when the stage
+output is missing (no db, table, run or file). The db is opened
+read-only (file:...?mode=ro). The run shown is the latest one with
+status "ok" for the stage and dataset (and model). Every "run" value is
+{id, started, finished}. Non-finite numbers become None (JSON has no
+NaN).
+"""
+
+from __future__ import annotations
 
 __all__ = [
-    "ARM_METRICS",
-    "OPERATING_COLUMNS",
-    "PARTITION_AXES",
-    "PARTITION_METRICS",
-    "PREDICTORS",
-    "REGION_COLUMNS",
-    "SCORES",
-    "STAGE_ORDER",
-    "class_clusterings",
-    "class_metrics",
-    "classes",
-    "classifier_grid",
-    "connect",
-    "descriptors",
-    "execution_configs",
-    "execution_dirs",
-    "features",
-    "history",
-    "importances",
-    "metrics_by_stage",
-    "operating_points",
-    "partition_class_levels",
-    "partition_groups",
-    "partitions",
-    "predictor_stage",
+    "complexity",
+    "failures",
+    "region",
     "regions",
-    "regressor_folds",
-    "run",
-    "run_metrics",
-    "runs",
-    "stage_ids",
+    "regress",
+    "split",
+    "train",
 ]
 
 import json
+import math
 import sqlite3
-from collections.abc import Mapping, Sequence
+from collections import defaultdict
+from collections.abc import Mapping
+from contextlib import closing
+from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
-# The stages in execution order, as `pipeline.runner.STAGES` lists them;
-# a test keeps the two equal, since importing the runner here would load
-# every stage's dependencies.
-STAGE_ORDER = (
-    "split prepare regions classify failures baselines complexity regress "
-    "render partitions"
-).split()
-# The failure-rate predictors, each with its label; the `regions`
-# columns carry its rates and `<key>_<score>` metrics its scores.
-PREDICTORS = {
-    "regressor": "RF regressor",
-    "val": "Val rate",
-    "mcp": "MCP",
-    "atc": "ATC",
-}
-SCORES = ("spearman", "mse", "r2", "mae")
-# The numeric columns of `regions` other than the complexity measures;
-# they follow the SELECT there and its abs_error.
-REGION_COLUMNS = (
-    "n_train n_val n_test n_val_error val_rate n_test_error test_rate used fold "
-    "regressor val mcp atc abs_error"
-).split()
-# The partitions columns the panel plots: its metrics and its x axes.
-PARTITION_METRICS = (
-    "skill",
-    "brier",
-    "resolution",
-    "reliability",
-    "auroc",
-    "kdn_spearman",
-    "share_no_val",
-)
-# The scores drawn at each arm's operating point, in reading order.
-ARM_METRICS = (
-    "skill",
-    "brier",
-    "resolution",
-    "reliability",
-    "auroc",
-    "kdn_spearman",
-)
-PARTITION_AXES = ("n_groups", "val_median")
-# The partitions columns averaged into an operating point.
-OPERATING_COLUMNS = (
-    "n_groups val_median share_no_val brier skill resolution reliability "
-    "auroc kdn_spearman"
-).split()
+import numpy as np
+import polars as pl
+
+from src.config import DatasetConfig, ModelConfig
+from stages.paths import estimates_file, predictions_file, read_classes
+
+CONFIDENCE_BINS = 20
 
 
-def predictor_stage(key: str) -> str:
-    """Return the stage whose metrics hold a predictor's scores.
+def split(cfg: DatasetConfig) -> dict[str, Any]:
+    """Return the last split run.
 
     Args:
-        key: A key of `PREDICTORS`.
+        cfg: The dataset.
 
     Returns:
-        "regress" for the regressor, "baselines" for the others.
+        run; summary {n_raw, n_incomplete, n_rare, n_kept, n_classes};
+        classes [{label, train, val, test}] sorted by label;
+        dropped_classes [{label, n_rows}]; features {num: [...], cat:
+        [...]}.
     """
-    return "regress" if key == "regressor" else "baselines"
+    with closing(_connect(cfg)) as conn:
+        run = _latest_run(conn, "split", cfg)
+        summary = _rows(conn, "split", "split_summary", run)[0]
+        features = _rows(conn, "split", "features", run)
+        return {
+            "run": _public(run),
+            "summary": summary,
+            "classes": sorted(
+                _rows(conn, "split", "split_class_counts", run),
+                key=lambda r: r["label"],
+            ),
+            "dropped_classes": _rows(conn, "split", "dropped_classes", run),
+            "features": {
+                kind: [f["column"] for f in features if f["kind"] == kind]
+                for kind in ("num", "cat")
+            },
+        }
 
 
-def connect(path: Path) -> sqlite3.Connection:
-    """Open a read-only connection to the DB at `path`.
+def regions(cfg: DatasetConfig) -> dict[str, Any]:
+    """Return the last regions run.
 
     Args:
-        path: The grace.db file.
+        cfg: The dataset.
 
     Returns:
-        The connection; its rows are `sqlite3.Row`.
+        run; stats {n_regions, algorithm, distance, n_graph_nodes,
+        eval_ratio}; classes [{class, n_train, n_regions, loss,
+        params}]; candidates [{class, params, n_clusters, loss}];
+        regions [{region, class, n_train, n_val, n_test}].
     """
-    # FastAPI runs the dependency and the endpoint in different threads,
-    # but the connection still serves a single request.
-    db = sqlite3.connect(
-        f"{path.resolve().as_uri()}?mode=ro", uri=True, check_same_thread=False
-    )
-    db.row_factory = sqlite3.Row
-    return db
+    with closing(_connect(cfg)) as conn:
+        run = _latest_run(conn, "regions", cfg)
+        classes = _rows(conn, "regions", "class_clusterings", run)
+        candidates = _rows(conn, "regions", "granularity_candidates", run)
+        for row in classes + candidates:
+            row["params"] = json.loads(row["params"])
+        return {
+            "run": _public(run),
+            "stats": _rows(conn, "regions", "region_stats", run)[0],
+            "classes": classes,
+            "candidates": candidates,
+            "regions": _rows(conn, "regions", "regions", run),
+        }
 
 
-def _all(
-    db: sqlite3.Connection,
-    sql: str,
-    params: Sequence[object] | Mapping[str, object] = (),
-) -> list[dict[str, object]]:
-    """Return the rows of a query as dicts."""
-    return [dict(row) for row in db.execute(sql, params)]
-
-
-def _decode(row: dict[str, object], *keys: str) -> dict[str, object]:
-    """Return `row` with the JSON text of `keys` decoded."""
-    return {**row, **{key: json.loads(row[key]) for key in keys}}
-
-
-def _stages_by_run(
-    db: sqlite3.Connection, run_id: int | None = None
-) -> dict[int, list[dict[str, object]]]:
-    """Group the stage executions of the runs by run, upstream first."""
-    # An execution id is larger than those of its inputs: a valid DAG
-    # order.
-    rows = _all(
-        db,
-        """
-        SELECT rs.run_id, rs.stage, rs.execution_id, rs.cached, e.status,
-               e.started_at, e.duration_s, e.error, e.dir
-        FROM run_stages rs JOIN executions e ON e.id = rs.execution_id
-        WHERE ? IS NULL OR rs.run_id = ? ORDER BY e.id
-        """,
-        (run_id, run_id),
-    )
-    grouped: dict[int, list[dict[str, object]]] = {}
-    for row in rows:
-        grouped.setdefault(row.pop("run_id"), []).append(row)
-    return grouped
-
-
-def runs(db: sqlite3.Connection) -> list[dict[str, object]]:
-    """List every run, newest first, with its stage executions.
+def complexity(cfg: DatasetConfig, measure: str | None) -> dict[str, Any]:
+    """Return the last complexity run, focused on one measure.
 
     Args:
-        db: A connection to grace.db.
+        cfg: The dataset.
+        measure: A measure of the run; None picks the first.
 
     Returns:
-        The runs, with decoded `targets` and `config` and a `stages`
-        list of the executions the run used, whatever their status.
+        run; measures [names, table order]; measure (the one shown);
+        regions [{region, class, value}]; classes [{class, value}];
+        summary [{measure, mean, min, max, n_null}] over the regions.
+
+    Raises:
+        LookupError: Also when measure is not a measure of the run.
     """
-    stages = _stages_by_run(db)
-    rows = _all(
-        db,
-        "SELECT id, targets, config, status, error, started_at, finished_at "
-        "FROM runs ORDER BY id DESC",
-    )
-    return [
-        {**_decode(row, "targets", "config"), "stages": stages.get(row["id"], [])}
-        for row in rows
-    ]
-
-
-def run(db: sqlite3.Connection, run_id: int) -> dict[str, object] | None:
-    """Return a run with its parsed config and stage executions.
-
-    Args:
-        db: A connection to grace.db.
-        run_id: The run id.
-
-    Returns:
-        The run as `runs` lists it, or None.
-    """
-    rows = _all(
-        db,
-        "SELECT id, targets, config, status, error, started_at, finished_at "
-        "FROM runs WHERE id = ?",
-        (run_id,),
-    )
-    if not rows:
-        return None
-    stages = _stages_by_run(db, run_id).get(run_id, [])
-    return {**_decode(rows[0], "targets", "config"), "stages": stages}
-
-
-def stage_ids(run_row: Mapping[str, object]) -> dict[str, int]:
-    """Map every done stage of a run to its execution id.
-
-    Args:
-        run_row: A run as `run` returns it.
-
-    Returns:
-        The execution id by stage name; a failed or running execution
-        has no results to show and is left out.
-    """
-    return {
-        row["stage"]: row["execution_id"]
-        for row in run_row["stages"]
-        if row["status"] == "done"
-    }
-
-
-def execution_dirs(run_row: Mapping[str, object]) -> dict[str, str]:
-    """Map every done stage of a run to its folder under the root."""
-    return {
-        row["stage"]: row["dir"] for row in run_row["stages"] if row["status"] == "done"
-    }
-
-
-def run_metrics(db: sqlite3.Connection) -> list[tuple[int, str, int, str, float]]:
-    """List the metrics of every done execution each run used.
-
-    Args:
-        db: A connection to grace.db.
-
-    Returns:
-        `(run_id, stage, execution_id, name, value)` tuples; `value` is
-        None for a metric that was NaN.
-    """
-    rows = db.execute("""
-        SELECT rs.run_id, e.stage, e.id, m.name, m.value
-        FROM run_stages rs
-        JOIN executions e ON e.id = rs.execution_id AND e.status = 'done'
-        JOIN metrics m ON m.execution_id = e.id
-        """)
-    return [tuple(row) for row in rows]
-
-
-def metrics_by_stage(
-    db: sqlite3.Connection, ids: Mapping[str, int]
-) -> dict[str, dict[str, float | None]]:
-    """Read the metrics of some executions.
-
-    Args:
-        db: A connection to grace.db.
-        ids: The execution id of each stage.
-
-    Returns:
-        The metric values by stage and name, in insertion order.
-    """
-    return {
-        stage: dict(
-            db.execute(
-                "SELECT name, value FROM metrics WHERE execution_id = ? "
-                "ORDER BY rowid",
-                (execution_id,),
-            )
+    with closing(_connect(cfg)) as conn:
+        run = _latest_run(conn, "complexity", cfg)
+        rows = _rows(conn, "complexity", "complexity", run)
+        region_class = _region_classes(conn, cfg)
+    measures = list(dict.fromkeys(r["measure"] for r in rows))
+    measure = measures[0] if measure is None else measure
+    if measure not in measures:
+        raise LookupError(f"unknown measure: {measure}")
+    class_names = _classes(cfg)
+    by_region = defaultdict(list)
+    for r in rows:
+        if r["scope"] == "region":
+            by_region[r["measure"]].append(r["value"])
+    summary = []
+    for m in measures:
+        values = np.array([np.nan if v is None else v for v in by_region[m]])
+        known = values[np.isfinite(values)]
+        summary.append(
+            {
+                "measure": m,
+                "mean": _finite(known.mean()) if known.size else None,
+                "min": _finite(known.min()) if known.size else None,
+                "max": _finite(known.max()) if known.size else None,
+                "n_null": int(values.size - known.size),
+            }
         )
-        for stage, execution_id in ids.items()
+    chosen = [r for r in rows if r["measure"] == measure]
+    return {
+        "run": _public(run),
+        "measures": measures,
+        "measure": measure,
+        "regions": [
+            {"region": r["id"], "class": region_class.get(r["id"]), "value": r["value"]}
+            for r in chosen
+            if r["scope"] == "region"
+        ],
+        "classes": [
+            {"class": class_names[r["id"]], "value": r["value"]}
+            for r in chosen
+            if r["scope"] == "class"
+        ],
+        "summary": summary,
     }
 
 
-def execution_configs(
-    db: sqlite3.Connection, ids: Mapping[str, int]
-) -> dict[str, dict[str, object]]:
-    """Read the config slice each of some executions ran with.
+def train(cfg: DatasetConfig, model: str, split: str) -> dict[str, Any]:
+    """Return the last train run of model, on val or test.
 
     Args:
-        db: A connection to grace.db.
-        ids: The execution id of each stage.
+        cfg: The dataset.
+        model: A model name.
+        split: "val" or "test".
 
     Returns:
-        The decoded config by stage.
+        run; models [models with an ok train run]; overall {accuracy,
+        macro_f1, weighted_f1}; classes [{label, precision, recall, f1,
+        support}]; confusion {labels, counts (rows true, columns pred)};
+        confidence {edges (CONFIDENCE_BINS + 1), correct, wrong} (counts
+        per bin, from the predictions file).
     """
-    configs = {}
-    for stage, execution_id in ids.items():
-        row = db.execute(
-            "SELECT config FROM executions WHERE id = ?", (execution_id,)
-        ).fetchone()
-        configs[stage] = json.loads(row[0])
-    return configs
-
-
-def operating_points(
-    db: sqlite3.Connection, run_id: int | None = None
-) -> list[dict[str, object]]:
-    """List the operating points of the done partitions executions.
-
-    Args:
-        db: A connection to grace.db.
-        run_id: Only this run's; None lists every run.
-
-    Returns:
-        One row per run, arm and rule other than `level`, with the
-        partitions columns of `OPERATING_COLUMNS` averaged over the
-        draws of `null`.
-    """
-    averages = ", ".join(f"AVG(p.{name}) AS {name}" for name in OPERATING_COLUMNS)
-    return _all(
-        db,
-        f"""
-        SELECT rs.run_id, rs.execution_id, p.arm, p.rule, {averages}
-        FROM run_stages rs
-        JOIN executions e ON e.id = rs.execution_id AND e.status = 'done'
-        JOIN partitions p ON p.execution_id = e.id
-        WHERE rs.stage = 'partitions' AND p.rule != 'level'
-          AND (? IS NULL OR rs.run_id = ?)
-        GROUP BY rs.run_id, p.arm, p.rule ORDER BY rs.run_id, p.arm, p.rule
-        """,
-        (run_id, run_id),
-    )
-
-
-def features(db: sqlite3.Connection, split_id: int) -> list[dict[str, object]]:
-    """List the features of a split execution, in column order."""
-    return _all(
-        db,
-        "SELECT position, name, kind FROM features WHERE execution_id = ? "
-        "ORDER BY position",
-        (split_id,),
-    )
-
-
-def classes(db: sqlite3.Connection, prepare_id: int) -> list[dict[str, object]]:
-    """List the classes of a prepare execution, rows per split."""
-    return _all(
-        db,
-        "SELECT class_id, name, n_train, n_val, n_test FROM classes "
-        "WHERE execution_id = ? ORDER BY class_id",
-        (prepare_id,),
-    )
-
-
-def class_clusterings(
-    db: sqlite3.Connection, regions_id: int, prepare_id: int
-) -> list[dict[str, object]]:
-    """List the clustering of every class of a regions execution.
-
-    Args:
-        db: A connection to grace.db.
-        regions_id: The execution id of regions.
-        prepare_id: The execution id of prepare, for the class names.
-
-    Returns:
-        One row per class: id, name, its clustering columns and the
-        number of regions it holds.
-    """
-    return _all(
-        db,
-        """
-        SELECT c.class_id, k.name, c.n_train, c.n_clusters, c.loss,
-               c.size_balance, c.n_merged_clusters, c.n_merged
-        FROM class_clusterings c
-        JOIN classes k ON k.execution_id = ? AND k.class_id = c.class_id
-        WHERE c.execution_id = ? ORDER BY c.class_id
-        """,
-        (prepare_id, regions_id),
-    )
-
-
-def class_metrics(
-    db: sqlite3.Connection, prepare_id: int, classify_id: int
-) -> list[dict[str, object]]:
-    """List the test size and classifier scores of every class.
-
-    Args:
-        db: A connection to grace.db.
-        prepare_id: The execution id of prepare.
-        classify_id: The execution id of classify.
-
-    Returns:
-        One row per class: id, name, `n_test`, precision, recall, f1.
-    """
-    return _all(
-        db,
-        """
-        SELECT k.class_id, k.name, k.n_test, m.precision, m.recall, m.f1
-        FROM classes k LEFT JOIN class_metrics m
-          ON m.execution_id = ? AND m.class_id = k.class_id
-        WHERE k.execution_id = ? ORDER BY k.class_id
-        """,
-        (classify_id, prepare_id),
-    )
-
-
-def classifier_grid(
-    db: sqlite3.Connection, classify_id: int
-) -> list[dict[str, object]]:
-    """List the grid-search candidates of a classify execution.
-
-    Returns:
-        The candidates, empty without a search, with decoded `params`.
-    """
-    rows = _all(
-        db,
-        "SELECT candidate, params, mean_score, std_score, best "
-        "FROM classifier_grid WHERE execution_id = ? ORDER BY candidate",
-        (classify_id,),
-    )
-    return [_decode(row, "params") for row in rows]
-
-
-def history(db: sqlite3.Connection, classify_id: int) -> list[dict[str, object]]:
-    """List the training loss of a DL classify execution by step."""
-    return _all(
-        db,
-        "SELECT step, loss FROM history WHERE execution_id = ? ORDER BY step",
-        (classify_id,),
-    )
-
-
-def regressor_folds(db: sqlite3.Connection, regress_id: int) -> list[dict[str, object]]:
-    """List the outer folds of the regressor, the refit (-1) last.
-
-    Args:
-        db: A connection to grace.db.
-        regress_id: The execution id of regress.
-
-    Returns:
-        One row per fold, with its sizes, scores and parameters.
-    """
-    return _all(
-        db,
-        """
-        SELECT fold, n_regions, spearman, r2, mae, best_score, params
-        FROM regressor_folds WHERE execution_id = ? ORDER BY fold = -1, fold
-        """,
-        (regress_id,),
-    )
-
-
-def importances(db: sqlite3.Connection, regress_id: int) -> list[dict[str, object]]:
-    """List the regressor's mean feature importances, largest first."""
-    return _all(
-        db,
-        "SELECT feature, importance FROM importances WHERE execution_id = ? "
-        "ORDER BY importance DESC",
-        (regress_id,),
-    )
-
-
-def regions(
-    db: sqlite3.Connection, ids: Mapping[str, int], *, measures: bool = True
-) -> tuple[list[str], list[dict[str, object]]]:
-    """List the complexity measures and the regions of a run.
-
-    Args:
-        db: A connection to grace.db.
-        ids: The execution id of each done stage of the run.
-        measures: Whether to read the complexity measures too; they are
-            most of the rows.
-
-    Returns:
-        The measure names and one row per region, with None where a
-        stage did not run.
-    """
-    rows = _all(
-        db,
-        """
-        SELECT g.region_id, g.class_id, k.name AS class,
-               g.n_train, g.n_val, g.n_test,
-               f.n_val_error, f.val_rate, f.n_test_error, f.test_rate,
-               b.used, e.fold, e.regressor, b.val, b.mcp, b.atc
-        FROM regions g
-        JOIN classes k ON k.execution_id = :prepare AND k.class_id = g.class_id
-        LEFT JOIN failures f
-          ON f.execution_id = :failures AND f.region_id = g.region_id
-        LEFT JOIN baselines b
-          ON b.execution_id = :baselines AND b.region_id = g.region_id
-        LEFT JOIN estimates e
-          ON e.execution_id = :regress AND e.region_id = g.region_id
-        WHERE g.execution_id = :regions ORDER BY g.region_id
-        """,
-        {
-            key: ids.get(key)
-            for key in ("prepare", "failures", "baselines", "regress", "regions")
+    model_cfg = _with_model(cfg, model)
+    with closing(_connect(cfg)) as conn:
+        run = _latest_run(conn, "train", cfg, model)
+        models = _models_with_run(conn, "train", cfg)
+        metrics = [
+            r for r in _rows(conn, "train", "model_metrics", run) if r["split"] == split
+        ]
+        cells = [
+            r for r in _rows(conn, "train", "confusion", run) if r["split"] == split
+        ]
+    class_names = _classes(cfg)
+    overall = {
+        r["metric"]: r["value"]
+        for r in metrics
+        if r["label"] == "all"
+        and r["metric"] in ("accuracy", "macro_f1", "weighted_f1")
+    }
+    per_class = defaultdict(dict)
+    for r in metrics:
+        if r["label"] != "all":
+            per_class[r["label"]][r["metric"]] = r["value"]
+    position = {name: i for i, name in enumerate(class_names)}
+    counts = np.zeros((len(class_names), len(class_names)), dtype=int)
+    for cell in cells:
+        counts[position[cell["true"]], position[cell["pred"]]] = cell["count"]
+    predictions = _parquet(predictions_file(model_cfg, split), "train")
+    correct = (predictions["label"] == predictions["pred"]).to_numpy()
+    confidence = predictions["confidence"].to_numpy()
+    edges = np.linspace(0.0, 1.0, CONFIDENCE_BINS + 1)
+    return {
+        "run": _public(run),
+        "models": models,
+        "overall": overall,
+        "classes": [{"label": name, **per_class[name]} for name in class_names],
+        "confusion": {"labels": class_names, "counts": counts.tolist()},
+        "confidence": {
+            "edges": edges.tolist(),
+            "correct": np.histogram(confidence[correct], edges)[0].tolist(),
+            "wrong": np.histogram(confidence[~correct], edges)[0].tolist(),
         },
-    )
-    by_id = {row["region_id"]: row for row in rows}
-    names: list[str] = []
-    if measures and "complexity" in ids:
-        for region_id, measure, value in db.execute(
-            "SELECT scope_id, measure, value FROM complexity "
-            "WHERE execution_id = ? AND scope = 'region' ORDER BY rowid",
-            (ids["complexity"],),
-        ):
-            if measure not in names:
-                names.append(measure)
-            if region_id in by_id:
-                by_id[region_id][measure] = value
-    for row in rows:
-        scored = (
-            row["used"] == 1
-            and row["regressor"] is not None
-            and row["test_rate"] is not None
-        )
-        row["abs_error"] = abs(row["regressor"] - row["test_rate"]) if scored else None
-    return names, rows
+    }
 
 
-def descriptors(
-    db: sqlite3.Connection, complexity_id: int, region_id: int, class_id: int
-) -> list[dict[str, object]]:
-    """List the region and class value of every complexity measure.
+def failures(cfg: DatasetConfig, model: str) -> dict[str, Any]:
+    """Return the last failures run of model.
 
     Args:
-        db: A connection to grace.db.
-        complexity_id: The execution id of complexity.
-        region_id: The region id.
-        class_id: The class of the region.
+        cfg: The dataset.
+        model: A model name.
 
     Returns:
-        One row per measure, with its `region` and `class` values.
+        run; models [models with an ok failures run]; stats {n_regions,
+        n_used, n_empty, n_small, error_rate, error_rate_used,
+        atc_threshold}; scores [{predictor, spearman, r2, mae, mse}];
+        regions [{region, class, n_eval, n_error, failure_rate, used,
+        mcp, atc}].
     """
-    return _all(
-        db,
-        """
-        SELECT r.measure, r.value AS region, c.value AS class
-        FROM complexity r LEFT JOIN complexity c
-          ON c.execution_id = r.execution_id AND c.scope = 'class'
-         AND c.measure = r.measure AND c.scope_id = ?
-        WHERE r.execution_id = ? AND r.scope = 'region' AND r.scope_id = ?
-        ORDER BY r.rowid
-        """,
-        (class_id, complexity_id, region_id),
-    )
+    with closing(_connect(cfg)) as conn:
+        run = _latest_run(conn, "failures", cfg, model)
+        return {
+            "run": _public(run),
+            "models": _models_with_run(conn, "failures", cfg),
+            "stats": _rows(conn, "failures", "failure_stats", run)[0],
+            "scores": _rows(conn, "failures", "baseline_scores", run),
+            "regions": [
+                {**r, "used": bool(r["used"])}
+                for r in _rows(conn, "failures", "failures", run)
+            ],
+        }
 
 
-def partitions(db: sqlite3.Connection, partitions_id: int) -> list[dict[str, object]]:
-    """List the rows of a partitions execution.
+def regress(cfg: DatasetConfig, model: str) -> dict[str, Any]:
+    """Return the last regress run of model.
 
     Args:
-        db: A connection to grace.db.
-        partitions_id: The execution id of partitions.
+        cfg: The dataset.
+        model: A model name.
 
     Returns:
-        One row per arm, rule, level and draw, in that order.
+        run; models [models with an ok regress run]; scores [{predictor,
+        spearman, r2, mae, mse}] (rf, mcp, atc); estimates [{region,
+        class, observed, predicted, fold, base, mcp, atc}]; importances
+        [{descriptor, mdi, mean_abs_shap}] by mdi descending; folds
+        [{fold, n_regions, spearman, r2, mae, best_score, params}].
     """
-    return _all(
-        db,
-        "SELECT * FROM partitions WHERE execution_id = ? "
-        "ORDER BY arm, rule, level, draw",
-        (partitions_id,),
-    )
+    model_cfg = _with_model(cfg, model)
+    with closing(_connect(cfg)) as conn:
+        run = _latest_run(conn, "regress", cfg, model)
+        models = _models_with_run(conn, "regress", cfg)
+        scores = _rows(conn, "regress", "regress_scores", run)
+        importances = _rows(conn, "regress", "importances", run)
+        folds = _rows(conn, "regress", "regressor_folds", run)
+    class_names = _classes(cfg)
+    estimates = _parquet(estimates_file(model_cfg), "regress").to_dicts()
+    return {
+        "run": _public(run),
+        "models": models,
+        "scores": scores,
+        "estimates": [
+            {
+                k: _json_value(v)
+                for k, v in {**r, "class": class_names[r["class"]]}.items()
+            }
+            for r in estimates
+        ],
+        "importances": sorted(importances, key=lambda r: -r["mdi"]),
+        "folds": [{**f, "params": json.loads(f["params"])} for f in folds],
+    }
 
 
-def partition_class_levels(
-    db: sqlite3.Connection, partitions_id: int
-) -> list[dict[str, object]]:
-    """List the intra arm's per-class loss curve.
+def region(cfg: DatasetConfig, model: str, region_id: int) -> dict[str, Any]:
+    """Return the explanation of one region of the last regress run.
 
     Args:
-        db: A connection to grace.db.
-        partitions_id: The execution id of partitions.
+        cfg: The dataset.
+        model: A model name.
+        region_id: A region id.
 
     Returns:
-        The rows, ordered by class and level.
+        run; region {region, class, observed, predicted, fold, base};
+        contributions [{descriptor, value, contribution}] by
+        |contribution| descending; descriptors [{measure, region, class,
+        class_mean, dataset_mean}] for every measure of the complexity
+        run (class_mean and dataset_mean: means over the regions of its
+        class and over all regions).
+
+    Raises:
+        LookupError: Also when region_id is not a used region of the
+            run.
     """
-    return _all(
-        db,
-        "SELECT * FROM partition_class_levels WHERE execution_id = ? "
-        "ORDER BY class_id, level",
-        (partitions_id,),
-    )
+    with closing(_connect(cfg)) as conn:
+        run = _latest_run(conn, "regress", cfg, model)
+        estimate = _rows(conn, "regress", "estimates", run, region=region_id)
+        if not estimate:
+            raise LookupError(f"region {region_id} has no estimate in run {run['id']}")
+        contributions = _rows(conn, "regress", "contributions", run, region=region_id)
+        complexity_run = _latest_run(conn, "complexity", cfg)
+        rows = _rows(conn, "complexity", "complexity", complexity_run)
+        region_class = _region_classes(conn, cfg)
+    class_names = _classes(cfg)
+    own_class = estimate[0]["class"]
+    values = defaultdict(dict)
+    for r in rows:
+        values[(r["scope"], r["id"])][r["measure"]] = r["value"]
+    measures = list(dict.fromkeys(r["measure"] for r in rows))
+    same_class = [i for i, c in region_class.items() if c == own_class]
+
+    def mean(ids: list[int], measure: str) -> float | None:
+        of_regions = [values[("region", i)].get(measure) for i in ids]
+        known = [v for v in of_regions if v is not None]
+        return _finite(float(np.mean(known))) if known else None
+
+    return {
+        "run": _public(run),
+        "region": estimate[0],
+        "contributions": sorted(contributions, key=lambda r: -abs(r["contribution"])),
+        "descriptors": [
+            {
+                "measure": m,
+                "region": values[("region", region_id)].get(m),
+                "class": values[("class", class_names.index(own_class))].get(m),
+                "class_mean": mean(same_class, m),
+                "dataset_mean": mean(list(region_class), m),
+            }
+            for m in measures
+        ],
+    }
 
 
-def partition_groups(
-    db: sqlite3.Connection, partitions_id: int
-) -> list[dict[str, object]]:
-    """List the groups of a partitions execution's operating points.
+def _finite(value: Any) -> float | None:
+    """Return a finite float, or None (JSON has no NaN)."""
+    if value is None:
+        return None
+    value = float(value)
+    return value if math.isfinite(value) else None
 
-    Args:
-        db: A connection to grace.db.
-        partitions_id: The execution id of partitions.
 
-    Returns:
-        The rows, ordered by arm, rule and group.
+def _json_value(value: Any) -> Any:
+    """Return floats through _finite, other values unchanged."""
+    return _finite(value) if isinstance(value, float) else value
+
+
+def _connect(cfg: DatasetConfig) -> sqlite3.Connection:
+    if not cfg.db_path.exists():
+        raise LookupError("run split first")
+    conn = sqlite3.connect(f"file:{cfg.db_path.resolve()}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _latest_run(
+    conn: sqlite3.Connection, stage: str, cfg: DatasetConfig, model: str | None = None
+) -> dict[str, Any]:
+    """Return the last ok run of a stage on the dataset (and model)."""
+    row = conn.execute(
+        "SELECT id, started, finished FROM runs WHERE stage = ? AND dataset = ? "
+        "AND status = 'ok' AND (? IS NULL OR model = ?) ORDER BY id DESC LIMIT 1",
+        (stage, cfg.name, model, model),
+    ).fetchone()
+    if row is None:
+        raise LookupError(f"run {stage} first")
+    return dict(row)
+
+
+def _public(run: Mapping[str, Any]) -> dict[str, Any]:
+    return {k: run[k] for k in ("id", "started", "finished")}
+
+
+def _rows(
+    conn: sqlite3.Connection,
+    stage: str,
+    table: str,
+    run: Mapping[str, Any],
+    **where: Any,
+) -> list[dict[str, Any]]:
+    """Return the rows of a table logged by a run, without run_id.
+
+    A missing table means the stage never logged it: LookupError.
     """
-    return _all(
-        db,
-        "SELECT * FROM partition_groups WHERE execution_id = ? "
-        "ORDER BY arm, rule, group_id",
-        (partitions_id,),
+    filters = "".join(f' AND "{k}" = ?' for k in where)
+    try:
+        rows = conn.execute(
+            f'SELECT * FROM "{table}" WHERE run_id = ?{filters}',
+            (run["id"], *where.values()),
+        ).fetchall()
+    except sqlite3.OperationalError as e:
+        raise LookupError(f"run {stage} first") from e
+    return [{k: _json_value(r[k]) for k in r.keys() if k != "run_id"} for r in rows]
+
+
+def _models_with_run(
+    conn: sqlite3.Connection, stage: str, cfg: DatasetConfig
+) -> list[str]:
+    rows = conn.execute(
+        "SELECT DISTINCT model FROM runs WHERE stage = ? AND dataset = ? "
+        "AND status = 'ok' AND model IS NOT NULL ORDER BY model",
+        (stage, cfg.name),
     )
+    return [model for (model,) in rows]
+
+
+def _region_classes(conn: sqlite3.Connection, cfg: DatasetConfig) -> dict[int, str]:
+    """Return the class name of every region of the last regions run."""
+    run = _latest_run(conn, "regions", cfg)
+    return {r["region"]: r["class"] for r in _rows(conn, "regions", "regions", run)}
+
+
+def _classes(cfg: DatasetConfig) -> list[str]:
+    try:
+        return read_classes(cfg)
+    except FileNotFoundError as e:
+        raise LookupError(str(e)) from e
+
+
+def _parquet(path: Path, stage: str) -> pl.DataFrame:
+    if not path.exists():
+        raise LookupError(f"run {stage} first")
+    return pl.read_parquet(path)
+
+
+def _with_model(cfg: DatasetConfig, model: str) -> DatasetConfig:
+    return replace(cfg, model=ModelConfig(name=model, params={}))

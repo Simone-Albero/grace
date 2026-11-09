@@ -1,325 +1,277 @@
-"""Region descriptors and the random-forest failure-rate regressor."""
+"""The failure regressor: region descriptors to failure rate.
+
+Nested cross-validation: each outer fold refits a RandomizedSearchCV
+over the other regions and predicts the held-out ones, so every region's
+estimate comes from a forest that never saw it, and TreeSHAP of that
+same forest explains it. A final refit on every region is the model
+kept.
+"""
+
+from __future__ import annotations
 
 __all__ = ["FailureRegressor", "fit_failure_regressor", "region_descriptors"]
 
-import logging
+import json
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import pandas as pd
+import polars as pl
+import shap
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import make_scorer, r2_score
 from sklearn.model_selection import (
-    BaseCrossValidator,
     KFold,
     ParameterGrid,
     RandomizedSearchCV,
     StratifiedKFold,
 )
 
-logger = logging.getLogger(__name__)
+from src.evaluation import rate_scores
+
+
+def region_descriptors(
+    complexity: pl.DataFrame,
+    regions: np.ndarray,
+    region_class: np.ndarray,
+    measures: Sequence[str] | None,
+) -> tuple[np.ndarray, list[str]]:
+    """Return the descriptors of regions: own measures and class's.
+
+    Args:
+        complexity: Long rows scope ("region" or "class"), id, measure,
+            value (null allowed), as the complexity stage writes them.
+        regions: The region ids, in output row order.
+        region_class: The class of every region of regions.
+        measures: The measures to use, None for all.
+
+    Returns:
+        X of shape (len(regions), 2 · m), NaN where a value is missing,
+        and its column names: region_<m> for every measure in order of
+        first appearance in complexity, then class_<m> in the same
+        order.
+
+    Raises:
+        ValueError: When measures names a measure complexity does not
+            hold.
+    """
+    # First appearance, not alphabetical: the forest draws max_features
+    # columns by position, so another order changes its results.
+    available = complexity["measure"].unique(maintain_order=True).to_list()
+    if measures is None:
+        measures = available
+    unknown = sorted(set(measures) - set(available))
+    if unknown:
+        raise ValueError(f"regressor.measures not in the complexity table: {unknown}")
+    order = [m for m in available if m in set(measures)]
+    values = {
+        (scope, population, measure): np.nan if value is None else value
+        for scope, population, measure, value in complexity.select(
+            "scope", "id", "measure", "value"
+        ).iter_rows()
+    }
+    X = np.array(
+        [
+            [values.get(("region", r, m), np.nan) for m in order]
+            + [values.get(("class", c, m), np.nan) for m in order]
+            for r, c in zip(regions.tolist(), region_class.tolist())
+        ],
+        dtype=np.float64,
+    ).reshape(len(regions), 2 * len(order))
+    names = [f"region_{m}" for m in order] + [f"class_{m}" for m in order]
+    return X, names
 
 
 @dataclass(frozen=True)
 class FailureRegressor:
-    """Out-of-fold failure rates of every region, and a forest on all.
+    """The fitted regressor and its out-of-fold results per region.
 
     Attributes:
-        predicted: The out-of-fold rate by region, indexed like `X`.
-        fold: The outer fold holding each region out, indexed like
-            `X`.
-        folds: One dict per outer fold, with "fold", "n_regions",
-            "best_score" and "params".
-        importances: The mean `feature_importances_` over the outer
-            folds, by descriptor.
         model: The forest refit on every region.
-        refit_params: The searched parameters of the refit.
-        refit_score: The best inner-CV score of the refit; None when it
-            was not searched.
-        n_outer: The outer split count, after adapting to the number of
-            regions.
-        n_inner: The inner split count, after the same adaptation.
+        predicted: The out-of-fold estimates, shape (n,), clipped to
+            [0, 1].
+        fold: The outer fold that held each region out, shape (n,).
+        base: The TreeSHAP expected value of that fold's forest, shape
+            (n,).
+        contributions: The TreeSHAP values, shape (n, f); base plus
+            their sum is the unclipped estimate.
+        importances: The mean impurity importance over the outer
+            folds, shape (f,).
+        folds: One row per fold, -1 for the refit: fold, n_regions,
+            spearman, r2, mae (NaN for the refit), best_score and
+            params (JSON text).
     """
 
-    predicted: pd.Series
-    fold: pd.Series
-    folds: list[dict[str, object]]
-    importances: pd.Series
     model: RandomForestRegressor
-    refit_params: dict[str, object]
-    refit_score: float | None
-    n_outer: int
-    n_inner: int
+    predicted: np.ndarray
+    fold: np.ndarray
+    base: np.ndarray
+    contributions: np.ndarray
+    importances: np.ndarray
+    folds: list[dict[str, Any]]
 
 
-def region_descriptors(
-    complexity: pd.DataFrame, region_class: pd.Series
-) -> pd.DataFrame:
-    """Build one row per region: its descriptors, then its class's.
+def fit_failure_regressor(
+    X: np.ndarray,
+    y: np.ndarray,
+    *,
+    params: Mapping[str, Any],
+    param_grid: Mapping[str, Sequence[Any]],
+    n_outer_splits: int,
+    n_inner_splits: int,
+    n_iter: int,
+    seed: int,
+) -> FailureRegressor:
+    """Fit the regressor under nested cross-validation.
+
+    Outer: StratifiedKFold on the quantile bins of y (shuffled, seed)
+    with min(n_outer_splits, smallest bin) folds;
+    KFold(min(n_outer_splits, n)) when that is below 2. Inner:
+    KFold(min(n_inner_splits, n - ceil(n / n_outer))), and no search
+    when that is below 2. Each search is a RandomizedSearchCV over
+    param_grid with min(n_iter, grid size) draws, scored by the r2 of
+    the clipped prediction, random_state seed + fold; the refit uses
+    seed + number of outer folds.
 
     Args:
-        complexity: The long complexity table, with "scope", "scope_id",
-            "measure" and "value".
-        region_class: The class id of every region, by region id.
+        X: The descriptors, shape (n, f); NaN allowed.
+        y: The observed failure rates, shape (n,).
+        params: Fixed RandomForestRegressor params (random_state is
+            seed).
+        param_grid: The searched params.
+        n_outer_splits: The most outer folds.
+        n_inner_splits: The most inner folds.
+        n_iter: The most search draws.
+        seed: The seed of the folds, the searches and the forests.
 
     Returns:
-        The `region_*` and `class_*` descriptors, indexed by region id,
-        in measure order.
+        The fitted regressor.
+
+    Raises:
+        ValueError: With fewer than 2 regions or a constant y (std <
+            1e-9).
     """
-    # Measures keep their order of first appearance: the forest draws
-    # max_features columns by position, so another order changes its
-    # results.
-    measures = complexity["measure"].unique()
-
-    def wide(scope: str, ids: pd.Index, prefix: str) -> pd.DataFrame:
-        table = complexity[complexity["scope"] == scope].pivot(
-            index="scope_id", columns="measure", values="value"
+    n = len(y)
+    if n < 2 or float(np.std(y)) < 1e-9:
+        raise ValueError(
+            f"the failure regressor needs 2+ regions whose rates differ, got {n} "
+            f"region(s) with rate std {float(np.std(y)) if n else 0.0:.3g}"
         )
-        return table[measures].loc[ids].add_prefix(prefix)
+    outer, strata = _outer_cv(y, n_outer_splits, seed)
+    n_outer = outer.get_n_splits()
+    n_inner = _usable_splits(n - math.ceil(n / n_outer), n_inner_splits)
+    inner = KFold(n_inner, shuffle=True, random_state=seed) if n_inner else None
+    search_settings = dict(
+        params=params, param_grid=param_grid, inner=inner, n_iter=n_iter, seed=seed
+    )
 
-    return pd.concat(
-        [
-            wide("region", region_class.index, "region_"),
-            wide("class", pd.Index(region_class), "class_").set_index(
-                region_class.index
-            ),
-        ],
-        axis=1,
+    predicted, base = np.empty(n), np.empty(n)
+    fold_of = np.empty(n, dtype=np.int64)
+    contributions = np.empty(X.shape)
+    folds, importances = [], []
+    for fold, (fit_rows, held_out) in enumerate(outer.split(X, strata)):
+        forest, best_params, best_score = _fit_forest(
+            X[fit_rows], y[fit_rows], search_seed=seed + fold, **search_settings
+        )
+        # Clipped as the inner scorer clips, so the fold scores match.
+        predicted[held_out] = np.clip(forest.predict(X[held_out]), 0.0, 1.0)
+        fold_of[held_out] = fold
+        explainer = shap.TreeExplainer(forest)
+        base[held_out] = float(np.ravel(explainer.expected_value)[0])
+        contributions[held_out] = explainer.shap_values(X[held_out])
+        importances.append(forest.feature_importances_)
+        scores = rate_scores(predicted[held_out], y[held_out])
+        folds.append(
+            {
+                "fold": fold,
+                "n_regions": len(held_out),
+                **{k: scores[k] for k in ("spearman", "r2", "mae")},
+                "best_score": best_score,
+                "params": json.dumps(best_params),
+            }
+        )
+    model, refit_params, refit_score = _fit_forest(
+        X, y, search_seed=seed + n_outer, **search_settings
+    )
+    folds.append(
+        {
+            "fold": -1,
+            "n_regions": n,
+            "spearman": np.nan,
+            "r2": np.nan,
+            "mae": np.nan,
+            "best_score": refit_score,
+            "params": json.dumps(refit_params),
+        }
+    )
+    return FailureRegressor(
+        model=model,
+        predicted=predicted,
+        fold=fold_of,
+        base=base,
+        contributions=contributions,
+        importances=np.mean(importances, axis=0),
+        folds=folds,
     )
 
 
-def _usable_n_splits(n_smallest: int, n_splits: int) -> int:
-    """Return the most splits the smallest group can fill.
-
-    It is at most `n_splits`, and 0 when fewer than two fit.
-    """
+def _usable_splits(n_smallest: int, n_splits: int) -> int:
+    """Return the most splits the smallest group fills, 0 below 2."""
     usable = min(n_splits, n_smallest)
     return usable if usable >= 2 else 0
 
 
-def _quantile_strata(y: pd.Series, n_bins: int) -> pd.Series | None:
-    """Return the target's quantile-bin codes, None below two bins."""
-    bins = pd.qcut(y, q=min(n_bins, len(y)), duplicates="drop")
-    if bins.nunique() < 2:
-        return None
-    return bins.cat.codes
-
-
-def _fit_model(
-    X: pd.DataFrame,
-    y: pd.Series,
-    *,
-    sample_weight: pd.Series,
-    params: Mapping[str, object],
-    param_grid: Mapping[str, Sequence[object]],
-    inner_cv: KFold | None,
-    n_iter: int,
-    n_jobs: int,
-    random_state: int,
-    search_seed: int,
-) -> tuple[RandomForestRegressor, dict[str, object], float | None]:
-    """Fit one forest; without `inner_cv`, keep defaults, no search."""
-    forest = RandomForestRegressor(**{**params, "random_state": random_state})
-    if inner_cv is None:
-        forest.fit(X, y, sample_weight=sample_weight)
-        fitted = forest.get_params()
-        return forest, {key: fitted[key] for key in param_grid}, None
-
-    search = RandomizedSearchCV(
-        estimator=forest,
-        param_distributions=param_grid,
-        # A grid smaller than the budget is searched whole: asking for
-        # more draws than it holds makes sklearn warn on every fold and
-        # run the whole grid anyway.
-        n_iter=min(n_iter, len(ParameterGrid(param_grid))),
-        cv=inner_cv,
-        # Scored as reported, clipped: a model is tuned for the
-        # predictor it is judged as.
-        scoring=make_scorer(
-            lambda y_true, y_pred: r2_score(y_true, np.clip(y_pred, 0.0, 1.0))
-        ),
-        n_jobs=n_jobs,
-        # At a fixed random_state RandomizedSearchCV draws the same
-        # combinations whatever the data, so each fit gets its own seed
-        # to search its own slice.
-        random_state=search_seed,
-    )
-    search.fit(X, y, sample_weight=sample_weight)
-    return search.best_estimator_, dict(search.best_params_), float(search.best_score_)
-
-
 def _outer_cv(
-    y: pd.Series, n_splits: int, random_state: int
-) -> tuple[BaseCrossValidator, int, pd.Series | None]:
-    """Build the outer CV, stratified by target quantile when it can be.
-
-    Returns:
-        The splitter, its effective split count and the strata (None
-        when it is a plain KFold).
-    """
-    strata = _quantile_strata(y, n_splits)
-    n_outer = (
-        _usable_n_splits(int(strata.value_counts().min()), n_splits)
-        if strata is not None
-        else 0
-    )
-    if n_outer >= 2:
-        outer_cv = StratifiedKFold(
-            n_splits=n_outer, shuffle=True, random_state=random_state
-        )
-    else:
-        n_outer = _usable_n_splits(len(y), n_splits)
-        outer_cv = KFold(n_splits=n_outer, shuffle=True, random_state=random_state)
-        strata = None
-    return outer_cv, n_outer, strata
+    y: np.ndarray, n_splits: int, seed: int
+) -> tuple[StratifiedKFold | KFold, np.ndarray | None]:
+    """Return the outer CV, on quantile strata of y when it can be."""
+    bins = pd.qcut(y, q=min(n_splits, len(y)), duplicates="drop")
+    strata = np.asarray(bins.codes) if bins.categories.size >= 2 else None
+    if strata is not None:
+        n_outer = _usable_splits(int(np.bincount(strata).min()), n_splits)
+        if n_outer:
+            return StratifiedKFold(n_outer, shuffle=True, random_state=seed), strata
+    n_outer = _usable_splits(len(y), n_splits)
+    return KFold(n_outer, shuffle=True, random_state=seed), None
 
 
-def _inner_cv(
-    n_used: int,
-    n_outer: int,
+def _clipped_r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    return r2_score(y_true, np.clip(y_pred, 0.0, 1.0))
+
+
+def _fit_forest(
+    X: np.ndarray,
+    y: np.ndarray,
     *,
-    n_outer_splits: int,
-    n_inner_splits: int,
-    random_state: int,
-) -> tuple[KFold | None, int]:
-    """Build the inner CV the smallest outer fit can fill.
-
-    It warns when a split count had to be lowered.
-
-    Returns:
-        The splitter, None when no search is possible, and its
-        effective split count.
-    """
-    n_fit_worst = n_used - math.ceil(n_used / n_outer)
-    n_inner = _usable_n_splits(n_fit_worst, n_inner_splits)
-    if n_outer < n_outer_splits or n_inner < n_inner_splits:
-        logger.warning(
-            "Adapting CV to %d regions: outer %d -> %d, inner %d -> %d%s",
-            n_used,
-            n_outer_splits,
-            n_outer,
-            n_inner_splits,
-            n_inner,
-            " (no search, forest defaults)" if n_inner == 0 else "",
-        )
-    inner_cv = (
-        KFold(n_splits=n_inner, shuffle=True, random_state=random_state)
-        if n_inner > 0
-        else None
-    )
-    return inner_cv, n_inner
-
-
-def fit_failure_regressor(
-    X: pd.DataFrame,
-    y: pd.Series,
-    *,
-    sample_weight: pd.Series,
-    params: Mapping[str, object],
-    param_grid: Mapping[str, Sequence[object]],
-    n_outer_splits: int,
-    n_inner_splits: int,
+    params: Mapping[str, Any],
+    param_grid: Mapping[str, Sequence[Any]],
+    inner: KFold | None,
     n_iter: int,
-    n_jobs: int,
-    random_state: int,
-) -> FailureRegressor:
-    """Fit a forest on region descriptors by nested CV, then refit.
-
-    Args:
-        X: The descriptors, one row per region.
-        y: The observed failure rate of each region, indexed like `X`.
-        sample_weight: Each region's weight, indexed like `X`; passed
-            to the forest's fit, not to the inner search's own scorer.
-        params: The forest's own parameters.
-        param_grid: The values the inner search draws from, by forest
-            parameter.
-        n_outer_splits: The outer folds asked for; fewer when the
-            regions cannot fill them.
-        n_inner_splits: The inner folds asked for, adapted likewise.
-        n_iter: The most parameter draws of the inner search.
-        n_jobs: The parallel jobs of the inner search.
-        random_state: The seed of the splits, the forests and the
-            searches.
-
-    Returns:
-        The out-of-fold rates, each outer fold's search result, the mean
-        importances and the forest refit on every region.
-
-    Raises:
-        ValueError: If fewer than two regions have rates that differ.
-    """
-    n_used = len(X)
-    if n_used < 2 or float(y.std()) < 1e-9:
-        raise ValueError(
-            f"{n_used} usable region(s), failure-rate std {float(y.std()):.3g}: the "
-            "failure regressor needs two regions whose rates differ. Raise "
-            "data.val_frac for more val-labelled regions; regressor_figures=false "
-            "draws the classifier's figures without it."
-        )
-
-    outer_cv, n_outer, strata = _outer_cv(y, n_outer_splits, random_state)
-    inner_cv, n_inner = _inner_cv(
-        n_used,
-        n_outer,
-        n_outer_splits=n_outer_splits,
-        n_inner_splits=n_inner_splits,
-        random_state=random_state,
+    seed: int,
+    search_seed: int,
+) -> tuple[RandomForestRegressor, dict[str, Any], float | None]:
+    """Fit one forest; without an inner CV, on its params, no search."""
+    forest = RandomForestRegressor(**{**params, "random_state": seed})
+    if inner is None:
+        forest.fit(X, y)
+        fitted = forest.get_params()
+        return forest, {k: fitted[k] for k in param_grid}, None
+    search = RandomizedSearchCV(
+        forest,
+        param_distributions=dict(param_grid),
+        # A grid smaller than the budget is searched whole.
+        n_iter=min(n_iter, len(ParameterGrid(dict(param_grid)))),
+        cv=inner,
+        # Scored clipped, as reported: tuned as the predictor it is
+        # judged as.
+        scoring=make_scorer(_clipped_r2),
+        # Each fit draws its own combinations: at one seed every search
+        # would draw the same ones.
+        random_state=search_seed,
+        n_jobs=-1,
     )
-    fit_args = dict(
-        params=params,
-        param_grid=param_grid,
-        inner_cv=inner_cv,
-        n_iter=n_iter,
-        n_jobs=n_jobs,
-        random_state=random_state,
-    )
-
-    predicted = np.empty(n_used)
-    fold_of = np.empty(n_used, dtype=int)
-    folds, importances = [], []
-    for fold, (fit_idx, held_idx) in enumerate(outer_cv.split(X, strata)):
-        forest, best_params, best_score = _fit_model(
-            X.iloc[fit_idx],
-            y.iloc[fit_idx],
-            sample_weight=sample_weight.iloc[fit_idx],
-            search_seed=random_state + fold,
-            **fit_args,
-        )
-        # Clip as the inner scorer does, so held-out predictions match
-        # the tuned ones.
-        predicted[held_idx] = np.clip(forest.predict(X.iloc[held_idx]), 0.0, 1.0)
-        fold_of[held_idx] = fold
-        importances.append(forest.feature_importances_)
-        folds.append(
-            {
-                "fold": fold,
-                "n_regions": len(held_idx),
-                "best_score": best_score,
-                "params": best_params,
-            }
-        )
-        logger.info("outer fold %d/%d: n_held_out=%d", fold + 1, n_outer, len(held_idx))
-
-    logger.info("Refitting the forest on the %d usable regions", n_used)
-    model, refit_params, refit_score = _fit_model(
-        X,
-        y,
-        sample_weight=sample_weight,
-        # The seed after the outer folds' own, so the refit searches a
-        # slice of its own.
-        search_seed=random_state + n_outer,
-        **fit_args,
-    )
-    return FailureRegressor(
-        predicted=pd.Series(predicted, index=X.index),
-        fold=pd.Series(fold_of, index=X.index),
-        folds=folds,
-        importances=pd.Series(np.mean(importances, axis=0), index=X.columns),
-        model=model,
-        refit_params=refit_params,
-        refit_score=refit_score,
-        n_outer=n_outer,
-        n_inner=n_inner,
-    )
+    search.fit(X, y)
+    return search.best_estimator_, dict(search.best_params_), float(search.best_score_)

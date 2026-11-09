@@ -1,11 +1,42 @@
-"""Dispersion, rival separation and silhouette tail."""
+"""Geometry: spread of a population and how close its rivals lie.
 
-__all__ = ["compute_geometry_measures"]
+- max_dispersion, p95_dispersion: max and 95th percentile of the
+  distances of the sampled rows from the population's centroid;
+- dist_to_nearest_rival: least centroid distance to any population of
+  another class (None if none);
+- p5_silhouette, frac_at_risk: 5th percentile and share below 0 of the
+  population's silhouette scores, computed jointly over all populations
+  on a subsample (silhouette_max_samples rows, at least
+  silhouette_min_per_cluster per population);
+- mahalanobis: least, over rivals with 2+ rows each side, of the
+  distance between the two means under the Ledoit-Wolf covariance of the
+  stacked centred rows;
+- rival_reach: largest, over rivals, of the 95th percentile of the own
+  rows' projection on the axis to the rival centroid, divided by the
+  squared axis length.
+"""
 
-from collections.abc import Sequence
+from __future__ import annotations
+
+__all__ = ["GEOMETRY_KEYS", "compute_geometry_measures"]
+
+from collections.abc import Mapping, Sequence
 
 import numpy as np
+from sklearn.covariance import LedoitWolf
 from sklearn.metrics import pairwise_distances, silhouette_samples
+
+from src.space import scale_for_metric
+
+GEOMETRY_KEYS = (
+    "max_dispersion",
+    "p95_dispersion",
+    "dist_to_nearest_rival",
+    "p5_silhouette",
+    "frac_at_risk",
+    "mahalanobis",
+    "rival_reach",
+)
 
 
 def _approx_silhouette(
@@ -80,11 +111,67 @@ def _nearest_rival(
     return float(np.min(finite))
 
 
+def _mahalanobis(own_rows: np.ndarray, rival_rows: np.ndarray) -> float:
+    """Return the Mahalanobis distance between the two means.
+
+    The covariance is pooled from both populations, each centred on
+    its own mean, and shrunk by Ledoit-Wolf: a region holds no more
+    rows than a few times the features, too few for the raw estimate
+    to be invertible.
+    """
+    own_mean, rival_mean = own_rows.mean(axis=0), rival_rows.mean(axis=0)
+    centered = np.vstack([own_rows - own_mean, rival_rows - rival_mean])
+    covariance = LedoitWolf(assume_centered=True).fit(centered).covariance_
+    mean_difference = own_mean - rival_mean
+    # lstsq, not solve: a feature constant in both populations leaves
+    # the covariance singular when the shrinkage comes out as zero.
+    solved = np.linalg.lstsq(covariance, mean_difference, rcond=None)[0]
+    return float(np.sqrt(max(float(mean_difference @ solved), 0.0)))
+
+
+def _rival_reach(
+    own_rows: np.ndarray, centroid: np.ndarray, rival_centroid: np.ndarray
+) -> float | None:
+    """Return the p95 reach of the rows along the axis to the rival.
+
+    It is a share of the centroid distance, None when the centroids
+    coincide.
+    """
+    axis = rival_centroid - centroid
+    squared_distance = float(axis @ axis)
+    if squared_distance == 0.0:
+        return None
+    return float(np.percentile((own_rows - centroid) @ axis, 95) / squared_distance)
+
+
+def _rival_separation(
+    rows_by_population: Mapping[int, np.ndarray],
+    centroid_of: Mapping[int, np.ndarray],
+    population_id: int,
+    rivals: Sequence[int],
+) -> dict[str, float | None]:
+    """Return the worst Mahalanobis distance and reach of the rivals."""
+    own_rows = rows_by_population[population_id]
+    mahalanobis_distances, reaches = [], []
+    for rival in rivals:
+        rival_rows = rows_by_population[rival]
+        if len(own_rows) >= 2 and len(rival_rows) >= 2:
+            mahalanobis_distances.append(_mahalanobis(own_rows, rival_rows))
+        reach = _rival_reach(own_rows, centroid_of[population_id], centroid_of[rival])
+        if reach is not None:
+            reaches.append(reach)
+    return {
+        "mahalanobis": min(mahalanobis_distances) if mahalanobis_distances else None,
+        "rival_reach": max(reaches) if reaches else None,
+    }
+
+
 def compute_geometry_measures(
     X: np.ndarray,
     population: np.ndarray,
     *,
     ids: Sequence[int],
+    rivals: Mapping[int, Sequence[int]],
     centroid_matrix: np.ndarray,
     classes: np.ndarray,
     centroid_distances: np.ndarray,
@@ -95,10 +182,15 @@ def compute_geometry_measures(
 ) -> dict[int, dict[str, float | None]]:
     """Return dispersion, rival separation and silhouette tail.
 
+    The rival measures read the rows as the graph measures them, so
+    under cosine on the unit sphere.
+
     Args:
         X: The sampled rows, shape (n, d).
         population: The population id of every row of `X`.
-        ids: The population ids, in the row order of the next three.
+        ids: The population ids, in the row order of `centroid_matrix`,
+            `classes` and `centroid_distances`.
+        rivals: The nearest rival ids of every population.
         centroid_matrix: The centroids, shape (len(ids), d).
         classes: The class of every population in `ids`.
         centroid_distances: The centroid distances, diagonal inf.
@@ -109,7 +201,9 @@ def compute_geometry_measures(
 
     Returns:
         By population id: "max_dispersion", "p95_dispersion",
-        "dist_to_nearest_rival", "p5_silhouette" and "frac_at_risk".
+        "dist_to_nearest_rival", "p5_silhouette", "frac_at_risk", then
+        "mahalanobis", the least over the rivals with two rows or more,
+        and "rival_reach", the most over the rivals; None without one.
     """
     silhouettes = _approx_silhouette(
         X,
@@ -119,6 +213,13 @@ def compute_geometry_measures(
         min_per_cluster=silhouette_min_per_cluster,
         random_state=random_state,
     )
+
+    scaled = scale_for_metric(X, metric)
+    rows_by_population = {
+        int(population_id): scaled[population == population_id]
+        for population_id in np.unique(population)
+    }
+    centroid_of = dict(zip(ids, centroid_matrix))
 
     result: dict[int, dict[str, float | None]] = {}
 
@@ -148,6 +249,9 @@ def compute_geometry_measures(
             "dist_to_nearest_rival": dist_to_nearest_rival,
             "p5_silhouette": p5_silhouette,
             "frac_at_risk": frac_at_risk,
+            **_rival_separation(
+                rows_by_population, centroid_of, population_id, rivals[population_id]
+            ),
         }
 
     return result

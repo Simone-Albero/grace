@@ -1,367 +1,142 @@
-"""Pipeline: config loading, validation, sweeps and stage runs."""
+"""Every stage end to end on the small synthetic dataset."""
 
-import fcntl
-import os
-import re
-import shutil
-from contextlib import closing
-from pathlib import Path
+import json
+import sqlite3
 
-import pandas as pd
+import numpy as np
+import polars as pl
 import pytest
-from omegaconf import OmegaConf
+from conftest import MODEL, STAGE_ORDER, Workspace, make_workspace
 
-import stages.prepare
-from pipeline.config import CONFIGS, load_config, sweep, validate
-from pipeline.db import KILLED, RUNS_LOCK, connect, reap
-from pipeline.runner import STAGES, _config_slice, plan, run
-from stages import SPLITS, Context
-from tests.helpers import fast_cfg, query
+from main import main
+from src.complexity.measure import MEASURES
+from src.prepare import LABEL
 
 
-def _links(root: Path, run_id: int) -> dict[str, tuple[int, int]]:
-    """Return {stage: (execution id, cached)} of a run."""
-    rows = query(
-        root / "grace.db",
-        "SELECT stage, execution_id, cached FROM run_stages WHERE run_id = ?",
-        (run_id,),
-    )
-    return {stage: (execution, cached) for stage, execution, cached in rows}
+def _rows(workspace: Workspace, sql: str) -> list[tuple]:
+    with sqlite3.connect(workspace.db_path) as conn:
+        return conn.execute(sql).fetchall()
 
 
-def test_cache_and_invalidation(tmp_path: Path) -> None:
-    """Check that stages are cached and a rerun split invalidates."""
-    cfg = fast_cfg(tmp_path)
-    assert _links(tmp_path, run(["prepare"], cfg, force=False)) == {
-        "split": (1, 0),
-        "prepare": (2, 0),
+def _read(workspace: Workspace, name: str) -> pl.DataFrame:
+    return pl.read_parquet(workspace.output_dir / name)
+
+
+def test_every_run_is_ok(done):
+    runs = _rows(done, "SELECT stage, status, model FROM runs ORDER BY id")
+    assert [r[0] for r in runs] == list(STAGE_ORDER)
+    assert {r[1] for r in runs} == {"ok"}
+    assert [r[2] for r in runs] == [None] * 3 + [MODEL] * 3
+
+
+def test_split_drops_the_rare_class_and_prepares_every_split(done):
+    classes = json.loads((done.output_dir / "classes.json").read_text())
+    assert "class_10" not in classes and len(classes) == 9
+    dropped = _rows(done, "SELECT label FROM dropped_classes")
+    assert dropped == [("class_10",)]
+    sizes = {
+        name: _read(done, f"{name}.parquet").height for name in ("train", "val", "test")
     }
-    assert _links(tmp_path, run(["prepare"], cfg, force=False)) == {
-        "split": (1, 1),
-        "prepare": (2, 1),
-    }
-    top_n = fast_cfg(tmp_path, "data.top_n=64")
-    assert _links(tmp_path, run(["prepare"], top_n, force=False)) == {
-        "split": (1, 1),
-        "prepare": (3, 0),
-    }
-    assert _links(tmp_path, run(["split"], cfg, force=True)) == {"split": (4, 0)}
-    # A re-executed split invalidates prepare through its execution id.
-    assert _links(tmp_path, run(["prepare"], cfg, force=False)) == {
-        "split": (4, 1),
-        "prepare": (5, 0),
-    }
+    (n_kept,) = _rows(done, "SELECT n_kept FROM split_summary")[0]
+    assert sum(sizes.values()) == n_kept
+    train = _read(done, "train.parquet")
+    assert train.columns[-1] == LABEL
+    assert set(train[LABEL].unique().to_list()) == set(range(9))
 
 
-def test_lost_outputs_and_forced_downstream(tmp_path: Path) -> None:
-    """Check that lost outputs rerun and --force spares the upstream."""
-    cfg = fast_cfg(tmp_path)
-    run(["prepare"], cfg, force=False)
-    # --force on a downstream target leaves the upstream cached.
-    assert _links(tmp_path, run(["prepare"], cfg, force=True)) == {
-        "split": (1, 1),
-        "prepare": (3, 0),
-    }
-    (tmp_path / "artifacts/split/1/train.parquet").unlink()
-    assert _links(tmp_path, run(["prepare"], cfg, force=False)) == {
-        "split": (4, 0),
-        "prepare": (5, 0),
-    }
-    # A cut file (same name, other size) is lost too.
-    with (tmp_path / "artifacts/prepare/5/train.parquet").open("r+b") as file:
-        file.truncate(100)
-    assert _links(tmp_path, run(["prepare"], cfg, force=False)) == {
-        "split": (4, 1),
-        "prepare": (6, 0),
-    }
-    # Without its sizes.json an execution cannot be checked: lost too.
-    (tmp_path / "artifacts/prepare/6/sizes.json").unlink()
-    assert _links(tmp_path, run(["prepare"], cfg, force=False)) == {
-        "split": (4, 1),
-        "prepare": (7, 0),
-    }
-
-
-def test_killed_run_is_failed_by_the_next_run(tmp_path: Path) -> None:
-    """Check that a run left `running` by a dead process is failed."""
-    cfg = fast_cfg(tmp_path)
-    run(["split"], cfg, force=False)
-    path = tmp_path / "grace.db"
-    with closing(connect(path)) as db:
-        db.execute(
-            "INSERT INTO runs (targets, config, status, started_at) "
-            "VALUES ('[]', '{}', 'running', 'then')"
+def test_assignments_cover_every_row_and_train_keeps_its_class(done):
+    assignments = _read(done, "assignments.parquet")
+    regions = _read(done, "regions.parquet")
+    for name in ("train", "val", "test"):
+        rows = assignments.filter(pl.col("split") == name).sort("row")
+        assert rows["row"].to_list() == list(
+            range(_read(done, f"{name}.parquet").height)
         )
-        db.execute(
-            "INSERT INTO executions "
-            "(stage, key, config, inputs, dir, status, started_at) "
-            "VALUES ('split', 'k', '{}', '{}', '', 'running', 'then')"
-        )
-        db.commit()
-    run(["split"], cfg, force=False)
-    assert query(path, "SELECT status, error FROM runs WHERE id = 2") == [
-        ("failed", KILLED)
-    ]
-    assert query(path, "SELECT status, error FROM executions WHERE id = 2") == [
-        ("failed", KILLED)
-    ]
-    assert query(path, "SELECT status FROM runs WHERE id = 3") == [("done",)]
+        assert set(rows["region"].to_list()) <= set(regions["region"].to_list())
+    train = assignments.filter(pl.col("split") == "train").sort("row")
+    region_class = dict(zip(regions["region"].to_list(), regions["class"].to_list()))
+    labels = _read(done, "train.parquet")[LABEL].to_list()
+    assert [region_class[r] for r in train["region"].to_list()] == labels
+    assert regions["n_test"].sum() == _read(done, "test.parquet").height
 
 
-def test_reap_spares_a_live_run(tmp_path: Path) -> None:
-    """Check that a run whose process holds runs.lock stays running."""
-    with closing(connect(tmp_path / "grace.db")) as db:
-        db.execute(
-            "INSERT INTO runs (targets, config, status, started_at) "
-            "VALUES ('[]', '{}', 'running', 'now')"
-        )
-        db.commit()
-    with (tmp_path / RUNS_LOCK).open("a") as lock:
-        # Hold the lock as a second, live process would.
-        fcntl.flock(lock, fcntl.LOCK_SH)
-        reap(tmp_path)
-    assert query(tmp_path / "grace.db", "SELECT status FROM runs") == [("running",)]
+def test_complexity_has_every_measure_of_every_population(done):
+    table = _read(done, "complexity.parquet")
+    regions = _read(done, "regions.parquet")
+    region_rows = table.filter(pl.col("scope") == "region")
+    assert region_rows.height == regions.height * len(MEASURES)
+    assert table.filter(pl.col("scope") == "class").height == 9 * len(MEASURES)
 
 
-def test_csv_without_a_configured_column(tmp_path: Path) -> None:
-    """Check that split names the CSV, the column and keys to fix."""
-    raw = tmp_path / "raw.csv"
-    frame = pd.read_csv(fast_cfg(tmp_path).data.path, nrows=50)
-    frame.drop(columns="num_20").to_csv(raw, index=False)
-    cfg = fast_cfg(tmp_path, f"data.path={raw}")
-    with pytest.raises(ValueError, match=r"raw\.csv.*num_20.*data\.num_cols"):
-        run(["split"], cfg, force=False)
+def test_predictions_line_up_with_the_splits(done):
+    for name in ("val", "test"):
+        pred = _read(done, f"pred_{MODEL}_{name}.parquet")
+        split = _read(done, f"{name}.parquet")
+        assert pred["row"].to_list() == list(range(split.height))
+        assert pred["label"].to_list() == split[LABEL].to_list()
+        proba = pred.select(pl.selectors.starts_with("proba_")).to_numpy()
+        assert proba.shape[1] == 9
+        np.testing.assert_allclose(proba.sum(axis=1), 1.0, atol=1e-6)
+        np.testing.assert_array_equal(proba.argmax(axis=1), pred["pred"].to_numpy())
 
 
-def test_root_is_relocatable(tmp_path: Path) -> None:
-    """Check that a moved root keeps its cache and relative dirs."""
-    run(["prepare"], fast_cfg(tmp_path / "a"), force=False)
-    shutil.move(tmp_path / "a", tmp_path / "b")
-    run_id = run(["prepare"], fast_cfg(tmp_path / "b"), force=False)
-    assert _links(tmp_path / "b", run_id) == {"split": (1, 1), "prepare": (2, 1)}
-    rows = query(tmp_path / "b" / "grace.db", "SELECT stage, id, dir FROM executions")
-    assert rows == [(stage, i, f"artifacts/{stage}/{i}") for stage, i, _ in rows]
+def test_failures_count_every_test_row(done):
+    failures = _read(done, f"failures_{MODEL}.parquet")
+    regions = _read(done, "regions.parquet")
+    assert failures["region"].to_list() == regions["region"].to_list()
+    test = _read(done, f"pred_{MODEL}_test.parquet")
+    assert failures["n_eval"].sum() == test.height
+    assert failures["n_error"].sum() == (test["label"] != test["pred"]).sum()
+    (n_used,) = _rows(done, "SELECT n_used FROM failure_stats")[0]
+    assert n_used == failures["used"].sum() > 0
 
 
-def test_changed_raw_file_reruns_split(tmp_path: Path) -> None:
-    """Check that a changed raw file reruns the split."""
-    raw = tmp_path / "raw.csv"
-    shutil.copy(fast_cfg(tmp_path).data.path, raw)
-    cfg = fast_cfg(tmp_path, f"data.path={raw}")
-    assert _links(tmp_path, run(["split"], cfg, force=False)) == {"split": (1, 0)}
-    assert _links(tmp_path, run(["split"], cfg, force=False)) == {"split": (1, 1)}
-    os.utime(raw, ns=(1, 1))
-    assert _links(tmp_path, run(["split"], cfg, force=False)) == {"split": (2, 0)}
+def test_regress_estimates_every_used_region(done):
+    estimates = _read(done, f"regress_{MODEL}_estimates.parquet")
+    failures = _read(done, f"failures_{MODEL}.parquet").filter(pl.col("used"))
+    assert sorted(estimates["region"].to_list()) == sorted(failures["region"].to_list())
+    contributions = _read(done, f"regress_{MODEL}_contributions.parquet")
+    assert set(contributions["region"].to_list()) == set(estimates["region"].to_list())
+    scores = dict(_rows(done, "SELECT predictor, spearman FROM regress_scores"))
+    assert set(scores) == {"rf", "mcp", "atc"}
+    assert scores["rf"] > 0
 
 
-def test_prepare_outputs(tmp_path: Path) -> None:
-    """Check that prepare's classes, splits and features match."""
-    run(["prepare"], fast_cfg(tmp_path), force=False)
-    with closing(connect(tmp_path / "grace.db")) as db:
-        classes = pd.read_sql_query("SELECT * FROM classes WHERE execution_id = 2", db)
-        assert classes["class_id"].tolist() == list(range(9))
-        metrics = dict(
-            db.execute("SELECT name, value FROM metrics WHERE execution_id = 1")
-        )
-        for name in SPLITS:
-            path = tmp_path / "artifacts/prepare/2" / f"{name}.parquet"
-            frame = pd.read_parquet(path)
-            assert len(frame) == metrics[f"n_{name}"]
-            assert frame["label"].isin(classes["class_id"]).all()
-            assert classes[f"n_{name}"].sum() == len(frame)
-        kinds = db.execute(
-            "SELECT kind, COUNT(*) FROM features WHERE execution_id = 1 GROUP BY kind"
-        ).fetchall()
-        assert dict(kinds) == {"num": 20, "cat": 2}
+def test_regions_never_read_the_test_labels(copy_of_done):
+    before = _read(copy_of_done, "assignments.parquet")
+    test_file = copy_of_done.output_dir / "test.parquet"
+    test = pl.read_parquet(test_file)
+    shuffled = np.random.default_rng(0).permutation(test[LABEL].to_numpy())
+    test.with_columns(pl.Series(LABEL, shuffled)).write_parquet(test_file)
+    copy_of_done.run("regions")
+    after = _read(copy_of_done, "assignments.parquet")
+    assert before.equals(after)
 
 
-def _failing_prepare(ctx: Context) -> None:
-    """Queue a row, then fail, like a stage that crashes late."""
-    ctx.write(
-        "classes",
-        pd.DataFrame(
-            {"class_id": [0], "name": ["x"], "n_train": 1, "n_val": 1, "n_test": 1}
-        ),
-    )
-    raise RuntimeError("boom")
+def test_a_stage_without_its_input_fails_and_is_logged(tmp_path, synthetic_csv):
+    workspace = make_workspace(tmp_path, synthetic_csv)
+    with pytest.raises(FileNotFoundError, match="run split first"):
+        workspace.run("train")
+    assert _rows(workspace, "SELECT stage, status FROM runs") == [("train", "failed")]
 
 
-def test_failed_stage_rolls_back(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Check that a failed stage rolls back its rows and reruns."""
-    cfg = fast_cfg(tmp_path)
-    with monkeypatch.context() as patch:
-        patch.setattr(stages.prepare, "run", _failing_prepare)
-        with pytest.raises(RuntimeError, match="boom"):
-            run(["prepare"], cfg, force=False)
-
-    db_path = tmp_path / "grace.db"
-    rows = query(db_path, "SELECT stage, status FROM executions ORDER BY id")
-    assert rows == [("split", "done"), ("prepare", "failed")]
-    assert query(db_path, "SELECT status FROM runs") == [("failed",)]
-    assert query(db_path, "SELECT COUNT(*) FROM classes") == [(0,)]
-    assert _links(tmp_path, run(["prepare"], cfg, force=False)) == {
-        "split": (1, 1),
-        "prepare": (3, 0),
-    }
+def test_model_stages_need_a_model(done):
+    with pytest.raises(SystemExit):
+        main(["--stage", "train", "--dataset", str(done.dataset)])
 
 
-@pytest.mark.parametrize(
-    "overrides, targets",
-    [
-        (["data=nope"], ["prepare"]),
-        (["data.trian_frac=0.5"], ["prepare"]),
-        (["distance=manhattan"], ["prepare"]),
-        (["groups.data=nb15_v2"], ["prepare"]),
-        (["root="], ["prepare"]),
-        (["classifier.kind=xx"], ["prepare"]),
-        (["classifier.name=nope"], ["prepare"]),
-        (["loss.name=nope"], ["prepare"]),
-        (["fit.training.epochs=0"], ["prepare"]),
-        (["fit.training.early_stopping.min_delta=-1"], ["prepare"]),
-        (["fit.training.early_stopping.holdout=0"], ["prepare"]),
-        (["fit.training.early_stopping.holdout=1"], ["prepare"]),
-        (["fit.training.max_grad_norm=0"], ["prepare"]),
-        (["fit.balance=oversample"], ["prepare"]),
-        (["runtime.num_workers=-1"], ["prepare"]),
-        (["graph.k=0"], ["prepare"]),
-        (["failure_regressor.n_outer_splits=1"], ["prepare"]),
-        (["failure_regressor.param_grid.max_depth=5"], ["prepare"]),
-        (["failure_regressor.n_iter=0"], ["prepare"]),
-        (["partitions.null_draws=0"], ["prepare"]),
-        ([], ["bogus"]),
-    ],
-)
-def test_config_errors(
-    tmp_path: Path, overrides: list[str], targets: list[str]
-) -> None:
-    """Check that a bad value fails before any stage runs."""
-    with pytest.raises(ValueError):
-        run(targets, fast_cfg(tmp_path, *overrides), force=False)
+def test_failures_refuse_predictions_of_another_split(copy_of_done):
+    test_file = copy_of_done.output_dir / "test.parquet"
+    test = pl.read_parquet(test_file)
+    shuffled = np.random.default_rng(0).permutation(test[LABEL].to_numpy())
+    test.with_columns(pl.Series(LABEL, shuffled)).write_parquet(test_file)
+    with pytest.raises(ValueError, match="run train again"):
+        copy_of_done.run("failures")
 
 
-@pytest.mark.parametrize(
-    "overrides, match",
-    [
-        (["grid_search.scoring=bogus"], "grid_search.scoring"),
-        (
-            ["classifier=random_forest", "classifier.grid.n_estimators=5"],
-            "classifier.grid",
-        ),
-        (["optimizer.name=Bogus"], "optimizer.name"),
-        (["optimizer.name=Optimizer"], "optimizer.name"),
-        (["scheduler.name=Nope"], "scheduler.name"),
-        (["scheduler.name=LRScheduler"], "scheduler.name"),
-        (["fit.training.dataloader.batch_size=1"], "batch_size"),
-        (["fit.training.early_stopping.dataloader.batch_size=0"], "batch_size"),
-        (["runtime.device=cuda:x"], "runtime.device"),
-        (["clustering.params=5"], "must be a mapping"),
-        (
-            ["clustering=hdbscan", "clustering.params.min_samples=[]"],
-            "at least one",
-        ),
-        (["clustering.name=birch"], "pick it with <group>=<option>"),
-        (["classifier.name=knn"], "pick it with <group>=<option>"),
-        (["classifier.kind=ml"], "pick it with <group>=<option>"),
-        (["groups.data=nb15_v2"], "pick it with <group>=<option>"),
-        (["[groups][data]=nb15_v2"], "pick it with <group>=<option>"),
-        (["seed=-1"], "seed"),
-        # The regressor's searches take seed + fold, below 2**32.
-        ([f"seed={2**31}"], "seed"),
-        (["regressor_figures=maybe"], "regressor_figures"),
-        (["data.num_cols=[num_1,num_1]"], "more than once"),
-        (["loss.params.label_smoothing=1.0"], "label_smoothing"),
-        (["loss=focal", "loss.params.gamma=-1"], "gamma"),
-    ],
-)
-def test_config_errors_name_the_key(overrides: list[str], match: str) -> None:
-    """Check that a config error names the offending key."""
-    with pytest.raises(ValueError, match=re.escape(match)):
-        load_config(["data=synthetic_test", *overrides])
-
-
-def test_render_reads_the_regressor_only_when_asked() -> None:
-    """Check that regressor_figures decides what render runs after."""
-    with_regressor = load_config(["data=synthetic_test"])
-    without_regressor = load_config(["data=synthetic_test", "regressor_figures=false"])
-    # render never reads partitions: it is its own, independent target.
-    non_partition_stages = [stage for stage in STAGES if stage != "partitions"]
-    assert plan(["render"], with_regressor) == non_partition_stages
-    skipped = {"complexity", "regress"}
-    assert plan(["render"], without_regressor) == [
-        stage for stage in non_partition_stages if stage not in skipped
-    ]
-
-
-def test_plan_partitions_skips_the_regressor_chain() -> None:
-    """Check that partitions plans only the chain it reads."""
-    cfg = load_config(["data=synthetic_test"])
-    assert plan(["partitions"], cfg) == [
-        "split",
-        "prepare",
-        "regions",
-        "classify",
-        "partitions",
-    ]
-
-
-def test_clustering_params_checked() -> None:
-    """Check that pipeline-owned and unknown clustering params fail."""
-    cfg = load_config(["data=synthetic_test"])
-    OmegaConf.set_struct(cfg, False)
-    for params, key in (({"n_clusters": [5]}, "n_clusters"), ({"bogus": 1}, "bogus")):
-        cfg.clustering.params = params
-        with pytest.raises(ValueError, match=key):
-            validate(cfg)
-    cfg = load_config(["data=synthetic_test", "clustering=hdbscan"])
-    OmegaConf.set_struct(cfg, False)
-    cfg.clustering.params = {"min_cluster_size": [5]}
-    validate(cfg)
-
-
-@pytest.mark.parametrize(
-    "path", sorted((CONFIGS / "clustering").glob("*.yaml")), ids=lambda path: path.stem
-)
-def test_clustering_shared_keys(path: Path) -> None:
-    """Check that each clustering YAML has a name and shared keys."""
-    cfg = load_config(["data=synthetic_test", f"clustering={path.stem}"])
-    shared = OmegaConf.load(CONFIGS / "config.yaml").clustering
-    assert cfg.clustering.name == path.stem
-    for key, value in shared.items():
-        assert cfg.clustering[key] == value
-    assert "max_regions" in _config_slice("regions", cfg)["clustering"]
-
-
-@pytest.mark.parametrize(
-    "path", sorted((CONFIGS / "data").glob("*.yaml")), ids=lambda path: path.stem
-)
-def test_every_data_config_validates(path: Path) -> None:
-    """Check that every data config loads and validates."""
-    load_config([f"data={path.stem}"])
-
-
-def test_sweep() -> None:
-    """Check that a sweep is the product of its values, lists too."""
-    combos = sweep(["classifier=a,b", "distance=x,y,z"])
-    assert len(combos) == 6
-    assert combos[0] == ["classifier=a", "distance=x"]
-    assert combos[-1] == ["classifier=b", "distance=z"]
-    assert sweep([]) == [[]]
-    min_samples = "clustering.params.min_samples"
-    assert sweep([f"{min_samples}=[1,5],[15]"]) == [
-        [f"{min_samples}=[1,5]"],
-        [f"{min_samples}=[15]"],
-    ]
-    assert len(sweep(["x=[[1,2],[3]],[4]"])) == 2
-    cfg = load_config(
-        [
-            "data=synthetic_test",
-            "clustering=hdbscan",
-            *sweep([f"{min_samples}=[1,5],[15]"])[0],
-        ]
-    )
-    assert cfg.clustering.params.min_samples == [1, 5]
-    for bad in ("classifier", "classifier=a,", "=a,b", "a=[1,2],"):
-        with pytest.raises(ValueError, match="--sweep"):
-            sweep([bad])
+def test_regress_refuses_descriptors_of_other_regions(copy_of_done):
+    complexity_file = copy_of_done.output_dir / "complexity.parquet"
+    complexity = pl.read_parquet(complexity_file)
+    complexity.filter(pl.col("id") != 0).write_parquet(complexity_file)
+    with pytest.raises(ValueError, match="run complexity and failures again"):
+        copy_of_done.run("regress")

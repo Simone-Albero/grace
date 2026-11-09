@@ -1,131 +1,94 @@
-"""Space (numerics, weighted one-hot) and its scaling helpers."""
+"""The euclidean space every distance of the method is measured in.
 
-__all__ = ["Space", "l2_normalize", "scale_for_metric"]
+The prepared numeric columns as they are, plus a one-hot block per
+categorical column for its top_k most frequent codes of train and one
+shared "other" slot. A slot is worth sqrt(cat_cost / 2), so two rows
+that differ on one categorical column are cat_cost apart in squared
+distance. Under the cosine distance every row is then scaled to unit
+length.
+"""
 
+from __future__ import annotations
+
+__all__ = ["Space", "embed", "fit_space", "scale_for_metric"]
+
+import math
 from dataclasses import dataclass
 
 import numpy as np
-import pandas as pd
-
-_EPS = 1e-8
 
 
 @dataclass(frozen=True)
 class Space:
-    """The euclidean space of geometry: numerics, one-hot categoricals.
-
-    Numerics stay as prepared.
+    """The kept codes of each categorical column and the slot weight.
 
     Attributes:
-        num_cols: The numerical columns, which come first as they are.
-        kept: By categorical column, the train codes with a slot of
-            their own; the rest share one.
-        cat_cost: The squared distance between two rows differing on
-            one categorical column. Numerics are IQR-scaled, so 1 weighs
-            a mismatch like one IQR step.
+        kept: The kept codes of each categorical column, ascending.
+        weight: The value of an active slot, sqrt(cat_cost / 2).
     """
 
-    num_cols: list[str]
-    kept: dict[str, list[int]]
-    cat_cost: float
-
-    @classmethod
-    def fit(
-        cls,
-        train: pd.DataFrame,
-        *,
-        num_cols: list[str],
-        cat_cols: list[str],
-        top_k: int,
-        cat_cost: float,
-    ) -> "Space":
-        """Fit the `top_k` most frequent codes of each categorical.
-
-        Args:
-            train: The train rows, with the prepared codes.
-            num_cols: The numerical column names.
-            cat_cols: The categorical column names.
-            top_k: The codes per categorical column with a slot of
-                their own.
-            cat_cost: The squared distance between two rows differing
-                on one categorical column.
-
-        Returns:
-            The fitted space.
-        """
-        kept = {
-            col: [int(code) for code in train[col].value_counts().index[:top_k]]
-            for col in cat_cols
-        }
-        return cls(list(num_cols), kept, cat_cost)
-
-    def columns(self) -> list[str]:
-        """Return the names of the coordinates `embed` returns.
-
-        Returns:
-            The names, in coordinate order.
-        """
-        columns = list(self.num_cols)
-        for col, codes in self.kept.items():
-            columns += [f"{col}={code}" for code in codes] + [f"{col}=other"]
-        return columns
-
-    def embed(self, rows: pd.DataFrame) -> np.ndarray:
-        """Return the rows as points of the space.
-
-        Args:
-            rows: The rows, with the prepared columns.
-
-        Returns:
-            The points, shape (n, len(columns())): float64 without
-            categoricals, else float32.
-        """
-        numerics = rows[self.num_cols].to_numpy(dtype=np.float64)
-        if not self.kept:
-            return numerics
-        weight = np.sqrt(self.cat_cost / 2.0)
-        # float32: the one-hot blocks are most of the matrix, and a
-        # class of millions of rows has to fit in memory next to its
-        # copies.
-        blocks = [numerics.astype(np.float32)]
-        for col, codes in self.kept.items():
-            slot = (
-                rows[col]
-                .map({code: i for i, code in enumerate(codes)})
-                .fillna(len(codes))
-                .to_numpy(dtype=np.int64)
-            )
-            block = np.zeros((len(rows), len(codes) + 1), dtype=np.float32)
-            block[np.arange(len(rows)), slot] = weight
-            blocks.append(block)
-        return np.hstack(blocks)
+    kept: tuple[np.ndarray, ...]
+    weight: float
 
 
-def l2_normalize(points: np.ndarray) -> np.ndarray:
-    """Return the rows scaled to unit L2 norm.
-
-    Euclidean distance on unit vectors is monotone in the cosine
-    distance.
+def fit_space(cat: np.ndarray, top_k: int, cat_cost: float) -> Space:
+    """Learn the top_k most frequent codes of each categorical column.
 
     Args:
-        points: The points, shape (n, d).
+        cat: The categorical codes of train, shape (n, n_cat); n_cat may
+            be 0.
+        top_k: The codes per column with their own slot (ties: the
+            smaller code first); 0 leaves only the "other" slot.
+        cat_cost: The squared distance a mismatch adds, > 0.
 
     Returns:
-        The normalized points; a row of norm under 1e-8 is divided by
-        1e-8 instead.
+        The fitted space.
     """
-    norms = np.linalg.norm(points, axis=1, keepdims=True)
-    return points / np.maximum(norms, _EPS)
+    kept = []
+    for column in cat.T:
+        codes, counts = np.unique(column, return_counts=True)
+        order = np.lexsort((codes, -counts))
+        kept.append(np.sort(codes[order[:top_k]]))
+    return Space(kept=tuple(kept), weight=math.sqrt(cat_cost / 2))
+
+
+def embed(space: Space, num: np.ndarray, cat: np.ndarray) -> np.ndarray:
+    """Place rows in the space.
+
+    Args:
+        space: The fitted space.
+        num: The prepared numeric columns, shape (n, n_num).
+        cat: The categorical codes, shape (n, n_cat).
+
+    Returns:
+        Float64 points of shape (n, n_num + Σ (len(kept) + 1)): num,
+        then per column one slot per kept code and a last "other" slot,
+        exactly one of them set to space.weight.
+    """
+    blocks = [np.asarray(num, dtype=np.float64)]
+    for kept, column in zip(space.kept, cat.T):
+        position = np.searchsorted(kept, column)
+        found = position < len(kept)
+        found[found] = kept[position[found]] == column[found]
+        slot = np.where(found, position, len(kept))
+        block = np.zeros((len(column), len(kept) + 1))
+        block[np.arange(len(column)), slot] = space.weight
+        blocks.append(block)
+    return np.hstack(blocks)
 
 
 def scale_for_metric(points: np.ndarray, metric: str) -> np.ndarray:
-    """Return the points as the graph measures them.
+    """Scale points so that euclidean distances serve the metric.
 
     Args:
-        points: The points, shape (n, d).
-        metric: `euclidean` or `cosine`.
+        points: Shape (n, d).
+        metric: "euclidean" (unchanged) or "cosine" (each row divided by
+            max(its norm, 1e-8)).
 
     Returns:
-        The unit rows under cosine, else the points unchanged.
+        A new array of the same shape.
     """
-    return l2_normalize(points) if metric == "cosine" else points
+    if metric == "cosine":
+        norms = np.linalg.norm(points, axis=1, keepdims=True)
+        return points / np.maximum(norms, 1e-8)
+    return np.array(points, dtype=np.float64)

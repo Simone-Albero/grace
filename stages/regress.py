@@ -1,172 +1,145 @@
-"""Random Forest failure regressor on the complexity descriptors.
+"""Stage regress: the forest that predicts region failure rates."""
 
-Each region with a val row has its val failure rate predicted out of
-fold from its descriptors (and its class's), weighted by its val rows.
-A region baselines scored (`used`) but without a val row is predicted
-by the refit instead, which never trained on it. Every predictor is
-scored against test, on the regions baselines scored. Artifact: the
-forest refit on every region with a val row. DB rows written:
-`estimates` (every region; `regressor` NULL without a val row and
-unused), `regressor_folds` (the outer folds, scored against test, then
-the refit as fold -1), `importances` and the regressor's scores in
-metrics.
-"""
+from __future__ import annotations
 
-__all__ = ["CONFIG", "INPUTS", "FILES", "OUTPUTS", "run"]
+__all__ = ["run"]
 
-import json
+import sqlite3
 
 import joblib
 import numpy as np
-import pandas as pd
-from omegaconf import OmegaConf
+import polars as pl
 
-from src.regressor import FailureRegressor, fit_failure_regressor, region_descriptors
-from src.scores import log_scores, rate_scores
-from stages import Context
-
-CONFIG = ("failure_regressor", "seed")
-INPUTS = ("regions", "complexity", "failures", "baselines")
-FILES = ()
-OUTPUTS = ("model.joblib",)
-
-
-def _fold_score(
-    fold_of: pd.Series, predicted: pd.Series, test_rate: pd.Series, fold: int
-) -> dict[str, float]:
-    """Score one outer fold's held-out, used regions against test.
-
-    Returns:
-        `spearman`, `r2` and `mae`, NaN when none of the fold's
-        held-out regions are used.
-    """
-    names = ("spearman", "r2", "mae")
-    held_out = fold_of.index[fold_of == fold].intersection(test_rate.index)
-    if held_out.empty:
-        return dict.fromkeys(names, float("nan"))
-    score = rate_scores(predicted.loc[held_out], test_rate.loc[held_out])
-    return {name: score[name] for name in names}
+from src import db
+from src.config import DatasetConfig
+from src.evaluation import rate_scores
+from src.regressor import fit_failure_regressor, region_descriptors
+from stages.paths import (
+    complexity_file,
+    contributions_file,
+    estimates_file,
+    failures_file,
+    need,
+    read_classes,
+    regressor_file,
+)
 
 
-def _predicted_rates(
-    fitted: FailureRegressor,
-    descriptors: pd.DataFrame,
-    columns: pd.Index,
-    refit_only: pd.Index,
-) -> pd.Series:
-    """Return every trained region's out-of-fold rate, refit-filled.
+def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
+    """Fit the failure regressor and explain its estimates.
 
-    Args:
-        fitted: The fitted regressor.
-        descriptors: Every region's descriptors.
-        columns: The descriptor columns the model trained on.
-        refit_only: Regions the refit predicts but never trained on.
+    Reads complexity.parquet, failures_<model>.parquet and classes.json.
+    X = regressor.region_descriptors of the used regions with
+    regressor.measures, without its all-NaN columns; y = failure_rate.
+    regressor.fit_failure_regressor with the regressor config and seed.
+    The estimates are scored against the observed rates, next to MCP
+    and ATC on the same regions.
 
-    Returns:
-        The predicted rate of every trained region, plus `refit_only`.
-    """
-    if refit_only.empty:
-        refit_predicted = pd.Series(dtype=float)
-    else:
-        refit_predicted = pd.Series(
-            np.clip(
-                fitted.model.predict(descriptors.loc[refit_only, columns]), 0.0, 1.0
-            ),
-            index=refit_only,
-        )
-    return pd.concat([fitted.predicted, refit_predicted])
-
-
-def _folds_table(
-    fitted: FailureRegressor, predicted: pd.Series, test_rate: pd.Series, n_trained: int
-) -> pd.DataFrame:
-    """Return the outer folds' test scores, the refit as fold -1."""
-    rows = [
-        {**fold, **_fold_score(fitted.fold, predicted, test_rate, fold["fold"])}
-        for fold in fitted.folds
-    ]
-    refit = {
-        "fold": -1,
-        "n_regions": n_trained,
-        "best_score": fitted.refit_score,
-        "params": fitted.refit_params,
-    }
-    folds = pd.DataFrame([*rows, refit])
-    folds["params"] = [json.dumps(params, sort_keys=True) for params in folds["params"]]
-    return folds
-
-
-def run(ctx: Context) -> None:
-    """Fit the failure regressor out of fold on val-labelled regions.
-
-    Args:
-        ctx: The stage context.
+    Writes to output_dir: regress_<model>_estimates.parquet (region,
+    class, observed, predicted, fold, base, mcp, atc),
+    regress_<model>_contributions.parquet (region, descriptor, value,
+    contribution) and regress_<model>.joblib (the refit forest and its
+    descriptor names).
+    Logs: estimates (region, class name, observed, predicted, fold,
+    base), contributions (region, descriptor, value, contribution),
+    regressor_folds (FailureRegressor.folds), importances (descriptor,
+    mdi, mean_abs_shap), regress_scores (predictor "rf" | "mcp" | "atc",
+    spearman, r2, mae, mse).
 
     Raises:
-        ValueError: Fewer than two regions have a val row, or their val
-            rates do not differ.
+        ValueError: When cfg.model is None, or regressor.measures names
+            an unknown measure.
     """
-    regressor_cfg = ctx.cfg.failure_regressor
-    regions = ctx.read("regions", "regions").set_index("region_id")
-    descriptors = region_descriptors(
-        ctx.read("complexity", "complexity"), regions["class_id"]
+    if cfg.model is None:
+        raise ValueError(f"regress of {cfg.name} needs a model, got none")
+    settings = cfg.method.regressor
+    complexity = pl.read_parquet(need(complexity_file(cfg), "complexity"))
+    failures = pl.read_parquet(need(failures_file(cfg), "failures"))
+    described = complexity.filter(pl.col("scope") == "region")["id"].unique()
+    if set(described.to_list()) != set(failures["region"].to_list()):
+        raise ValueError(
+            "complexity.parquet describes other regions than "
+            f"{failures_file(cfg).name}: run complexity and failures again"
+        )
+    failures = failures.filter(pl.col("used"))
+    regions = failures["region"].to_numpy()
+    X, names = region_descriptors(
+        complexity, regions, failures["class"].to_numpy(), settings.measures
     )
-    failures = ctx.read("failures", "failures").set_index("region_id")
-    baselines = ctx.read("baselines", "baselines").set_index("region_id")
-    used = baselines.index[baselines["used"] == 1]
-    # Kept in failures order, which fixes the CV folds.
-    trained = failures.index[failures["n_val"] > 0]
-
-    # A descriptor no region has a value for has nothing to learn from.
-    X = descriptors.loc[trained].dropna(axis=1, how="all")
-    y = failures.loc[trained, "val_rate"].astype(float)
-    weight = failures.loc[trained, "n_val"].astype(float)
-
+    present = ~np.isnan(X).all(axis=0)
+    X = X[:, present]
+    names = [name for name, is_present in zip(names, present) if is_present]
+    observed = failures["failure_rate"].to_numpy()
+    print(f"[regress] {len(regions)} regions, {len(names)} descriptors", flush=True)
     fitted = fit_failure_regressor(
         X,
-        y,
-        sample_weight=weight,
-        params=OmegaConf.to_container(regressor_cfg.params),
-        param_grid=OmegaConf.to_container(regressor_cfg.param_grid),
-        n_outer_splits=regressor_cfg.n_outer_splits,
-        n_inner_splits=regressor_cfg.n_inner_splits,
-        n_iter=regressor_cfg.n_iter,
-        n_jobs=ctx.runtime.n_jobs,
-        random_state=ctx.cfg.seed,
+        observed,
+        params=settings.params,
+        param_grid=settings.param_grid,
+        n_outer_splits=settings.n_outer_splits,
+        n_inner_splits=settings.n_inner_splits,
+        n_iter=settings.n_iter,
+        seed=cfg.seed,
     )
-
-    # Used regions without a val row: the refit never saw them either.
-    refit_only = used.difference(trained)
-    predicted = _predicted_rates(fitted, descriptors, X.columns, refit_only)
-
-    estimates = pd.DataFrame(
+    joblib.dump({"model": fitted.model, "descriptors": names}, regressor_file(cfg))
+    estimates = pl.DataFrame(
         {
-            "fold": fitted.fold.reindex(failures.index).astype("Int64"),
-            "regressor": predicted.reindex(failures.index),
-        },
-        index=failures.index,
-    )
-    ctx.write("estimates", estimates.reset_index())
-
-    test_rate = failures.loc[used, "test_rate"].astype(float)
-    score = rate_scores(predicted.loc[used], test_rate)
-    baseline_metrics = ctx.read("metrics", "baselines").set_index("name")["value"]
-    log_scores("regressor", score)
-    for name in ("val", "mcp", "atc"):
-        log_scores(name, {key: baseline_metrics[f"{name}_{key}"] for key in score})
-
-    ctx.write("regressor_folds", _folds_table(fitted, predicted, test_rate, len(X)))
-    ctx.write(
-        "importances",
-        fitted.importances.rename_axis("feature").rename("importance").reset_index(),
-    )
-
-    ctx.save_metrics(
-        {
-            **{f"regressor_{name}": value for name, value in score.items()},
-            "n_features": X.shape[1],
-            "n_outer_splits": fitted.n_outer,
-            "n_inner_splits": fitted.n_inner,
+            "region": regions,
+            "class": failures["class"],
+            "observed": observed,
+            "predicted": fitted.predicted,
+            "fold": fitted.fold,
+            "base": fitted.base,
+            "mcp": failures["mcp"],
+            "atc": failures["atc"],
         }
     )
-    joblib.dump(fitted.model, ctx.out / "model.joblib")
+    estimates.write_parquet(estimates_file(cfg))
+    contributions = pl.DataFrame(
+        {
+            "region": np.repeat(regions, len(names)),
+            "descriptor": names * len(regions),
+            "value": X.ravel(),
+            "contribution": fitted.contributions.ravel(),
+        }
+    ).with_columns(pl.col("value").fill_nan(None))
+    contributions.write_parquet(contributions_file(cfg))
+    scores = [
+        {"predictor": name, **rate_scores(estimates[column].to_numpy(), observed)}
+        for name, column in (("rf", "predicted"), ("mcp", "mcp"), ("atc", "atc"))
+    ]
+    print(
+        "[regress] spearman "
+        + ", ".join(
+            f"{score['predictor']} {score['spearman']:.3f}" for score in scores
+        ),
+        flush=True,
+    )
+
+    classes = read_classes(cfg)
+    db.log_table(
+        conn,
+        run_id,
+        "estimates",
+        [
+            {
+                key: row[key]
+                for key in ("region", "observed", "predicted", "fold", "base")
+            }
+            | {"class": classes[row["class"]]}
+            for row in estimates.to_dicts()
+        ],
+    )
+    db.log_table(conn, run_id, "contributions", contributions.to_dicts())
+    db.log_table(conn, run_id, "regressor_folds", fitted.folds)
+    mean_abs_shap = np.abs(fitted.contributions).mean(axis=0)
+    db.log_table(
+        conn,
+        run_id,
+        "importances",
+        [
+            {"descriptor": name, "mdi": float(mdi), "mean_abs_shap": float(abs_shap)}
+            for name, mdi, abs_shap in zip(names, fitted.importances, mean_abs_shap)
+        ],
+    )
+    db.log_table(conn, run_id, "regress_scores", scores)

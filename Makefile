@@ -1,42 +1,39 @@
-# grace. The pipeline is `python -m stages <target…> [key=value…] [--sweep k=v1,v2…] [--force]`;
+# grace. The pipeline is `python main.py --stage <stage> --dataset <name> [--model <name>]`;
 # these targets are shortcuts.
 .DEFAULT_GOAL := help
 PYTHON ?= $(if $(wildcard venv/bin/python),venv/bin/python,python)
-
-VERIFY := data=synthetic_test root=resources/verify
-MODE ?= quick
-ROOT ?= resources
+DATA ?= synthetic_test
+MODEL ?= random_forest
 PORT ?= 8000
-CLASSIFIERS := logistic_regression,decision_tree,naive_bayes,hist_gradient_boosting,lda,linear_svc,xgboost,knn,random_forest,mlp
-SWEEP_quick := --sweep classifier=random_forest,mlp
-SWEEP_full := --sweep classifier=$(CLASSIFIERS) --sweep clustering=kmeans,hdbscan,birch,spectral --sweep distance=euclidean,cosine
-SWEEP = $(or $(SWEEP_$(MODE)),$(error MODE must be quick or full, not '$(MODE)'))
 
-.PHONY: help test format smoke generate dashboard
+.PHONY: help test format generate run dashboard
 
 ## help: this list
 help:
 	@grep -hE '^## ' $(MAKEFILE_LIST) | sed 's/^## //'
 
-## test: the pytest suite, about 4-5 minutes
+## test: the pytest suite
 test:
 	$(PYTHON) -m pytest -q tests
 
-## format: black and isort over the repo, as the style requires
+## format: black and isort over the repo
 format:
 	$(PYTHON) -m black .
 	$(PYTHON) -m isort --profile black .
 
-## smoke: every stage on synthetic_test into resources/verify (own DB), MODE=quick|full; the second pass must be fully cached
-smoke:
-	$(PYTHON) -m stages render partitions $(VERIFY) $(SWEEP)
-	$(PYTHON) -m stages render partitions $(VERIFY) $(SWEEP) 2> resources/verify/cached.log || { cat resources/verify/cached.log; exit 1; }
-	! grep "running execution" resources/verify/cached.log
-
 ## generate: the synthetic dataset (ROWS=<n> for a smaller one)
 generate:
-	$(PYTHON) -m pipeline.generate_synthetic $(if $(ROWS),--rows $(ROWS),)
+	$(PYTHON) generate_synthetic.py $(if $(ROWS),--rows $(ROWS),)
 
-## dashboard: dashboard (the results of every stage, by experiment) of ROOT/grace.db (default resources), created if missing, on 127.0.0.1:PORT (default 8000); remote host: ssh -L PORT:127.0.0.1:PORT <host>
+## run: every stage in order on DATA (default synthetic_test) with MODEL (default random_forest)
+run:
+	$(PYTHON) main.py --stage split --dataset $(DATA)
+	$(PYTHON) main.py --stage regions --dataset $(DATA)
+	$(PYTHON) main.py --stage complexity --dataset $(DATA)
+	$(PYTHON) main.py --stage train --dataset $(DATA) --model $(MODEL)
+	$(PYTHON) main.py --stage failures --dataset $(DATA) --model $(MODEL)
+	$(PYTHON) main.py --stage regress --dataset $(DATA) --model $(MODEL)
+
+## dashboard: the read-only dashboard on 127.0.0.1:PORT (default 8000)
 dashboard:
-	$(PYTHON) -m dashboard --root $(ROOT) --port $(PORT)
+	$(PYTHON) -m uvicorn dashboard.app:app --port $(PORT)

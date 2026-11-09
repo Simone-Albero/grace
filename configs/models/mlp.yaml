@@ -1,0 +1,5 @@
+name: mlp
+params:
+  hidden_layer_sizes: [128, 64, 32, 16]
+  early_stopping: true
+  max_iter: 200

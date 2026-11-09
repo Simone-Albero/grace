@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Grace Dashboard</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="top">
+    <div class="top-inner">
+      <h1>grace</h1>
+      <div class="controls">
+        <label>dataset <select id="dataset"></select></label>
+        <label id="model-label" hidden>model <select id="model"></select></label>
+        <label id="split-label" hidden>split
+          <select id="split"><option>test</option><option>val</option></select>
+        </label>
+      </div>
+      <span id="run-info" class="muted"></span>
+    </div>
+    <nav class="tabs" role="tablist">
+      <button role="tab" data-tab="split" aria-selected="true">split</button>
+      <button role="tab" data-tab="regions" aria-selected="false">regions</button>
+      <button role="tab" data-tab="complexity" aria-selected="false">complexity</button>
+      <button role="tab" data-tab="train" aria-selected="false">train</button>
+      <button role="tab" data-tab="failures" aria-selected="false">failures</button>
+      <button role="tab" data-tab="regress" aria-selected="false">regress</button>
+    </nav>
+  </header>
+
+  <main>
+    <!-- split -->
+    <section id="tab-split" class="panel">
+      <p class="empty">Select a dataset.</p>
+      <div id="sp-tiles" class="tiles"></div>
+      <div class="card"><h2>Classes per split</h2>
+        <p class="note">Stratified by class, after dropping rows with a missing or infinite value and the classes
+          under min_class_count.</p>
+        <div id="sp-classes" class="table-wrap"></div></div>
+      <div class="card"><h2>Dropped classes</h2><div id="sp-dropped" class="chips"></div></div>
+      <div class="card"><h2>Features</h2><div id="sp-features"></div></div>
+    </section>
+
+    <!-- regions -->
+    <section id="tab-regions" class="panel" hidden>
+      <p class="empty">Select a dataset.</p>
+      <div id="rg-tiles" class="tiles"></div>
+      <div class="card"><h2>Granularity per class</h2>
+        <p class="note">Each class of train is clustered on its own. A candidate's loss adds the hardness spread its
+          regions hide (kDN variance) to the sampling noise of their test failure rate; the least loss wins.</p>
+        <div id="rg-classes" class="table-wrap"></div></div>
+      <div class="card"><h2>Candidates of a class</h2>
+        <div class="filters"><label class="inline">class <select id="rg-class"></select></label></div>
+        <div id="rg-loss"></div></div>
+      <div class="card"><h2>Regions</h2>
+        <p class="note">Val and test rows are routed to the nearest region centre without their label.</p>
+        <div id="rg-sizes"></div>
+        <div id="rg-table" class="table-wrap"></div></div>
+    </section>
+
+    <!-- complexity -->
+    <section id="tab-complexity" class="panel" hidden>
+      <p class="empty">Select a dataset.</p>
+      <div class="card"><h2>Measure by class</h2>
+        <p class="note">One dot per region, measured on its train rows against the nearest regions of other
+          classes; the bar is the value of the whole class.</p>
+        <div class="filters"><label class="inline">measure <select id="cx-measure"></select></label></div>
+        <div id="cx-strip"></div></div>
+      <div class="card"><h2>Every measure over the regions</h2><div id="cx-summary" class="table-wrap"></div></div>
+    </section>
+
+    <!-- train -->
+    <section id="tab-train" class="panel" hidden>
+      <p class="empty">Select a dataset and a model.</p>
+      <div id="tr-tiles" class="tiles"></div>
+      <div class="card"><h2>F1 per class</h2><div id="tr-f1"></div></div>
+      <div class="card"><h2>Confusion matrix</h2>
+        <div class="toggle" id="tr-mode" role="group">
+          <button data-mode="count" aria-pressed="true">count</button>
+          <button data-mode="row" aria-pressed="false">% of row</button>
+        </div>
+        <div id="tr-confusion"></div></div>
+      <div class="card"><h2>Confidence</h2>
+        <p class="note">Maximum class probability, correct and wrong predictions.</p>
+        <div id="tr-confidence"></div></div>
+    </section>
+
+    <!-- failures -->
+    <section id="tab-failures" class="panel" hidden>
+      <p class="empty">Select a dataset and a model.</p>
+      <div id="fl-tiles" class="tiles"></div>
+      <div class="card"><h2>Baselines against the observed rate</h2>
+        <p class="note">Test failure rate of every used region against MCP (mean of 1 − confidence) and ATC (share
+          of rows under a confidence threshold fitted on val). Dashed: y = x.</p>
+        <div id="fl-scores" class="table-wrap"></div>
+        <div id="fl-scatter" class="pair"></div></div>
+      <div class="card"><h2>Failure rate by class</h2>
+        <p class="note">One dot per region with test rows; its area follows its test rows.</p>
+        <div id="fl-strip"></div></div>
+      <div class="card"><h2>Regions</h2><div id="fl-table" class="table-wrap"></div></div>
+    </section>
+
+    <!-- regress -->
+    <section id="tab-regress" class="panel" hidden>
+      <p class="empty">Select a dataset and a model.</p>
+      <div id="rr-tiles" class="tiles"></div>
+      <div class="card"><h2>Scores</h2>
+        <p class="note">The Random Forest estimates come from outer folds that never saw the region; MCP and ATC
+          are scored on the same regions.</p>
+        <div id="rr-scores"></div></div>
+      <div class="card"><h2>Estimated against observed</h2>
+        <p class="note">Click a region for its explanation.</p>
+        <div id="rr-scatter"></div></div>
+      <div class="card" id="rr-region-card" hidden><h2 id="rr-region-title">Region</h2>
+        <p class="note">TreeSHAP of the forest that held this region out: base + contributions = the estimate
+          before its clip to [0, 1].</p>
+        <div id="rr-waterfall"></div>
+        <div id="rr-descriptors" class="table-wrap"></div></div>
+      <div class="card"><h2>Importances</h2><div id="rr-importances" class="pair"></div></div>
+      <div class="card"><h2>Folds</h2><p class="note">Fold −1 is the refit on every region.</p>
+        <div id="rr-folds" class="table-wrap"></div></div>
+    </section>
+  </main>
+
+  <div id="tooltip" role="tooltip" hidden></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

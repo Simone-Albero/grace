@@ -1,0 +1,35 @@
+name: letter_recognition
+path: resources/raw_data/letter_recognition/letter_recognition.csv
+label_col: lettr
+
+num_cols:
+  - x_box
+  - y_box
+  - width
+  - high
+  - onpix
+  - x_bar
+  - y_bar
+  - x2bar
+  - y2bar
+  - xybar
+  - x2ybr
+  - xy2br
+  - x_ege
+  - xegvy
+  - y_ege
+  - yegvx
+
+cat_cols: []
+
+split:  # stratified by class, after dropping non-finite rows and rare classes
+  train: 0.4
+  val: 0.15  # the ATC threshold is fitted here; no classifier trains on it
+  test: 0.45  # every failure rate is measured here
+
+min_class_count: 100  # classes with fewer rows are dropped
+top_n: 32  # most frequent values of a categorical column that keep their own code
+hash_buckets: 64  # the other values are hashed into this many codes
+seed: 42
+output_dir: resources/processed/letter_recognition
+db_path: resources/processed/grace.db

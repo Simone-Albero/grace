@@ -1,292 +1,216 @@
-"""Regions per class in a fitted space, with val and test routed.
+"""Stage regions: classes of train clustered into regions."""
 
-Artifacts: the fitted space, the graph arrays, region centroids and
-assignments. DB rows written: `regions`, `class_clusterings` and
-metrics n_regions, n_graph_rows and eval_rows_per_train_row.
-"""
+from __future__ import annotations
 
-__all__ = ["CONFIG", "INPUTS", "FILES", "OUTPUTS", "run"]
+__all__ = ["run"]
 
-import logging
-from collections.abc import Mapping, Sequence
+import json
+import sqlite3
 
 import joblib
 import numpy as np
-import pandas as pd
-from omegaconf import DictConfig, OmegaConf
-from tqdm import tqdm
+import polars as pl
 
+from src import db
 from src.clustering import (
-    KdnNodes,
-    assign_nearest_centroid,
+    ALGORITHMS,
+    assign_nearest,
+    centroids,
     cluster_class,
-    cluster_size_balance,
-    compute_centroids,
-    subsample_indices,
+    kdn,
 )
-from src.graph import build_train_graph
-from src.space import Space, scale_for_metric
-from stages import LABEL, SPLITS, Context
+from src.config import DatasetConfig
+from src.data import SPLITS
+from src.graph import build_graph, nearest_neighbors, sample_rows
+from src.prepare import LABEL
+from src.space import embed, fit_space, scale_for_metric
+from stages.paths import (
+    assignments_file,
+    graph_file,
+    read_classes,
+    read_split,
+    regions_file,
+    space_file,
+)
 
-logger = logging.getLogger(__name__)
 
-CONFIG = ("space", "graph", "clustering", "distance", "seed")
-# Split gives the feature kinds; prepare, the splits.
-INPUTS = ("split", "prepare")
-FILES = ()
-OUTPUTS = ("space.joblib", "graph.npz", "centroids.parquet", "assignments.parquet")
-_ROUTE_ROWS = 500_000
+def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
+    """Cluster each class into regions and route val and test to them.
 
+    Reads the prepared splits; the labels of val and test are never
+    read.
+    Order: space.fit_space on train's codes -> points of every split
+    (space.embed, scale_for_metric(distance)) -> graph.build_graph on
+    graph.sample_rows(n_train, graph.max_samples, seed) -> per class,
+    ascending: its kDN on its graph.sample_rows(n_class,
+    max_fit_samples, seed) rows (hardness_k nearest graph nodes, never
+    itself) -> clustering.cluster_class with max_clusters = max(2,
+    max_regions // n_classes) and eval_ratio = n_test / n_train ->
+    region id = label + offset, offset += max label + 1 -> centroids of
+    the class's points -> val and test rows to the nearest region
+    centroid of any class (clustering.assign_nearest); train rows keep
+    their own region.
 
-def _points(space: Space, rows: pd.DataFrame, distance: str) -> np.ndarray:
-    """Return the rows in the space the regions are drawn in.
-
-    Under cosine these are unit vectors.
+    Writes to output_dir: regions.parquet (region, class, n_train,
+    n_val, n_test, centroid as a list of floats), assignments.parquet
+    (split, row, region for every row of every split), space.joblib,
+    graph.npz (rows, points, knn_idx, knn_dist, mst).
+    Logs: regions (region, class name, n_train, n_val, n_test),
+    class_clusterings (class, n_train, n_regions, loss, params as JSON),
+    granularity_candidates (class, params as JSON, n_clusters, loss),
+    region_stats (one row: n_regions, algorithm, distance,
+    n_graph_nodes, eval_ratio).
     """
-    return scale_for_metric(space.embed(rows), distance)
+    method, clustering = cfg.method, cfg.method.clustering
+    splits = {name: read_split(cfg, name) for name in SPLITS}
+    labels = splits["train"][LABEL].to_numpy()
+    print("[regions] fitting the space on train", flush=True)
+    space = fit_space(
+        _codes(cfg, splits["train"]), method.space.top_k, method.space.cat_cost
+    )
+    points = {
+        name: scale_for_metric(
+            embed(space, frame.select(cfg.num_cols).to_numpy(), _codes(cfg, frame)),
+            method.distance,
+        )
+        for name, frame in splits.items()
+    }
+    n_train = len(labels)
+    graph_rows = sample_rows(n_train, method.graph.max_samples, cfg.seed)
+    print(f"[regions] graph of {len(graph_rows)} train rows", flush=True)
+    graph = build_graph(points["train"][graph_rows], graph_rows, method.graph.k)
+    graph_labels = labels[graph_rows]
 
-
-def _cluster_per_class(
-    cfg: DictConfig,
-    space: Space,
-    train: pd.DataFrame,
-    *,
-    graph_rows: np.ndarray,
-    graph_points: np.ndarray,
-    eval_rows_per_train_row: float,
-) -> tuple[np.ndarray, dict[int, np.ndarray], list[dict[str, object]]]:
-    """Cluster every class of train and number its regions.
-
-    Each class gets the granularity that least misreads its rows'
-    hardness from their region's error rate; any undersized cluster is
-    merged into a survivor.
-
-    Returns:
-        The region id of every train row, the centroid of each region
-        and one report row per class.
-    """
-    distance, seed = cfg.distance, cfg.seed
-    clustering = cfg.clustering
-    train_labels = train[LABEL].to_numpy()
-    classes = sorted(np.unique(train_labels).tolist())
-    params = OmegaConf.to_container(clustering.params, resolve=True)
-    max_clusters_per_class = max(2, clustering.max_regions // len(classes))
-    labels = np.full(len(train), -1, dtype=np.int64)
-    centroids: dict[int, np.ndarray] = {}
+    classes = read_classes(cfg)
+    algorithm = ALGORITHMS[clustering.name]
+    max_clusters = max(2, clustering.max_regions // len(classes))
+    eval_ratio = splits["test"].height / n_train
+    region = np.empty(n_train, dtype=np.int64)
+    class_rows, candidate_rows = [], []
     offset = 0
-    report: list[dict[str, object]] = []
-
-    nodes = KdnNodes(
-        X=scale_for_metric(graph_points, distance),
-        y=train_labels[graph_rows],
-        row_ids=graph_rows,
-    )
-
-    for class_id in tqdm(classes, desc="Clustering classes"):
-        in_class = train_labels == class_id
-        class_rows = np.flatnonzero(in_class)
-        X_class = _points(space, train.iloc[class_rows], distance)
-
-        raw_labels, n_merged_clusters, n_merged, loss = cluster_class(
-            X_class,
-            row_ids=class_rows,
-            label=class_id,
-            algorithm=clustering.name,
-            params=params,
-            nodes=nodes,
+    for code, name in enumerate(classes):
+        rows = np.flatnonzero(labels == code)
+        X = points["train"][rows]
+        scored = sample_rows(len(rows), clustering.max_fit_samples, cfg.seed)
+        neighbors, _ = nearest_neighbors(
+            graph.points, graph.rows, X[scored], rows[scored], clustering.hardness_k
+        )
+        chosen = cluster_class(
+            X,
+            scored,
+            kdn(graph_labels[neighbors], code),
+            algorithm=algorithm,
+            params=clustering.params,
             max_fit_samples=clustering.max_fit_samples,
-            max_clusters=max_clusters_per_class,
             min_cluster_floor=clustering.min_cluster_floor,
-            hardness_k=clustering.hardness_k,
-            eval_rows_per_train_row=eval_rows_per_train_row,
-            metric=distance,
-            random_state=seed,
+            max_clusters=max_clusters,
+            eval_ratio=eval_ratio,
+            metric=method.distance,
+            seed=cfg.seed,
         )
-        cluster_ids = np.unique(raw_labels)
-        n_class_clusters = int(cluster_ids.size)
-
-        report.append(
+        n_regions = len(np.unique(chosen.labels))
+        if n_regions > max_clusters:
+            raise ValueError(
+                f"class {name}: {n_regions} regions after the refit, "
+                f"more than max_clusters={max_clusters}"
+            )
+        region[rows] = chosen.labels + offset
+        offset += int(chosen.labels.max()) + 1
+        print(
+            f"[regions] {name}: {n_regions} regions, loss {chosen.loss:.4g}", flush=True
+        )
+        class_rows.append(
             {
-                "class_id": int(class_id),
-                "n_train": int(raw_labels.shape[0]),
-                "n_clusters": n_class_clusters,
-                "loss": loss,
-                "size_balance": cluster_size_balance(raw_labels),
-                "n_merged_clusters": n_merged_clusters,
-                "n_merged": n_merged,
+                "class": name,
+                "n_train": len(rows),
+                "n_regions": n_regions,
+                "loss": chosen.loss,
+                "params": json.dumps(chosen.params),
             }
         )
-
-        labels[in_class] = raw_labels + offset
-        class_centroids = compute_centroids(X_class, raw_labels, metric=distance)
-        centroids.update(
+        candidate_rows += [
             {
-                int(cluster) + offset: centroid
-                for cluster, centroid in class_centroids.items()
+                "class": name,
+                "params": json.dumps(candidate.params),
+                "n_clusters": candidate.n_clusters,
+                "loss": candidate.loss,
             }
-        )
-        offset += int(cluster_ids.max()) + 1
+            for candidate in chosen.candidates
+        ]
 
-    return labels, centroids, report
-
-
-def _route(
-    space: Space,
-    rows: pd.DataFrame,
-    centroids: Mapping[int, np.ndarray],
-    distance: str,
-) -> np.ndarray:
-    """Return each row's nearest centroid id, embedded in chunks."""
-    region = np.empty(len(rows), dtype=np.int64)
-    # A whole split embedded at once peaks at ~28 GB on bot_iot_v2. A
-    # multiple of the 50 000-row batches keeps the labels equal.
-    for start in range(0, len(rows), _ROUTE_ROWS):
-        chunk = rows.iloc[start : start + _ROUTE_ROWS]
-        region[start : start + len(chunk)] = assign_nearest_centroid(
-            space.embed(chunk), centroids, metric=distance
-        )
-    return region
-
-
-def _centroid_table(
-    region_ids: Sequence[int],
-    centroids: Mapping[int, np.ndarray],
-    region_class: pd.Series,
-    columns: Sequence[str],
-) -> pd.DataFrame:
-    """Return the region centroids with their ids and classes.
-
-    Raises:
-        ValueError: A centroid is not finite.
-    """
-    table = pd.DataFrame(
-        np.stack([centroids[region] for region in region_ids]).astype(np.float32),
-        columns=columns,
+    ids, centers = centroids(points["train"], region, method.distance)
+    region_class = labels[[np.flatnonzero(region == i)[0] for i in ids]]
+    assigned = {"train": region}
+    for name in ("val", "test"):
+        assigned[name] = ids[assign_nearest(points[name], centers, method.distance)]
+    sizes = {
+        name: np.array([(assigned[name] == i).sum() for i in ids]) for name in SPLITS
+    }
+    regions = pl.DataFrame(
+        {
+            "region": ids,
+            "class": region_class,
+            **{f"n_{name}": sizes[name] for name in SPLITS},
+            "centroid": centers.tolist(),
+        }
     )
-    finite = np.isfinite(table.to_numpy()).all(axis=1)
-    if not finite.all():
-        bad = np.asarray(region_ids)[~finite].tolist()
-        raise ValueError(
-            f"The centroids of regions {bad} are not finite: a column of the "
-            "space is."
-        )
-    table.insert(0, "class_id", region_class.loc[region_ids].to_numpy())
-    table.insert(0, "region_id", region_ids)
-    return table
-
-
-def _assignments(assigned: Mapping[str, np.ndarray]) -> pd.DataFrame:
-    """Return the region id of every row of every split."""
-    assignments = pd.concat(
+    assignments = pl.concat(
         [
-            pd.DataFrame(
+            pl.DataFrame(
                 {
                     "split": name,
-                    "row": np.arange(len(assigned[name]), dtype=np.int32),
-                    "region_id": assigned[name].astype(np.int32),
+                    "row": np.arange(len(assigned[name])),
+                    "region": assigned[name],
                 }
             )
             for name in SPLITS
-        ],
-        ignore_index=True,
+        ]
     )
-    assignments["split"] = pd.Categorical(assignments["split"], categories=SPLITS)
-    return assignments
-
-
-def run(ctx: Context) -> None:
-    """Write the space, graph, centroids and every row's region.
-
-    Args:
-        ctx: The stage context.
-
-    Raises:
-        ValueError: A train row has no region or a centroid is not
-            finite.
-    """
-    cfg = ctx.cfg
-    num_cols, cat_cols = ctx.features()
-
-    prepared = ctx.inputs["prepare"].dir
-    train = pd.read_parquet(prepared / "train.parquet")
-    # Features only: routing must not see a row's class (no leakage).
-    eval_rows = {
-        name: pd.read_parquet(prepared / f"{name}.parquet", columns=num_cols + cat_cols)
-        for name in SPLITS[1:]
-    }
-    eval_rows_per_train_row = len(eval_rows["val"]) / len(train)
-
-    graph_rows = np.sort(
-        subsample_indices(
-            len(train), max_samples=cfg.graph.max_samples, random_state=cfg.seed
-        )
-    )
-    space = Space.fit(
-        train,
-        num_cols=num_cols,
-        cat_cols=cat_cols,
-        top_k=cfg.space.top_k,
-        cat_cost=cfg.space.cat_cost,
-    )
-    graph_points = space.embed(train.iloc[graph_rows])
-    train_graph = build_train_graph(
-        graph_points,
-        k=cfg.graph.k,
-        metric=cfg.distance,
-        n_jobs=ctx.runtime.n_jobs,
-    )
-
-    logger.info("Running per-class clustering on train (n=%d)...", len(train))
-    labels, centroids, report = _cluster_per_class(
-        cfg,
-        space,
-        train,
-        graph_rows=graph_rows,
-        graph_points=graph_points,
-        eval_rows_per_train_row=eval_rows_per_train_row,
-    )
-    if (labels < 0).any():
-        raise ValueError(f"{int((labels < 0).sum())} train rows were given no region.")
-    region_ids = sorted(centroids)
-    region_class = pd.Series(train[LABEL].to_numpy()).groupby(labels).first()
-    centroid_table = _centroid_table(
-        region_ids, centroids, region_class, space.columns()
-    )
-    assigned = {"train": labels} | {
-        name: _route(space, rows, centroids, cfg.distance)
-        for name, rows in eval_rows.items()
-    }
-    assignments = _assignments(assigned)
-
-    joblib.dump(space, ctx.out / "space.joblib")
+    regions.write_parquet(regions_file(cfg))
+    assignments.write_parquet(assignments_file(cfg))
+    joblib.dump(space, space_file(cfg))
     np.savez(
-        ctx.out / "graph.npz",
-        rows=graph_rows,
-        knn_idx=train_graph.knn_idx,
-        knn_dist=train_graph.knn_dist,
-        mst=train_graph.mst_edges,
+        graph_file(cfg),
+        rows=graph.rows,
+        points=graph.points,
+        knn_idx=graph.knn_idx,
+        knn_dist=graph.knn_dist,
+        mst=graph.mst,
     )
-    centroid_table.to_parquet(ctx.out / "centroids.parquet", index=False)
-    assignments.to_parquet(ctx.out / "assignments.parquet", index=False)
+    print(f"[regions] saved {len(ids)} regions", flush=True)
 
-    sizes = (
-        assignments.groupby(["region_id", "split"], observed=False)
-        .size()
-        .unstack("split")
-        .add_prefix("n_")
-    )
-    ctx.write(
+    db.log_table(
+        conn,
+        run_id,
         "regions",
-        pd.DataFrame(
-            {"region_id": region_ids, "class_id": centroid_table["class_id"]}
-        ).join(sizes, on="region_id"),
+        [
+            {
+                "region": int(region_id),
+                "class": classes[code],
+                **{f"n_{name}": int(sizes[name][k]) for name in SPLITS},
+            }
+            for k, (region_id, code) in enumerate(zip(ids, region_class))
+        ],
     )
-    ctx.write("class_clusterings", pd.DataFrame(report))
-    ctx.save_metrics(
-        {
-            "n_regions": len(region_ids),
-            "n_graph_rows": len(graph_rows),
-            "eval_rows_per_train_row": eval_rows_per_train_row,
-        }
+    db.log_table(conn, run_id, "class_clusterings", class_rows)
+    db.log_table(conn, run_id, "granularity_candidates", candidate_rows)
+    db.log_table(
+        conn,
+        run_id,
+        "region_stats",
+        [
+            {
+                "n_regions": len(ids),
+                "algorithm": clustering.name,
+                "distance": method.distance,
+                "n_graph_nodes": len(graph_rows),
+                "eval_ratio": eval_ratio,
+            }
+        ],
     )
-    logger.info("Clustering complete: %d regions", len(region_ids))
+
+
+def _codes(cfg: DatasetConfig, frame: pl.DataFrame) -> np.ndarray:
+    return (
+        frame.select(cfg.cat_cols).to_numpy().reshape(frame.height, len(cfg.cat_cols))
+    )

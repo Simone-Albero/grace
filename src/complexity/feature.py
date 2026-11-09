@@ -1,17 +1,29 @@
-"""F1-F4 feature overlap."""
+"""F1-F4: how well single features separate a population from rivals.
 
-__all__ = ["compute_f_measures"]
+Per (own, rival) pair on the scaled rows, with population variances and
+eps = 1e-8; a pair is skipped when the rival has fewer than 2 rows:
+- f1 = 1 / (1 + max_j (mu_o - mu_r)^2 / (var_o + var_r + eps));
+- f2 = mean over features of the overlap of the two ranges over their
+  union, max(0, min(max) - max(min)) / (max(max) - min(min) + eps);
+- f3 = min over features of the share of own rows inside the overlap
+  interval [max(min), min(max)] (0 for a feature without overlap);
+- f4 = share of own rows inside the overlap box on every feature at once
+  (0 when some feature has no overlap).
+"""
+
+from __future__ import annotations
+
+__all__ = ["F_KEYS", "compute_f_measures"]
 
 from collections.abc import Mapping, Sequence
 
 import numpy as np
-from tqdm import tqdm
 
 from src.complexity.common import summarize
 from src.space import scale_for_metric
 
 _EPS = 1e-8
-_F_KEYS = ("f1", "f2", "f3", "f4")
+F_KEYS = ("f1", "f2", "f3", "f4")
 
 
 def _f1_pair(own_rows: np.ndarray, rival_rows: np.ndarray) -> float:
@@ -35,19 +47,28 @@ def _f2_pair(own_rows: np.ndarray, rival_rows: np.ndarray) -> float:
     return float(np.mean(overlap / total_range))
 
 
+def _overlap_bounds(
+    own_rows: np.ndarray, rival_rows: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the per-feature bounds of the overlap of the two ranges.
+
+    A feature whose ranges do not overlap has its low above its high.
+    """
+    low = np.maximum(own_rows.min(axis=0), rival_rows.min(axis=0))
+    high = np.minimum(own_rows.max(axis=0), rival_rows.max(axis=0))
+    return low, high
+
+
 def _f3_pair(own_rows: np.ndarray, rival_rows: np.ndarray) -> float:
     """Return F3, least own share in the overlap; higher is harder."""
-    min_own, max_own = own_rows.min(axis=0), own_rows.max(axis=0)
-    min_rival, max_rival = rival_rows.min(axis=0), rival_rows.max(axis=0)
-    lo = np.maximum(min_own, min_rival)
-    hi = np.minimum(max_own, max_rival)
+    low, high = _overlap_bounds(own_rows, rival_rows)
     fractions = []
     for feature in range(own_rows.shape[1]):
-        if hi[feature] >= lo[feature]:
+        if high[feature] >= low[feature]:
             fraction = float(
                 np.mean(
-                    (own_rows[:, feature] >= lo[feature])
-                    & (own_rows[:, feature] <= hi[feature])
+                    (own_rows[:, feature] >= low[feature])
+                    & (own_rows[:, feature] <= high[feature])
                 )
             )
         else:
@@ -58,16 +79,13 @@ def _f3_pair(own_rows: np.ndarray, rival_rows: np.ndarray) -> float:
 
 def _f4_pair(own_rows: np.ndarray, rival_rows: np.ndarray) -> float:
     """Return F4, the own share in every overlap; higher is harder."""
-    min_own, max_own = own_rows.min(axis=0), own_rows.max(axis=0)
-    min_rival, max_rival = rival_rows.min(axis=0), rival_rows.max(axis=0)
-    lo = np.maximum(min_own, min_rival)
-    hi = np.minimum(max_own, max_rival)
-    if np.any(hi < lo):
+    low, high = _overlap_bounds(own_rows, rival_rows)
+    if np.any(high < low):
         return 0.0
     in_all = np.ones(len(own_rows), dtype=bool)
     for feature in range(own_rows.shape[1]):
-        in_all &= (own_rows[:, feature] >= lo[feature]) & (
-            own_rows[:, feature] <= hi[feature]
+        in_all &= (own_rows[:, feature] >= low[feature]) & (
+            own_rows[:, feature] <= high[feature]
         )
     return float(np.mean(in_all))
 
@@ -76,7 +94,7 @@ def _pair_measures(
     own_rows: np.ndarray, rivals_rows: Sequence[np.ndarray]
 ) -> dict[str, list[float]]:
     """Return F1-F4 of a population against each of its rivals."""
-    values_by_key: dict[str, list[float]] = {key: [] for key in _F_KEYS}
+    values_by_key: dict[str, list[float]] = {key: [] for key in F_KEYS}
     for rival_rows in rivals_rows:
         if len(rival_rows) < 2:
             continue
@@ -114,17 +132,15 @@ def compute_f_measures(
     }
 
     result: dict[int, dict[str, float | None]] = {}
-    for population_id, own_rows in tqdm(
-        rows_by_population.items(), desc="F measures", unit="pop", leave=False
-    ):
+    for population_id, own_rows in rows_by_population.items():
         if len(own_rows) < 2 or own_rows.shape[1] == 0:
-            pair_values = {key: [] for key in _F_KEYS}
+            pair_values = {key: [] for key in F_KEYS}
         else:
             pair_values = _pair_measures(
                 own_rows, [rows_by_population[rival] for rival in rivals[population_id]]
             )
         row: dict[str, float | None] = {}
-        for key in _F_KEYS:
+        for key in F_KEYS:
             row |= summarize(key, pair_values[key])
         result[population_id] = row
 

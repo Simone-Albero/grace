@@ -1,23 +1,43 @@
-"""Every complexity family for every population."""
+"""Every complexity family for every population (region or class)."""
 
-__all__ = ["compute_population_complexity"]
+from __future__ import annotations
+
+__all__ = ["MEASURES", "compute_population_complexity", "nearest_rivals"]
 
 from collections.abc import Mapping, Sequence
+from itertools import chain
 
 import numpy as np
 from sklearn.metrics import pairwise_distances
 
-from src.complexity.common import MeasuredSample
+from src.complexity.common import MeasuredSample, summary_keys
 from src.complexity.dimensionality import compute_t_measures
-from src.complexity.feature import compute_f_measures
-from src.complexity.geometry import compute_geometry_measures
-from src.complexity.neighborhood import compute_n_measures
+from src.complexity.feature import F_KEYS, compute_f_measures
+from src.complexity.geometry import GEOMETRY_KEYS, compute_geometry_measures
+from src.complexity.linearity import L_KEYS, compute_l_measures
+from src.complexity.neighborhood import N_KEYS, compute_n_measures
 from src.complexity.network import compute_network_measures
-from src.graph import TrainGraph
+from src.graph import Graph
+
+MEASURES: tuple[str, ...] = (
+    *chain.from_iterable(map(summary_keys, F_KEYS)),
+    *chain.from_iterable(map(summary_keys, N_KEYS)),
+    *summary_keys("network_density"),
+    "cls_coef",
+    "hub",
+    "rival_classes",
+    "rival_entropy",
+    "t2",
+    "t3",
+    "t4",
+    "anisotropy",
+    *GEOMETRY_KEYS,
+    *L_KEYS,
+)
 
 
-def _nearest_rivals(
-    ids: Sequence[int], classes: np.ndarray, distances: np.ndarray, *, top_k: int
+def nearest_rivals(
+    ids: Sequence[int], classes: np.ndarray, distances: np.ndarray, top_k: int
 ) -> dict[int, list[int]]:
     """Return each population's `top_k` nearest rivals by centroid.
 
@@ -39,7 +59,7 @@ def _nearest_rivals(
 
 
 def compute_population_complexity(
-    train_graph: TrainGraph,
+    graph: Graph,
     graph_population: np.ndarray,
     sample: MeasuredSample,
     *,
@@ -55,7 +75,7 @@ def compute_population_complexity(
     """Return every complexity family for each population.
 
     Args:
-        train_graph: The graph of the train rows.
+        graph: The graph of the train rows.
         graph_population: The population id of every graph node.
         sample: The sampled rows with their graph neighbours.
         population_class: The class of every population id.
@@ -65,13 +85,14 @@ def compute_population_complexity(
         metric: The distance of the clustering space.
         silhouette_max_samples: The silhouette subsample cap.
         silhouette_min_per_cluster: The silhouette floor per cluster.
-        random_state: The seed of the silhouette subsample.
+        random_state: The seed of the silhouette subsample and of the
+            points the L3 measure interpolates.
 
     Returns:
-        The F, N, ND, T and G measures by population id, ascending.
+        The F, N, ND, T, G and L measures by population id, ascending.
     """
     ids = list(population_class)
-    matrix = np.stack(
+    centroid_matrix = np.stack(
         [
             np.asarray(centroids[population_id], dtype=np.float64)
             for population_id in ids
@@ -80,18 +101,23 @@ def compute_population_complexity(
     classes = np.array(
         [population_class[population_id] for population_id in ids], dtype=np.int64
     )
-    centroid_distances = pairwise_distances(matrix, metric=metric)
+    centroid_distances = pairwise_distances(centroid_matrix, metric=metric)
     np.fill_diagonal(centroid_distances, np.inf)
-    rivals = _nearest_rivals(ids, classes, centroid_distances, top_k=top_k_clusters)
+    rivals = nearest_rivals(ids, classes, centroid_distances, top_k=top_k_clusters)
 
     feature_overlap = compute_f_measures(
         sample.X, sample.population, rivals, metric=metric
     )
-    neighborhood = compute_n_measures(
-        sample, graph_population, train_graph.mst_edges, rivals
-    )
+    neighborhood = compute_n_measures(sample, graph_population, graph.mst, rivals)
     network = compute_network_measures(
-        sample, graph_population, train_graph.knn_idx, rivals
+        sample,
+        graph_population,
+        graph.knn_idx,
+        rivals,
+        population_class=population_class,
+        graph_class=np.array(
+            [population_class[population_id] for population_id in graph_population]
+        ),
     )
     dimensionality = compute_t_measures(
         sample.X, sample.population, sizes, metric=metric
@@ -100,13 +126,17 @@ def compute_population_complexity(
         sample.X,
         sample.population,
         ids=ids,
-        centroid_matrix=matrix,
+        rivals=rivals,
+        centroid_matrix=centroid_matrix,
         classes=classes,
         centroid_distances=centroid_distances,
         metric=metric,
         silhouette_max_samples=silhouette_max_samples,
         silhouette_min_per_cluster=silhouette_min_per_cluster,
         random_state=random_state,
+    )
+    linearity = compute_l_measures(
+        sample.X, sample.population, rivals, metric=metric, random_state=random_state
     )
 
     return {
@@ -116,6 +146,7 @@ def compute_population_complexity(
             **network[population_id],
             **dimensionality[population_id],
             **geometry[population_id],
+            **linearity[population_id],
         }
         for population_id in sorted(population_class)
     }

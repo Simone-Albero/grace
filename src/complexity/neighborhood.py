@@ -1,16 +1,29 @@
-"""N1-N4 neighbourhood measures."""
+"""N1-N4: how many of a population's neighbours belong to a rival.
 
-__all__ = ["compute_n_measures"]
+Per (own, rival) pair; only neighbours of own or of the rival count:
+- n1 = own graph nodes with an MST edge to a rival node / own graph
+  nodes (0 without such an edge; no value when own has no graph node);
+- n2 = mean of d_own / (d_own + d_rival + 1e-8) over the sampled own
+  rows with both an own and a rival node among their k neighbours (0 if
+  none), d_* the distance to the nearest of each;
+- n3 = share of the own rows whose nearest own-or-rival neighbour is a
+  rival (over the rows with one; 0 if none);
+- n4 = share of the own rows with more rival than own neighbours (ties
+  are right; over the rows with a vote; 0 if none).
+"""
+
+from __future__ import annotations
+
+__all__ = ["N_KEYS", "compute_n_measures"]
 
 from collections.abc import Mapping, Sequence
 
 import numpy as np
-from tqdm import tqdm
 
 from src.complexity.common import MeasuredSample, summarize
 
 _EPS = 1e-8
-_N_KEYS = ("n1", "n2", "n3", "n4")
+N_KEYS = ("n1", "n2", "n3", "n4")
 
 
 def _n1_pair(
@@ -99,7 +112,7 @@ def _pair_measures(
     mst_edges: np.ndarray,
 ) -> dict[str, list[float]]:
     """Return N1-N4 of a population against each of its rivals."""
-    values_by_key: dict[str, list[float]] = {key: [] for key in _N_KEYS}
+    values_by_key: dict[str, list[float]] = {key: [] for key in N_KEYS}
     for rival_mask in rival_masks:
         n1, n2, n3, n4 = _rival_measures(
             neighbors, neighbor_dist, own_mask, rival_mask, mst_edges
@@ -135,7 +148,7 @@ def compute_n_measures(
         its rivals.
     """
     result: dict[int, dict[str, float | None]] = {}
-    for population_id in tqdm(rivals, desc="N measures", unit="pop", leave=False):
+    for population_id in rivals:
         in_population = sample.population == population_id
         pair_values = _pair_measures(
             sample.neighbors[in_population],
@@ -145,7 +158,7 @@ def compute_n_measures(
             mst_edges,
         )
         row: dict[str, float | None] = {}
-        for key in _N_KEYS:
+        for key in N_KEYS:
             row |= summarize(key, pair_values[key])
         result[population_id] = row
 

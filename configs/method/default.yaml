@@ -1,0 +1,58 @@
+# Parameters of the method, shared by every dataset and classifier (src.config.MethodConfig).
+distance: euclidean      # euclidean | cosine: metric of the graph, the regions and the complexity measures
+balance: undersample     # train: undersample every class to the smallest one | none
+
+space:                   # the euclidean space regions live in (src.space)
+  top_k: 16              # most frequent codes of each categorical column with their own one-hot slot; the rest share one
+  cat_cost: 1.0          # squared distance a categorical mismatch adds; 1.0 weighs it like one IQR step
+
+graph:                   # k-nearest-neighbour graph of train (src.graph)
+  max_samples: 50000     # train rows in the graph: a uniform sample above this (the build is quadratic)
+  k: 30                  # neighbours of each row
+
+clustering:              # regions: each class of train clustered on its own (src.clustering)
+  name: kmeans           # kmeans | birch | spectral | hdbscan
+  params: {}             # keyword-only parameters of the fit function; a list is swept and the least loss kept
+                         #   birch: {branching_factor: 50}; spectral: {n_neighbors: 10}
+                         #   hdbscan: {min_cluster_size: [5, 10, 25, 50, 100, 200],
+                         #             min_samples: [1, 5, 15, 50, 100], cluster_selection_method: leaf}
+  max_fit_samples: 20000 # rows a candidate is fitted and scored on; a larger class is subsampled, then refit whole
+  max_regions: 2500      # regions over all classes, shared equally between them
+  min_cluster_floor: 20  # finest n_clusters ≈ class size / this; also the merge floor of small clusters and noise
+  hardness_k: 30         # neighbours behind the kDN hardness the granularity loss is judged on
+
+complexity:              # descriptors of every region and class (src.complexity)
+  top_k_clusters: 10           # nearest rivals (populations of another class) each population is compared with
+  max_sample_per_region: 200   # rows a region is measured on when train is larger than graph.max_samples
+  max_sample_per_class: 2000   # the same for a class
+  silhouette_max_samples: 10000  # subsample behind the silhouette tail (p5_silhouette, frac_at_risk)
+  silhouette_min_per_cluster: 50 # rows per population kept even past silhouette_max_samples
+
+regressor:               # Random Forest from descriptors to failure rate (src.regressor)
+  min_eval_support: 5    # regions with fewer test rows are scored by no predictor (RF, MCP, ATC)
+  n_outer_splits: 5      # outer CV folds: each region's rate is predicted by a fit that never saw it
+  n_inner_splits: 5      # inner CV folds of the hyper-parameter search
+  n_iter: 40             # RandomizedSearchCV draws per fit; a smaller grid is searched whole
+  params: {}             # fixed RandomForestRegressor parameters (random_state comes from the dataset seed)
+  param_grid:
+    n_estimators: [100, 200, 300, 500]
+    max_depth: [null, 3, 5, 10, 20]
+    min_samples_leaf: [1, 2, 3, 5]
+    max_features: [sqrt, 0.5]
+  measures:              # complexity measures the forest sees, as region_<m> and class_<m>; null: every measure
+    - network_density_max
+    - p95_dispersion
+    - p5_silhouette
+    - f1_mean
+    - f3_mean
+    - n2_mean
+    - n1_mean
+    - t2
+    - dist_to_nearest_rival
+    - hub
+    - cls_coef
+    - rival_reach
+    - anisotropy
+    - l2
+    - rival_classes
+    - rival_entropy

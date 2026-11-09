@@ -1,6 +1,8 @@
-"""The sample and aggregation helpers of the complexity families."""
+"""The sample the complexity families read, and their summary."""
 
-__all__ = ["MeasuredSample", "summarize"]
+from __future__ import annotations
+
+__all__ = ["MeasuredSample", "summarize", "summary_keys"]
 
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -26,6 +28,18 @@ class MeasuredSample:
     neighbor_dist: np.ndarray
 
 
+def summary_keys(key: str) -> tuple[str, str, str]:
+    """Return the names summarize gives the min, mean and max of key.
+
+    Args:
+        key: The descriptor name, e.g. "f1".
+
+    Returns:
+        `<key>_min`, `<key>_mean` and `<key>_max`.
+    """
+    return (f"{key}_min", f"{key}_mean", f"{key}_max")
+
+
 def summarize(key: str, values: Sequence[float]) -> dict[str, float | None]:
     """Return the min, mean and max of `values`, as `<key>_min` etc.
 
@@ -37,7 +51,7 @@ def summarize(key: str, values: Sequence[float]) -> dict[str, float | None]:
         The three entries, in that order; None each when `values` is
         empty.
     """
-    names = (f"{key}_min", f"{key}_mean", f"{key}_max")
+    names = summary_keys(key)
     if not values:
         return dict.fromkeys(names)
     array = np.asarray(values, dtype=np.float64)

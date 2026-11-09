@@ -1,0 +1,39 @@
+name: bank_marketing
+path: resources/raw_data/bank_marketing/bank_marketing.csv
+label_col: y
+
+num_cols:
+  - age
+  - duration
+  - campaign
+  - pdays
+  - previous
+  - emp.var.rate
+  - cons.price.idx
+  - cons.conf.idx
+  - euribor3m
+  - nr.employed
+
+cat_cols:
+  - job
+  - marital
+  - education
+  - default
+  - housing
+  - loan
+  - contact
+  - month
+  - day_of_week
+  - poutcome
+
+split:  # stratified by class, after dropping non-finite rows and rare classes
+  train: 0.4
+  val: 0.15  # the ATC threshold is fitted here; no classifier trains on it
+  test: 0.45  # every failure rate is measured here
+
+min_class_count: 100  # classes with fewer rows are dropped
+top_n: 32  # most frequent values of a categorical column that keep their own code
+hash_buckets: 64  # the other values are hashed into this many codes
+seed: 42
+output_dir: resources/processed/bank_marketing
+db_path: resources/processed/grace.db

@@ -1,216 +1,165 @@
-"""F/N/ND/T/G complexity descriptors of each region and class, on train.
+"""Stage complexity: descriptors of every region and class."""
 
-DB rows written: `complexity` (one row per scope, id and measure) and
-metric n_measures.
-"""
+from __future__ import annotations
 
-__all__ = ["CONFIG", "INPUTS", "FILES", "OUTPUTS", "run"]
+__all__ = ["run"]
 
-import logging
-from collections.abc import Mapping
-from pathlib import Path
+import math
+import sqlite3
 
 import joblib
 import numpy as np
-import pandas as pd
-from omegaconf import DictConfig
+import polars as pl
 
-from src.clustering import compute_centroids
+from src import db
+from src.clustering import centroids
 from src.complexity.common import MeasuredSample
 from src.complexity.measure import compute_population_complexity
-from src.graph import TrainGraph, nearest_neighbors
-from src.grouping import RowsBy
-from src.space import Space, scale_for_metric
-from stages import LABEL, Context
+from src.config import DatasetConfig
+from src.graph import Graph, nearest_neighbors
+from src.prepare import LABEL
+from src.space import embed, scale_for_metric
+from stages.paths import (
+    assignments_file,
+    complexity_file,
+    graph_file,
+    need,
+    read_split,
+    regions_file,
+    space_file,
+)
 
-logger = logging.getLogger(__name__)
 
-CONFIG = ("complexity", "graph.k", "distance", "seed")
-INPUTS = ("prepare", "regions")
-FILES = ()
-# The stage writes DB rows only.
-OUTPUTS = ()
+def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
+    """Describe every region and every class on its train rows.
+
+    Reads train, regions.parquet, the train rows of assignments.parquet,
+    space.joblib and graph.npz. When the graph samples train (fewer
+    nodes than train rows), a region is measured on at most
+    max_sample_per_region of its rows and a class on
+    max_sample_per_class (one generator seeded by seed per scope,
+    populations in ascending id); otherwise on every row, reusing the
+    graph's own neighbours. The measured rows get their graph.k nearest
+    graph nodes, never themselves. Region centroids are those of
+    regions.parquet; class centroids the mean of the measured rows (unit
+    length under cosine). Then measure.compute_population_complexity per
+    scope.
+
+    Writes to output_dir: complexity.parquet (scope "region" | "class",
+    id, measure, value; null when undefined), one row per population and
+    measure of MEASURES.
+    Logs: complexity (the same rows).
+    """
+    method = cfg.method
+    train = read_split(cfg, "train")
+    space = joblib.load(need(space_file(cfg), "regions"))
+    with np.load(need(graph_file(cfg), "regions")) as stored:
+        graph = Graph(**{name: stored[name] for name in stored.files})
+    regions = pl.read_parquet(need(regions_file(cfg), "regions"))
+    assignments = pl.read_parquet(need(assignments_file(cfg), "regions"))
+    region = assignments.filter(pl.col("split") == "train").sort("row")["region"]
+    region = region.to_numpy()
+    label = train[LABEL].to_numpy()
+    region_class = dict(zip(regions["region"].to_list(), regions["class"].to_list()))
+    if len(region) != len(label) or any(
+        region_class[r] != c for r, c in zip(region.tolist(), label.tolist())
+    ):
+        raise ValueError(
+            "the regions were built on another train split: run regions again"
+        )
+    codes = (
+        train.select(cfg.cat_cols).to_numpy().reshape(train.height, len(cfg.cat_cols))
+    )
+    points = scale_for_metric(
+        embed(space, train.select(cfg.num_cols).to_numpy(), codes), method.distance
+    )
+    sampled = len(graph.rows) < train.height
+    caps = {
+        "region": method.complexity.max_sample_per_region if sampled else None,
+        "class": method.complexity.max_sample_per_class if sampled else None,
+    }
+    region_centroids = dict(
+        zip(regions["region"].to_list(), np.array(regions["centroid"].to_list()))
+    )
+    measure_rows = []
+    for scope, population in (("region", region), ("class", label)):
+        print(f"[complexity] measuring every {scope}", flush=True)
+        sample = _draw_sample(cfg, points, population, graph, caps[scope])
+        if scope == "region":
+            population_class = dict(
+                zip(regions["region"].to_list(), regions["class"].to_list())
+            )
+            centers = region_centroids
+        else:
+            population_class = {int(code): int(code) for code in np.unique(label)}
+            class_ids, class_centroids = centroids(
+                sample.X, sample.population, method.distance
+            )
+            centers = dict(zip(class_ids.tolist(), class_centroids))
+        ids, counts = np.unique(population, return_counts=True)
+        measures = compute_population_complexity(
+            graph,
+            population[graph.rows],
+            sample,
+            population_class=population_class,
+            centroids=centers,
+            sizes=dict(zip(ids.tolist(), counts.tolist())),
+            top_k_clusters=method.complexity.top_k_clusters,
+            metric=method.distance,
+            silhouette_max_samples=method.complexity.silhouette_max_samples,
+            silhouette_min_per_cluster=method.complexity.silhouette_min_per_cluster,
+            random_state=cfg.seed,
+        )
+        for population_id, values in measures.items():
+            measure_rows += [
+                {
+                    "scope": scope,
+                    "id": int(population_id),
+                    "measure": measure,
+                    "value": _number(value),
+                }
+                for measure, value in values.items()
+            ]
+    table = pl.DataFrame(
+        measure_rows,
+        schema={
+            "scope": pl.String,
+            "id": pl.Int64,
+            "measure": pl.String,
+            "value": pl.Float64,
+        },
+    )
+    table.write_parquet(complexity_file(cfg))
+    print(f"[complexity] saved {table.height} values", flush=True)
+    db.log_table(conn, run_id, "complexity", measure_rows)
+
+
+def _number(value: float | None) -> float | None:
+    """Return value as a float, None when undefined or not finite."""
+    return None if value is None or not math.isfinite(value) else float(value)
 
 
 def _draw_sample(
-    cfg: DictConfig,
-    *,
-    space: Space,
-    train: pd.DataFrame,
+    cfg: DatasetConfig,
+    points: np.ndarray,
     population: np.ndarray,
-    train_graph: TrainGraph,
-    graph_rows: np.ndarray,
+    graph: Graph,
     cap: int | None,
-    n_jobs: int,
 ) -> MeasuredSample:
-    """Draw the rows to measure and find their nearest graph nodes.
-
-    Returns:
-        Up to `cap` rows of every population, in train order, with
-        their nearest graph nodes.
-    """
-    by_population = RowsBy(population)
+    """Draw at most cap rows per population, with their graph nodes."""
     rng = np.random.default_rng(cfg.seed)
     picked = []
-    for i in range(len(by_population.ids)):
-        members = by_population.members(i)
+    for population_id in np.unique(population):
+        members = np.flatnonzero(population == population_id)
         if cap is not None and len(members) > cap:
             members = rng.choice(members, size=cap, replace=False)
         picked.append(members)
     rows = np.sort(np.concatenate(picked))
-    if np.array_equal(rows, graph_rows):
+    if np.array_equal(rows, graph.rows):
         return MeasuredSample(
-            train_graph.points,
-            population[rows],
-            train_graph.knn_idx,
-            train_graph.knn_dist,
+            graph.points, population[rows], graph.knn_idx, graph.knn_dist
         )
-    points = space.embed(train.iloc[rows])
-    neighbors, neighbor_dist = nearest_neighbors(
-        train_graph.points,
-        graph_rows,
-        points,
-        rows,
-        k=cfg.graph.k,
-        metric=cfg.distance,
-        n_jobs=n_jobs,
+    neighbors, distances = nearest_neighbors(
+        graph.points, graph.rows, points[rows], rows, cfg.method.graph.k
     )
-    return MeasuredSample(points, population[rows], neighbors, neighbor_dist)
-
-
-def _measure(
-    cfg: DictConfig,
-    *,
-    train_graph: TrainGraph,
-    graph_rows: np.ndarray,
-    population: np.ndarray,
-    sample: MeasuredSample,
-    population_class: Mapping[int, int],
-    centroids: Mapping[int, np.ndarray],
-) -> dict[int, dict[str, float | None]]:
-    """Return the complexity measures of every population, by id."""
-    ids, counts = np.unique(population, return_counts=True)
-    return compute_population_complexity(
-        train_graph,
-        population[graph_rows],
-        sample,
-        population_class=population_class,
-        centroids=centroids,
-        sizes=dict(zip(ids.tolist(), counts.tolist())),
-        top_k_clusters=cfg.complexity.top_k_clusters,
-        metric=cfg.distance,
-        silhouette_max_samples=cfg.complexity.silhouette_max_samples,
-        silhouette_min_per_cluster=cfg.complexity.silhouette_min_per_cluster,
-        random_state=cfg.seed,
-    )
-
-
-def _long_rows(
-    scope: str, measures: Mapping[int, Mapping[str, float | None]]
-) -> pd.DataFrame:
-    """Return one row per (scope id, measure).
-
-    An undefined measure gives a NULL value.
-    """
-    rows = []
-    for scope_id, row in measures.items():
-        for measure, value in row.items():
-            rows.append(
-                {
-                    "scope": scope,
-                    "scope_id": scope_id,
-                    "measure": measure,
-                    "value": value,
-                }
-            )
-    return pd.DataFrame(rows)
-
-
-def _load_train_graph(
-    regions_dir: Path, space: Space, train: pd.DataFrame
-) -> tuple[TrainGraph, np.ndarray]:
-    """Load the train graph of regions and the train rows it covers."""
-    with np.load(regions_dir / "graph.npz") as stored:
-        graph_arrays = {name: stored[name] for name in stored.files}
-    graph_rows = graph_arrays["rows"]
-    train_graph = TrainGraph(
-        space.embed(train.iloc[graph_rows]),
-        graph_arrays["knn_idx"],
-        graph_arrays["knn_dist"],
-        graph_arrays["mst"],
-    )
-    return train_graph, graph_rows
-
-
-def run(ctx: Context) -> None:
-    """Measure every region and class of the train split.
-
-    Args:
-        ctx: The stage context.
-    """
-    cfg = ctx.cfg
-    regions_dir = ctx.inputs["regions"].dir
-    space = joblib.load(regions_dir / "space.joblib")
-    train = pd.read_parquet(ctx.inputs["prepare"].dir / "train.parquet")
-    train_graph, graph_rows = _load_train_graph(regions_dir, space, train)
-    assigned = ctx.split_rows("regions", "assignments.parquet", "train", ["region_id"])
-    region = assigned["region_id"].to_numpy(dtype=np.int64)
-    label = train[LABEL].to_numpy(dtype=np.int64)
-
-    graph_is_sample = len(graph_rows) < len(train)
-    centroids = pd.read_parquet(regions_dir / "centroids.parquet")
-    region_class = dict(zip(centroids["region_id"], centroids["class_id"]))
-    coordinates = centroids.drop(columns=["region_id", "class_id"]).to_numpy()
-
-    region_sample = _draw_sample(
-        cfg,
-        space=space,
-        train=train,
-        population=region,
-        train_graph=train_graph,
-        graph_rows=graph_rows,
-        cap=cfg.complexity.max_sample_per_region if graph_is_sample else None,
-        n_jobs=ctx.runtime.n_jobs,
-    )
-    region_measures = _measure(
-        cfg,
-        train_graph=train_graph,
-        graph_rows=graph_rows,
-        population=region,
-        sample=region_sample,
-        population_class=region_class,
-        # Exact centroids: the ones regions routes by, not a sample's.
-        centroids=dict(zip(centroids["region_id"], coordinates)),
-    )
-
-    label_sample = _draw_sample(
-        cfg,
-        space=space,
-        train=train,
-        population=label,
-        train_graph=train_graph,
-        graph_rows=graph_rows,
-        cap=cfg.complexity.max_sample_per_class if graph_is_sample else None,
-        n_jobs=ctx.runtime.n_jobs,
-    )
-    class_measures = _measure(
-        cfg,
-        train_graph=train_graph,
-        graph_rows=graph_rows,
-        population=label,
-        sample=label_sample,
-        population_class={
-            int(class_id): int(class_id) for class_id in np.unique(label)
-        },
-        centroids=compute_centroids(
-            scale_for_metric(label_sample.X, cfg.distance),
-            label_sample.population,
-            metric=cfg.distance,
-        ),
-    )
-    rows = pd.concat(
-        [_long_rows("region", region_measures), _long_rows("class", class_measures)],
-        ignore_index=True,
-    )
-    ctx.write("complexity", rows)
-    ctx.save_metrics({"n_measures": rows["measure"].nunique()})
+    return MeasuredSample(points[rows], population[rows], neighbors, distances)
