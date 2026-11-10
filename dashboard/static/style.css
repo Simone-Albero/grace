@@ -137,5 +137,9 @@ svg .dot.selected { stroke: var(--text); stroke-width: 2; }
 /* region trees and maps */
 .tree .edge { stroke: var(--axis); stroke-width: 1.5; }
 .tree .node { cursor: pointer; }
+button.chip { background: none; font: inherit; font-size: 12px; cursor: pointer; }
+button.chip:hover { color: var(--text); border-color: var(--muted); }
+.chip i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 6px; }
+#rg-ov-branches { margin-bottom: 12px; }
 .zoomable { cursor: grab; touch-action: none; user-select: none; }
 .zoomable.dragging { cursor: grabbing; }

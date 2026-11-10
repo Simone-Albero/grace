@@ -10,6 +10,9 @@ pruned; their rows, and the rows of the class outside the sample the
 tree was built on, take the region of their nearest labelled rows by
 vote. Hardness is kDN: the share of a row's nearest graph nodes of
 another class.
+
+The regions of every class then grow one more Ward tree, the class
+ignored: the overlap tree, where the classes meet.
 """
 
 from __future__ import annotations
@@ -17,21 +20,28 @@ from __future__ import annotations
 __all__ = [
     "Candidate",
     "ClassClustering",
+    "Contact",
+    "OverlapTree",
     "RegionTree",
     "WardTree",
     "best_cut",
     "centroids",
     "cluster_class",
+    "contacts",
     "kdn",
+    "overlap_tree",
     "region_loss",
     "vote",
     "ward_tree",
+    "within_ss",
 ]
 
 from dataclasses import dataclass
 
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
+
+_CHUNK = 65536  # rows per block of within_ss
 
 
 @dataclass(frozen=True)
@@ -107,6 +117,64 @@ class ClassClustering:
     loss: float
     n_voted: int
     candidates: list[Candidate]
+
+
+@dataclass(frozen=True)
+class OverlapTree:
+    """The Ward tree of the regions of every class, the class ignored.
+
+    Ward needs only the weighted centroid and the mass of each cluster,
+    so the tree grown from the regions is the Ward tree their rows would
+    grow from there: the class trees continued across the classes.
+    Nodes are in pre-order, the left child first, so a parent comes
+    before its children and the leaves come in the order of the tree.
+
+    Attributes:
+        parent: The parent of each node, -1 at the root, shape (m,),
+            int64.
+        region: The region of a leaf (its row in the centroids); -1 at
+            an internal node. Shape (m,), int64.
+        height: The merge height of an internal node, sqrt(2 Δ) as in
+            WardTree; 0 at a leaf. Shape (m,), float64.
+        distance: The distance between the centroids of an internal
+            node's two children; nan at a leaf. Shape (m,), float64.
+        ratio: distance / (r_left + r_right), r the radius of a child:
+            the root mean square distance of its rows (weighted) from
+            its centroid. Under 1 the two spreads overlap. nan at a
+            leaf; with both radii 0, 0 on one point and inf apart.
+            Shape (m,), float64.
+    """
+
+    parent: np.ndarray
+    region: np.ndarray
+    height: np.ndarray
+    distance: np.ndarray
+    ratio: np.ndarray
+
+
+@dataclass(frozen=True)
+class Contact:
+    """A node of the overlap tree where two classes meet.
+
+    One class lies only below the node's left child, the other only
+    below its right child: neither child holds both.
+
+    Attributes:
+        node: The overlap tree node.
+        classes: The two classes, the left child's first.
+        regions: The regions of each class below node, ascending.
+        distance: The distance between the centroids of the two
+            classes' rows below node.
+        ratio: distance / (r_0 + r_1), r the radius of each class's
+            rows below node (as in OverlapTree; with both radii 0, 0
+            on one point and inf apart).
+    """
+
+    node: int
+    classes: tuple[int, int]
+    regions: tuple[np.ndarray, np.ndarray]
+    distance: float
+    ratio: float
 
 
 def kdn(neighbor_labels: np.ndarray, label: int) -> np.ndarray:
@@ -223,6 +291,140 @@ def ward_tree(X: np.ndarray, weights: np.ndarray) -> WardTree:
         children[j] = sorted((node[a], node[b]))
         node[a] = n + j
     return WardTree(children, np.asarray(heights)[order])
+
+
+def within_ss(
+    X: np.ndarray, labels: np.ndarray, weights: np.ndarray, centers: np.ndarray
+) -> np.ndarray:
+    """Return the weighted sum of squared distances of each label's rows from its centroid.
+
+    Args:
+        X: The points, shape (n, d).
+        labels: The label of every row, 0..m - 1.
+        weights: The weight of every row, > 0.
+        centers: The weighted centroid of every label, shape (m, d).
+
+    Returns:
+        Σ w ||x - c||² per label, shape (m,).
+    """
+    ss = np.zeros(len(centers))
+    for start in range(0, len(X), _CHUNK):
+        part = slice(start, start + _CHUNK)
+        diff = np.asarray(X[part], dtype=np.float64) - centers[labels[part]]
+        ss += np.bincount(
+            labels[part],
+            weights=weights[part] * np.einsum("ij,ij->i", diff, diff),
+            minlength=len(centers),
+        )
+    return ss
+
+
+def overlap_tree(
+    centers: np.ndarray, masses: np.ndarray, scatter: np.ndarray
+) -> OverlapTree:
+    """Grow the Ward tree of the regions, each a cluster of its rows.
+
+    Args:
+        centers: The weighted centroid of every region, shape (m, d),
+            m >= 1.
+        masses: The summed weight of every region's rows, > 0.
+        scatter: within_ss of every region.
+
+    Returns:
+        The tree; a single leaf when m = 1.
+    """
+    centers = np.asarray(centers, dtype=np.float64)
+    masses = np.asarray(masses, dtype=np.float64)
+    m = len(centers)
+    ward = ward_tree(centers, masses)
+    n_nodes = 2 * m - 1
+    center = np.empty((n_nodes, centers.shape[1]))
+    mass, ss = np.empty(n_nodes), np.empty(n_nodes)
+    center[:m], mass[:m], ss[:m] = centers, masses, scatter
+    distance, ratio = np.full(n_nodes, np.nan), np.full(n_nodes, np.nan)
+    for j, (a, b) in enumerate(ward.children):
+        v = m + j
+        mass[v] = mass[a] + mass[b]
+        center[v] = (mass[a] * center[a] + mass[b] * center[b]) / mass[v]
+        squared = float(np.sum((center[a] - center[b]) ** 2))
+        ss[v] = ss[a] + ss[b] + mass[a] * mass[b] / mass[v] * squared
+        distance[v] = np.sqrt(squared)
+        ratio[v] = _ratio(
+            distance[v], np.sqrt(ss[a] / mass[a]) + np.sqrt(ss[b] / mass[b])
+        )
+    height = np.concatenate([np.zeros(m), ward.heights])
+    order, parent = [], []
+    stack = [(n_nodes - 1, -1)]
+    while stack:
+        v, up = stack.pop()
+        parent.append(up)
+        if v >= m:
+            a, b = ward.children[v - m]
+            stack += [(b, len(order)), (a, len(order))]
+        order.append(v)
+    order = np.asarray(order, dtype=np.int64)
+    return OverlapTree(
+        parent=np.asarray(parent, dtype=np.int64),
+        region=np.where(order < m, order, -1),
+        height=height[order],
+        distance=distance[order],
+        ratio=ratio[order],
+    )
+
+
+def contacts(
+    tree: OverlapTree,
+    classes: np.ndarray,
+    centers: np.ndarray,
+    masses: np.ndarray,
+    scatter: np.ndarray,
+) -> list[Contact]:
+    """Return every node where two classes meet, in the node order of tree.
+
+    A node with k classes on one side and l on the other is a contact
+    of each pair (one class from each side) that neither child holds
+    both of.
+
+    Args:
+        tree: overlap_tree of the regions.
+        classes: The class of every region.
+        centers: The weighted centroid of every region, shape (m, d).
+        masses: The summed weight of every region's rows, > 0.
+        scatter: within_ss of every region.
+
+    Returns:
+        The contacts, by node, then by the pair of classes.
+    """
+    n_nodes = len(tree.parent)
+    kids: list[list[int]] = [[] for _ in range(n_nodes)]
+    for v in range(1, n_nodes):
+        kids[tree.parent[v]].append(v)  # ascending: the left child first
+    members: list[dict[int, list[int]]] = [{} for _ in range(n_nodes)]
+    for v in range(n_nodes - 1, -1, -1):
+        if tree.region[v] >= 0:
+            members[v] = {int(classes[tree.region[v]]): [int(tree.region[v])]}
+            continue
+        for kid in kids[v]:
+            for code, regions in members[kid].items():
+                members[v].setdefault(code, []).extend(regions)
+    found = []
+    for v in np.flatnonzero(tree.region < 0):
+        left, right = (members[kid] for kid in kids[v])
+        for a in sorted(left):
+            for b in sorted(right):
+                if a == b or b in left or a in right:
+                    continue
+                parts = (np.sort(left[a]), np.sort(right[b]))
+                (c_a, r_a), (c_b, r_b) = (
+                    _spread(part, centers, masses, scatter) for part in parts
+                )
+                distance = float(np.linalg.norm(c_a - c_b))
+                found.append(
+                    Contact(
+                        int(v), (a, b), parts, distance, _ratio(distance, r_a + r_b)
+                    )
+                )
+    return found
 
 
 def best_cut(
@@ -484,6 +686,24 @@ def _costs(
     var = np.where(count > 1, variance(count, mass, first, second), overall)
     noise = np.maximum(mean * (1 - mean), 1e-3) / count
     return mass / whole_mass * (var + noise)
+
+
+def _spread(
+    regions: np.ndarray, centers: np.ndarray, masses: np.ndarray, scatter: np.ndarray
+) -> tuple[np.ndarray, float]:
+    """Return the weighted centroid and the radius of the rows of some regions."""
+    weight = masses[regions]
+    mass = weight.sum()
+    center = weight @ centers[regions] / mass
+    ss = scatter[regions].sum() + weight @ np.sum((centers[regions] - center) ** 2, 1)
+    return center, float(np.sqrt(max(ss, 0.0) / mass))
+
+
+def _ratio(distance: float, radii: float) -> float:
+    """Return distance / radii: 0 on one point, inf apart when radii is 0."""
+    if radii > 0:
+        return float(distance / radii)
+    return 0.0 if distance == 0 else float("inf")
 
 
 def _leaf_ranges(

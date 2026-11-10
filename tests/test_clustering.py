@@ -1,4 +1,4 @@
-"""src.clustering: weighted Ward tree, cut, vote, loss and choice."""
+"""src.clustering: weighted Ward tree, cut, vote, loss, choice and overlaps."""
 
 import itertools
 
@@ -11,10 +11,13 @@ from src.clustering import (
     best_cut,
     centroids,
     cluster_class,
+    contacts,
     kdn,
+    overlap_tree,
     region_loss,
     vote,
     ward_tree,
+    within_ss,
 )
 from src.graph import sample_rows
 
@@ -319,3 +322,129 @@ def test_cluster_class_caps_the_regions_with_a_penalty():
     )
     assert result.labels.max() + 1 <= 2
     assert result.penalty > 0.0
+
+
+# --- overlaps ---
+
+
+def test_within_ss_by_hand():
+    X = np.array([[0.0, 0.0], [4.0, 0.0], [10.0, 10.0], [0.0, 3.0]])
+    labels = np.array([0, 0, 1, 0])
+    weights = np.array([3.0, 1.0, 2.0, 1.0])
+    _, centers = centroids(X, labels, weights)
+    expected = [
+        sum(
+            w * np.sum((x - centers[label]) ** 2)
+            for x, w, l in zip(X, weights, labels)
+            if l == label
+        )
+        for label in (0, 1)
+    ]
+    np.testing.assert_allclose(within_ss(X, labels, weights, centers), expected)
+
+
+def _regions(m: int, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Centroids, masses and scatters of m random regions."""
+    rng = np.random.default_rng(seed)
+    return (
+        rng.normal(0.0, 3.0, size=(m, 3)),
+        rng.integers(1, 50, size=m).astype(float),
+        rng.uniform(0.0, 20.0, size=m),
+    )
+
+
+def _below(tree, node: int) -> list[int]:
+    """The regions of the leaves below node."""
+    kids: dict[int, list[int]] = {}
+    for v, parent in enumerate(tree.parent):
+        kids.setdefault(int(parent), []).append(v)
+    stack, regions = [node], []
+    while stack:
+        v = stack.pop()
+        if tree.region[v] >= 0:
+            regions.append(int(tree.region[v]))
+        stack += kids.get(v, [])
+    return sorted(regions)
+
+
+def _spread(regions, centers, masses, scatter) -> tuple[np.ndarray, float, float]:
+    """Centroid, mass and radius of a group of regions, from its rows."""
+    mass = masses[regions].sum()
+    center = masses[regions] @ centers[regions] / mass
+    ss = scatter[regions].sum() + masses[regions] @ np.sum(
+        (centers[regions] - center) ** 2, axis=1
+    )
+    return center, mass, np.sqrt(ss / mass)
+
+
+def test_overlap_tree_of_one_region_is_a_leaf():
+    tree = overlap_tree(np.zeros((1, 2)), np.ones(1), np.zeros(1))
+    assert tree.parent.tolist() == [-1] and tree.region.tolist() == [0]
+    assert tree.height.tolist() == [0.0]
+    assert np.isnan(tree.distance).all() and np.isnan(tree.ratio).all()
+
+
+def test_overlap_tree_is_the_ward_tree_of_the_regions():
+    centers, masses, scatter = _regions(12, seed=1)
+    tree = overlap_tree(centers, masses, scatter)
+    m = len(tree.parent)
+    assert m == 2 * 12 - 1 and tree.parent[0] == -1
+    assert sorted(tree.region[tree.region >= 0].tolist()) == list(range(12))
+    internal = np.flatnonzero(tree.region < 0)
+    np.testing.assert_allclose(
+        np.sort(tree.height[internal]), ward_tree(centers, masses).heights
+    )
+    assert (tree.height[tree.region >= 0] == 0).all()
+    for v in range(1, m):
+        assert tree.parent[v] < v
+        assert tree.height[tree.parent[v]] >= tree.height[v]
+    for v in internal:
+        left, right = np.flatnonzero(tree.parent == v)
+        c_l, _, r_l = _spread(_below(tree, left), centers, masses, scatter)
+        c_r, _, r_r = _spread(_below(tree, right), centers, masses, scatter)
+        distance = np.linalg.norm(c_l - c_r)
+        assert tree.distance[v] == pytest.approx(distance)
+        assert tree.ratio[v] == pytest.approx(distance / (r_l + r_r))
+    leaves = np.flatnonzero(tree.region >= 0)
+    assert np.isnan(tree.distance[leaves]).all() and np.isnan(tree.ratio[leaves]).all()
+
+
+def test_contacts_are_where_two_classes_first_meet():
+    centers, masses, scatter = _regions(16, seed=2)
+    classes = np.random.default_rng(3).integers(0, 3, size=16)
+    tree = overlap_tree(centers, masses, scatter)
+    met = contacts(tree, classes, centers, masses, scatter)
+    expected = []
+    for v in np.flatnonzero(tree.region < 0):
+        left, right = np.flatnonzero(tree.parent == v)
+        on_left = set(classes[_below(tree, left)].tolist())
+        on_right = set(classes[_below(tree, right)].tolist())
+        for a, b in itertools.product(sorted(on_left), sorted(on_right)):
+            if a != b and not {a, b} <= on_left and not {a, b} <= on_right:
+                expected.append((int(v), (a, b)))
+    assert [(c.node, c.classes) for c in met] == expected
+    for c in met:
+        regions = _below(tree, c.node)
+        parts = [[r for r in regions if classes[r] == k] for k in c.classes]
+        assert [p.tolist() for p in c.regions] == parts
+        c_a, _, r_a = _spread(parts[0], centers, masses, scatter)
+        c_b, _, r_b = _spread(parts[1], centers, masses, scatter)
+        distance = np.linalg.norm(c_a - c_b)
+        assert c.distance == pytest.approx(distance)
+        assert c.ratio == pytest.approx(distance / (r_a + r_b))
+
+
+def test_overlapping_classes_meet_below_apart_ones():
+    # Classes 0 and 1 share a place, class 2 is far: 0 and 1 meet first,
+    # at a ratio under 1, and 2 meets each of them at the root.
+    centers = np.array([[0.0, 0.0], [0.5, 0.0], [0.2, 0.3], [40.0, 0.0]])
+    masses = np.array([10.0, 10.0, 5.0, 10.0])
+    scatter = masses * 4.0  # radius 2 for every region
+    classes = np.array([0, 0, 1, 2])
+    tree = overlap_tree(centers, masses, scatter)
+    met = contacts(tree, classes, centers, masses, scatter)
+    pairs = {frozenset(c.classes): c for c in met}
+    assert set(pairs) == {frozenset({0, 1}), frozenset({0, 2}), frozenset({1, 2})}
+    assert pairs[frozenset({0, 1})].ratio < 1
+    assert pairs[frozenset({0, 2})].ratio > 1
+    assert pairs[frozenset({0, 2})].node == pairs[frozenset({1, 2})].node == 0

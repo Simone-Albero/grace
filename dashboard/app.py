@@ -74,6 +74,10 @@ def create_app(dataset_dir: Path = DATASET_DIR) -> FastAPI:
     def region_map(dataset: str, node: int) -> Any:
         return _query(queries.region_map, load_dataset(dataset), node)
 
+    @app.get("/api/{dataset}/regions/overlap_map")
+    def overlap_map(dataset: str, node: int) -> Any:
+        return _query(queries.overlap_map, load_dataset(dataset), node)
+
     @app.get("/api/{dataset}/complexity")
     def complexity(dataset: str, measure: str | None = None) -> Any:
         return _query(queries.complexity, load_dataset(dataset), measure)

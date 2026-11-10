@@ -42,7 +42,8 @@ Stages (each writes its files into the dataset's `output_dir` and its rows into 
   being the kDN hardness spread a region hides plus the sampling noise of its mean hardness, measured on the sample.
   A branch under `min_cluster_floor` distinct rows of the sample is pruned. Its rows, and the rows outside the sample
   of the tree, take the majority region of their `vote_k` nearest labelled rows. Past `max_regions` a penalty per
-  region coarsens the cut.
+  region coarsens the cut. Last, the regions of every class grow one more weighted Ward tree, the class ignored (the
+  overlap tree): the class trees continued across the classes, where classes whose regions lie close meet low.
   Writes `regions.parquet` (with `n_read`, the rows of the CSV), `assignments.parquet`, `graph.npz`.
 - `complexity`: 45 descriptors (feature overlap F1-F4, neighbourhood N1-N4, network density and hubs,
   dimensionality T2-T4, geometry, linearity L1-L3; `src/complexity/`) of every region and every class, on its rows
@@ -66,14 +67,18 @@ whole config as JSON, status `running`, `ok` or `failed`, start and end); every 
 run that wrote it and is created by its first insert: `clean_summary`, `dropped_classes`, `dropped_columns`,
 `class_counts`, `features` (clean); `prepare_summary`, `prepared_columns` (prepare); `regions` (with the mean and
 standard deviation of the kDN hardness of each region), `region_tree` (the tree each class's cut keeps, each node with
-the distinct and CSV rows below it), `class_clusterings`, `granularity_candidates`, `region_stats` (regions);
+the distinct and CSV rows below it), `class_clusterings`, `granularity_candidates`, `overlap_tree` (the Ward tree of
+the regions of every class, the class ignored), `class_overlaps` (where two classes meet in it, each side with its
+branch of `region_tree`), `region_stats` (regions);
 `complexity`. There are no migrations: after a change of a table, delete the DB.
 
 Dashboard: `make dashboard` (`PORT=` to change it) or `python -m uvicorn dashboard.app:app` serves a read-only page
 on 127.0.0.1, one tab per stage, for the datasets of `configs/datasets/`. Each tab shows the latest `ok` run of its
 stage on that dataset, and says which stage to run when there is none. The regions tab draws the tree of each class;
 a click on a node maps its rows (at most 2,000 per region, 20,000 in all) on their first two principal components,
-computed on the click. The URL hash keeps tab and dataset, and on the regions tab class and node.
+computed on the click. Below it, the overlap tree shows where the classes meet; a click on one of its nodes maps
+its rows by class and names its branch in each class tree. The URL hash keeps tab and dataset, and on the regions tab
+class, node and overlap node.
 
 Layout:
 - `main.py`: the CLI, one stage per call inside a logged run

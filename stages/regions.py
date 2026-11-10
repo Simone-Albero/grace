@@ -10,7 +10,17 @@ import numpy as np
 import polars as pl
 
 from src import db
-from src.clustering import RegionTree, centroids, cluster_class, kdn
+from src.clustering import (
+    Contact,
+    OverlapTree,
+    RegionTree,
+    centroids,
+    cluster_class,
+    contacts,
+    kdn,
+    overlap_tree,
+    within_ss,
+)
 from src.config import DatasetConfig
 from src.graph import build_graph, nearest_neighbors, sample_rows
 from stages.paths import (
@@ -36,7 +46,9 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     nearest graph nodes, never itself) -> clustering.cluster_class with
     max_clusters = max(1, max_regions // n_classes) -> region id =
     label + offset, offset += the class's regions; tree node id = node +
-    node offset -> weighted centroids of the regions.
+    node offset -> weighted centroids of the regions -> their
+    clustering.overlap_tree (the regions of every class, each weighted
+    by its CSV rows) and its clustering.contacts.
 
     Writes to output_dir: regions.parquet (region, class, n_rows,
     n_read, centroid as a list of floats), assignments.parquet (row,
@@ -49,9 +61,18 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     (null at an internal node), n_rows and n_read of the regions below;
     nodes in pre-order), class_clusterings (class, n_rows, n_read,
     n_regions, n_voted, penalty, loss), granularity_candidates (class,
-    penalty, n_clusters, loss), region_stats (one row: n_regions,
-    distance, n_graph_nodes). n_rows counts distinct rows, n_read rows
-    of the CSV (the summed weights).
+    penalty, n_clusters, loss), overlap_tree (node, parent (-1 at the
+    root), depth, height (0 at a leaf), region (null at an internal
+    node), class (null where the node holds several), n_classes, n_rows,
+    n_read, distance and ratio of its two children (null at a leaf,
+    ratio null when infinite); nodes in pre-order), class_overlaps
+    (node of the overlap tree, height, then for its left side a and its
+    right side b: class, branch (the lowest node of region_tree above
+    every region of the class below node), n_regions, n_rows, n_read;
+    distance, ratio; one row per clustering.contacts, none with one
+    class), region_stats (one row: n_regions, distance, n_graph_nodes).
+    n_rows counts distinct rows, n_read rows of the CSV (the summed
+    weights).
     """
     method, clustering = cfg.method, cfg.method.clustering
     points, labels = read_points(cfg)
@@ -125,6 +146,10 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     region_class = labels[[np.flatnonzero(region == i)[0] for i in ids]]
     sizes = np.bincount(region, minlength=len(ids))
     reads = np.bincount(region, weights=weights, minlength=len(ids))
+    scatter = within_ss(points, region, weights, centers)
+    joint = overlap_tree(centers, reads, scatter)
+    met = contacts(joint, region_class, centers, reads, scatter)
+    print(f"[regions] overlap tree: {len(met)} contacts between classes", flush=True)
     regions = pl.DataFrame(
         {
             "region": ids,
@@ -168,6 +193,18 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     db.log_table(conn, run_id, "region_tree", tree_rows)
     db.log_table(conn, run_id, "class_clusterings", class_rows)
     db.log_table(conn, run_id, "granularity_candidates", candidate_rows)
+    db.log_table(
+        conn,
+        run_id,
+        "overlap_tree",
+        _overlap_rows(joint, region_class, classes, sizes, reads),
+    )
+    db.log_table(
+        conn,
+        run_id,
+        "class_overlaps",
+        _contact_rows(met, joint, classes, tree_rows, sizes, reads),
+    )
     db.log_table(
         conn,
         run_id,
@@ -237,3 +274,93 @@ def _tree_rows(
         }
         for node, (parent, region) in enumerate(zip(tree.parent, tree.region))
     ]
+
+
+def _overlap_rows(
+    tree: OverlapTree,
+    region_class: np.ndarray,
+    classes: list[str],
+    sizes: np.ndarray,
+    reads: np.ndarray,
+) -> list[dict]:
+    """Return the overlap_tree rows: each node counts the regions below it."""
+    m = len(tree.parent)
+    leaf = np.flatnonzero(tree.region >= 0)
+    n_rows, n_read = np.zeros(m), np.zeros(m)
+    n_rows[leaf], n_read[leaf] = sizes[tree.region[leaf]], reads[tree.region[leaf]]
+    held: list[set[int]] = [set() for _ in range(m)]
+    for v in leaf:
+        held[v].add(int(region_class[tree.region[v]]))
+    # Pre-order: walking back adds each finished node into its parent.
+    for v in range(m - 1, 0, -1):
+        n_rows[tree.parent[v]] += n_rows[v]
+        n_read[tree.parent[v]] += n_read[v]
+        held[tree.parent[v]] |= held[v]
+    depth = np.zeros(m, dtype=np.int64)
+    for v in range(1, m):
+        depth[v] = depth[tree.parent[v]] + 1
+    return [
+        {
+            "node": v,
+            "parent": int(tree.parent[v]),
+            "depth": int(depth[v]),
+            "height": float(tree.height[v]),
+            "region": int(tree.region[v]) if tree.region[v] >= 0 else None,
+            "class": classes[next(iter(held[v]))] if len(held[v]) == 1 else None,
+            "n_classes": len(held[v]),
+            "n_rows": int(n_rows[v]),
+            "n_read": float(n_read[v]),
+            "distance": _finite(tree.distance[v]),
+            "ratio": _finite(tree.ratio[v]),
+        }
+        for v in range(m)
+    ]
+
+
+def _contact_rows(
+    met: list[Contact],
+    tree: OverlapTree,
+    classes: list[str],
+    tree_rows: list[dict],
+    sizes: np.ndarray,
+    reads: np.ndarray,
+) -> list[dict]:
+    """Return the class_overlaps rows, each side mapped to its branch of region_tree."""
+    parent = {row["node"]: row["parent"] for row in tree_rows}
+    leaf_of = {
+        row["region"]: row["node"] for row in tree_rows if row["region"] is not None
+    }
+
+    def above(node: int) -> list[int]:
+        path = [node]
+        while parent[path[-1]] != -1:
+            path.append(parent[path[-1]])
+        return path
+
+    def branch(regions: np.ndarray) -> int:
+        path = above(leaf_of[int(regions[0])])
+        common = set(path)
+        for region in regions[1:]:
+            common &= set(above(leaf_of[int(region)]))
+        return next(node for node in path if node in common)
+
+    rows = []
+    for contact in met:
+        row = {"node": contact.node, "height": float(tree.height[contact.node])}
+        for side, code, regions in zip("ab", contact.classes, contact.regions):
+            row |= {
+                f"class_{side}": classes[code],
+                f"branch_{side}": branch(regions),
+                f"n_regions_{side}": len(regions),
+                f"n_rows_{side}": int(sizes[regions].sum()),
+                f"n_read_{side}": float(reads[regions].sum()),
+            }
+        rows.append(
+            row | {"distance": contact.distance, "ratio": _finite(contact.ratio)}
+        )
+    return rows
+
+
+def _finite(value: float) -> float | None:
+    """Return value as a float, None when nan or infinite."""
+    return float(value) if np.isfinite(value) else None

@@ -116,7 +116,13 @@ def regions(cfg: DatasetConfig) -> dict[str, Any]:
         candidates [{class, penalty, n_clusters, loss}]; regions
         [{region, class, n_rows, n_read, hardness_mean, hardness_std}];
         tree [{node, class, parent,
-        depth, region, n_rows, n_read}] in pre-order per class.
+        depth, region, n_rows, n_read}] in pre-order per class;
+        overlap_tree [{node, parent, depth, height, region, class,
+        n_classes, n_rows, n_read, distance, ratio}] in pre-order;
+        overlaps [{node, height, class_a, branch_a, n_regions_a,
+        n_rows_a, n_read_a, class_b, branch_b, n_regions_b, n_rows_b,
+        n_read_b, distance, ratio}] (none with one class); both empty
+        for a run older than the overlap tree.
     """
     with closing(_connect(cfg)) as conn:
         run = _latest_run(conn, "regions", cfg)
@@ -129,6 +135,10 @@ def regions(cfg: DatasetConfig) -> dict[str, Any]:
             "candidates": candidates,
             "regions": _rows(conn, "regions", "regions", run),
             "tree": _rows(conn, "regions", "region_tree", run),
+            "overlap_tree": _rows(
+                conn, "regions", "overlap_tree", run, missing_ok=True
+            ),
+            "overlaps": _rows(conn, "regions", "class_overlaps", run, missing_ok=True),
         }
 
 
@@ -156,18 +166,42 @@ def region_map(cfg: DatasetConfig, node: int) -> dict[str, Any]:
         LookupError: When regions has not run or node is not a node of
             its tree.
     """
+    return _map(cfg, "region_tree", node)
+
+
+def overlap_map(cfg: DatasetConfig, node: int) -> dict[str, Any]:
+    """Return the rows of one node of the overlap tree in their own plane.
+
+    As region_map, with the regions below node in overlap_tree.
+
+    Args:
+        cfg: The dataset.
+        node: A node id of overlap_tree.
+
+    Returns:
+        node; shares [s1, s2]; points [[pc1, pc2, region]].
+
+    Raises:
+        LookupError: When regions has not run or node is not a node of
+            its overlap tree.
+    """
+    return _map(cfg, "overlap_tree", node)
+
+
+def _map(cfg: DatasetConfig, table: str, node: int) -> dict[str, Any]:
+    """Return region_map of the regions below node in table, a tree of the last regions run."""
     with closing(_connect(cfg)) as conn:
         run = _latest_run(conn, "regions", cfg)
         (config,) = conn.execute(
             "SELECT config FROM runs WHERE id = ?", (run["id"],)
         ).fetchone()
-        tree = _rows(conn, "regions", "region_tree", run)
+        tree = _rows(conn, "regions", table, run)
     children = defaultdict(list)
     for row in tree:
         children[row["parent"]].append(row)
     by_node = {row["node"]: row for row in tree}
     if node not in by_node:
-        raise LookupError(f"no node {node} in the region trees")
+        raise LookupError(f"no node {node} in {table}")
     leaves, stack = [], [by_node[node]]
     while stack:
         row = stack.pop()

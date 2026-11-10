@@ -75,6 +75,22 @@
         <h3 id="rg-map-title">Map</h3>
         <p class="note" id="rg-map-note"></p>
         <div id="rg-map"></div></div>
+      <div class="card"><h2>Overlaps between classes</h2>
+        <p class="note">The regions of every class, weighted by their CSV rows, grow one more Ward tree with the class
+          ignored: it continues the trees of the classes from their regions, so classes whose regions lie close meet
+          low in it. Each branch takes the colour of its class while it holds one; a dot marks where classes meet and
+          its height is the cost of that merge (log scale). The ratio of a merge is the distance between its two sides'
+          centroids over the sum of their radii (the root mean square distance of their rows from their centroid):
+          under 1 the two spreads overlap. Click a node to map its rows and find its branch in each class tree.</p>
+        <div id="rg-ov-tree"></div>
+        <h3 id="rg-ov-title">Map</h3>
+        <p class="note" id="rg-ov-note"></p>
+        <div id="rg-ov-branches" class="chips"></div>
+        <div id="rg-ov-map"></div>
+        <h3>Where two classes meet</h3>
+        <p class="note">One row per node where a class from one side meets a class from the other and neither side
+          holds both; branch is the node of the class tree above all its regions there. Click a row to select it.</p>
+        <div id="rg-overlaps" class="table-wrap"></div></div>
       <div class="card"><h2>Granularity per class</h2>
         <p class="note">The cut of least loss per class, and its loss against its regions when a penalty per region
           coarsens it (the penalty is above 0 only when the class had to be capped at max_regions).</p>

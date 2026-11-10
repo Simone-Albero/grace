@@ -118,6 +118,36 @@ def test_region_map_of_an_unknown_node_is_404(client):
     assert client.get("/api/toy/regions/map?node=-5").status_code == 404
 
 
+def test_regions_carry_the_overlap_tree(client):
+    data = _get(client, "/api/toy/regions")
+    assert len(data["overlap_tree"]) == 2 * len(data["regions"]) - 1
+    assert data["overlaps"]
+    assert {"class_a", "branch_a", "class_b", "branch_b", "ratio"} <= set(
+        data["overlaps"][0]
+    )
+
+
+def test_overlap_map_of_the_root_and_of_a_leaf(client):
+    nodes = _get(client, "/api/toy/regions")["overlap_tree"]
+    root = next(n for n in nodes if n["parent"] == -1)
+    data = _get(client, f"/api/toy/regions/overlap_map?node={root['node']}")
+    assert data["node"] == root["node"]
+    regions = {p[2] for p in data["points"]}
+    leaves = [n for n in nodes if n["region"] is not None]
+    assert regions == {n["region"] for n in leaves}
+    per_leaf = min(MAP_PER_LEAF, max(1, MAP_MAX_POINTS // len(leaves)))
+    assert len(data["points"]) == sum(min(n["n_rows"], per_leaf) for n in leaves)
+    s1, s2 = data["shares"]
+    assert 0 <= s2 <= s1 <= 1
+    leaf = leaves[0]
+    data = _get(client, f"/api/toy/regions/overlap_map?node={leaf['node']}")
+    assert {p[2] for p in data["points"]} == {leaf["region"]}
+
+
+def test_overlap_map_of_an_unknown_node_is_404(client):
+    assert client.get("/api/toy/regions/overlap_map?node=-5").status_code == 404
+
+
 def test_complexity(client):
     data = _get(client, "/api/toy/complexity")
     assert data["measure"] == data["measures"][0]

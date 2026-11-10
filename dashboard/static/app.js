@@ -3,9 +3,10 @@
 /**
  * UI state.
  * @type {{dataset: string|null, tab: "clean"|"prepare"|"regions"|"complexity", cls: string|null, node: number|null,
- *   measure: string|null}} node: the region tree node whose map is shown (null: the root of state.cls)
+ *   overlap: number|null, measure: string|null}} node: the region tree node whose map is shown (null: the root of
+ *   state.cls); overlap: the overlap tree node whose map is shown (null: its root)
  */
-const state = { dataset: null, tab: "clean", cls: null, node: null, measure: null };
+const state = { dataset: null, tab: "clean", cls: null, node: null, overlap: null, measure: null };
 
 const last = { regions: null }; // last responses, for the controls that only redraw
 let loadId = 0; // drops answers of superseded requests
@@ -105,12 +106,16 @@ async function api(path) {
 async function init() {
   const opts = await api("/options");
   $("dataset").replaceChildren(...opts.datasets.map((v) => h("option", {}, v)));
-  const [tab, dataset, cls, node] = location.hash.slice(1).split("/").map(decodeURIComponent);
+  const [tab, dataset, cls, node, overlap] = location.hash.slice(1).split("/").map(decodeURIComponent);
   if ([...document.querySelectorAll(".tabs button")].some((b) => b.dataset.tab === tab)) state.tab = tab;
   state.dataset = opts.datasets.includes(dataset) ? dataset : opts.datasets[0];
-  if (state.tab === "regions") { state.cls = cls || null; state.node = node ? Number(node) : null; }
+  if (state.tab === "regions") {
+    state.cls = cls || null;
+    state.node = node ? Number(node) : null;
+    state.overlap = overlap ? Number(overlap) : null;
+  }
   $("dataset").value = state.dataset;
-  $("dataset").onchange = (e) => { state.dataset = e.target.value; state.cls = state.node = state.measure = null; load(); };
+  $("dataset").onchange = (e) => { state.dataset = e.target.value; state.cls = state.node = state.overlap = state.measure = null; load(); };
   $("rg-class").onchange = (e) => selectClass(e.target.value);
   $("cx-measure").onchange = (e) => { state.measure = e.target.value; load(); };
   for (const b of document.querySelectorAll(".tabs button")) b.onclick = () => showTab(b.dataset.tab);
@@ -125,10 +130,12 @@ function showTab(tab) {
   load();
 }
 
-/** Keep tab, dataset and, on the regions tab, class and node in the URL hash. */
+/** Keep tab, dataset and, on the regions tab, class, node and overlap node in the URL hash. */
 function saveHash() {
   const parts = [state.tab, state.dataset];
-  if (state.tab === "regions" && state.cls != null) parts.push(state.cls, ...(state.node == null ? [] : [state.node]));
+  if (state.tab === "regions" && state.cls != null && state.node != null) {
+    parts.push(state.cls, state.node, ...(state.overlap == null ? [] : [state.overlap]));
+  } else if (state.tab === "regions" && state.cls != null) parts.push(state.cls);
   history.replaceState(null, "", `#${parts.map((p) => encodeURIComponent(p)).join("/")}`);
 }
 
@@ -263,6 +270,7 @@ function renderRegions(data) {
     onClick: (r) => { selectNode(leafOf.get(r.region)); $("rg-map-title").scrollIntoView({ behavior: "smooth", block: "start" }); },
   });
   drawClass();
+  drawOverlaps();
 }
 
 /** Show the tree of a class, mapped from its root. @param {string} cls */
@@ -441,6 +449,249 @@ async function drawMap(nodes, colors) {
     const name = n.region != null ? `region ${n.region}` : `node ${n.node}`;
     return h("span", {}, h("i", { style: `background:${g.color}` }), `${name} · ${num(n.n_rows)} rows`);
   }));
+  const svg = pointMap(data, (r) => colors.byRegion.get(r)?.color ?? "var(--muted)", (r) => {
+    const n = regionNode.get(r);
+    return n ? nodeTip(n) : null;
+  }, `map-clip-${id}`);
+  el.replaceChildren(legend, h("div", { class: "table-wrap" }, svg));
+}
+
+/**
+ * The colour of every class, in the fixed order of the classes; past the palette the classes share the muted "other".
+ * @param {string[]} classes in class order
+ * @returns {Map<string, string>}
+ */
+function classColor(classes) {
+  return new Map(classes.map((c, i) => [c, i < SERIES.length ? SERIES[i] : "var(--muted)"]));
+}
+
+/** Show a node of the overlap tree: its tree, map, branches and contacts. @param {number} node */
+function selectOverlap(node) {
+  state.overlap = node;
+  drawOverlaps();
+}
+
+/** Overlap tree, the map and the class branches of state.overlap (null: the root), and the contacts table. */
+function drawOverlaps() {
+  const data = last.regions;
+  const nodes = data.overlap_tree;
+  if (!nodes.length) {
+    fill("rg-ov-tree", h("p", { class: "note" }, "This regions run has no overlap tree: run regions again."));
+    for (const id of ["rg-ov-branches", "rg-ov-map", "rg-overlaps"]) fill(id);
+    $("rg-ov-note").textContent = "";
+    return;
+  }
+  const regionClass = new Map(data.regions.map((r) => [r.region, r.class]));
+  const colors = classColor(data.classes.map((c) => c.class));
+  if (!nodes.some((n) => n.node === state.overlap)) state.overlap = nodes.find((n) => n.parent < 0).node;
+  saveHash();
+  overlapDiagram($("rg-ov-tree"), nodes, colors, regionClass);
+  const sel = nodes.find((n) => n.node === state.overlap);
+  fill("rg-ov-branches", branchesOf(data.tree, regionsBelow(nodes, sel.node), regionClass).map((b) => {
+    const where = b.node.parent < 0 ? "the root" : b.node.region != null ? `region ${b.node.region}` : `node ${b.node.node}`;
+    const chip = h("button", { class: "chip", type: "button", title: "show it in the tree of its class" },
+      h("i", { style: `background:${colors.get(b.class)}` }),
+      `${b.class}: ${where} · ${b.n_regions} of its ${b.n_below} ${b.n_below > 1 ? "regions" : "region"}`);
+    chip.onclick = () => { selectNode(b.node.node); $("rg-tree").scrollIntoView({ behavior: "smooth", block: "start" }); };
+    return chip;
+  }));
+  drawOverlapMap(sel, colors, regionClass);
+  const ratio = (v) => (v == null ? "∞" : dec(v, 2));
+  const classNode = new Map(data.tree.map((n) => [n.node, n]));
+  const branch = (v) => (classNode.get(v)?.region != null ? `region ${classNode.get(v).region}` : `node ${v}`);
+  sortable($("rg-overlaps"), [
+    { key: "node", label: "node" },
+    { key: "class_a", label: "class a" },
+    { key: "branch_a", label: "branch a", format: branch },
+    { key: "n_rows_a", label: "rows a", format: num },
+    { key: "class_b", label: "class b" },
+    { key: "branch_b", label: "branch b", format: branch },
+    { key: "n_rows_b", label: "rows b", format: num },
+    { key: "distance", label: "distance", format: (v) => dec(v, 3) },
+    { key: "ratio", label: "ratio", format: ratio },
+    { key: "height", label: "height", format: short },
+  ], [...data.overlaps].sort((a, b) => (a.ratio ?? Infinity) - (b.ratio ?? Infinity)), {
+    onClick: (r) => { selectOverlap(r.node); $("rg-ov-tree").scrollIntoView({ behavior: "smooth", block: "start" }); },
+    selected: (r) => r.node === state.overlap,
+  });
+}
+
+/** The regions of the leaves below a node of a tree (region_tree or overlap_tree rows). @returns {number[]} */
+function regionsBelow(nodes, id) {
+  const kids = childrenOf(nodes);
+  const byId = new Map(nodes.map((n) => [n.node, n]));
+  const regions = [], stack = [id];
+  while (stack.length) {
+    const v = stack.pop();
+    if (byId.get(v).region != null) regions.push(byId.get(v).region);
+    stack.push(...(kids.get(v) ?? []));
+  }
+  return regions;
+}
+
+/**
+ * Dendrogram of the overlap tree, leaves at the bottom in pre-order, a node at the log of its height; a branch takes
+ * its class colour while it holds one class, neutral above; a dot at every node where classes meet, sized by
+ * sqrt(n_rows); state.overlap outlined; hover for counts, classes, height and ratio; a click selects a node.
+ * @param {HTMLElement} el container, replaced
+ * @param {object[]} nodes the overlap_tree rows, in pre-order
+ * @param {Map<string, string>} colors from classColor
+ * @param {Map<number, string>} regionClass the class of every region
+ */
+function overlapDiagram(el, nodes, colors, regionClass) {
+  const kids = childrenOf(nodes);
+  const byId = new Map(nodes.map((n) => [n.node, n]));
+  const posX = new Map(), held = new Map(), rows = new Map();
+  let next = 0;
+  for (const n of nodes) if (n.region != null) posX.set(n.node, next++); // pre-order: leaves left to right
+  for (const n of [...nodes].reverse()) {
+    const below = kids.get(n.node) ?? [];
+    if (!below.length) {
+      held.set(n.node, new Set([n.class]));
+      rows.set(n.node, new Map([[n.class, n.n_rows]]));
+      continue;
+    }
+    posX.set(n.node, below.reduce((a, c) => a + posX.get(c), 0) / below.length);
+    held.set(n.node, new Set(below.flatMap((c) => [...held.get(c)])));
+    const count = new Map();
+    for (const c of below) for (const [k, v] of rows.get(c)) count.set(k, (count.get(k) ?? 0) + v);
+    rows.set(n.node, count);
+  }
+  // where two classes meet: each side holds a class the other does not
+  const meets = (n) => {
+    const [l, r] = (kids.get(n.node) ?? []).map((c) => held.get(c));
+    return l && [...l].some((k) => !r.has(k)) && [...r].some((k) => !l.has(k));
+  };
+  const heights = nodes.filter((n) => n.region == null).map((n) => n.height).filter((v) => v > 0);
+  const lo = heights.length ? Math.log10(Math.min(...heights)) : 0;
+  const hi = heights.length ? Math.log10(Math.max(...heights)) : 1;
+  const step = Math.max(8, 1100 / Math.max(next, 1)); // room per leaf; wider trees scroll
+  const m = { l: 56, r: 16, t: 16, b: 24 };
+  const W = Math.max(1100, m.l + m.r + step * next), H = 440;
+  const x = (id) => (next > 1 ? m.l + 8 + (posX.get(id) / (next - 1)) * (W - m.l - m.r - 16) : W / 2);
+  const base = H - m.b; // the leaves
+  const top = m.t, bottom = base - 18; // the merges, log of their height
+  const y = (n) => (n.region != null ? base
+    : hi > lo ? bottom - ((Math.log10(Math.max(n.height, 10 ** lo)) - lo) / (hi - lo)) * (bottom - top) : (top + bottom) / 2);
+  const color = (n) => (n.class != null ? colors.get(n.class) ?? "var(--muted)" : "var(--muted)");
+  const grid = [];
+  for (let e = Math.ceil(lo); e <= Math.floor(hi); e++) {
+    const v = bottom - ((e - lo) / (hi - lo || 1)) * (bottom - top);
+    grid.push(sv("line", { class: "grid", x1: m.l, x2: W - m.r, y1: v, y2: v }),
+      sv("text", { x: m.l - 8, y: v + 4, "text-anchor": "end" }, short(10 ** e)));
+  }
+  grid.push(sv("text", { transform: `translate(14, ${(top + bottom) / 2}) rotate(-90)`, "text-anchor": "middle" },
+    "merge height (log)"));
+  const edges = nodes.filter((n) => n.parent >= 0).map((n) => {
+    const up = byId.get(n.parent);
+    return sv("path", {
+      d: `M${x(n.node)},${y(n)}V${y(up)}H${x(up.node)}`, fill: "none",
+      style: `stroke:${color(n)};stroke-width:${n.class != null ? 1.5 : 1.25}`,
+    });
+  });
+  const biggest = Math.max(...nodes.map((n) => n.n_rows), 1);
+  const nodeTipOf = (n) => {
+    const mix = [...rows.get(n.node)].sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${num(v)}`).join(", ");
+    if (n.region != null) return `region ${n.region} · ${n.class} · ${num(n.n_rows)} rows · ${num(n.n_read)} CSV rows`;
+    const ratio = n.ratio == null ? "∞" : dec(n.ratio, 2);
+    return `node ${n.node} · ${mix} rows · height ${short(n.height)} · sides ${dec(n.distance, 3)} apart, ratio ${ratio}`;
+  };
+  const marks = nodes.map((n) => {
+    const picked = n.node === state.overlap;
+    const leaf = n.region != null, meet = !leaf && meets(n);
+    const r = leaf ? 3 : meet ? 3 + 5 * Math.sqrt(n.n_rows / biggest) : n.class == null ? 2.5 : 0;
+    const mark = leaf
+      ? sv("rect", { x: x(n.node) - 3, y: base - 3, width: 6, height: 6, rx: 1, style: `fill:${color(n)}` })
+      : r ? sv("circle", { cx: x(n.node), cy: y(n), r, style: `fill:${meet ? "var(--text-2)" : "var(--muted)"};stroke:var(--surface);stroke-width:1.5` }) : null;
+    const ring = picked ? sv("circle", { cx: x(n.node), cy: y(n), r: Math.max(r, 3) + 4, fill: "none", style: "stroke:var(--text);stroke-width:2" }) : null;
+    const hit = sv("circle", { cx: x(n.node), cy: y(n), r: Math.max(r + 3, step / 2, 6), fill: "transparent" });
+    const g = sv("g", { class: "node" }, mark, ring, hit);
+    g.onmousemove = (ev) => tip(ev, nodeTipOf(n));
+    g.onmouseleave = () => tip(null);
+    g.onclick = () => selectOverlap(n.node);
+    return g;
+  });
+  const present = [...colors].filter(([c]) => [...regionClass.values()].includes(c));
+  const legend = h("div", { class: "legend" }, present.map(([c, col]) => h("span", {}, h("i", { style: `background:${col}` }), c)),
+    h("span", {}, h("i", { style: "background:var(--text-2);border-radius:50%" }), "classes meet"));
+  const wrap = h("div", { class: "table-wrap" },
+    sv("svg", { class: "tree", viewBox: `0 0 ${W} ${H}`, width: W, role: "img", style: "max-width:none" }, grid, edges, marks));
+  el.replaceChildren(legend, wrap);
+  if (byId.has(state.overlap)) wrap.scrollLeft = x(state.overlap) - wrap.clientWidth / 2; // the selected node in view
+}
+
+/**
+ * The branch of each class tree below an overlap node: per class, the lowest region_tree node above all the regions of
+ * the class under it.
+ * @param {object[]} tree the region_tree rows
+ * @param {number[]} regions the regions under the overlap node
+ * @param {Map<number, string>} regionClass the class of every region
+ * @returns {{class: string, node: object, n_regions: number}[]} in class order
+ */
+function branchesOf(tree, regions, regionClass) {
+  const byId = new Map(tree.map((n) => [n.node, n]));
+  const leafOf = new Map(tree.filter((n) => n.region != null).map((n) => [n.region, n.node]));
+  const above = (id) => { const path = []; for (let v = id; v >= 0; v = byId.get(v).parent) path.push(v); return path; };
+  const byClass = new Map();
+  for (const r of regions) byClass.set(regionClass.get(r), [...(byClass.get(regionClass.get(r)) ?? []), r]);
+  const order = new Map([...new Set(tree.map((n) => n.class))].map((c, i) => [c, i]));
+  return [...byClass].map(([cls, rs]) => {
+    const path = above(leafOf.get(rs[0]));
+    let common = new Set(path);
+    for (const r of rs.slice(1)) { const a = new Set(above(leafOf.get(r))); common = new Set([...common].filter((v) => a.has(v))); }
+    const node = byId.get(path.find((v) => common.has(v)));
+    return { class: cls, node, n_regions: rs.length, n_below: regionsBelow(tree, node.node).length };
+  }).sort((a, b) => order.get(a.class) - order.get(b.class));
+}
+
+/**
+ * Fetch the map of state.overlap and draw it, its rows coloured by class (as drawMap otherwise).
+ * @param {object} sel the overlap_tree row of state.overlap
+ * @param {Map<string, string>} colors from classColor
+ * @param {Map<number, string>} regionClass the class of every region
+ */
+async function drawOverlapMap(sel, colors, regionClass) {
+  const id = ++overlapMapId;
+  const el = $("rg-ov-map");
+  const what = sel.parent < 0 ? "every class" : sel.region != null ? `region ${sel.region}` : `node ${sel.node}`;
+  $("rg-ov-title").textContent = `Map of ${what}`;
+  let data;
+  try {
+    data = await api(`/${encodeURIComponent(state.dataset)}/regions/overlap_map?node=${sel.node}`);
+  } catch (e) {
+    if (id === overlapMapId) { el.replaceChildren(h("p", { class: "note" }, e.message)); $("rg-ov-note").textContent = ""; }
+    return;
+  }
+  if (id !== overlapMapId) return;
+  const regionRow = new Map(last.regions.regions.map((r) => [r.region, r]));
+  const rows = new Map();
+  for (const r of regionsBelow(last.regions.overlap_tree, sel.node)) {
+    rows.set(regionClass.get(r), (rows.get(regionClass.get(r)) ?? 0) + regionRow.get(r).n_rows);
+  }
+  $("rg-ov-note").textContent = `${num(data.points.length)} random rows of ${what} (at most 2,000 per region, ` +
+    "20,000 in all), on the first two principal components of these rows, in the space of the regions, coloured by " +
+    "class. Hover a point for its region; drag to pan, pinch or ctrl + scroll to zoom, double click to reset.";
+  const legend = h("div", { class: "legend" }, [...colors].filter(([c]) => rows.has(c)).map(([c, col]) =>
+    h("span", {}, h("i", { style: `background:${col}` }), `${c} · ${num(rows.get(c))} rows`)));
+  const svg = pointMap(data, (r) => colors.get(regionClass.get(r)) ?? "var(--muted)", (r) => {
+    const row = regionRow.get(r);
+    return row ? `region ${r} · ${row.class} · ${num(row.n_rows)} rows · ${num(row.n_read)} CSV rows` : null;
+  }, `overlap-clip-${id}`);
+  el.replaceChildren(legend, h("div", { class: "table-wrap" }, svg));
+}
+
+let overlapMapId = 0; // drops overlap map answers of superseded requests
+
+/**
+ * Sampled rows in their PCA plane, one scale for both axes framed on the 1st to 99th percentiles, navigable with
+ * panZoom (the plot of drawMap).
+ * @param {{shares: number[], points: number[][]}} data response of a map endpoint
+ * @param {(region: number) => string} colorOf fill of a region's points
+ * @param {(region: number) => string|null} tipOf tooltip of a region's points
+ * @param {string} clip a unique id for the clip path
+ * @returns {SVGSVGElement}
+ */
+function pointMap(data, colorOf, tipOf, clip) {
   const pts = data.points.map(([a, b, region]) => ({ a, b, region }));
   const frame = (vals) => {
     const lo = percentile(vals, 1), hi = percentile(vals, 99), pad = 0.2 * (hi - lo || 1);
@@ -452,10 +703,8 @@ async function drawMap(nodes, colors) {
   const cx = (W - m.l - m.r - k * (xb - xa)) / 2 + m.l, cy = (H - m.t - m.b - k * (yb - ya)) / 2 + m.t;
   const X = (v) => cx + (v - xa) * k, Y = (v) => cy + (yb - v) * k;
   const dots = pts.map((p) => sv("circle", {
-    r: 2.5, "data-region": p.region,
-    style: `fill:${colors.byRegion.get(p.region)?.color ?? "var(--muted)"};opacity:0.8`,
+    r: 2.5, "data-region": p.region, style: `fill:${colorOf(p.region)};opacity:0.8`,
   }));
-  const clip = `map-clip-${id}`;
   const svg = sv("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", class: "zoomable", style: "min-width:640px" },
     sv("defs", {}, sv("clipPath", { id: clip }, sv("rect", { x: m.l, y: m.t, width: W - m.l - m.r, height: H - m.t - m.b }))),
     sv("rect", { x: m.l, y: m.t, width: W - m.l - m.r, height: H - m.t - m.b, fill: "none", style: "stroke:var(--grid)" }),
@@ -465,8 +714,7 @@ async function drawMap(nodes, colors) {
       `PC 2 · ${pct(data.shares[1], 0)} of the variance`));
   svg.onmousemove = (ev) => {
     const region = ev.target.getAttribute?.("data-region");
-    const n = region == null ? null : regionNode.get(Number(region));
-    tip(ev, n ? nodeTip(n) : null);
+    tip(ev, region == null ? null : tipOf(Number(region)));
   };
   svg.onmouseleave = () => tip(null);
   const bx = pts.map((p) => X(p.a)), by = pts.map((p) => Y(p.b));
@@ -474,7 +722,7 @@ async function drawMap(nodes, colors) {
     d.setAttribute("cx", (t.k * bx[i] + t.x).toFixed(1));
     d.setAttribute("cy", (t.k * by[i] + t.y).toFixed(1));
   }));
-  el.replaceChildren(legend, h("div", { class: "table-wrap" }, svg));
+  return svg;
 }
 
 /** p-th percentile (0-100) of values, linear between ranks. */

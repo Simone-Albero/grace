@@ -212,6 +212,102 @@ def test_region_tree_counts_the_rows_below_each_node(done):
         assert row["depth"] == parent["depth"] + 1
 
 
+def test_overlap_tree_counts_the_regions_below_each_node(done):
+    regions = _read(done, "regions.parquet")
+    classes = json.loads((done.output_dir / "classes.json").read_text())
+    columns = [
+        "node",
+        "parent",
+        "depth",
+        "height",
+        "region",
+        "class",
+        "n_classes",
+        "n_rows",
+        "n_read",
+        "distance",
+        "ratio",
+    ]
+    nodes = pl.DataFrame(
+        _rows(done, f"SELECT {', '.join(columns)} FROM overlap_tree ORDER BY node"),
+        schema=columns,
+        orient="row",
+    )
+    assert nodes.height == 2 * regions.height - 1
+    root = nodes.row(0, named=True)
+    assert root["parent"] == -1 and root["depth"] == 0
+    assert root["n_rows"] == regions["n_rows"].sum()
+    assert root["n_classes"] == len(classes) and root["class"] is None
+    leaves = nodes.filter(pl.col("region").is_not_null()).sort("region")
+    assert leaves["region"].to_list() == regions["region"].to_list()
+    assert leaves["n_rows"].to_list() == regions["n_rows"].to_list()
+    assert leaves["class"].to_list() == [classes[c] for c in regions["class"]]
+    assert (leaves["height"] == 0).all() and (leaves["n_classes"] == 1).all()
+    assert leaves["distance"].is_null().all()
+    by_node = {row["node"]: row for row in nodes.iter_rows(named=True)}
+    below: dict[int, list[dict]] = {}
+    for row in nodes.filter(pl.col("parent") >= 0).iter_rows(named=True):
+        parent = by_node[row["parent"]]
+        assert parent["node"] < row["node"] and row["depth"] == parent["depth"] + 1
+        assert parent["height"] >= row["height"]
+        below.setdefault(row["parent"], []).append(row)
+    for node, kids in below.items():
+        row = by_node[node]
+        assert len(kids) == 2 and row["region"] is None
+        assert row["n_rows"] == sum(k["n_rows"] for k in kids)
+        assert row["n_read"] == pytest.approx(sum(k["n_read"] for k in kids))
+        assert row["distance"] >= 0 and (row["ratio"] is None or row["ratio"] >= 0)
+        assert (row["class"] is None) == (row["n_classes"] > 1)
+        if row["class"] is not None:
+            assert all(k["class"] == row["class"] for k in kids)
+
+
+def test_class_overlaps_name_a_branch_of_each_class_tree(done):
+    columns = [
+        "node",
+        "class_a",
+        "branch_a",
+        "n_regions_a",
+        "n_rows_a",
+        "class_b",
+        "branch_b",
+        "n_regions_b",
+        "n_rows_b",
+        "ratio",
+    ]
+    overlaps = _rows(done, f"SELECT {', '.join(columns)} FROM class_overlaps")
+    assert overlaps
+    tree = {
+        node: (cls, parent, region)
+        for node, cls, parent, region in _rows(
+            done, "SELECT node, class, parent, region FROM region_tree"
+        )
+    }
+    joint = dict(_rows(done, "SELECT node, n_classes FROM overlap_tree"))
+    regions = dict(_rows(done, "SELECT region, n_rows FROM regions"))
+    for row in (dict(zip(columns, r)) for r in overlaps):
+        assert row["class_a"] != row["class_b"] and joint[row["node"]] >= 2
+        assert row["ratio"] is None or row["ratio"] >= 0
+        for side in "ab":
+            branch = tree[row[f"branch_{side}"]]
+            assert branch[0] == row[f"class_{side}"]
+            leaves = [
+                region
+                for node, (_, _, region) in tree.items()
+                if region is not None and _is_below(tree, node, row[f"branch_{side}"])
+            ]
+            assert row[f"n_regions_{side}"] <= len(leaves)
+            assert row[f"n_rows_{side}"] <= sum(regions[r] for r in leaves)
+
+
+def _is_below(tree: dict, node: int, ancestor: int) -> bool:
+    while node != -1:
+        if node == ancestor:
+            return True
+        node = tree[node][1]
+    return False
+
+
 def test_complexity_has_every_measure_of_every_population(done):
     table = _read(done, "complexity.parquet")
     regions = _read(done, "regions.parquet")
