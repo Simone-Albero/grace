@@ -1,7 +1,8 @@
 # grace
 
-Data quality through the geometry of the data: each class is clustered into regions, and each region and each class
-is described by 45 data-complexity descriptors.
+Data quality through the geometry of the data: each class is clustered into regions, and the regions and the pairs
+of neighbouring regions of different classes get a quality report after the data design smells of Flood et al.
+(EuroS&P 2024): copies, label conflicts, overlap, single-feature separation and shortcuts, poor diversity.
 
 ```
 make generate                                                    # resources/raw_data/synthetic/synthetic_test.csv
@@ -9,7 +10,7 @@ make run DATA=synthetic_test                                     # the four stag
 python main.py --stage clean --dataset synthetic_test
 python main.py --stage prepare --dataset synthetic_test          # after clean
 python main.py --stage regions --dataset synthetic_test          # after prepare
-python main.py --stage complexity --dataset synthetic_test       # after regions
+python main.py --stage quality_report --dataset synthetic_test   # after regions
 make dashboard                                                   # http://127.0.0.1:8000
 ```
 
@@ -36,7 +37,8 @@ Stages (each writes its files into the dataset's `output_dir` and its rows into 
   class code; same rows as `data.parquet`).
 - `regions`: builds the points of the space (`graph.space_points`): the prepared numbers, at unit length under
   `cosine`, then the categorical slots unchanged, `n_missing` left out. Every distance from there on, here and in
-  `complexity`, is euclidean on them. Builds the k-NN graph of a sample of them, then splits each class on its own
+  `quality_report`, is euclidean on them. Draws a sample of them as the reference rows of the kDN hardness
+  (`graph.max_samples`), then splits each class on its own
   (`src/clustering.py`): a Ward tree of its distinct rows (at most `clustering.max_fit_samples`), each weighted by
   `n_duplicates`, so it is the Ward tree of the rows as read; then the cut of least loss, branch by branch, the loss
   being the kDN hardness spread a region hides plus the sampling noise of its mean hardness, measured on the sample.
@@ -48,19 +50,29 @@ Stages (each writes its files into the dataset's `output_dir` and its rows into 
   their rows (weighted) along the line between them. Two regions of different classes overlap under
   `overlap_separation`; single linkage on these pairs groups the regions into overlap zones, and a region close to no
   other class is in none.
-  Writes `regions.parquet` (with `n_read`, the rows of the CSV), `assignments.parquet`, `graph.npz`.
-- `complexity`: 45 descriptors (feature overlap F1-F4, neighbourhood N1-N4, network density and hubs,
-  dimensionality T2-T4, geometry, linearity L1-L3; `src/complexity/`) of every region and every class, on its rows
-  against the `complexity.top_k_clusters` nearest populations of other classes. Writes `complexity.parquet`.
+  Writes `regions.parquet` (with `n_read`, the rows of the CSV) and `assignments.parquet`.
+- `quality_report`: the quality of the regions and of the pairs of regions of different classes (`src/quality.py`),
+  after the smells of Flood et al. but per region rather than per class. The pairs measured are those whose
+  separation is under `quality.candidate_separation` (in the full space or without `shortcut_cols`), those that share
+  label conflicts, and each region's nearest rival; s only chooses them, every verdict comes from the measures. Per
+  pair, on at most `quality.max_rows_per_region` distinct rows of each region: kDN and ENN (`quality.k` neighbours
+  inside the pair), N1 (rows on the border of the pair's spanning tree), F3 read as separation (the share of rows one
+  feature alone tells apart, the feature, and how many features do) and L2 (error of a linear SVM: high with a low
+  overlap, the boundary is curved), all again without `shortcut_cols`. Label conflicts: rows equal on every feature as
+  read under different classes (and equal on every feature but `shortcut_cols`). Per region: the copies clean
+  removed (`n_read - n_rows`), the mean cosine similarity of `quality.diversity_pairs` pairs of its rows on the points
+  scaled into [0, 1] (pdd) and the share of those pairs over 0.95 (tc). Per class, the roll-up of its regions.
+  `quality.highlight` only says from where the dashboard marks a value, and which pairs count as shortcuts.
 
 Configs:
 - `configs/datasets/`: one yaml per dataset: `name`, `path`, `label_col`, `num_cols`, `cat_cols`,
-  `min_class_count`, `top_n`, `seed`, `output_dir` and `db_path`. Four network datasets (`nb15_v2`,
+  `min_class_count`, `top_n`, `seed`, `output_dir`, `db_path` and, optional, `shortcut_cols` (the columns suspected of
+  shortcuts, which the quality report leaves out to measure the pairs again). Four network datasets (`nb15_v2`,
   `cic_2018_v2`, `ton_iot_v2`, `bot_iot_v2`), five general benchmarks (`bank_marketing`, `covertype`,
   `letter_recognition`, `statlog_landsat_satellite`, `thyroid_disease`) and `synthetic_test`; their CSVs are not in
   the repo.
 - `configs/method/default.yaml`: the method, shared by every dataset: `distance` (`euclidean` or `cosine`), `prepare`,
-  `graph`, `clustering` (the weighted Ward regions) and `complexity`, each key commented.
+  `graph`, `clustering` (the weighted Ward regions) and `quality` (the report), each key commented.
   Another method is a copy of it passed as `--method <path>`.
 
 `src/config.py` loads both into frozen dataclasses and validates them before any stage reads data.
@@ -74,21 +86,23 @@ standard deviation of the kDN hardness of each region), `region_tree` (the tree 
 the distinct and CSV rows below it), `class_clusterings` (with the loss over that of the class as one region),
 `granularity_candidates`, `overlap_zones` (the tree of each
 overlap zone, each merge at the separation of the pair that made it), `region_overlaps` (every pair of regions of
-different classes under `overlap_separation`), `region_stats` (regions);
-`complexity`. There are no migrations: after a change of a table, delete the DB.
+different classes under `overlap_separation`), `region_stats` (regions); `quality_pairs`, `quality_regions`,
+`quality_classes`, `label_conflict_groups` (every row in a label conflict, with its group), `quality_stats`
+(quality_report). There are no migrations: after a change of a table, delete the DB.
 
 Dashboard: `make dashboard` (`PORT=` to change it) or `python -m uvicorn dashboard.app:app` serves a read-only page
 on 127.0.0.1, one tab per stage, for the datasets of `configs/datasets/`. Each tab shows the latest `ok` run of its
 stage on that dataset, and says which stage to run when there is none. The regions tab draws the tree of each class;
 a click on a node maps its rows (at most 2,000 per region, 20,000 in all) on their first two principal components,
 computed on the click. Below it, the overlap zones show where the classes overlap; a click on one of their nodes maps
-its rows by class and names its branch in each class tree. The URL hash keeps tab and dataset, and on the regions tab
-class, node and overlap node.
+its rows by class and names its branch in each class tree. The quality tab shows the smells per class, the pairs of
+regions with their diagnoses (filtered by diagnosis) and the regions. The URL hash keeps tab and dataset, and on the
+regions tab class, node and overlap node.
 
 Layout:
 - `main.py`: the CLI, one stage per call inside a logged run
 - `stages/`: one file per stage, `run(cfg, conn, run_id)`; `stages/paths.py` names every file a stage writes
-- `src/`: config and DB logging, then the method on arrays and frames: data, prepare, graph, clustering, complexity/
+- `src/`: config and DB logging, then the method on arrays and frames: data, prepare, graph, clustering, quality
 - `dashboard/`: FastAPI `app.py`, read-only `queries.py`, `static/` (one page, hand-made SVG charts)
 - `generate_synthetic.py`: the synthetic dataset, a ladder of sub-groups per class that overlap their rivals by
   known margins (the `true_subgroup` column records it; no stage reads it)
@@ -97,8 +111,8 @@ Layout:
 To add:
 - a dataset: put the CSV under `resources/raw_data/`, copy a yaml of `configs/datasets/`, set `name`, `path`, the
   columns and `output_dir`, and pass its name to `--dataset`.
-- a descriptor: one more key returned by a family function of `src/complexity/` and listed in `MEASURES` in
-  `src/complexity/measure.py`.
+- a pair measure: a function of `src/quality.py` called in `_pair_measures` of `stages/quality_report.py`, its key
+  listed in `MEASURES` there.
 
 Known limits: every rerun of a stage overwrites its files, so the files hold only the latest run of each stage, and
 nothing records which run wrote a stage's inputs: after changing the method or rerunning a stage, rerun everything

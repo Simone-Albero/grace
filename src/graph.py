@@ -1,52 +1,23 @@
-"""The k-nearest-neighbour graph of the rows and its minimum spanning tree.
+"""The points of the space and their nearest neighbours.
 
-Its nodes are a uniform sample of the rows. The clustering reads it for the
-kDN hardness, the complexity measures for the neighbourhoods, the MST
-and the hubs. space_points turns the prepared rows into the points
-every distance is measured on; past it every distance is euclidean.
+space_points turns the prepared rows into the points every distance is
+measured on; past it every distance is euclidean. sample_rows draws the
+uniform sample of reference rows the kDN hardness looks up, and
+nearest_neighbors finds the neighbours of rows among them.
 """
 
 from __future__ import annotations
 
 __all__ = [
-    "Graph",
-    "build_graph",
     "nearest_neighbors",
     "sample_rows",
     "space_points",
 ]
 
-from dataclasses import dataclass
-
 import numpy as np
-import scipy.sparse
-from scipy.sparse.csgraph import connected_components, minimum_spanning_tree
 from sklearn.neighbors import NearestNeighbors
 
 _CHUNK_ROWS = 20_000  # rows of queries whose neighbour offsets are held at once
-
-
-@dataclass(frozen=True)
-class Graph:
-    """The nodes, their neighbours and the spanning tree.
-
-    rows[i] is the row position of node i; knn_idx and mst hold node
-    indices, not row positions.
-
-    Attributes:
-        rows: The row positions of the nodes, shape (n,), ascending.
-        points: The scaled points of the nodes, shape (n, d).
-        knn_idx: The nearest other nodes, shape (n, k), nearest first.
-        knn_dist: Their distances, shape (n, k).
-        mst: The node pairs of the minimum spanning tree, shape
-            (n - 1, 2).
-    """
-
-    rows: np.ndarray
-    points: np.ndarray
-    knn_idx: np.ndarray
-    knn_dist: np.ndarray
-    mst: np.ndarray
 
 
 def space_points(numbers: np.ndarray, slots: np.ndarray, metric: str) -> np.ndarray:
@@ -142,70 +113,3 @@ def nearest_neighbors(
         np.take_along_axis(indices, order, axis=1),
         np.take_along_axis(distances, order, axis=1),
     )
-
-
-def build_graph(points: np.ndarray, rows: np.ndarray, k: int) -> Graph:
-    """Build the k-NN graph of the nodes and its minimum spanning tree.
-
-    The MST is that of the symmetrised k-NN graph (an edge keeps the
-    smaller of its two distances; zero-distance edges are dropped).
-    Components left apart are first bridged to the component of node 0,
-    each through its node closest to node 0, with weight max(distance,
-    1e-10).
-
-    Args:
-        points: The node points, shape (n, d), n >= 2.
-        rows: Their row positions.
-        k: The neighbours per node.
-
-    Returns:
-        The graph.
-
-    Raises:
-        ValueError: When there are fewer than 2 points.
-    """
-    n = len(points)
-    if n < 2:
-        raise ValueError(f"the graph needs at least 2 points, got {n}")
-    knn_idx, knn_dist = nearest_neighbors(points, rows, points, rows, k)
-    return Graph(
-        rows=np.asarray(rows),
-        points=points,
-        knn_idx=knn_idx,
-        knn_dist=knn_dist,
-        mst=_spanning_tree(points, knn_idx, knn_dist),
-    )
-
-
-def _spanning_tree(
-    points: np.ndarray, knn_idx: np.ndarray, knn_dist: np.ndarray
-) -> np.ndarray:
-    n, k = knn_idx.shape
-    origins = np.repeat(np.arange(n), k)
-    sources = np.concatenate([origins, knn_idx.ravel()])
-    targets = np.concatenate([knn_idx.ravel(), origins])
-    weights = np.concatenate([knn_dist.ravel(), knn_dist.ravel()])
-    # Sorted by edge then weight, the first copy of an edge is its
-    # shorter direction.
-    order = np.lexsort((weights, targets, sources))
-    sources, targets, weights = sources[order], targets[order], weights[order]
-    first = np.ones(len(order), dtype=bool)
-    first[1:] = (sources[1:] != sources[:-1]) | (targets[1:] != targets[:-1])
-    adjacency = scipy.sparse.csr_matrix(
-        (weights[first], (sources[first], targets[first])), shape=(n, n)
-    )
-    adjacency.setdiag(0)
-    adjacency.eliminate_zeros()
-    n_components, component = connected_components(adjacency, directed=False)
-    if n_components > 1:
-        adjacency = adjacency.tolil()
-        anchor = int(np.flatnonzero(component == 0)[0])
-        to_anchor = np.linalg.norm(points - points[anchor], axis=1)
-        for c in range(1, n_components):
-            members = np.flatnonzero(component == c)
-            bridge = int(members[to_anchor[members].argmin()])
-            weight = max(float(to_anchor[bridge]), 1e-10)
-            adjacency[anchor, bridge] = adjacency[bridge, anchor] = weight
-        adjacency = adjacency.tocsr()
-    tree = minimum_spanning_tree(adjacency).tocoo()
-    return np.column_stack((tree.row, tree.col)).astype(np.int64)

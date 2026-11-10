@@ -38,8 +38,8 @@ def test_degenerate_counts_fail(tmp_path):
             "synthetic_test",
             method=_method(tmp_path, clustering__min_cluster_floor=0),
         )
-    with pytest.raises(ValueError, match="graph.k"):
-        load_config("synthetic_test", method=_method(tmp_path, graph__k=0))
+    with pytest.raises(ValueError, match="graph.max_samples"):
+        load_config("synthetic_test", method=_method(tmp_path, graph__max_samples=0))
     with pytest.raises(ValueError, match="vote_k"):
         load_config("synthetic_test", method=_method(tmp_path, clustering__vote_k=0))
     with pytest.raises(ValueError, match="region_cost"):
@@ -93,3 +93,34 @@ def test_the_duplicates_column_cannot_be_configured(tmp_path):
     path.write_text(yaml.safe_dump({**raw, "cat_cols": ["n_missing"]}))
     with pytest.raises(ValueError, match="n_missing"):
         load_config(str(path))
+
+
+def test_quality_values_out_of_range_fail(tmp_path):
+    with pytest.raises(ValueError, match="quality.k"):
+        load_config("synthetic_test", method=_method(tmp_path, quality__k=0))
+    with pytest.raises(ValueError, match="candidate_separation"):
+        load_config(
+            "synthetic_test",
+            method=_method(tmp_path, quality__candidate_separation=0),
+        )
+    raw = yaml.safe_load((ROOT / "configs/method/default.yaml").read_text())
+    for highlight in ({**raw["quality"]["highlight"], "nope": 0.1}, {"kdn": 0.1}):
+        path = tmp_path / "highlight.yaml"
+        path.write_text(
+            yaml.safe_dump(
+                {**raw, "quality": {**raw["quality"], "highlight": highlight}}
+            )
+        )
+        with pytest.raises(ValueError, match="quality.highlight"):
+            load_config("synthetic_test", method=str(path))
+
+
+def test_shortcut_cols_must_be_configured_columns(tmp_path):
+    raw = yaml.safe_load((DATASET_DIR / "synthetic_test.yaml").read_text())
+    path = tmp_path / "shortcuts.yaml"
+    path.write_text(yaml.safe_dump({**raw, "shortcut_cols": ["num_1", "ttl"]}))
+    with pytest.raises(ValueError, match="ttl"):
+        load_config(str(path))
+    path.write_text(yaml.safe_dump({**raw, "shortcut_cols": ["num_1", "cat_1"]}))
+    assert load_config(str(path)).shortcut_cols == ("num_1", "cat_1")
+    assert load_config("synthetic_test").shortcut_cols == ()

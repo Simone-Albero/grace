@@ -22,10 +22,9 @@ from src.clustering import (
     separation,
 )
 from src.config import DatasetConfig
-from src.graph import build_graph, nearest_neighbors, sample_rows
+from src.graph import nearest_neighbors, sample_rows
 from stages.paths import (
     assignments_file,
-    graph_file,
     read_classes,
     read_points,
     read_weights,
@@ -39,11 +38,11 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     Reads the points of the prepared file (paths.read_points: the
     numbers scaled for distance, the categorical slots, not MISSING;
     every distance from here on is euclidean on them) and the weight of
-    every row (paths.read_weights: its copies in the CSV). Order:
-    graph.build_graph on graph.sample_rows(n_rows, graph.max_samples,
-    seed) -> per class, ascending: its kDN on its
+    every row (paths.read_weights: its copies in the CSV). Order: the
+    reference rows, graph.sample_rows(n_rows, graph.max_samples, seed)
+    -> per class, ascending: its kDN on its
     graph.sample_rows(n_class, max_fit_samples, seed) rows (hardness_k
-    nearest graph nodes, never itself) -> clustering.cluster_class with
+    nearest reference rows, never itself) -> clustering.cluster_class with
     max_clusters = max(1, max_regions // n_classes) and region_cost ->
     region id = label + offset, offset += the class's regions; tree
     node id = node + node offset -> weighted centroids of the regions ->
@@ -53,8 +52,7 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
 
     Writes to output_dir: regions.parquet (region, class, n_rows,
     n_read, centroid as a list of floats), assignments.parquet (row,
-    region for every row), graph.npz (rows, points, knn_idx, knn_dist,
-    mst).
+    region for every row).
     Logs: regions (region, class name, n_rows, n_read, hardness_mean and
     hardness_std: the mean and standard deviation of the kDN of its
     scored rows, weighted by their copies), region_tree
@@ -81,8 +79,8 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     weights = read_weights(cfg)
     n_rows = len(labels)
     graph_rows = sample_rows(n_rows, method.graph.max_samples, cfg.seed)
-    print(f"[regions] graph of {len(graph_rows)} rows", flush=True)
-    graph = build_graph(points[graph_rows], graph_rows, method.graph.k)
+    print(f"[regions] {len(graph_rows)} reference rows", flush=True)
+    graph_points = points[graph_rows]
     graph_labels = labels[graph_rows]
 
     classes = read_classes(cfg)
@@ -96,7 +94,7 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
         X, w = points[rows], weights[rows]
         scored = sample_rows(len(rows), clustering.max_fit_samples, cfg.seed)
         neighbors, _ = nearest_neighbors(
-            graph.points, graph.rows, X[scored], rows[scored], clustering.hardness_k
+            graph_points, graph_rows, X[scored], rows[scored], clustering.hardness_k
         )
         hardness = kdn(graph_labels[neighbors], code)
         chosen = cluster_class(
@@ -172,14 +170,6 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     assignments = pl.DataFrame({"row": np.arange(n_rows), "region": region})
     regions.write_parquet(regions_file(cfg))
     assignments.write_parquet(assignments_file(cfg))
-    np.savez(
-        graph_file(cfg),
-        rows=graph.rows,
-        points=graph.points,
-        knn_idx=graph.knn_idx,
-        knn_dist=graph.knn_dist,
-        mst=graph.mst,
-    )
     print(f"[regions] saved {len(ids)} regions", flush=True)
 
     db.log_table(

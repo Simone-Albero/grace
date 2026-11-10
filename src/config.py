@@ -9,6 +9,7 @@ from __future__ import annotations
 
 __all__ = [
     "DATASET_DIR",
+    "HIGHLIGHTS",
     "DatasetConfig",
     "dataset_names",
     "load_config",
@@ -46,16 +47,13 @@ class PrepareConfig:
 
 @dataclass(frozen=True)
 class GraphConfig:
-    """The k-nearest-neighbour graph of the rows (`src.graph`).
+    """The reference rows of the kDN hardness (`src.graph`).
 
     Attributes:
-        max_samples: The rows in the graph, a uniform sample above
-            this.
-        k: The neighbours of each row.
+        max_samples: The reference rows, a uniform sample above this.
     """
 
     max_samples: int
-    k: int
 
 
 @dataclass(frozen=True)
@@ -92,28 +90,33 @@ class ClusteringConfig:
     overlap_separation: float
 
 
+HIGHLIGHTS = ("conflict", "kdn", "enn", "f3", "l2", "pdd", "tc", "dup_share")
+
+
 @dataclass(frozen=True)
-class ComplexityConfig:
-    """The descriptors of every region and class (`src.complexity`).
+class QualityConfig:
+    """The quality report on pairs of regions (`src.quality`).
 
     Attributes:
-        top_k_clusters: The nearest rivals each population is compared
-            with.
-        max_sample_per_region: The rows measured per region when the
-            graph samples the rows.
-        max_sample_per_class: The rows measured per class when the
-            graph samples the rows.
-        silhouette_max_samples: The subsample behind the silhouette
-            tail.
-        silhouette_min_per_cluster: The rows per population kept in
-            that subsample.
+        max_rows_per_region: The distinct rows of a region its pairs
+            are measured on, a uniform sample above this.
+        k: The neighbours inside a pair behind kDN and ENN.
+        candidate_separation: Two regions of different classes are
+            measured when their separation (`clustering.separation`)
+            is under this, in the full space or without the shortcut
+            columns.
+        diversity_pairs: The pairs of rows drawn per region for its
+            diversity.
+        highlight: Per key of HIGHLIGHTS, the value from which the
+            dashboard marks a measure; the values are kept as they
+            are.
     """
 
-    top_k_clusters: int
-    max_sample_per_region: int
-    max_sample_per_class: int
-    silhouette_max_samples: int
-    silhouette_min_per_cluster: int
+    max_rows_per_region: int
+    k: int
+    candidate_separation: float
+    diversity_pairs: int
+    highlight: dict[str, float]
 
 
 @dataclass(frozen=True)
@@ -124,16 +127,16 @@ class MethodConfig:
         distance: One of DISTANCES: how the numeric columns are
             compared (graph.space_points).
         prepare: The prepared features.
-        graph: The k-NN graph of the rows.
+        graph: The reference rows of the kDN hardness.
         clustering: The per-class clustering.
-        complexity: The descriptors.
+        quality: The quality report.
     """
 
     distance: str
     prepare: PrepareConfig
     graph: GraphConfig
     clustering: ClusteringConfig
-    complexity: ComplexityConfig
+    quality: QualityConfig
 
 
 @dataclass(frozen=True)
@@ -149,6 +152,8 @@ class DatasetConfig:
         min_class_count: Classes with fewer rows are dropped.
         top_n: The most frequent values of a categorical column with
             their own one-hot slot; the others share one.
+        shortcut_cols: The columns suspected of shortcuts: the quality
+            report measures the pairs of regions again without them.
         seed: The seed of every stage.
         output_dir: The folder of every file of every stage.
         db_path: The SQLite file.
@@ -162,6 +167,7 @@ class DatasetConfig:
     cat_cols: tuple[str, ...]
     min_class_count: int
     top_n: int
+    shortcut_cols: tuple[str, ...]
     seed: int
     output_dir: Path
     db_path: Path
@@ -212,14 +218,15 @@ def _validate_method(method: MethodConfig) -> None:
     )
     clustering = method.clustering
     positive = {
-        "graph.k": method.graph.k,
         "graph.max_samples": method.graph.max_samples,
         "clustering.max_fit_samples": clustering.max_fit_samples,
         "clustering.max_regions": clustering.max_regions,
         "clustering.min_cluster_floor": clustering.min_cluster_floor,
         "clustering.hardness_k": clustering.hardness_k,
         "clustering.vote_k": clustering.vote_k,
-        "complexity.top_k_clusters": method.complexity.top_k_clusters,
+        "quality.max_rows_per_region": method.quality.max_rows_per_region,
+        "quality.k": method.quality.k,
+        "quality.diversity_pairs": method.quality.diversity_pairs,
     }
     for key, value in positive.items():
         _check(value >= 1, f"{key} must be >= 1, got {value}")
@@ -230,6 +237,18 @@ def _validate_method(method: MethodConfig) -> None:
         separation > 0,
         f"clustering.overlap_separation must be > 0, got {separation}",
     )
+    candidate = method.quality.candidate_separation
+    _check(
+        candidate > 0,
+        f"quality.candidate_separation must be > 0, got {candidate}",
+    )
+    highlight = method.quality.highlight
+    _check(
+        set(highlight) == set(HIGHLIGHTS),
+        f"quality.highlight must hold {HIGHLIGHTS}, got {sorted(highlight)}",
+    )
+    for key, value in highlight.items():
+        _check(0 <= value <= 1, f"quality.highlight.{key} must be in [0, 1]")
     cat_cost = method.prepare.cat_cost
     _check(cat_cost > 0, f"prepare.cat_cost must be > 0, got {cat_cost}")
 
@@ -254,7 +273,7 @@ def load_method_config(name_or_path: str = "default") -> MethodConfig:
         "prepare": PrepareConfig,
         "graph": GraphConfig,
         "clustering": ClusteringConfig,
-        "complexity": ComplexityConfig,
+        "quality": QualityConfig,
     }
     for key, section in sections.items():
         _check_keys(raw[key], section, path, prefix=f"{key}.")
@@ -291,6 +310,9 @@ def load_config(dataset: str, method: str = "default") -> DatasetConfig:
             f"{added} is the column stage {stage} adds, not a configured one",
         )
     _check(raw["top_n"] >= 1, f"top_n must be >= 1, got {raw['top_n']}")
+    shortcut_cols = tuple(raw.get("shortcut_cols") or ())
+    unknown = sorted(set(shortcut_cols) - set(columns[:-1]))
+    _check(not unknown, f"shortcut_cols must be configured columns, got {unknown}")
     return DatasetConfig(
         name=raw["name"],
         path=Path(raw["path"]),
@@ -299,6 +321,7 @@ def load_config(dataset: str, method: str = "default") -> DatasetConfig:
         cat_cols=tuple(raw["cat_cols"] or ()),
         min_class_count=raw["min_class_count"],
         top_n=raw["top_n"],
+        shortcut_cols=shortcut_cols,
         seed=raw["seed"],
         output_dir=Path(raw["output_dir"]),
         db_path=Path(raw["db_path"]),

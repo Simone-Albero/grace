@@ -78,9 +78,9 @@ def create_app(dataset_dir: Path = DATASET_DIR) -> FastAPI:
     def overlap_map(dataset: str, node: int) -> Any:
         return _query(queries.overlap_map, load_dataset(dataset), node)
 
-    @app.get("/api/{dataset}/complexity")
-    def complexity(dataset: str, measure: str | None = None) -> Any:
-        return _query(queries.complexity, load_dataset(dataset), measure)
+    @app.get("/api/{dataset}/quality")
+    def quality(dataset: str) -> Any:
+        return _query(queries.quality, load_dataset(dataset))
 
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
     return app

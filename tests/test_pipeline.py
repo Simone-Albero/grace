@@ -1,5 +1,6 @@
 """Every stage end to end on the small synthetic dataset."""
 
+import dataclasses
 import json
 import sqlite3
 
@@ -8,11 +9,10 @@ import polars as pl
 import pytest
 from conftest import N_DUPLICATES, STAGE_ORDER, Workspace, make_workspace
 
-from src.complexity.measure import MEASURES
 from src.config import load_config
 from src.data import DUPLICATES, LABEL
 from src.prepare import MISSING, OTHER
-from stages.paths import read_points, read_weights
+from stages.paths import prepared_columns, read_points, read_weights
 
 
 def _rows(workspace: Workspace, sql: str) -> list[tuple]:
@@ -25,7 +25,7 @@ def _read(workspace: Workspace, name: str) -> pl.DataFrame:
 
 
 def test_every_run_is_ok(done):
-    runs = _rows(done, "SELECT stage, status FROM runs ORDER BY id")
+    runs = _rows(done, "SELECT stage, status FROM runs ORDER BY id")[: len(STAGE_ORDER)]
     assert [r[0] for r in runs] == list(STAGE_ORDER)
     assert {r[1] for r in runs} == {"ok"}
 
@@ -214,14 +214,6 @@ def test_region_tree_counts_the_rows_below_each_node(done):
         assert row["depth"] == parent["depth"] + 1
 
 
-def test_complexity_has_every_measure_of_every_population(done):
-    table = _read(done, "complexity.parquet")
-    regions = _read(done, "regions.parquet")
-    region_rows = table.filter(pl.col("scope") == "region")
-    assert region_rows.height == regions.height * len(MEASURES)
-    assert table.filter(pl.col("scope") == "class").height == 9 * len(MEASURES)
-
-
 def _zones(done) -> pl.DataFrame:
     columns = [
         "node",
@@ -340,15 +332,6 @@ def test_region_overlaps_are_the_pairs_under_the_threshold(done):
         assert p["separation"] < threshold
 
 
-def test_complexity_refuses_regions_of_other_data(copy_of_done):
-    prepared_file = copy_of_done.output_dir / "prepared.parquet"
-    prepared = pl.read_parquet(prepared_file)
-    shuffled = np.random.default_rng(0).permutation(prepared[LABEL].to_numpy())
-    prepared.with_columns(pl.Series(LABEL, shuffled)).write_parquet(prepared_file)
-    with pytest.raises(ValueError, match="run regions again"):
-        copy_of_done.run("complexity")
-
-
 def test_a_stage_without_its_input_fails_and_is_logged(tmp_path, synthetic_csv):
     workspace = make_workspace(tmp_path, synthetic_csv)
     with pytest.raises(FileNotFoundError, match="run clean first"):
@@ -371,3 +354,121 @@ def test_clean_refuses_rows_without_a_label(tmp_path, synthetic_csv):
     workspace = make_workspace(tmp_path, csv)
     with pytest.raises(ValueError, match="2 rows .* have no label"):
         workspace.run("clean")
+
+
+def test_the_points_without_shortcuts_lose_their_columns(done):
+    cfg = load_config(str(done.dataset), method=str(done.method))
+    full = prepared_columns(cfg)
+    points, _ = read_points(cfg)
+    assert len(full) == points.shape[1]
+    assert full.count("num_1") == 1 and full.count("cat_1") == 3
+    kept = prepared_columns(cfg, drop=cfg.shortcut_cols)
+    assert kept == [c for c in full if c not in {"num_1", "cat_1"}]
+    without, labels = read_points(cfg, drop=cfg.shortcut_cols)
+    keep = [i for i, c in enumerate(full) if c not in {"num_1", "cat_1"}]
+    np.testing.assert_array_equal(without, points[:, keep])
+    assert labels.tolist() == _read(done, "data.parquet")[LABEL].to_list()
+    cosine = dataclasses.replace(
+        cfg, method=dataclasses.replace(cfg.method, distance="cosine")
+    )
+    unit, _ = read_points(cosine, drop=cfg.shortcut_cols)
+    n_num = sum(c.startswith("num_") for c in kept)
+    norms = np.linalg.norm(unit[:, :n_num], axis=1)
+    np.testing.assert_allclose(norms[norms > 0], 1.0)
+
+
+def _table(workspace: Workspace, table: str) -> pl.DataFrame:
+    with sqlite3.connect(workspace.db_path) as conn:
+        cursor = conn.execute(
+            f"SELECT * FROM {table} WHERE run_id = (SELECT max(id) FROM runs "
+            "WHERE stage = 'quality_report' AND status = 'ok')"
+        )
+        names = [d[0] for d in cursor.description]
+        return pl.DataFrame(cursor.fetchall(), schema=names, orient="row")
+
+
+def test_quality_report_runs_ok(reported):
+    runs = _rows(reported, "SELECT status FROM runs WHERE stage = 'quality_report'")
+    assert runs[-1] == ("ok",)
+
+
+def test_quality_classes_count_the_rows_of_every_class(reported):
+    classes = _table(reported, "quality_classes").sort("class")
+    counts = pl.DataFrame(
+        _rows(reported, "SELECT label, n_read, n_rows FROM class_counts"),
+        schema=["class", "n_read", "n_rows"],
+        orient="row",
+    ).sort("class")
+    kept = counts.filter(pl.col("class").is_in(classes["class"].to_list()))
+    assert classes["class"].to_list() == kept["class"].to_list()
+    assert classes["n_rows"].to_list() == kept["n_rows"].to_list()
+    assert classes["n_read"].to_list() == pytest.approx(kept["n_read"].to_list())
+    assert classes["dup_share"].to_list() == pytest.approx(
+        (1 - kept["n_rows"] / kept["n_read"]).to_list()
+    )
+
+
+def test_quality_regions_count_their_copies(reported):
+    regions = _table(reported, "quality_regions").sort("region")
+    parquet = _read(reported, "regions.parquet").sort("region")
+    assert regions["region"].to_list() == parquet["region"].to_list()
+    assert regions["n_rows"].to_list() == parquet["n_rows"].to_list()
+    assert regions["dup_share"].to_list() == pytest.approx(
+        (1 - parquet["n_rows"] / parquet["n_read"]).to_list()
+    )
+    for column in ("pdd", "tc"):
+        assert regions[column].is_between(0, 1).all()
+    assert regions["rival"].is_not_null().all()
+
+
+def test_the_relabelled_row_is_a_label_conflict(reported):
+    groups = _table(reported, "label_conflict_groups")
+    n_rows = _read(reported, "data.parquet").height
+    every = groups.filter(pl.col("scope") == "all")
+    of_last = every.filter(pl.col("row") == n_rows - 1)["group"].to_list()
+    assert len(of_last) == 1
+    group = every.filter(pl.col("group") == of_last[0])
+    assert group.height == 2 and group["class"].n_unique() == 2
+    without = groups.filter(pl.col("scope") == "ns")
+    assert set(every["row"]) <= set(without["row"])
+    pairs = _table(reported, "quality_pairs")
+    a, b = sorted(group["region"].to_list())
+    pair = pairs.filter((pl.col("region_a") == a) & (pl.col("region_b") == b))
+    assert pair.height == 1 and "conflict" in pair["reasons"][0].split(",")
+    assert pair["n_conflicts"][0] >= 2
+
+
+def test_quality_pairs_follow_their_reasons(reported):
+    cfg = load_config(str(reported.dataset), method=str(reported.method))
+    quality = cfg.method.quality
+    pairs = _table(reported, "quality_pairs")
+    regions = _read(reported, "regions.parquet")
+    assert pairs.height and (pairs["class_a"] != pairs["class_b"]).all()
+    assert (pairs["region_a"] < pairs["region_b"]).all()
+    measured = set(pairs["region_a"]) | set(pairs["region_b"])
+    assert measured == set(regions["region"])
+    for p in pairs.iter_rows(named=True):
+        reasons = p["reasons"].split(",")
+        near = p["sep"] < quality.candidate_separation
+        near |= p["sep_ns"] < quality.candidate_separation
+        assert ("near" in reasons) == near
+        assert ("conflict" in reasons) == (p["n_conflicts"] + p["n_conflicts_ns"] > 0)
+        for suffix in ("", "_ns"):
+            for key in ("f3", "kdn", "enn", "n1"):
+                assert 0 <= p[key + suffix] <= 1
+            assert p["f3_feature" + suffix] in cfg.num_cols + cfg.cat_cols + (None,)
+        assert p["f3_feature_ns"] not in cfg.shortcut_cols
+        highlight = quality.highlight["kdn"]
+        shortcut = (p["kdn_ns"] >= highlight > p["kdn"]) or (
+            p["n_conflicts_ns"] > p["n_conflicts"]
+        )
+        assert bool(p["shortcut"]) == shortcut
+
+
+def test_quality_report_refuses_regions_of_other_data(copy_of_done):
+    prepared_file = copy_of_done.output_dir / "prepared.parquet"
+    prepared = pl.read_parquet(prepared_file)
+    shuffled = np.random.default_rng(0).permutation(prepared[LABEL].to_numpy())
+    prepared.with_columns(pl.Series(LABEL, shuffled)).write_parquet(prepared_file)
+    with pytest.raises(ValueError, match="run regions again"):
+        copy_of_done.run("quality_report")

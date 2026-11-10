@@ -9,10 +9,9 @@ from __future__ import annotations
 __all__ = [
     "assignments_file",
     "classes_file",
-    "complexity_file",
     "data_file",
-    "graph_file",
     "need",
+    "prepared_columns",
     "prepared_file",
     "read_classes",
     "read_data",
@@ -22,6 +21,7 @@ __all__ = [
 ]
 
 import json
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
@@ -112,30 +112,6 @@ def assignments_file(cfg: DatasetConfig) -> Path:
     return cfg.output_dir / "assignments.parquet"
 
 
-def graph_file(cfg: DatasetConfig) -> Path:
-    """Return the file of the Graph arrays (stage regions).
-
-    Args:
-        cfg: The dataset config.
-
-    Returns:
-        The npz path of the src.graph.Graph fields.
-    """
-    return cfg.output_dir / "graph.npz"
-
-
-def complexity_file(cfg: DatasetConfig) -> Path:
-    """Return the file of the descriptors (stage complexity).
-
-    Args:
-        cfg: The dataset config.
-
-    Returns:
-        The parquet path of the long table.
-    """
-    return cfg.output_dir / "complexity.parquet"
-
-
 def read_data(cfg: DatasetConfig) -> pl.DataFrame:
     """Return the cleaned rows.
 
@@ -151,31 +127,79 @@ def read_data(cfg: DatasetConfig) -> pl.DataFrame:
     return pl.read_parquet(need(data_file(cfg), "clean"))
 
 
-def read_points(cfg: DatasetConfig) -> tuple[np.ndarray, np.ndarray]:
+def read_points(
+    cfg: DatasetConfig, drop: Sequence[str] = ()
+) -> tuple[np.ndarray, np.ndarray]:
     """Return the prepared rows as points of the space, and their classes.
 
     The numeric columns of the prepared file (data.feature_cols) and its
     one-hot slots (every other column but MISSING and LABEL) go through
     graph.space_points with method.distance. MISSING is a diagnostic:
-    no distance sees it.
+    no distance sees it. A column of drop leaves before: a numeric one
+    with its column, a categorical one with all its slots; under
+    "cosine" the remaining numbers are then the ones put at unit length.
 
     Args:
         cfg: The dataset config.
+        drop: Configured columns (numeric or categorical) left out.
 
     Returns:
         The Float64 points, shape (n, d_num + d_cat), and the class
-        codes, shape (n,). Row i is row i of the data file.
+        codes, shape (n,). Row i is row i of the data file. Column j is
+        a column of prepared_columns(cfg, drop)[j].
 
     Raises:
         FileNotFoundError: When stage prepare has not run.
     """
     prepared = pl.read_parquet(need(prepared_file(cfg), "prepare"))
-    numeric = feature_cols(prepared.columns, cfg.num_cols, cfg.cat_cols).num
-    slots = prepared.drop(*numeric, MISSING, LABEL)
+    numeric, slots, _ = _space_columns(cfg, prepared.columns, drop)
     points = space_points(
-        prepared.select(numeric).to_numpy(), slots.to_numpy(), cfg.method.distance
+        prepared.select(numeric).to_numpy(),
+        prepared.select(slots).to_numpy(),
+        cfg.method.distance,
     )
     return points, prepared[LABEL].to_numpy()
+
+
+def prepared_columns(cfg: DatasetConfig, drop: Sequence[str] = ()) -> list[str]:
+    """Return the configured column behind every column of read_points.
+
+    Args:
+        cfg: The dataset config.
+        drop: The columns read_points leaves out.
+
+    Returns:
+        One name per column of the points: a numeric column's own, the
+        categorical column of a one-hot slot.
+
+    Raises:
+        FileNotFoundError: When stage prepare has not run.
+    """
+    names = pl.read_parquet_schema(need(prepared_file(cfg), "prepare")).names()
+    numeric, _, owners = _space_columns(cfg, names, drop)
+    return [*numeric, *owners]
+
+
+def _space_columns(
+    cfg: DatasetConfig, columns: Sequence[str], drop: Sequence[str]
+) -> tuple[list[str], list[str], list[str]]:
+    """Return the numeric columns, the slots and the column of each slot.
+
+    A slot f"{column}={value}" belongs to the longest categorical column
+    it starts with; MISSING and LABEL are neither.
+    """
+    present = feature_cols(columns, cfg.num_cols, cfg.cat_cols).num
+    by_length = sorted(cfg.cat_cols, key=len, reverse=True)
+    numeric = [c for c in present if c not in drop]
+    slots, owners = [], []
+    for name in columns:
+        if name in present or name in (MISSING, LABEL):
+            continue
+        owner = next(c for c in by_length if name.startswith(f"{c}="))
+        if owner not in drop:
+            slots.append(name)
+            owners.append(owner)
+    return numeric, slots, owners
 
 
 def read_weights(cfg: DatasetConfig) -> np.ndarray:

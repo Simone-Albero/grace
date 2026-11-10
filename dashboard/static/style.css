@@ -19,6 +19,7 @@
   --div-lo: #3987e5;      /* diverging: below the centre */
   --div-mid: #383835;     /* diverging: neutral midpoint */
   --div-hi: #e66767;      /* diverging: above the centre */
+  --warning: #fab219;     /* status: a value over its threshold, always with the sign and a label */
   --radius: 6px;
   --font: system-ui, -apple-system, "Segoe UI", sans-serif;
   --mono: ui-monospace, "SF Mono", Menlo, monospace;
@@ -143,3 +144,10 @@ button.chip:hover { color: var(--text); border-color: var(--muted); }
 #rg-ov-branches { margin-bottom: 12px; }
 .zoomable { cursor: grab; touch-action: none; user-select: none; }
 .zoomable.dragging { cursor: grabbing; }
+
+/* quality report */
+.flag .sign { color: var(--warning); font-weight: 400; font-size: 10px; margin-right: 4px; }
+.chip.flag { color: var(--text); }
+td .chips { display: inline-flex; flex-wrap: nowrap; }
+td .chips:empty::after { content: "–"; }
+button.chip[aria-pressed="true"] { color: var(--text); border-color: var(--accent); background: rgba(57, 135, 229, 0.12); }

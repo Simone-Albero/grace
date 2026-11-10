@@ -150,17 +150,17 @@ def test_overlap_map_of_an_unknown_node_is_404(client):
     assert client.get("/api/toy/regions/overlap_map?node=-5").status_code == 404
 
 
-def test_complexity(client):
-    data = _get(client, "/api/toy/complexity")
-    assert data["measure"] == data["measures"][0]
-    assert len(data["classes"]) == 9
-    other = _get(client, f"/api/toy/complexity?measure={data['measures'][1]}")
-    assert other["measure"] == data["measures"][1]
-    assert client.get("/api/toy/complexity?measure=nope").status_code == 404
+def test_quality(reported, client):
+    data = _get(client, "/api/toy/quality")
+    assert len(data["classes"]) == 9 and data["pairs"] and data["regions"]
+    assert data["stats"]["shortcut_cols"] == ["num_1", "cat_1"]
+    assert set(data["stats"]["highlight"]) >= {"kdn", "enn", "f3", "pdd"}
+    assert all(isinstance(p["reasons"], list) for p in data["pairs"])
 
 
 def test_missing_runs_are_404(client):
     assert client.get("/api/empty/clean").status_code == 404
     assert client.get("/api/empty/prepare").status_code == 404
     assert client.get("/api/empty/regions").status_code == 404
+    assert client.get("/api/empty/quality").status_code == 404
     assert client.get("/api/nope/clean").status_code == 404

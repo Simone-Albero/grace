@@ -6,9 +6,8 @@ prepare:                 # the features every distance is measured on (src.prepa
   cat_cost: 1.0          # weight of each categorical column against a numeric one, on average over pairs of rows;
                          #   the mismatch cost of a column grows as its values concentrate (2 · cat_cost / (1 - Σ p²))
 
-graph:                   # k-nearest-neighbour graph of the rows (src.graph)
-  max_samples: 50000     # rows in the graph: a uniform sample above this (the build is quadratic)
-  k: 30                  # neighbours of each row
+graph:                   # reference rows of the kDN hardness (src.graph)
+  max_samples: 50000     # reference rows: a uniform sample above this
 
 clustering:              # regions: a weighted Ward tree per class (weight: n_duplicates), cut where the loss is least
   max_fit_samples: 20000 # distinct rows of a class the tree is built on (quadratic time); the others are voted
@@ -21,9 +20,18 @@ clustering:              # regions: a weighted Ward tree per class (weight: n_du
   overlap_separation: 1.0  # two regions of different classes overlap when their centroids lie closer than this many
                            #   standard deviations of their rows along the line between them
 
-complexity:              # descriptors of every region and class (src.complexity)
-  top_k_clusters: 10           # nearest rivals (populations of another class) each population is compared with
-  max_sample_per_region: 200   # rows a region is measured on when the rows exceed graph.max_samples
-  max_sample_per_class: 2000   # the same for a class
-  silhouette_max_samples: 10000  # subsample behind the silhouette tail (p5_silhouette, frac_at_risk)
-  silhouette_min_per_cluster: 50 # rows per population kept even past silhouette_max_samples
+quality:                 # the quality report on pairs of regions of different classes (src.quality)
+  max_rows_per_region: 500     # distinct rows of a region its pairs are measured on: a uniform sample above this
+  k: 4                         # neighbours inside a pair behind kDN and ENN (4 as in Flood et al.'s ENN)
+  candidate_separation: 2.0    # pairs measured: separation under this (full space or without shortcut_cols), plus
+                               #   the pairs sharing conflicting rows and each region's nearest rival
+  diversity_pairs: 1000        # pairs of rows drawn per region for its mean cosine similarity (pdd) and collapse (tc)
+  highlight:                   # from where the dashboard marks a measure (the tables keep every value)
+    conflict: 0.0              #   share of rows equal to a row of another class (marked when above)
+    kdn: 0.1                   #   mean share of neighbours of the other region
+    enn: 0.1                   #   share of rows whose neighbours are mostly of the other region
+    f3: 0.95                   #   share of the pair's rows one feature alone tells apart
+    l2: 0.1                    #   error of a linear boundary between the two regions
+    pdd: 0.95                  #   mean cosine similarity of the rows of a region
+    tc: 0.5                    #   share of pairs of rows of a region that are functionally identical (cosine > 0.95)
+    dup_share: 0.5             #   share of the CSV rows of a region that are copies of another

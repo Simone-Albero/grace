@@ -14,8 +14,8 @@ __all__ = [
     "MAP_MAX_POINTS",
     "MAP_PER_LEAF",
     "clean",
-    "complexity",
     "prepare",
+    "quality",
     "region_map",
     "regions",
 ]
@@ -142,6 +142,35 @@ def regions(cfg: DatasetConfig) -> dict[str, Any]:
         }
 
 
+def quality(cfg: DatasetConfig) -> dict[str, Any]:
+    """Return the last quality_report run.
+
+    Args:
+        cfg: The dataset.
+
+    Returns:
+        run; stats (the quality_stats row, shortcut_cols and highlight
+        parsed from JSON); classes, regions and pairs: the rows of
+        quality_classes, quality_regions and quality_pairs, pairs with
+        reasons as a list.
+    """
+    with closing(_connect(cfg)) as conn:
+        run = _latest_run(conn, "quality_report", cfg)
+        stats = _rows(conn, "quality_report", "quality_stats", run)[0]
+        stats["shortcut_cols"] = json.loads(stats["shortcut_cols"])
+        stats["highlight"] = json.loads(stats["highlight"])
+        pairs = _rows(conn, "quality_report", "quality_pairs", run)
+        for pair in pairs:
+            pair["reasons"] = pair["reasons"].split(",")
+        return {
+            "run": _public(run),
+            "stats": stats,
+            "classes": _rows(conn, "quality_report", "quality_classes", run),
+            "regions": _rows(conn, "quality_report", "quality_regions", run),
+            "pairs": pairs,
+        }
+
+
 def region_map(cfg: DatasetConfig, node: int) -> dict[str, Any]:
     """Return the rows of one node of the region trees in their own plane.
 
@@ -238,66 +267,6 @@ def _map(cfg: DatasetConfig, table: str, node: int) -> dict[str, Any]:
     }
 
 
-def complexity(cfg: DatasetConfig, measure: str | None) -> dict[str, Any]:
-    """Return the last complexity run, focused on one measure.
-
-    Args:
-        cfg: The dataset.
-        measure: A measure of the run; None picks the first.
-
-    Returns:
-        run; measures [names, table order]; measure (the one shown);
-        regions [{region, class, value}]; classes [{class, value}];
-        summary [{measure, mean, min, max, n_null}] over the regions.
-
-    Raises:
-        LookupError: Also when measure is not a measure of the run.
-    """
-    with closing(_connect(cfg)) as conn:
-        run = _latest_run(conn, "complexity", cfg)
-        rows = _rows(conn, "complexity", "complexity", run)
-        region_class = _region_classes(conn, cfg)
-    measures = list(dict.fromkeys(r["measure"] for r in rows))
-    measure = measures[0] if measure is None else measure
-    if measure not in measures:
-        raise LookupError(f"unknown measure: {measure}")
-    class_names = _classes(cfg)
-    by_region = defaultdict(list)
-    for r in rows:
-        if r["scope"] == "region":
-            by_region[r["measure"]].append(r["value"])
-    summary = []
-    for m in measures:
-        values = np.array([np.nan if v is None else v for v in by_region[m]])
-        known = values[np.isfinite(values)]
-        summary.append(
-            {
-                "measure": m,
-                "mean": _finite(known.mean()) if known.size else None,
-                "min": _finite(known.min()) if known.size else None,
-                "max": _finite(known.max()) if known.size else None,
-                "n_null": int(values.size - known.size),
-            }
-        )
-    chosen = [r for r in rows if r["measure"] == measure]
-    return {
-        "run": _public(run),
-        "measures": measures,
-        "measure": measure,
-        "regions": [
-            {"region": r["id"], "class": region_class.get(r["id"]), "value": r["value"]}
-            for r in chosen
-            if r["scope"] == "region"
-        ],
-        "classes": [
-            {"class": class_names[r["id"]], "value": r["value"]}
-            for r in chosen
-            if r["scope"] == "class"
-        ],
-        "summary": summary,
-    }
-
-
 def _finite(value: Any) -> float | None:
     """Return a finite float, or None (JSON has no NaN)."""
     if value is None:
@@ -359,12 +328,6 @@ def _rows(
             return []
         raise LookupError(f"run {stage} first") from e
     return [{k: _json_value(r[k]) for k in r.keys() if k != "run_id"} for r in rows]
-
-
-def _region_classes(conn: sqlite3.Connection, cfg: DatasetConfig) -> dict[int, str]:
-    """Return the class name of every region of the last regions run."""
-    run = _latest_run(conn, "regions", cfg)
-    return {r["region"]: r["class"] for r in _rows(conn, "regions", "regions", run)}
 
 
 def _classes(cfg: DatasetConfig) -> list[str]:

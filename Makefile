@@ -29,7 +29,7 @@ run:
 	$(PYTHON) main.py --stage clean --dataset $(DATA)
 	$(PYTHON) main.py --stage prepare --dataset $(DATA)
 	$(PYTHON) main.py --stage regions --dataset $(DATA)
-	$(PYTHON) main.py --stage complexity --dataset $(DATA)
+	$(PYTHON) main.py --stage quality_report --dataset $(DATA)
 
 ## dashboard: the read-only dashboard on 127.0.0.1:PORT (default 8000)
 dashboard:

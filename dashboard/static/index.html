@@ -19,7 +19,7 @@
       <button role="tab" data-tab="clean" aria-selected="true">clean</button>
       <button role="tab" data-tab="prepare" aria-selected="false">prepare</button>
       <button role="tab" data-tab="regions" aria-selected="false">regions</button>
-      <button role="tab" data-tab="complexity" aria-selected="false">complexity</button>
+      <button role="tab" data-tab="quality" aria-selected="false">quality</button>
     </nav>
   </header>
 
@@ -105,15 +105,29 @@
         <div id="rg-table" class="table-wrap"></div></div>
     </section>
 
-    <!-- complexity -->
-    <section id="tab-complexity" class="panel" hidden>
+    <!-- quality -->
+    <section id="tab-quality" class="panel" hidden>
       <p class="empty">Select a dataset.</p>
-      <div class="card"><h2>Measure by class</h2>
-        <p class="note">One dot per region, measured on its rows against the nearest regions of other
-          classes; the bar is the value of the whole class.</p>
-        <div class="filters"><label class="inline">measure <select id="cx-measure"></select></label></div>
-        <div id="cx-strip"></div></div>
-      <div class="card"><h2>Every measure over the regions</h2><div id="cx-summary" class="table-wrap"></div></div>
+      <div id="qr-tiles" class="tiles"></div>
+      <div class="card"><h2>Classes</h2>
+        <p class="note">The smells of Flood et al. (EuroS&amp;P 2024) per class, measured on its regions. Copies: CSV
+          rows that repeat another. Conflicts: CSV rows equal on every feature to a row of another class. Overlap (ENN):
+          rows whose nearest neighbours are mostly of the closest rival region, weighted by rows. One feature: the most
+          of a pair's rows a single feature tells apart. Shortcut: rows of regions that overlap a rival only once
+          <span id="qr-shortcuts"></span> are removed. Diversity: mean cosine similarity of pairs of rows of a region
+          (pdd) and share of pairs that are functionally identical (tc). Marked: from the thresholds of
+          <code>quality.highlight</code>.</p>
+        <div id="qr-classes" class="table-wrap"></div></div>
+      <div class="card"><h2>Pairs of regions</h2>
+        <p class="note">Each pair of regions of different classes that is near (separation under
+          <span id="qr-candidate"></span>), shares conflicting rows, or is a region's nearest rival, measured on at most
+          <span id="qr-rows"></span> rows per region: kDN and ENN (neighbours of the other region), N1 (rows on the
+          spanning tree's border), F3 (rows one feature tells apart, and which), L2 (error of a linear boundary: high
+          with a low overlap, the boundary is curved). "without shortcuts": the same without the shortcut columns.</p>
+        <div id="qr-filters" class="filters"></div>
+        <div id="qr-pairs" class="table-wrap"></div></div>
+      <div class="card"><h2>Regions</h2>
+        <div id="qr-regions" class="table-wrap"></div></div>
     </section>
 
   </main>

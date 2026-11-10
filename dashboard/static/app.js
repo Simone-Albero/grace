@@ -2,11 +2,12 @@
 
 /**
  * UI state.
- * @type {{dataset: string|null, tab: "clean"|"prepare"|"regions"|"complexity", cls: string|null, node: number|null,
- *   overlap: number|null, measure: string|null}} node: the region tree node whose map is shown (null: the root of
- *   state.cls); overlap: the overlap zones node whose map is shown (null: the root of the first zone)
+ * @type {{dataset: string|null, tab: "clean"|"prepare"|"regions"|"quality", cls: string|null, node: number|null,
+ *   overlap: number|null, diagnosis: string|null}} node: the region tree node whose map is shown (null: the root of
+ *   state.cls); overlap: the overlap zones node whose map is shown (null: the root of the first zone); diagnosis:
+ *   the diagnosis the quality pairs are filtered on (null: every pair)
  */
-const state = { dataset: null, tab: "clean", cls: null, node: null, overlap: null, measure: null };
+const state = { dataset: null, tab: "clean", cls: null, node: null, overlap: null, diagnosis: null };
 
 const last = { regions: null }; // last responses, for the controls that only redraw
 let loadId = 0; // drops answers of superseded requests
@@ -115,9 +116,8 @@ async function init() {
     state.overlap = overlap ? Number(overlap) : null;
   }
   $("dataset").value = state.dataset;
-  $("dataset").onchange = (e) => { state.dataset = e.target.value; state.cls = state.node = state.overlap = state.measure = null; load(); };
+  $("dataset").onchange = (e) => { state.dataset = e.target.value; state.cls = state.node = state.overlap = state.diagnosis = null; load(); };
   $("rg-class").onchange = (e) => selectClass(e.target.value);
-  $("cx-measure").onchange = (e) => { state.measure = e.target.value; load(); };
   for (const b of document.querySelectorAll(".tabs button")) b.onclick = () => showTab(b.dataset.tab);
   showTab(state.tab);
 }
@@ -151,14 +151,14 @@ async function load() {
     clean: `${d}/clean`,
     prepare: `${d}/prepare`,
     regions: `${d}/regions`,
-    complexity: `${d}/complexity${state.measure ? `?measure=${encodeURIComponent(state.measure)}` : ""}`,
+    quality: `${d}/quality`,
   }[tab];
   try {
     const data = await api(path);
     if (id !== loadId) return;
     panel.classList.remove("failed");
     empty.hidden = true;
-    ({ clean: renderClean, prepare: renderPrepare, regions: renderRegions, complexity: renderComplexity })[tab](data);
+    ({ clean: renderClean, prepare: renderPrepare, regions: renderRegions, quality: renderQuality })[tab](data);
     renderRun(data.run);
   } catch (e) {
     if (id !== loadId) return;
@@ -238,7 +238,7 @@ function renderRegions(data) {
     tile("regions", num(s.n_regions)),
     tile("rows voted", num(voted), `${pct(voted / rows)} of ${num(rows)}`),
     tile("distance", s.distance),
-    tile("graph nodes", num(s.n_graph_nodes)),
+    tile("kDN reference rows", num(s.n_graph_nodes)),
     ...(s.n_zones == null ? [] : [tile("overlap zones", num(s.n_zones),
       `${num(data.overlaps.length)} ${data.overlaps.length === 1 ? "pair" : "pairs"} of regions under ${s.overlap_separation} sd`)]));
   sortable($("rg-classes"), [
@@ -808,22 +808,129 @@ function panZoom(svg, draw) {
   draw(t);
 }
 
-/** Strip of the measure by class with the class value, and the summary of every measure. @param {object} data response of /complexity */
-function renderComplexity(data) {
-  state.measure = data.measure;
-  $("cx-measure").replaceChildren(...data.measures.map((m) => h("option", {}, m)));
-  $("cx-measure").value = data.measure;
-  const classValue = Object.fromEntries(data.classes.map((c) => [c.class, c.value]));
-  strip($("cx-strip"), data.classes.map((c) => c.class), data.regions.map((r) => ({
-    group: r.class, y: r.value, tip: `region ${r.region} (${r.class}): ${short(r.value)}`,
-  })), { marks: classValue, yLabel: data.measure });
-  sortable($("cx-summary"), [
-    { key: "measure", label: "measure" },
-    { key: "mean", label: "mean", format: short },
-    { key: "min", label: "min", format: short },
-    { key: "max", label: "max", format: short },
-    { key: "n_null", label: "undefined", format: num },
-  ], data.summary, { onClick: (r) => { state.measure = r.measure; load(); } });
+/** The diagnoses of a pair, in the order of the filter chips. */
+const DIAGNOSES = ["label conflict", "overlap", "one feature", "nonlinear", "shortcut"];
+
+/**
+ * Tiles, the classes table (Flood et al.'s smells per class), the pairs table with its diagnosis filter, the regions.
+ * @param {object} data response of /quality
+ */
+function renderQuality(data) {
+  const s = data.stats, hl = s.highlight;
+  const shortcuts = s.shortcut_cols.length > 0;
+  for (const p of data.pairs) p.diagnoses = diagnoses(p, hl);
+  const rows = data.regions.reduce((a, r) => a + r.n_rows, 0);
+  const read = data.regions.reduce((a, r) => a + r.n_read, 0);
+  const conflictRead = data.regions.reduce((a, r) => a + r.conflict_read, 0);
+  const count = (d) => data.pairs.filter((p) => p.diagnoses.includes(d)).length;
+  fill("qr-tiles",
+    tile("copies removed", num(read - rows), `${pct((read - rows) / read)} of ${num(read)} CSV rows`),
+    tile("rows in a label conflict", num(conflictRead), `${pct(conflictRead / read, 2)} of the CSV rows`),
+    tile("pairs measured", num(s.n_pairs), `${num(s.n_near)} near · ${num(s.n_conflict)} conflict · ${num(s.n_nearest)} nearest`),
+    tile("pairs that overlap", num(count("overlap")), `ENN ≥ ${hl.enn} or kDN ≥ ${hl.kdn}`),
+    tile("shortcut pairs", shortcuts ? num(count("shortcut")) : "–",
+      shortcuts ? `without ${s.shortcut_cols.join(", ")}` : "no shortcut_cols in the dataset yaml"));
+  $("qr-shortcuts").textContent = shortcuts ? s.shortcut_cols.join(", ") : "the shortcut_cols (none configured)";
+  $("qr-candidate").textContent = `${s.candidate_separation} sd`;
+  $("qr-rows").textContent = num(s.max_rows_per_region);
+
+  sortable($("qr-classes"), [
+    { key: "class", label: "class" },
+    { key: "n_rows", label: "rows", format: num },
+    { key: "n_read", label: "CSV rows", format: num },
+    { key: "dup_share", label: "copies", format: (v) => share(v, v >= hl.dup_share) },
+    { key: "conflict_share", label: "conflicts", format: (v) => share(v, v > hl.conflict, 2) },
+    { key: "enn", label: "overlap (ENN)", format: (v) => share(v, v >= hl.enn) },
+    { key: "f3", label: "one feature (F3)", format: (v, r) => flagged(v == null ? "–" : `${pct(v)} ${r.f3_feature ?? ""}`, v >= hl.f3) },
+    { key: "shortcut_share", label: "shortcut", format: (v) => (shortcuts ? share(v, v > 0) : "–") },
+    { key: "pdd", label: "diversity (pdd)", format: (v) => flagged(dec(v, 3), v >= hl.pdd) },
+    { key: "tc", label: "collapse (tc)", format: (v) => flagged(pct(v), v >= hl.tc) },
+    { key: "n_pairs", label: "pairs", format: num },
+  ], data.classes);
+
+  const draw = () => {
+    const shown = state.diagnosis ? data.pairs.filter((p) => p.diagnoses.includes(state.diagnosis)) : data.pairs;
+    fill("qr-filters", h("div", { class: "chips" }, [null, ...DIAGNOSES].map((d) => {
+      if (d === "shortcut" && !shortcuts) return null;
+      const chip = h("button", { class: "chip", type: "button", "aria-pressed": String(state.diagnosis === d) },
+        d == null ? `all pairs (${num(data.pairs.length)})` : `${d} (${num(count(d))})`);
+      chip.onclick = () => { state.diagnosis = d; draw(); };
+      return chip;
+    })));
+    const columns = [
+      { key: "region_a", label: "region a" },
+      { key: "class_a", label: "class a" },
+      { key: "region_b", label: "region b" },
+      { key: "class_b", label: "class b" },
+      { key: "reasons", label: "measured as", format: (v) => v.join(", ") },
+      { key: "diagnoses", label: "diagnoses", format: (v) => h("span", { class: "chips" }, v.map(diagnosisChip)) },
+      { key: "sep", label: "separation", format: short },
+      { key: "n_conflicts", label: "conflicts", format: num },
+      { key: "kdn", label: "kDN", format: (v) => flagged(dec(v, 3), v >= hl.kdn) },
+      { key: "enn", label: "ENN", format: (v) => flagged(dec(v, 3), v >= hl.enn) },
+      { key: "n1", label: "N1", format: (v) => dec(v, 3) },
+      { key: "f3", label: "F3", format: (v, r) => flagged(`${dec(v, 3)} ${r.f3_feature ?? ""}`, v >= hl.f3) },
+      { key: "n_separating", label: "separating features", format: num },
+      { key: "l2", label: "L2", format: (v) => flagged(dec(v, 3), v >= hl.l2) },
+    ];
+    if (shortcuts) columns.push(
+      { key: "sep_ns", label: "separation · no shortcuts", format: short },
+      { key: "n_conflicts_ns", label: "conflicts · no shortcuts", format: num },
+      { key: "kdn_ns", label: "kDN · no shortcuts", format: (v) => flagged(dec(v, 3), v >= hl.kdn) },
+      { key: "enn_ns", label: "ENN · no shortcuts", format: (v) => flagged(dec(v, 3), v >= hl.enn) },
+      { key: "f3_ns", label: "F3 · no shortcuts", format: (v, r) => flagged(`${dec(v, 3)} ${r.f3_feature_ns ?? ""}`, v >= hl.f3) },
+      { key: "l2_ns", label: "L2 · no shortcuts", format: (v) => flagged(dec(v, 3), v >= hl.l2) });
+    sortable($("qr-pairs"), columns, shown);
+  };
+  draw();
+
+  sortable($("qr-regions"), [
+    { key: "region", label: "region" },
+    { key: "class", label: "class" },
+    { key: "n_rows", label: "rows", format: num },
+    { key: "n_read", label: "CSV rows", format: num },
+    { key: "dup_share", label: "copies", format: (v) => share(v, v >= hl.dup_share) },
+    { key: "conflict_rows", label: "rows in a conflict", format: num },
+    { key: "pdd", label: "diversity (pdd)", format: (v) => flagged(dec(v, 3), v >= hl.pdd) },
+    { key: "tc", label: "collapse (tc)", format: (v) => flagged(pct(v), v >= hl.tc) },
+    { key: "rival", label: "closest rival", format: (v) => (v == null ? "–" : String(v)) },
+    { key: "enn", label: "ENN with it", format: (v) => flagged(dec(v, 3), v >= hl.enn) },
+    { key: "shortcut", label: "shortcut", format: (v) => (shortcuts ? (v ? diagnosisChip("shortcut") : "no") : "–") },
+  ], data.regions);
+}
+
+/**
+ * Diagnoses of a pair under the highlight thresholds, in DIAGNOSES order. One feature: some feature tells at least
+ * hl.f3 of the rows apart and at most one does so for every row (many would only say the regions are far apart).
+ * Nonlinear: the linear boundary errs while the neighbours do not mix.
+ * @param {object} p a pair of /quality @param {Object<string, number>} hl stats.highlight @returns {string[]}
+ */
+function diagnoses(p, hl) {
+  const overlap = p.enn >= hl.enn || p.kdn >= hl.kdn;
+  return [
+    p.n_conflicts > hl.conflict && "label conflict",
+    overlap && "overlap",
+    p.f3 >= hl.f3 && p.n_separating <= 1 && "one feature",
+    p.l2 != null && p.l2 >= hl.l2 && p.kdn < hl.kdn && "nonlinear",
+    p.shortcut && "shortcut",
+  ].filter(Boolean);
+}
+
+/** A diagnosis as a chip: the warning sign and its name. @param {string} d */
+function diagnosisChip(d) {
+  return h("span", { class: "chip flag" }, h("b", { class: "sign", "aria-hidden": "true" }, "▲"), d);
+}
+
+/** A value, with the warning sign when it reaches its threshold. @param {string} text @param {boolean} over */
+function flagged(text, over) {
+  return over ? h("span", { class: "flag", title: "over the highlight threshold" },
+    h("b", { class: "sign", "aria-label": "over the threshold" }, "▲"), text) : text;
+}
+
+/** A share in [0, 1] as an inline bar and a percentage, flagged when over its threshold. */
+function share(v, over, digits = 1) {
+  if (v == null) return "–";
+  return h("span", {}, h("i", { class: "bar", style: `width:${Math.round(v * 60)}px` }), flagged(pct(v, digits), over));
 }
 
 // --- charts ---
@@ -933,53 +1040,6 @@ function scatter(el, points, opts) {
     kids.push(dot);
   }
   el.replaceChildren(sv("svg", { viewBox: `0 0 ${W} ${H}`, role: "img" }, kids));
-}
-
-/**
- * Dots by category along x, jittered; an optional mark per category drawn as a short bar.
- * @param {HTMLElement} el container, replaced
- * @param {string[]} groups categories, in x order
- * @param {{group: string, y: number, tip: string, r?: number}[]} points
- * @param {{yLabel: string, max?: number, marks?: Object<string, number>}} opts
- */
-function strip(el, groups, points, opts) {
-  const W = 900, H = 300, m = { l: 56, r: 12, t: 10, b: 60 };
-  const pts = points.filter((p) => p.y != null);
-  const marks = Object.values(opts.marks ?? {}).filter((v) => v != null);
-  const lo = Math.min(0, ...pts.map((p) => p.y), ...marks);
-  const hi = opts.max ?? niceMax(Math.max(...pts.map((p) => p.y), ...marks, 1e-9));
-  const pw = W - m.l - m.r, ph = H - m.t - m.b;
-  const bw = pw / Math.max(groups.length, 1);
-  const y = (v) => m.t + ph - ((v - lo) / (hi - lo || 1)) * ph;
-  const kids = [];
-  yTicks(kids, y, lo, hi, m, W);
-  kids.push(sv("text", { transform: `translate(12, ${m.t + ph / 2}) rotate(-90)`, "text-anchor": "middle" }, opts.yLabel));
-  groups.forEach((g, i) => {
-    kids.push(sv("text", { transform: `translate(${m.l + i * bw + bw / 2}, ${H - m.b + 14}) rotate(30)`, "text-anchor": "start" }, g));
-    const mark = opts.marks?.[g];
-    if (mark != null) {
-      const bar = sv("line", { x1: m.l + i * bw + bw * 0.2, x2: m.l + i * bw + bw * 0.8, y1: y(mark), y2: y(mark), style: "stroke:var(--series-4); stroke-width:2.5" });
-      bar.onmousemove = (ev) => tip(ev, `class ${g}: ${short(mark)}`);
-      bar.onmouseleave = () => tip(null);
-      kids.push(bar);
-    }
-  });
-  let seed = 1;
-  const jitter = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647 - 0.5; };
-  for (const p of pts) {
-    const i = groups.indexOf(p.group);
-    const dot = sv("circle", {
-      class: "dot", cx: m.l + i * bw + bw / 2 + jitter() * bw * 0.5, cy: y(p.y), r: p.r ?? 3.5,
-      style: "fill:var(--accent); fill-opacity:0.6",
-    });
-    dot.onmousemove = (ev) => tip(ev, p.tip);
-    dot.onmouseleave = () => tip(null);
-    kids.push(dot);
-  }
-  const legend = opts.marks ? h("div", { class: "legend" },
-    h("span", {}, h("i", { style: "background:var(--accent)" }), "region"),
-    h("span", {}, h("i", { style: "background:var(--series-4)" }), "whole class")) : null;
-  el.replaceChildren(...[legend, sv("svg", { viewBox: `0 0 ${W} ${H}`, role: "img" }, kids)].filter(Boolean));
 }
 
 /** Show #tooltip near the pointer with the given text, or hide it when text is null. @param {MouseEvent} ev @param {string|null} text */

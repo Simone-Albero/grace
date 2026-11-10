@@ -15,7 +15,7 @@ import yaml
 from main import main
 
 ROOT = Path(__file__).resolve().parents[1]
-STAGE_ORDER = ("clean", "prepare", "regions", "complexity")
+STAGE_ORDER = ("clean", "prepare", "regions")
 N_DUPLICATES = 52  # copies synthetic_csv appends
 
 
@@ -60,6 +60,7 @@ def write_dataset_yaml(folder: Path, csv: Path, name: str = "toy") -> Path:
         num_cols=[*base["num_cols"], "flat"],
         min_class_count=600,
         top_n=3,  # cat_1 has 3 values, all slotted; cat_2 has 4, one "other"
+        shortcut_cols=["num_1", "cat_1"],
         output_dir=str(folder / "out"),
         db_path=str(folder / "grace.db"),
     )
@@ -76,9 +77,8 @@ def write_method_yaml(folder: Path) -> Path:
     # The closest synthetic regions of different classes lie about 1.2 sd
     # apart: under 2 a few zones form.
     method["clustering"]["overlap_separation"] = 2.0
-    method["complexity"]["top_k_clusters"] = 3
-    method["complexity"]["max_sample_per_region"] = 50
-    method["complexity"]["max_sample_per_class"] = 300
+    method["quality"]["max_rows_per_region"] = 100
+    method["quality"]["diversity_pairs"] = 200
     path = folder / "method.yaml"
     path.write_text(yaml.safe_dump(method, sort_keys=False))
     return path
@@ -90,7 +90,8 @@ def synthetic_csv(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
     A constant column, flat, is added for stage clean to drop, and
     N_DUPLICATES copies at the end: rows 0-49 once more, row 50 twice
-    more. Row 51 comes back under another class, which is not a copy.
+    more. Row 51 comes back under another class, which is not a copy
+    but a label conflict, the last row of the data.
     """
     csv = tmp_path_factory.mktemp("data") / "synthetic.csv"
     subprocess.run(
@@ -130,6 +131,16 @@ def done(tmp_path_factory: pytest.TempPathFactory, synthetic_csv: Path) -> Works
     for stage in STAGE_ORDER:
         workspace.run(stage)
     return workspace
+
+
+@pytest.fixture(scope="session")
+def reported(done: Workspace) -> Workspace:
+    """The done workspace after stage quality_report, kept apart from done.
+
+    Its tables join done's db; no other fixture reads them.
+    """
+    done.run("quality_report")
+    return done
 
 
 @pytest.fixture
