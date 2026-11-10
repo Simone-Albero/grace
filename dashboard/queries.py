@@ -10,7 +10,7 @@ NaN).
 
 from __future__ import annotations
 
-__all__ = ["clean", "complexity", "regions"]
+__all__ = ["clean", "complexity", "prepare", "regions"]
 
 import json
 import math
@@ -60,6 +60,27 @@ def clean(cfg: DatasetConfig) -> dict[str, Any]:
                 kind: [f["column"] for f in features if f["kind"] == kind]
                 for kind in ("num", "cat")
             },
+        }
+
+
+def prepare(cfg: DatasetConfig) -> dict[str, Any]:
+    """Return the last prepare run.
+
+    Args:
+        cfg: The dataset.
+
+    Returns:
+        run; summary {n_rows, n_num, n_cat, n_columns, n_missing,
+        n_missing_rows}; columns
+        [{column, source, kind, mean, std, value, n_rows, weight}] in column
+        order.
+    """
+    with closing(_connect(cfg)) as conn:
+        run = _latest_run(conn, "prepare", cfg)
+        return {
+            "run": _public(run),
+            "summary": _rows(conn, "prepare", "prepare_summary", run)[0],
+            "columns": _rows(conn, "prepare", "prepared_columns", run),
         }
 
 

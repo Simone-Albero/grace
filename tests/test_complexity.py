@@ -45,7 +45,7 @@ def _pair(own: list[float], rival: list[float]) -> tuple[np.ndarray, np.ndarray]
 
 def test_f_measures_separated_by_hand():
     points, population = _pair([0.0, 2.0], [10.0, 12.0])
-    f = compute_f_measures(points, population, {0: [1], 1: [0]}, metric="euclidean")
+    f = compute_f_measures(points, population, {0: [1], 1: [0]})
     assert f[0]["f1_mean"] == pytest.approx(1 / 51, rel=1e-6)
     assert f[0]["f2_mean"] == 0.0
     assert f[0]["f3_mean"] == 0.0
@@ -54,7 +54,7 @@ def test_f_measures_separated_by_hand():
 
 def test_f_measures_overlapping_by_hand():
     points, population = _pair([0.0, 4.0], [2.0, 6.0])
-    f = compute_f_measures(points, population, {0: [1], 1: [0]}, metric="euclidean")
+    f = compute_f_measures(points, population, {0: [1], 1: [0]})
     assert f[0]["f1_mean"] == pytest.approx(1 / 1.5, rel=1e-6)
     assert f[0]["f2_mean"] == pytest.approx(1 / 3, rel=1e-6)
     assert f[0]["f3_mean"] == pytest.approx(0.5)
@@ -64,7 +64,7 @@ def test_f_measures_overlapping_by_hand():
 def test_t_measures_of_a_line():
     x = np.arange(10, dtype=np.float64)
     X = np.column_stack([x, 2 * x])
-    t = compute_t_measures(X, np.zeros(10, dtype=int), {0: 20}, metric="euclidean")
+    t = compute_t_measures(X, np.zeros(10, dtype=int), {0: 20})
     assert t[0]["t2"] == pytest.approx(0.1)
     assert t[0]["t3"] == pytest.approx(0.05)
     assert t[0]["t4"] == pytest.approx(0.5)
@@ -75,9 +75,7 @@ def test_l_measures_of_separated_blobs():
     rng = np.random.default_rng(0)
     points = np.vstack([rng.normal(0, 1, (30, 2)), rng.normal(20, 1, (30, 2))])
     population = np.repeat([0, 1], 30)
-    lin = compute_l_measures(
-        points, population, {0: [1], 1: [0]}, metric="euclidean", random_state=0
-    )
+    lin = compute_l_measures(points, population, {0: [1], 1: [0]}, random_state=0)
     assert lin[0] == {"l1": 0.0, "l2": 0.0, "l3": 0.0}
 
 
@@ -97,7 +95,6 @@ def _complexity(gap: float) -> dict[int, dict[str, float | None]]:
         centroids={p: X[population == p].mean(axis=0) for p in range(4)},
         sizes={p: 40 for p in range(4)},
         top_k_clusters=2,
-        metric="euclidean",
         silhouette_max_samples=1000,
         silhouette_min_per_cluster=10,
         random_state=0,

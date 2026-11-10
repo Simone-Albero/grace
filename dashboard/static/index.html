@@ -17,6 +17,7 @@
     </div>
     <nav class="tabs" role="tablist">
       <button role="tab" data-tab="clean" aria-selected="true">clean</button>
+      <button role="tab" data-tab="prepare" aria-selected="false">prepare</button>
       <button role="tab" data-tab="regions" aria-selected="false">regions</button>
       <button role="tab" data-tab="complexity" aria-selected="false">complexity</button>
     </nav>
@@ -30,13 +31,31 @@
       <div class="card"><h2>Classes</h2>
         <p class="note">Rows equal on every column, the class included, are kept once; the n_duplicates feature
           counts their copies (1 when unique). Then the classes under min_class_count distinct rows are dropped. Rows
-          with a missing or infinite value are kept: the region space puts them on the median.</p>
+          with a missing or infinite value are kept: stage prepare puts them on the mean.</p>
         <div id="sp-classes" class="table-wrap"></div></div>
       <div class="card"><h2>Dropped classes</h2><div id="sp-dropped" class="chips"></div></div>
       <div class="card"><h2>Dropped columns</h2>
         <p class="note">Configured columns with a single value over the kept rows.</p>
         <div id="sp-constant" class="chips"></div></div>
       <div class="card"><h2>Features</h2><div id="sp-features"></div></div>
+    </section>
+
+    <!-- prepare -->
+    <section id="tab-prepare" class="panel" hidden>
+      <p class="empty">Select a dataset.</p>
+      <div id="pp-tiles" class="tiles"></div>
+      <div class="card"><h2>Numeric columns</h2>
+        <p class="note">Each number becomes sign(x)·log1p(|x|), then is standardized with the mean and standard
+          deviation below (of the logged finite values); a missing or infinite one lands on the mean, 0, and the
+          n_missing column counts, unscaled, how many numbers of the row did (present even when none). It is a
+          diagnostic: no distance sees it.</p>
+        <div id="pp-num" class="table-wrap"></div></div>
+      <div class="card"><h2>Categorical slots</h2>
+        <p class="note">The top_n most frequent values of a column (a missing one counts as a value) get their own
+          one-hot slot; the others share the &lt;other&gt; slot. The active slot weighs sqrt(cat_cost / g), with g the
+          chance two rows differ on the column: on average a column adds cat_cost times what a number adds, and a
+          mismatch on a concentrated column costs more (2·weight² in squared distance).</p>
+        <div id="pp-cat" class="table-wrap"></div></div>
     </section>
 
     <!-- regions -->

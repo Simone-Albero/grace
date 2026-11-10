@@ -20,8 +20,6 @@ import numpy as np
 from sklearn.metrics import balanced_accuracy_score
 from sklearn.svm import LinearSVC
 
-from src.space import scale_for_metric
-
 _EPS = 1e-8
 L_KEYS = ("l1", "l2", "l3")
 
@@ -68,7 +66,6 @@ def compute_l_measures(
     population: np.ndarray,
     rivals: Mapping[int, Sequence[int]],
     *,
-    metric: str,
     random_state: int,
 ) -> dict[int, dict[str, float | None]]:
     """Return L1-L3 per population, the worst over its nearest rivals.
@@ -86,7 +83,6 @@ def compute_l_measures(
         points: The sampled rows, shape (n, d).
         population: The population id of every row of `points`.
         rivals: The nearest rival ids of every population.
-        metric: The distance, which fixes how `points` is scaled.
         random_state: The seed of the interpolated points.
 
     Returns:
@@ -94,9 +90,8 @@ def compute_l_measures(
         None each when the population has fewer than two rows or none
         of its rivals does.
     """
-    scaled = scale_for_metric(points, metric)
     rows_by_population = {
-        int(population_id): scaled[population == population_id]
+        int(population_id): points[population == population_id]
         for population_id in np.unique(population)
     }
     rng = np.random.default_rng(random_state)

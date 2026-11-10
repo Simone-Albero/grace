@@ -7,7 +7,6 @@ __all__ = ["run"]
 import math
 import sqlite3
 
-import joblib
 import numpy as np
 import polars as pl
 
@@ -16,33 +15,29 @@ from src.clustering import centroids
 from src.complexity.common import MeasuredSample
 from src.complexity.measure import compute_population_complexity
 from src.config import DatasetConfig
-from src.data import LABEL
 from src.graph import Graph, nearest_neighbors
-from src.space import embed
 from stages.paths import (
     assignments_file,
     complexity_file,
     graph_file,
     need,
-    read_data,
+    read_points,
     regions_file,
-    space_file,
 )
 
 
 def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     """Describe every region and every class on its rows.
 
-    Reads the data file, regions.parquet, assignments.parquet,
-    space.joblib and graph.npz. When the graph samples the rows (fewer
+    Reads the points of the prepared file (paths.read_points, as stage
+    regions does), regions.parquet, assignments.parquet and graph.npz. When the graph samples the rows (fewer
     nodes than rows), a region is measured on at most
     max_sample_per_region of its rows and a class on
     max_sample_per_class (one generator seeded by seed per scope,
     populations in ascending id); otherwise on every row, reusing the
     graph's own neighbours. The measured rows get their graph.k nearest
     graph nodes, never themselves. Region centroids are those of
-    regions.parquet; class centroids the mean of the measured rows (unit
-    length under cosine). Then measure.compute_population_complexity per
+    regions.parquet; class centroids the mean of the measured rows. Then measure.compute_population_complexity per
     scope.
 
     Writes to output_dir: complexity.parquet (scope "region" | "class",
@@ -51,21 +46,18 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     Logs: complexity (the same rows).
     """
     method = cfg.method
-    data = read_data(cfg)
-    space = joblib.load(need(space_file(cfg), "regions"))
+    points, label = read_points(cfg)
     with np.load(need(graph_file(cfg), "regions")) as stored:
         graph = Graph(**{name: stored[name] for name in stored.files})
     regions = pl.read_parquet(need(regions_file(cfg), "regions"))
     assignments = pl.read_parquet(need(assignments_file(cfg), "regions"))
     region = assignments.sort("row")["region"].to_numpy()
-    label = data[LABEL].to_numpy()
     region_class = dict(zip(regions["region"].to_list(), regions["class"].to_list()))
     if len(region) != len(label) or any(
         region_class[r] != c for r, c in zip(region.tolist(), label.tolist())
     ):
         raise ValueError("the regions were built on other data: run regions again")
-    points = embed(space, data)
-    sampled = len(graph.rows) < data.height
+    sampled = len(graph.rows) < len(label)
     caps = {
         "region": method.complexity.max_sample_per_region if sampled else None,
         "class": method.complexity.max_sample_per_class if sampled else None,
@@ -84,9 +76,7 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
             centers = region_centroids
         else:
             population_class = {int(code): int(code) for code in np.unique(label)}
-            class_ids, class_centroids = centroids(
-                sample.X, sample.population, method.distance
-            )
+            class_ids, class_centroids = centroids(sample.X, sample.population)
             centers = dict(zip(class_ids.tolist(), class_centroids))
         ids, counts = np.unique(population, return_counts=True)
         measures = compute_population_complexity(
@@ -97,7 +87,6 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
             centroids=centers,
             sizes=dict(zip(ids.tolist(), counts.tolist())),
             top_k_clusters=method.complexity.top_k_clusters,
-            metric=method.distance,
             silhouette_max_samples=method.complexity.silhouette_max_samples,
             silhouette_min_per_cluster=method.complexity.silhouette_min_per_cluster,
             random_state=cfg.seed,

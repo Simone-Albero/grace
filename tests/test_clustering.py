@@ -37,25 +37,23 @@ def test_kdn():
     np.testing.assert_allclose(kdn(labels, 0), [2 / 3, 0.0])
 
 
-def test_centroids_skip_noise_and_normalise_under_cosine():
+def test_centroids_skip_noise():
     X = np.array([[0.0, 0.0], [2.0, 0.0], [10.0, 10.0], [50.0, 50.0]])
-    ids, centers = centroids(X, np.array([0, 0, 5, -1]), "euclidean")
+    ids, centers = centroids(X, np.array([0, 0, 5, -1]))
     assert ids.tolist() == [0, 5]
     np.testing.assert_allclose(centers, [[1.0, 0.0], [10.0, 10.0]])
-    _, centers = centroids(X, np.array([0, 0, 5, -1]), "cosine")
-    np.testing.assert_allclose(np.linalg.norm(centers, axis=1), [1.0, 1.0])
 
 
 def test_merge_small_clusters():
     X = np.array([[0.0], [0.1], [0.2], [10.0], [10.1], [10.2], [9.5], [0.3]])
     labels = np.array([0, 0, 0, 1, 1, 1, 2, -1])
-    merged = merge_small_clusters(X, labels, 2, "euclidean")
+    merged = merge_small_clusters(X, labels, 2)
     assert merged.tolist() == [0, 0, 0, 1, 1, 1, 1, 0]
 
 
 def test_merge_small_clusters_without_survivors():
     X = np.array([[0.0], [5.0], [9.0]])
-    merged = merge_small_clusters(X, np.array([3, 4, -1]), 2, "euclidean")
+    merged = merge_small_clusters(X, np.array([3, 4, -1]), 2)
     assert merged.tolist() == [0, 0, 0]
 
 
@@ -133,7 +131,6 @@ def test_cluster_class_never_mixes_blobs():
         max_fit_samples=1000,
         min_cluster_floor=20,
         max_clusters=10,
-        metric="euclidean",
         seed=0,
     )
     assert result.labels.shape == (300,)
@@ -156,7 +153,6 @@ def test_cluster_class_respects_max_clusters_and_refits_past_the_sample():
         max_fit_samples=100,
         min_cluster_floor=20,
         max_clusters=2,
-        metric="euclidean",
         seed=0,
     )
     assert result.labels.shape == (300,)
@@ -167,6 +163,6 @@ def test_cluster_class_respects_max_clusters_and_refits_past_the_sample():
 def test_assign_nearest():
     points = np.array([[0.0, 0.0], [9.0, 9.0], [5.0, 5.0]])
     centers = np.array([[10.0, 10.0], [1.0, 1.0], [9.0, 9.0]])
-    assert assign_nearest(points, centers, "euclidean").tolist() == [1, 2, 1]
+    assert assign_nearest(points, centers).tolist() == [1, 2, 1]
     ties = np.array([[1.0, 0.0], [-1.0, 0.0]])
-    assert assign_nearest(np.zeros((1, 2)), ties, "euclidean").tolist() == [0]
+    assert assign_nearest(np.zeros((1, 2)), ties).tolist() == [0]

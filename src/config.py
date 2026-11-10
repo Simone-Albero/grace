@@ -23,6 +23,7 @@ import yaml
 
 from src.clustering import ALGORITHMS, tunable_params
 from src.data import DUPLICATES
+from src.prepare import MISSING
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
 DATASET_DIR = CONFIG_DIR / "datasets"
@@ -32,16 +33,15 @@ DISTANCES = ("euclidean", "cosine")
 
 
 @dataclass(frozen=True)
-class SpaceConfig:
-    """The euclidean space regions live in (`src.space`).
+class PrepareConfig:
+    """The prepared features distances are measured on (`src.prepare`).
 
     Attributes:
-        top_k: The most frequent codes per categorical column with
-            their own slot.
-        cat_cost: The squared distance a categorical mismatch adds.
+        cat_cost: The average squared distance a categorical column
+            adds between two random rows, in units of a standardized
+            number's.
     """
 
-    top_k: int
     cat_cost: float
 
 
@@ -111,15 +111,16 @@ class MethodConfig:
     """Parameters of the method, shared by every dataset.
 
     Attributes:
-        distance: One of DISTANCES.
-        space: The region space.
+        distance: One of DISTANCES: how the numeric columns are
+            compared (graph.space_points).
+        prepare: The prepared features.
         graph: The k-NN graph of the rows.
         clustering: The per-class clustering.
         complexity: The descriptors.
     """
 
     distance: str
-    space: SpaceConfig
+    prepare: PrepareConfig
     graph: GraphConfig
     clustering: ClusteringConfig
     complexity: ComplexityConfig
@@ -137,9 +138,7 @@ class DatasetConfig:
         cat_cols: The categorical columns.
         min_class_count: Classes with fewer rows are dropped.
         top_n: The most frequent values of a categorical column with
-            their own code in the space.
-        hash_buckets: The codes the other categorical values are
-            hashed into in the space.
+            their own one-hot slot; the others share one.
         seed: The seed of every stage.
         output_dir: The folder of every file of every stage.
         db_path: The SQLite file.
@@ -153,7 +152,6 @@ class DatasetConfig:
     cat_cols: tuple[str, ...]
     min_class_count: int
     top_n: int
-    hash_buckets: int
     seed: int
     output_dir: Path
     db_path: Path
@@ -224,6 +222,8 @@ def _validate_method(method: MethodConfig) -> None:
     }
     for key, value in positive.items():
         _check(value >= 1, f"{key} must be >= 1, got {value}")
+    cat_cost = method.prepare.cat_cost
+    _check(cat_cost > 0, f"prepare.cat_cost must be > 0, got {cat_cost}")
 
 
 def load_method_config(name_or_path: str = "default") -> MethodConfig:
@@ -246,7 +246,7 @@ def load_method_config(name_or_path: str = "default") -> MethodConfig:
     clustering["params"] = clustering.get("params") or {}
     method = MethodConfig(
         distance=raw["distance"],
-        space=SpaceConfig(**raw["space"]),
+        prepare=PrepareConfig(**raw["prepare"]),
         graph=GraphConfig(**raw["graph"]),
         clustering=ClusteringConfig(**clustering),
         complexity=ComplexityConfig(**raw["complexity"]),
@@ -274,10 +274,12 @@ def load_config(dataset: str, method: str = "default") -> DatasetConfig:
     raw = _yaml(path)
     _check_keys(raw, DatasetConfig, path)
     columns = [*(raw["num_cols"] or ()), *(raw["cat_cols"] or ()), raw["label_col"]]
-    _check(
-        DUPLICATES not in columns,
-        f"{DUPLICATES} is the column stage clean adds, not a configured one",
-    )
+    for added, stage in ((DUPLICATES, "clean"), (MISSING, "prepare")):
+        _check(
+            added not in columns,
+            f"{added} is the column stage {stage} adds, not a configured one",
+        )
+    _check(raw["top_n"] >= 1, f"top_n must be >= 1, got {raw['top_n']}")
     return DatasetConfig(
         name=raw["name"],
         path=Path(raw["path"]),
@@ -286,7 +288,6 @@ def load_config(dataset: str, method: str = "default") -> DatasetConfig:
         cat_cols=tuple(raw["cat_cols"] or ()),
         min_class_count=raw["min_class_count"],
         top_n=raw["top_n"],
-        hash_buckets=raw["hash_buckets"],
         seed=raw["seed"],
         output_dir=Path(raw["output_dir"]),
         db_path=Path(raw["db_path"]),

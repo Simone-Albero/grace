@@ -67,7 +67,6 @@ def compute_population_complexity(
     centroids: Mapping[int, np.ndarray],
     sizes: Mapping[int, int],
     top_k_clusters: int,
-    metric: str,
     silhouette_max_samples: int,
     silhouette_min_per_cluster: int,
     random_state: int,
@@ -82,7 +81,6 @@ def compute_population_complexity(
         centroids: The centroid of every population id.
         sizes: The rows of every population id.
         top_k_clusters: The nearest rivals per population.
-        metric: The distance of the clustering space.
         silhouette_max_samples: The silhouette subsample cap.
         silhouette_min_per_cluster: The silhouette floor per cluster.
         random_state: The seed of the silhouette subsample and of the
@@ -101,13 +99,11 @@ def compute_population_complexity(
     classes = np.array(
         [population_class[population_id] for population_id in ids], dtype=np.int64
     )
-    centroid_distances = pairwise_distances(centroid_matrix, metric=metric)
+    centroid_distances = pairwise_distances(centroid_matrix)
     np.fill_diagonal(centroid_distances, np.inf)
     rivals = nearest_rivals(ids, classes, centroid_distances, top_k=top_k_clusters)
 
-    feature_overlap = compute_f_measures(
-        sample.X, sample.population, rivals, metric=metric
-    )
+    feature_overlap = compute_f_measures(sample.X, sample.population, rivals)
     neighborhood = compute_n_measures(sample, graph_population, graph.mst, rivals)
     network = compute_network_measures(
         sample,
@@ -119,9 +115,7 @@ def compute_population_complexity(
             [population_class[population_id] for population_id in graph_population]
         ),
     )
-    dimensionality = compute_t_measures(
-        sample.X, sample.population, sizes, metric=metric
-    )
+    dimensionality = compute_t_measures(sample.X, sample.population, sizes)
     geometry = compute_geometry_measures(
         sample.X,
         sample.population,
@@ -130,13 +124,12 @@ def compute_population_complexity(
         centroid_matrix=centroid_matrix,
         classes=classes,
         centroid_distances=centroid_distances,
-        metric=metric,
         silhouette_max_samples=silhouette_max_samples,
         silhouette_min_per_cluster=silhouette_min_per_cluster,
         random_state=random_state,
     )
     linearity = compute_l_measures(
-        sample.X, sample.population, rivals, metric=metric, random_state=random_state
+        sample.X, sample.population, rivals, random_state=random_state
     )
 
     return {

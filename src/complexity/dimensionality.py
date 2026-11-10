@@ -17,8 +17,6 @@ from collections.abc import Mapping
 import numpy as np
 from sklearn.decomposition import PCA
 
-from src.space import scale_for_metric
-
 
 def _pca_measures(
     rows: np.ndarray, n_rows: int
@@ -51,7 +49,7 @@ def _pca_measures(
 
 
 def compute_t_measures(
-    X: np.ndarray, population: np.ndarray, sizes: Mapping[int, int], *, metric: str
+    X: np.ndarray, population: np.ndarray, sizes: Mapping[int, int]
 ) -> dict[int, dict[str, float | None]]:
     """Return T2, T3, T4 and the anisotropy per population.
 
@@ -61,13 +59,12 @@ def compute_t_measures(
         population: The population id of every row of `X`.
         sizes: The rows each population really holds; the ratios are
             over these.
-        metric: The distance, which fixes how `X` is scaled.
 
     Returns:
         By population id, "t2", "t3", "t4" and "anisotropy"; the last
         three are None when the sample is degenerate.
     """
-    X = scale_for_metric(X, metric)
+    X = X
     result: dict[int, dict[str, float | None]] = {}
     n_features = X.shape[1]
     for population_id in np.unique(population):

@@ -64,8 +64,7 @@ num_cols:
 cat_cols: []
 
 min_class_count: 100  # classes with fewer rows are dropped
-top_n: 32  # most frequent values of a categorical column with their own code in the space
-hash_buckets: 64  # the other values are hashed into this many codes
+top_n: 32  # most frequent values of a categorical column with their own one-hot slot; the others share one
 seed: 42
 output_dir: resources/processed/covertype
 db_path: resources/processed/grace.db

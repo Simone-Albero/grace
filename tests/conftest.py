@@ -15,7 +15,7 @@ import yaml
 from main import main
 
 ROOT = Path(__file__).resolve().parents[1]
-STAGE_ORDER = ("clean", "regions", "complexity")
+STAGE_ORDER = ("clean", "prepare", "regions", "complexity")
 N_DUPLICATES = 52  # copies synthetic_csv appends
 
 
@@ -59,8 +59,7 @@ def write_dataset_yaml(folder: Path, csv: Path, name: str = "toy") -> Path:
         path=str(csv),
         num_cols=[*base["num_cols"], "flat"],
         min_class_count=600,
-        top_n=16,
-        hash_buckets=16,
+        top_n=3,  # cat_1 has 3 values, all slotted; cat_2 has 4, one "other"
         output_dir=str(folder / "out"),
         db_path=str(folder / "grace.db"),
     )

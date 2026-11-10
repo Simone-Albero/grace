@@ -62,6 +62,10 @@ def create_app(dataset_dir: Path = DATASET_DIR) -> FastAPI:
     def clean(dataset: str) -> Any:
         return _query(queries.clean, load_dataset(dataset))
 
+    @app.get("/api/{dataset}/prepare")
+    def prepare(dataset: str) -> Any:
+        return _query(queries.prepare, load_dataset(dataset))
+
     @app.get("/api/{dataset}/regions")
     def regions(dataset: str) -> Any:
         return _query(queries.regions, load_dataset(dataset))

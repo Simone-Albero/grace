@@ -38,7 +38,6 @@ from sklearn.metrics import pairwise_distances
 from sklearn.neighbors import NearestNeighbors
 
 from src.graph import sample_rows
-from src.space import scale_for_metric
 
 FitFn = Callable[..., np.ndarray]
 RESERVED = ("n_clusters", "max_fit_samples", "random_state")
@@ -230,26 +229,23 @@ def kdn(neighbor_labels: np.ndarray, label: int) -> np.ndarray:
     return (neighbor_labels != label).mean(axis=1)
 
 
-def centroids(
-    X: np.ndarray, labels: np.ndarray, metric: str
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return the mean point of every label, unit length under cosine.
+def centroids(X: np.ndarray, labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return the mean point of every label.
 
     Args:
         X: The points, shape (n, d).
         labels: The label of every row; -1 rows are ignored.
-        metric: "euclidean" or "cosine".
 
     Returns:
         The labels, ascending, and their centroids, shape (m, d).
     """
     ids = np.unique(labels[labels != -1])
     centers = np.stack([X[labels == i].mean(axis=0) for i in ids])
-    return ids, scale_for_metric(centers, metric)
+    return ids, centers
 
 
 def merge_small_clusters(
-    X: np.ndarray, labels: np.ndarray, min_size: float, metric: str
+    X: np.ndarray, labels: np.ndarray, min_size: float
 ) -> np.ndarray:
     """Move noise and small clusters to the nearest surviving centroid.
 
@@ -262,7 +258,6 @@ def merge_small_clusters(
         X: The points, shape (n, d).
         labels: The label of every row; -1 is noise.
         min_size: The fewest rows a cluster keeps.
-        metric: The distance between rows and centroids.
 
     Returns:
         The new labels, all >= 0.
@@ -273,9 +268,9 @@ def merge_small_clusters(
         return labels.copy()
     if absorbed.all():
         return np.zeros_like(labels)
-    survivors, centers = centroids(X[~absorbed], labels[~absorbed], metric)
+    survivors, centers = centroids(X[~absorbed], labels[~absorbed])
     merged = labels.copy()
-    merged[absorbed] = survivors[assign_nearest(X[absorbed], centers, metric)]
+    merged[absorbed] = survivors[assign_nearest(X[absorbed], centers)]
     return merged
 
 
@@ -409,7 +404,6 @@ def cluster_class(
     max_fit_samples: int,
     min_cluster_floor: int,
     max_clusters: int,
-    metric: str,
     seed: int,
 ) -> ClassClustering:
     """Cluster one class at the granularity of least loss.
@@ -434,7 +428,6 @@ def cluster_class(
         max_fit_samples: Passed to algorithm.
         min_cluster_floor: The merge floor on the whole class.
         max_clusters: The most clusters of the class.
-        metric: The distance of the merge.
         seed: Passed to algorithm as random_state.
 
     Returns:
@@ -468,7 +461,7 @@ def cluster_class(
         except Exception as e:
             print(f"[regions] skipped {combination}: {e}", flush=True)
             continue
-        labels = merge_small_clusters(sample, labels, min_cluster_floor / scale, metric)
+        labels = merge_small_clusters(sample, labels, min_cluster_floor / scale)
         loss = granularity_loss(labels, hardness, scale)
         candidates.append(Candidate(combination, len(np.unique(labels)), loss))
         candidate_labels.append(labels)
@@ -492,17 +485,16 @@ def cluster_class(
         labels = algorithm(
             X, max_fit_samples=max_fit_samples, random_state=seed, **chosen.params
         )
-        labels = merge_small_clusters(X, labels, min_cluster_floor, metric)
+        labels = merge_small_clusters(X, labels, min_cluster_floor)
     return ClassClustering(labels, chosen.params, chosen.loss, candidates)
 
 
-def assign_nearest(points: np.ndarray, centers: np.ndarray, metric: str) -> np.ndarray:
+def assign_nearest(points: np.ndarray, centers: np.ndarray) -> np.ndarray:
     """Return the index of the nearest center of every point.
 
     Args:
         points: Shape (n, d).
         centers: Shape (m, d).
-        metric: "euclidean" or "cosine".
 
     Returns:
         Indices into centers (ties: the first), int64.
@@ -510,9 +502,7 @@ def assign_nearest(points: np.ndarray, centers: np.ndarray, metric: str) -> np.n
     # In chunks: the rows against every centre may not fit in memory.
     return np.concatenate(
         [
-            pairwise_distances(
-                points[start : start + _ASSIGN_ROWS], centers, metric=metric
-            )
+            pairwise_distances(points[start : start + _ASSIGN_ROWS], centers)
             .argmin(axis=1)
             .astype(np.int64)
             for start in range(0, len(points), _ASSIGN_ROWS)

@@ -26,8 +26,6 @@ import numpy as np
 from sklearn.covariance import LedoitWolf
 from sklearn.metrics import pairwise_distances, silhouette_samples
 
-from src.space import scale_for_metric
-
 GEOMETRY_KEYS = (
     "max_dispersion",
     "p95_dispersion",
@@ -43,7 +41,6 @@ def _approx_silhouette(
     X: np.ndarray,
     labels: np.ndarray,
     *,
-    metric: str,
     max_samples: int,
     min_per_cluster: int,
     random_state: int,
@@ -80,7 +77,7 @@ def _approx_silhouette(
             rows = floor_rows
 
     try:
-        scores = silhouette_samples(X[rows], labels[rows], metric=metric)
+        scores = silhouette_samples(X[rows], labels[rows])
     except ValueError:
         # scikit-learn rejects a label count outside [2, n_samples - 1].
         return None
@@ -90,13 +87,9 @@ def _approx_silhouette(
     return scores_by_row
 
 
-def _dispersion(
-    samples: np.ndarray, centroid: np.ndarray, *, metric: str
-) -> tuple[float, float]:
+def _dispersion(samples: np.ndarray, centroid: np.ndarray) -> tuple[float, float]:
     """Return the max and 95th-percentile distance to the centroid."""
-    distances = pairwise_distances(
-        samples, centroid.reshape(1, -1), metric=metric
-    ).ravel()
+    distances = pairwise_distances(samples, centroid.reshape(1, -1)).ravel()
     return float(np.max(distances)), float(np.percentile(distances, 95))
 
 
@@ -175,15 +168,14 @@ def compute_geometry_measures(
     centroid_matrix: np.ndarray,
     classes: np.ndarray,
     centroid_distances: np.ndarray,
-    metric: str,
     silhouette_max_samples: int,
     silhouette_min_per_cluster: int,
     random_state: int,
 ) -> dict[int, dict[str, float | None]]:
     """Return dispersion, rival separation and silhouette tail.
 
-    The rival measures read the rows as the graph measures them, so
-    under cosine on the unit sphere.
+    Every distance is euclidean on the points of the space
+    (graph.space_points), as the graph measures them.
 
     Args:
         X: The sampled rows, shape (n, d).
@@ -194,7 +186,6 @@ def compute_geometry_measures(
         centroid_matrix: The centroids, shape (len(ids), d).
         classes: The class of every population in `ids`.
         centroid_distances: The centroid distances, diagonal inf.
-        metric: The distance of the clustering space.
         silhouette_max_samples: The silhouette subsample cap.
         silhouette_min_per_cluster: The silhouette floor per cluster.
         random_state: The seed of the silhouette subsample.
@@ -208,15 +199,13 @@ def compute_geometry_measures(
     silhouettes = _approx_silhouette(
         X,
         population,
-        metric=metric,
         max_samples=silhouette_max_samples,
         min_per_cluster=silhouette_min_per_cluster,
         random_state=random_state,
     )
 
-    scaled = scale_for_metric(X, metric)
     rows_by_population = {
-        int(population_id): scaled[population == population_id]
+        int(population_id): X[population == population_id]
         for population_id in np.unique(population)
     }
     centroid_of = dict(zip(ids, centroid_matrix))
@@ -226,7 +215,7 @@ def compute_geometry_measures(
     for i, population_id in enumerate(ids):
         in_population = population == population_id
         max_dispersion, p95_dispersion = _dispersion(
-            X[in_population], centroid_matrix[i], metric=metric
+            X[in_population], centroid_matrix[i]
         )
         dist_to_nearest_rival = _nearest_rival(
             centroid_distances[i], classes[i], classes

@@ -42,7 +42,7 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     data.constant_columns of num_cols and cat_cols, dropped -> classes
     sorted, label_col replaced by its code in LABEL. No row is dropped
     for a missing or non-finite value, and nothing is scaled or encoded:
-    the region space is fitted by stage regions.
+    stage prepare does it.
 
     Writes to output_dir: data.parquet (the kept num_cols as read, then
     DUPLICATES, a numeric feature, then the kept cat_cols as read, then

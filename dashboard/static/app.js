@@ -2,7 +2,7 @@
 
 /**
  * UI state.
- * @type {{dataset: string|null, tab: "clean"|"regions"|"complexity", cls: string|null, measure: string|null}}
+ * @type {{dataset: string|null, tab: "clean"|"prepare"|"regions"|"complexity", cls: string|null, measure: string|null}}
  */
 const state = { dataset: null, tab: "clean", cls: null, measure: null };
 
@@ -134,6 +134,7 @@ async function load() {
   const d = `/${encodeURIComponent(state.dataset)}`;
   const path = {
     clean: `${d}/clean`,
+    prepare: `${d}/prepare`,
     regions: `${d}/regions`,
     complexity: `${d}/complexity${state.measure ? `?measure=${encodeURIComponent(state.measure)}` : ""}`,
   }[tab];
@@ -142,7 +143,7 @@ async function load() {
     if (id !== loadId) return;
     panel.classList.remove("failed");
     empty.hidden = true;
-    ({ clean: renderClean, regions: renderRegions, complexity: renderComplexity })[tab](data);
+    ({ clean: renderClean, prepare: renderPrepare, regions: renderRegions, complexity: renderComplexity })[tab](data);
     renderRun(data.run);
   } catch (e) {
     if (id !== loadId) return;
@@ -186,6 +187,30 @@ function renderClean(data) {
     h("div", { class: "chips" }, data.features.num.map((c) => h("span", { class: "chip" }, c))),
     h("h3", { style: "margin-top:12px" }, `categorical (${data.features.cat.length})`),
     h("div", { class: "chips" }, data.features.cat.map((c) => h("span", { class: "chip" }, c))));
+}
+
+/** Tiles, numeric columns with their scaling, categorical slots with their rows. @param {object} data response of /prepare */
+function renderPrepare(data) {
+  const s = data.summary;
+  fill("pp-tiles",
+    tile("rows", num(s.n_rows)),
+    tile("numeric columns", num(s.n_num)),
+    tile("categorical columns", num(s.n_cat)),
+    tile("prepared columns", num(s.n_columns)),
+    tile("numbers set to 0", num(s.n_missing), `${num(s.n_missing_rows)} rows · ${pct(s.n_missing_rows / s.n_rows)}`));
+  sortable($("pp-num"), [
+    { key: "column", label: "column" },
+    { key: "mean", label: "mean (log)", format: (v) => dec(v, 4) },
+    { key: "std", label: "std (log)", format: (v) => dec(v, 4) },
+  ], data.columns.filter((c) => c.kind === "num"));
+  sortable($("pp-cat"), [
+    { key: "source", label: "column" },
+    { key: "value", label: "value" },
+    { key: "n_rows", label: "rows", format: num },
+    { key: "n_rows", label: "share", format: (v) => pct(v / s.n_rows) },
+    { key: "weight", label: "weight", format: (v) => dec(v, 3) },
+    { key: "weight", label: "mismatch cost", format: (v) => dec(v == null ? null : 2 * v * v, 2) },
+  ], data.columns.filter((c) => c.kind === "cat"));
 }
 
 /** Tiles, granularity per class, candidates of a class, regions table. @param {object} data response of /regions */

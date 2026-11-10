@@ -49,6 +49,18 @@ def test_clean(client):
     assert set(data["features"]) == {"num", "cat"}
 
 
+def test_prepare(client):
+    data = _get(client, "/api/toy/prepare")
+    assert set(data) >= {"run", "summary", "columns"}
+    summary, columns = data["summary"], data["columns"]
+    assert summary["n_columns"] == len(columns)
+    (missing,) = [c for c in columns if c["kind"] == "missing"]
+    assert missing["n_rows"] == summary["n_missing_rows"] > 0
+    assert [c["source"] for c in columns if c["kind"] == "num"][-1] == "n_duplicates"
+    cat = [c for c in columns if c["kind"] == "cat"]
+    assert len({c["source"] for c in cat}) == summary["n_cat"]
+
+
 def test_regions(client):
     data = _get(client, "/api/toy/regions")
     assert set(data) >= {"run", "stats", "classes", "candidates", "regions"}
@@ -66,5 +78,6 @@ def test_complexity(client):
 
 def test_missing_runs_are_404(client):
     assert client.get("/api/empty/clean").status_code == 404
+    assert client.get("/api/empty/prepare").status_code == 404
     assert client.get("/api/empty/regions").status_code == 404
     assert client.get("/api/nope/clean").status_code == 404

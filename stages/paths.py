@@ -13,18 +13,23 @@ __all__ = [
     "data_file",
     "graph_file",
     "need",
+    "prepared_file",
     "read_classes",
     "read_data",
+    "read_points",
     "regions_file",
-    "space_file",
 ]
 
 import json
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 
 from src.config import DatasetConfig
+from src.data import LABEL, feature_cols
+from src.graph import space_points
+from src.prepare import MISSING
 
 
 def need(path: Path, stage: str) -> Path:
@@ -70,6 +75,18 @@ def classes_file(cfg: DatasetConfig) -> Path:
     return cfg.output_dir / "classes.json"
 
 
+def prepared_file(cfg: DatasetConfig) -> Path:
+    """Return the file of the prepared rows (stage prepare).
+
+    Args:
+        cfg: The dataset config.
+
+    Returns:
+        The parquet path.
+    """
+    return cfg.output_dir / "prepared.parquet"
+
+
 def regions_file(cfg: DatasetConfig) -> Path:
     """Return the file of one row per region (stage regions).
 
@@ -92,18 +109,6 @@ def assignments_file(cfg: DatasetConfig) -> Path:
         The parquet path; it covers every row of the data.
     """
     return cfg.output_dir / "assignments.parquet"
-
-
-def space_file(cfg: DatasetConfig) -> Path:
-    """Return the file of the fitted Space (stage regions).
-
-    Args:
-        cfg: The dataset config.
-
-    Returns:
-        The joblib path of the src.space.Space.
-    """
-    return cfg.output_dir / "space.joblib"
 
 
 def graph_file(cfg: DatasetConfig) -> Path:
@@ -143,6 +148,33 @@ def read_data(cfg: DatasetConfig) -> pl.DataFrame:
         FileNotFoundError: When stage clean has not run.
     """
     return pl.read_parquet(need(data_file(cfg), "clean"))
+
+
+def read_points(cfg: DatasetConfig) -> tuple[np.ndarray, np.ndarray]:
+    """Return the prepared rows as points of the space, and their classes.
+
+    The numeric columns of the prepared file (data.feature_cols) and its
+    one-hot slots (every other column but MISSING and LABEL) go through
+    graph.space_points with method.distance. MISSING is a diagnostic:
+    no distance sees it.
+
+    Args:
+        cfg: The dataset config.
+
+    Returns:
+        The Float64 points, shape (n, d_num + d_cat), and the class
+        codes, shape (n,). Row i is row i of the data file.
+
+    Raises:
+        FileNotFoundError: When stage prepare has not run.
+    """
+    prepared = pl.read_parquet(need(prepared_file(cfg), "prepare"))
+    numeric = feature_cols(prepared.columns, cfg.num_cols, cfg.cat_cols).num
+    slots = prepared.drop(*numeric, MISSING, LABEL)
+    points = space_points(
+        prepared.select(numeric).to_numpy(), slots.to_numpy(), cfg.method.distance
+    )
+    return points, prepared[LABEL].to_numpy()
 
 
 def read_classes(cfg: DatasetConfig) -> list[str]:

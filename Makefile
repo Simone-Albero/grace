@@ -27,6 +27,7 @@ generate:
 ## run: every stage in order on DATA (default synthetic_test)
 run:
 	$(PYTHON) main.py --stage clean --dataset $(DATA)
+	$(PYTHON) main.py --stage prepare --dataset $(DATA)
 	$(PYTHON) main.py --stage regions --dataset $(DATA)
 	$(PYTHON) main.py --stage complexity --dataset $(DATA)
 

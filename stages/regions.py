@@ -7,32 +7,29 @@ __all__ = ["run"]
 import json
 import sqlite3
 
-import joblib
 import numpy as np
 import polars as pl
 
 from src import db
 from src.clustering import ALGORITHMS, centroids, cluster_class, kdn
 from src.config import DatasetConfig
-from src.data import LABEL, feature_cols
 from src.graph import build_graph, nearest_neighbors, sample_rows
-from src.space import embed, fit_space
 from stages.paths import (
     assignments_file,
     graph_file,
     read_classes,
-    read_data,
+    read_points,
     regions_file,
-    space_file,
 )
 
 
 def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     """Cluster each class into regions.
 
-    Reads the data file. Order: space.fit_space on the data (the columns
-    the config names, top_n, hash_buckets, method.space, distance) ->
-    points (space.embed) -> graph.build_graph on
+    Reads the points of the prepared file (paths.read_points: the
+    numbers scaled for distance, the categorical slots, not MISSING);
+    every distance from here on is euclidean on them. Order:
+    graph.build_graph on
     graph.sample_rows(n_rows, graph.max_samples, seed) -> per class,
     ascending: its kDN on its graph.sample_rows(n_class,
     max_fit_samples, seed) rows (hardness_k nearest graph nodes, never
@@ -42,8 +39,7 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
 
     Writes to output_dir: regions.parquet (region, class, n_rows,
     centroid as a list of floats), assignments.parquet (row, region for
-    every row), space.joblib, graph.npz (rows, points, knn_idx,
-    knn_dist, mst).
+    every row), graph.npz (rows, points, knn_idx, knn_dist, mst).
     Logs: regions (region, class name, n_rows), class_clusterings
     (class, n_rows, n_regions, loss, params as JSON),
     granularity_candidates (class, params as JSON, n_clusters, loss),
@@ -51,21 +47,7 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     n_graph_nodes).
     """
     method, clustering = cfg.method, cfg.method.clustering
-    data = read_data(cfg)
-    labels = data[LABEL].to_numpy()
-    print("[regions] fitting the space", flush=True)
-    features = feature_cols(data.columns, cfg.num_cols, cfg.cat_cols)
-    space = fit_space(
-        data,
-        features.num,
-        features.cat,
-        top_n=cfg.top_n,
-        hash_buckets=cfg.hash_buckets,
-        top_k=method.space.top_k,
-        cat_cost=method.space.cat_cost,
-        metric=method.distance,
-    )
-    points = embed(space, data)
+    points, labels = read_points(cfg)
     n_rows = len(labels)
     graph_rows = sample_rows(n_rows, method.graph.max_samples, cfg.seed)
     print(f"[regions] graph of {len(graph_rows)} rows", flush=True)
@@ -94,7 +76,6 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
             max_fit_samples=clustering.max_fit_samples,
             min_cluster_floor=clustering.min_cluster_floor,
             max_clusters=max_clusters,
-            metric=method.distance,
             seed=cfg.seed,
         )
         n_regions = len(np.unique(chosen.labels))
@@ -127,7 +108,7 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
             for candidate in chosen.candidates
         ]
 
-    ids, centers = centroids(points, region, method.distance)
+    ids, centers = centroids(points, region)
     region_class = labels[[np.flatnonzero(region == i)[0] for i in ids]]
     sizes = np.array([(region == i).sum() for i in ids])
     regions = pl.DataFrame(
@@ -141,7 +122,6 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     assignments = pl.DataFrame({"row": np.arange(n_rows), "region": region})
     regions.write_parquet(regions_file(cfg))
     assignments.write_parquet(assignments_file(cfg))
-    joblib.dump(space, space_file(cfg))
     np.savez(
         graph_file(cfg),
         rows=graph.rows,

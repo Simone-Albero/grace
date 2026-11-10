@@ -9,7 +9,10 @@ import pytest
 from conftest import N_DUPLICATES, STAGE_ORDER, Workspace, make_workspace
 
 from src.complexity.measure import MEASURES
+from src.config import load_config
 from src.data import DUPLICATES, LABEL
+from src.prepare import MISSING, OTHER
+from stages.paths import read_points
 
 
 def _rows(workspace: Workspace, sql: str) -> list[tuple]:
@@ -65,6 +68,73 @@ def test_clean_keeps_one_copy_of_each_row_and_counts_them(done):
     assert kind == "num"
 
 
+def test_prepare_has_one_finite_row_per_data_row(done):
+    data = _read(done, "data.parquet")
+    prepared = _read(done, "prepared.parquet")
+    assert prepared.height == data.height
+    assert prepared[LABEL].to_list() == data[LABEL].to_list()
+    features = prepared.drop(LABEL)
+    assert set(features.dtypes) == {pl.Float64}
+    assert np.isfinite(features.to_numpy()).all()
+    numbers = [c for c in data.columns if c.startswith("num_")] + [DUPLICATES]
+    assert features.columns[: len(numbers) + 1] == [*numbers, MISSING]
+    numeric = data.select(numbers).to_numpy().astype(float)
+    n_missing = (~np.isfinite(numeric)).sum(axis=1)
+    assert features[MISSING].to_list() == n_missing.astype(float).tolist()
+    assert n_missing.sum() > 0
+    slots = features.columns[len(numbers) + 1 :]
+    assert {slot.split("=")[0] for slot in slots} == {"cat_1", "cat_2"}
+    # Every row sets exactly one slot of each categorical column, all to
+    # the column's weight.
+    for column in ("cat_1", "cat_2"):
+        block = features.select(pl.selectors.starts_with(f"{column}=")).to_numpy()
+        assert (block > 0).sum(axis=1).tolist() == [1] * data.height
+        assert len(np.unique(block[block > 0])) == 1
+
+
+def test_prepare_logs_every_column(done):
+    prepared = _read(done, "prepared.parquet").drop(LABEL)
+    logged = _rows(
+        done,
+        "SELECT column, source, kind, mean, std, value, n_rows, weight "
+        "FROM prepared_columns",
+    )
+    assert [row[0] for row in logged] == prepared.columns
+    height = prepared.height
+    for column, source, kind, mean, std, value, n_rows, weight in logged:
+        if kind == "num":
+            assert column == source and std is not None and mean is not None
+        elif kind == "missing":
+            assert column == source == MISSING
+            assert n_rows == int((prepared[MISSING] > 0).sum())
+        else:
+            assert column == f"{source}={value}"
+            assert n_rows == int((prepared[column] > 0).sum())
+            assert prepared[column].max() == pytest.approx(weight)
+    for source in ("cat_1", "cat_2"):
+        counts = [r[6] for r in logged if r[1] == source]
+        assert sum(counts) == height
+    others = {row[1] for row in logged if row[5] == OTHER}
+    assert others == {"cat_2"}
+    n_rows, n_num, n_cat, n_columns, n_missing = _rows(
+        done,
+        "SELECT n_rows, n_num, n_cat, n_columns, n_missing FROM prepare_summary",
+    )[0]
+    assert (n_rows, n_cat, n_columns) == (height, 2, len(prepared.columns))
+    assert n_missing == prepared[MISSING].sum()
+    assert n_num == sum(row[2] == "num" for row in logged)
+
+
+def test_the_points_leave_missing_out(done):
+    cfg = load_config(str(done.dataset), method=str(done.method))
+    points, labels = read_points(cfg)
+    prepared = _read(done, "prepared.parquet")
+    without = prepared.drop(MISSING, LABEL)
+    assert points.shape == (prepared.height, without.width)
+    np.testing.assert_array_equal(points, without.to_numpy())
+    assert labels.tolist() == prepared[LABEL].to_list()
+
+
 def test_assignments_cover_every_row_and_keep_its_class(done):
     assignments = _read(done, "assignments.parquet").sort("row")
     regions = _read(done, "regions.parquet")
@@ -85,10 +155,10 @@ def test_complexity_has_every_measure_of_every_population(done):
 
 
 def test_complexity_refuses_regions_of_other_data(copy_of_done):
-    data_file = copy_of_done.output_dir / "data.parquet"
-    data = pl.read_parquet(data_file)
-    shuffled = np.random.default_rng(0).permutation(data[LABEL].to_numpy())
-    data.with_columns(pl.Series(LABEL, shuffled)).write_parquet(data_file)
+    prepared_file = copy_of_done.output_dir / "prepared.parquet"
+    prepared = pl.read_parquet(prepared_file)
+    shuffled = np.random.default_rng(0).permutation(prepared[LABEL].to_numpy())
+    prepared.with_columns(pl.Series(LABEL, shuffled)).write_parquet(prepared_file)
     with pytest.raises(ValueError, match="run regions again"):
         copy_of_done.run("complexity")
 
@@ -96,8 +166,15 @@ def test_complexity_refuses_regions_of_other_data(copy_of_done):
 def test_a_stage_without_its_input_fails_and_is_logged(tmp_path, synthetic_csv):
     workspace = make_workspace(tmp_path, synthetic_csv)
     with pytest.raises(FileNotFoundError, match="run clean first"):
+        workspace.run("prepare")
+    workspace.run("clean")
+    with pytest.raises(FileNotFoundError, match="run prepare first"):
         workspace.run("regions")
-    assert _rows(workspace, "SELECT stage, status FROM runs") == [("regions", "failed")]
+    assert _rows(workspace, "SELECT stage, status FROM runs") == [
+        ("prepare", "failed"),
+        ("clean", "ok"),
+        ("regions", "failed"),
+    ]
 
 
 def test_clean_refuses_rows_without_a_label(tmp_path, synthetic_csv):

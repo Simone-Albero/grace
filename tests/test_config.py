@@ -48,6 +48,16 @@ def test_degenerate_counts_fail(tmp_path):
         load_config("synthetic_test", method=_method(tmp_path, graph__k=0))
 
 
+def test_degenerate_preparation_fails(tmp_path):
+    with pytest.raises(ValueError, match="cat_cost"):
+        load_config("synthetic_test", method=_method(tmp_path, prepare__cat_cost=0))
+    raw = yaml.safe_load((DATASET_DIR / "synthetic_test.yaml").read_text())
+    path = tmp_path / "top_n.yaml"
+    path.write_text(yaml.safe_dump({**raw, "top_n": 0}))
+    with pytest.raises(ValueError, match="top_n"):
+        load_config(str(path))
+
+
 def test_a_missing_yaml_path_is_named_as_given(tmp_path):
     missing = tmp_path / "nope.yaml"
     with pytest.raises(FileNotFoundError, match=f"{missing}$"):
@@ -64,6 +74,9 @@ def test_unknown_top_level_keys_fail(tmp_path):
     path.write_text(yaml.safe_dump({**raw, "split": {"train": 1.0}}))
     with pytest.raises(ValueError, match="split"):
         load_config(str(path))
+    path.write_text(yaml.safe_dump({**raw, "hash_buckets": 16}))
+    with pytest.raises(ValueError, match="hash_buckets"):
+        load_config(str(path))
 
 
 def test_the_duplicates_column_cannot_be_configured(tmp_path):
@@ -71,4 +84,7 @@ def test_the_duplicates_column_cannot_be_configured(tmp_path):
     path = tmp_path / "clash.yaml"
     path.write_text(yaml.safe_dump({**raw, "num_cols": ["n_duplicates"]}))
     with pytest.raises(ValueError, match="n_duplicates"):
+        load_config(str(path))
+    path.write_text(yaml.safe_dump({**raw, "cat_cols": ["n_missing"]}))
+    with pytest.raises(ValueError, match="n_missing"):
         load_config(str(path))
