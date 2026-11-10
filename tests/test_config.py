@@ -42,6 +42,15 @@ def test_degenerate_counts_fail(tmp_path):
         load_config("synthetic_test", method=_method(tmp_path, graph__k=0))
     with pytest.raises(ValueError, match="vote_k"):
         load_config("synthetic_test", method=_method(tmp_path, clustering__vote_k=0))
+    with pytest.raises(ValueError, match="region_cost"):
+        load_config(
+            "synthetic_test", method=_method(tmp_path, clustering__region_cost=-0.1)
+        )
+    with pytest.raises(ValueError, match="overlap_separation"):
+        load_config(
+            "synthetic_test",
+            method=_method(tmp_path, clustering__overlap_separation=0.0),
+        )
 
 
 def test_degenerate_preparation_fails(tmp_path):

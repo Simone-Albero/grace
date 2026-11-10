@@ -76,24 +76,28 @@
         <p class="note" id="rg-map-note"></p>
         <div id="rg-map"></div></div>
       <div class="card"><h2>Overlaps between classes</h2>
-        <p class="note">The regions of every class, weighted by their CSV rows, grow one more Ward tree with the class
-          ignored: it continues the trees of the classes from their regions, so classes whose regions lie close meet
-          low in it. Each branch takes the colour of its class while it holds one; a dot marks where classes meet and
-          its height is the cost of that merge (log scale). The ratio of a merge is the distance between its two sides'
-          centroids over the sum of their radii (the root mean square distance of their rows from their centroid):
-          under 1 the two spreads overlap. Click a node to map its rows and find its branch in each class tree.</p>
+        <p class="note">Judged on the regions alone. The separation of two regions is the distance between their
+          centroids in standard deviations of their rows along the line between them (√ of Fisher's ratio on that
+          line): two regions of different classes overlap when it is under overlap_separation. Single linkage on these
+          pairs, the closest first, groups the regions into zones; a region close to no other class is in none, and
+          classes that never come that close never meet. Each zone is drawn as its tree: leaves in the colour of their
+          class, each merge at the separation of the pair that made it. Click a node to map its rows and find its
+          branch in each class tree.</p>
         <div id="rg-ov-tree"></div>
         <h3 id="rg-ov-title">Map</h3>
         <p class="note" id="rg-ov-note"></p>
         <div id="rg-ov-branches" class="chips"></div>
         <div id="rg-ov-map"></div>
-        <h3>Where two classes meet</h3>
-        <p class="note">One row per node where a class from one side meets a class from the other and neither side
-          holds both; branch is the node of the class tree above all its regions there. Click a row to select it.</p>
+        <h3>Pairs of regions that overlap</h3>
+        <p class="note">Every pair of regions of different classes under overlap_separation, not only those that made a
+          merge; sd a and sd b are the standard deviations of each region's rows along the line between the centroids.
+          Click a row to select the lowest node above both regions.</p>
         <div id="rg-overlaps" class="table-wrap"></div></div>
       <div class="card"><h2>Granularity per class</h2>
-        <p class="note">The cut of least loss per class, and its loss against its regions when a penalty per region
-          coarsens it (the penalty is above 0 only when the class had to be capped at max_regions).</p>
+        <p class="note">The cut of least loss plus a penalty per region, region_cost times the loss of the class as
+          one region: a split is kept only when it lowers the loss by at least that share. The penalty rises further
+          when the class had to be capped at max_regions. Loss / one region is the loss of the cut over that of the
+          class as one region. The curve is the loss of the cut against its regions as the penalty falls.</p>
         <div id="rg-classes" class="table-wrap"></div>
         <div id="rg-loss"></div></div>
       <div class="card"><h2>Regions</h2>

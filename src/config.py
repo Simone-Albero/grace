@@ -67,19 +67,29 @@ class ClusteringConfig:
             and the cut scored on; the others are labelled by vote.
         max_regions: The regions over all classes, shared equally
             between them.
+        region_cost: The cost of a region, as a share of the loss of
+            its class as one region: a split is kept only when it
+            lowers the loss by at least that much. 0 keeps every split
+            that lowers it.
         min_cluster_floor: The fewest scored rows (of the
             max_fit_samples) of a region; a smaller branch is pruned
             and its rows labelled by vote.
         hardness_k: The neighbours behind the kDN hardness.
         vote_k: The labelled neighbours that vote the region of an
             unlabelled row.
+        overlap_separation: Two regions of different classes overlap
+            when their centroids lie closer than this many standard
+            deviations of their rows along the line between them
+            (`clustering.separation`).
     """
 
     max_fit_samples: int
     max_regions: int
+    region_cost: float
     min_cluster_floor: int
     hardness_k: int
     vote_k: int
+    overlap_separation: float
 
 
 @dataclass(frozen=True)
@@ -213,6 +223,13 @@ def _validate_method(method: MethodConfig) -> None:
     }
     for key, value in positive.items():
         _check(value >= 1, f"{key} must be >= 1, got {value}")
+    region_cost = clustering.region_cost
+    _check(region_cost >= 0, f"clustering.region_cost must be >= 0, got {region_cost}")
+    separation = clustering.overlap_separation
+    _check(
+        separation > 0,
+        f"clustering.overlap_separation must be > 0, got {separation}",
+    )
     cat_cost = method.prepare.cat_cost
     _check(cat_cost > 0, f"prepare.cat_cost must be > 0, got {cat_cost}")
 

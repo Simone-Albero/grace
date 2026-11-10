@@ -11,8 +11,12 @@ tree was built on, take the region of their nearest labelled rows by
 vote. Hardness is kDN: the share of a row's nearest graph nodes of
 another class.
 
-The regions of every class then grow one more Ward tree, the class
-ignored: the overlap tree, where the classes meet.
+Where the regions of different classes overlap is judged on the
+regions alone: the separation of two regions is the distance between
+their centroids in standard deviations of their rows along the line
+between them. Single linkage on the pairs of different classes under
+a threshold groups the regions into overlap zones; a region with no
+such pair belongs to none.
 """
 
 from __future__ import annotations
@@ -20,20 +24,20 @@ from __future__ import annotations
 __all__ = [
     "Candidate",
     "ClassClustering",
-    "Contact",
-    "OverlapTree",
+    "OverlapZones",
     "RegionTree",
     "WardTree",
     "best_cut",
     "centroids",
     "cluster_class",
-    "contacts",
     "kdn",
-    "overlap_tree",
+    "line_spread",
+    "overlap_pairs",
+    "overlap_zones",
     "region_loss",
+    "separation",
     "vote",
     "ward_tree",
-    "within_ss",
 ]
 
 from dataclasses import dataclass
@@ -41,7 +45,7 @@ from dataclasses import dataclass
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
 
-_CHUNK = 65536  # rows per block of within_ss
+_CHUNK = 65536  # rows per block of line_spread
 
 
 @dataclass(frozen=True)
@@ -103,9 +107,10 @@ class ClassClustering:
         labels: The region of every row of the class, 0.. in the leaf
             order of tree, no gap.
         tree: The tree of the cut.
-        penalty: The penalty per region of the cut (0 unless the
-            regions had to be capped).
+        penalty: The penalty per region of the cut: region_cost times
+            whole_loss, raised when the regions had to be capped.
         loss: region_loss of the scored rows after the vote.
+        whole_loss: region_loss of the scored rows as one region.
         n_voted: The rows labelled by vote: the pruned scored rows and
             the rows outside the sample.
         candidates: The granularity curve, by descending penalty.
@@ -115,66 +120,41 @@ class ClassClustering:
     tree: RegionTree
     penalty: float
     loss: float
+    whole_loss: float
     n_voted: int
     candidates: list[Candidate]
 
 
 @dataclass(frozen=True)
-class OverlapTree:
-    """The Ward tree of the regions of every class, the class ignored.
+class OverlapZones:
+    """The overlap zones: a forest, one tree per zone.
 
-    Ward needs only the weighted centroid and the mass of each cluster,
-    so the tree grown from the regions is the Ward tree their rows would
-    grow from there: the class trees continued across the classes.
-    Nodes are in pre-order, the left child first, so a parent comes
-    before its children and the leaves come in the order of the tree.
+    Single linkage on the regions, linked only across classes: the pair
+    of least separation joins first, and nothing joins at or past the
+    threshold. A zone is so a connected component of the pairs of
+    different classes under it, its tree the order in which they join;
+    a region in no such pair is in no zone. Zones come by their least
+    separation, ascending; the nodes of a zone in pre-order, the left
+    child first, after those of the zones before it.
 
     Attributes:
-        parent: The parent of each node, -1 at the root, shape (m,),
-            int64.
-        region: The region of a leaf (its row in the centroids); -1 at
-            an internal node. Shape (m,), int64.
-        height: The merge height of an internal node, sqrt(2 Δ) as in
-            WardTree; 0 at a leaf. Shape (m,), float64.
-        distance: The distance between the centroids of an internal
-            node's two children; nan at a leaf. Shape (m,), float64.
-        ratio: distance / (r_left + r_right), r the radius of a child:
-            the root mean square distance of its rows (weighted) from
-            its centroid. Under 1 the two spreads overlap. nan at a
-            leaf; with both radii 0, 0 on one point and inf apart.
-            Shape (m,), float64.
+        parent: The parent of each node, -1 at the root of a zone,
+            shape (k,), int64.
+        zone: The zone of each node, 0.., shape (k,), int64.
+        region: The region of a leaf; -1 at an internal node. Shape
+            (k,), int64.
+        separation: The separation of the pair that made an internal
+            node; nan at a leaf. Shape (k,), float64; never below that
+            of a child.
+        link: The two regions of that pair, the one under the left
+            child first; -1 at a leaf. Shape (k, 2), int64.
     """
 
     parent: np.ndarray
+    zone: np.ndarray
     region: np.ndarray
-    height: np.ndarray
-    distance: np.ndarray
-    ratio: np.ndarray
-
-
-@dataclass(frozen=True)
-class Contact:
-    """A node of the overlap tree where two classes meet.
-
-    One class lies only below the node's left child, the other only
-    below its right child: neither child holds both.
-
-    Attributes:
-        node: The overlap tree node.
-        classes: The two classes, the left child's first.
-        regions: The regions of each class below node, ascending.
-        distance: The distance between the centroids of the two
-            classes' rows below node.
-        ratio: distance / (r_0 + r_1), r the radius of each class's
-            rows below node (as in OverlapTree; with both radii 0, 0
-            on one point and inf apart).
-    """
-
-    node: int
-    classes: tuple[int, int]
-    regions: tuple[np.ndarray, np.ndarray]
-    distance: float
-    ratio: float
+    separation: np.ndarray
+    link: np.ndarray
 
 
 def kdn(neighbor_labels: np.ndarray, label: int) -> np.ndarray:
@@ -291,140 +271,6 @@ def ward_tree(X: np.ndarray, weights: np.ndarray) -> WardTree:
         children[j] = sorted((node[a], node[b]))
         node[a] = n + j
     return WardTree(children, np.asarray(heights)[order])
-
-
-def within_ss(
-    X: np.ndarray, labels: np.ndarray, weights: np.ndarray, centers: np.ndarray
-) -> np.ndarray:
-    """Return the weighted sum of squared distances of each label's rows from its centroid.
-
-    Args:
-        X: The points, shape (n, d).
-        labels: The label of every row, 0..m - 1.
-        weights: The weight of every row, > 0.
-        centers: The weighted centroid of every label, shape (m, d).
-
-    Returns:
-        Σ w ||x - c||² per label, shape (m,).
-    """
-    ss = np.zeros(len(centers))
-    for start in range(0, len(X), _CHUNK):
-        part = slice(start, start + _CHUNK)
-        diff = np.asarray(X[part], dtype=np.float64) - centers[labels[part]]
-        ss += np.bincount(
-            labels[part],
-            weights=weights[part] * np.einsum("ij,ij->i", diff, diff),
-            minlength=len(centers),
-        )
-    return ss
-
-
-def overlap_tree(
-    centers: np.ndarray, masses: np.ndarray, scatter: np.ndarray
-) -> OverlapTree:
-    """Grow the Ward tree of the regions, each a cluster of its rows.
-
-    Args:
-        centers: The weighted centroid of every region, shape (m, d),
-            m >= 1.
-        masses: The summed weight of every region's rows, > 0.
-        scatter: within_ss of every region.
-
-    Returns:
-        The tree; a single leaf when m = 1.
-    """
-    centers = np.asarray(centers, dtype=np.float64)
-    masses = np.asarray(masses, dtype=np.float64)
-    m = len(centers)
-    ward = ward_tree(centers, masses)
-    n_nodes = 2 * m - 1
-    center = np.empty((n_nodes, centers.shape[1]))
-    mass, ss = np.empty(n_nodes), np.empty(n_nodes)
-    center[:m], mass[:m], ss[:m] = centers, masses, scatter
-    distance, ratio = np.full(n_nodes, np.nan), np.full(n_nodes, np.nan)
-    for j, (a, b) in enumerate(ward.children):
-        v = m + j
-        mass[v] = mass[a] + mass[b]
-        center[v] = (mass[a] * center[a] + mass[b] * center[b]) / mass[v]
-        squared = float(np.sum((center[a] - center[b]) ** 2))
-        ss[v] = ss[a] + ss[b] + mass[a] * mass[b] / mass[v] * squared
-        distance[v] = np.sqrt(squared)
-        ratio[v] = _ratio(
-            distance[v], np.sqrt(ss[a] / mass[a]) + np.sqrt(ss[b] / mass[b])
-        )
-    height = np.concatenate([np.zeros(m), ward.heights])
-    order, parent = [], []
-    stack = [(n_nodes - 1, -1)]
-    while stack:
-        v, up = stack.pop()
-        parent.append(up)
-        if v >= m:
-            a, b = ward.children[v - m]
-            stack += [(b, len(order)), (a, len(order))]
-        order.append(v)
-    order = np.asarray(order, dtype=np.int64)
-    return OverlapTree(
-        parent=np.asarray(parent, dtype=np.int64),
-        region=np.where(order < m, order, -1),
-        height=height[order],
-        distance=distance[order],
-        ratio=ratio[order],
-    )
-
-
-def contacts(
-    tree: OverlapTree,
-    classes: np.ndarray,
-    centers: np.ndarray,
-    masses: np.ndarray,
-    scatter: np.ndarray,
-) -> list[Contact]:
-    """Return every node where two classes meet, in the node order of tree.
-
-    A node with k classes on one side and l on the other is a contact
-    of each pair (one class from each side) that neither child holds
-    both of.
-
-    Args:
-        tree: overlap_tree of the regions.
-        classes: The class of every region.
-        centers: The weighted centroid of every region, shape (m, d).
-        masses: The summed weight of every region's rows, > 0.
-        scatter: within_ss of every region.
-
-    Returns:
-        The contacts, by node, then by the pair of classes.
-    """
-    n_nodes = len(tree.parent)
-    kids: list[list[int]] = [[] for _ in range(n_nodes)]
-    for v in range(1, n_nodes):
-        kids[tree.parent[v]].append(v)  # ascending: the left child first
-    members: list[dict[int, list[int]]] = [{} for _ in range(n_nodes)]
-    for v in range(n_nodes - 1, -1, -1):
-        if tree.region[v] >= 0:
-            members[v] = {int(classes[tree.region[v]]): [int(tree.region[v])]}
-            continue
-        for kid in kids[v]:
-            for code, regions in members[kid].items():
-                members[v].setdefault(code, []).extend(regions)
-    found = []
-    for v in np.flatnonzero(tree.region < 0):
-        left, right = (members[kid] for kid in kids[v])
-        for a in sorted(left):
-            for b in sorted(right):
-                if a == b or b in left or a in right:
-                    continue
-                parts = (np.sort(left[a]), np.sort(right[b]))
-                (c_a, r_a), (c_b, r_b) = (
-                    _spread(part, centers, masses, scatter) for part in parts
-                )
-                distance = float(np.linalg.norm(c_a - c_b))
-                found.append(
-                    Contact(
-                        int(v), (a, b), parts, distance, _ratio(distance, r_a + r_b)
-                    )
-                )
-    return found
 
 
 def best_cut(
@@ -577,19 +423,20 @@ def cluster_class(
     *,
     min_cluster_floor: int,
     max_clusters: int,
+    region_cost: float,
     vote_k: int,
 ) -> ClassClustering:
     """Split one class into the regions of least loss.
 
     Order: ward_tree of X[scored] -> best_cut with floor =
-    min_cluster_floor and penalty 0, raised by bisection when it gives
-    more than max_clusters regions -> vote of every row without a region
+    min_cluster_floor and penalty region_cost · L, L the loss of the
+    whole class as one region, raised by bisection when it gives more
+    than max_clusters regions -> vote of every row without a region
     among the labelled scored rows -> region_loss of the scored rows.
     The floor counts scored rows, whose hardness is measured, and the
     vote only adds rows, so every region ends with at least
     min_cluster_floor rows unless the class has fewer. The candidates are the cuts
-    at penalty L · 2^-j, j = 0..15, and 0, L the loss of the whole class
-    as one region; of the cuts with the same count of regions the one of
+    at penalty L · 2^-j, j = 0..15, 0 and the chosen one; of the cuts with the same count of regions the one of
     least penalty, each scored after its vote.
 
     Args:
@@ -599,6 +446,7 @@ def cluster_class(
         hardness: The kDN of every scored row.
         min_cluster_floor: The fewest scored rows of a region.
         max_clusters: The most regions, >= 1.
+        region_cost: The penalty per region as a share of L, >= 0.
         vote_k: The labelled neighbours that vote.
 
     Returns:
@@ -617,12 +465,12 @@ def cluster_class(
         return int((region_tree.region >= 0).sum())
 
     whole = region_loss(np.zeros(len(scored), dtype=np.int64), hardness, sample_weights)
-    penalty = 0.0
+    penalty = region_cost * whole
     labels, region_tree = cut(penalty)
     if n_regions(region_tree) > max_clusters:
         # A penalty of the whole loss leaves one region; the count of
         # regions never grows with the penalty.
-        low, high = 0.0, whole
+        low, high = penalty, max(whole, penalty)
         for _ in range(_BISECTIONS):
             middle = (low + high) / 2
             if n_regions(cut(middle)[1]) > max_clusters:
@@ -637,7 +485,8 @@ def cluster_class(
     loss = region_loss(voted[scored], hardness, sample_weights)
 
     by_count: dict[int, Candidate] = {}
-    for tried in [*(whole * 2.0**-j for j in range(_CURVE_STEPS)), 0.0]:
+    grid = [*(whole * 2.0**-j for j in range(_CURVE_STEPS)), 0.0, penalty]
+    for tried in sorted(grid, reverse=True):
         tried_labels, tried_tree = cut(tried)
         tried_labels = vote(sample, tried_labels, vote_k)
         by_count[n_regions(tried_tree)] = Candidate(
@@ -650,6 +499,7 @@ def cluster_class(
         tree=region_tree,
         penalty=penalty,
         loss=loss,
+        whole_loss=whole,
         n_voted=int((every < 0).sum()),
         candidates=sorted(by_count.values(), key=lambda c: -c.penalty),
     )
@@ -658,6 +508,163 @@ def cluster_class(
 _VOTE_ROWS = 100_000  # rows voted at once
 _BISECTIONS = 50  # halvings of the penalty that caps the regions
 _CURVE_STEPS = 16  # penalties of the granularity curve, halving from the whole loss
+
+
+def line_spread(
+    X: np.ndarray, labels: np.ndarray, weights: np.ndarray, centers: np.ndarray
+) -> np.ndarray:
+    """Return the spread of each label's rows along the line to every other centroid.
+
+    spread[a, b] is the weighted standard deviation of the rows of a
+    projected on the unit vector from c_a to c_b: sqrt(u' Σ_a u), Σ_a
+    the weighted covariance of a's rows, summed over them in blocks.
+    One covariance is held at a time, so memory is O(d² + m²).
+
+    Args:
+        X: The points, shape (n, d).
+        labels: The label of every row, 0..m - 1, each held by a row.
+        weights: The weight of every row, > 0.
+        centers: The weighted centroid of every label, shape (m, d).
+
+    Returns:
+        spread, shape (m, m), >= 0; 0 on the diagonal and where two
+        centroids coincide.
+    """
+    centers = np.asarray(centers, dtype=np.float64)
+    m = len(centers)
+    order = np.argsort(labels, kind="stable")
+    bounds = np.searchsorted(labels[order], np.arange(m + 1))
+    spread = np.zeros((m, m))
+    for a in range(m):
+        rows = order[bounds[a] : bounds[a + 1]]
+        cov = np.zeros((centers.shape[1], centers.shape[1]))
+        for start in range(0, len(rows), _CHUNK):
+            part = rows[start : start + _CHUNK]
+            diff = np.asarray(X[part], dtype=np.float64) - centers[a]
+            cov += diff.T @ (diff * weights[part, None])
+        cov /= weights[rows].sum()
+        line = centers - centers[a]
+        length = np.linalg.norm(line, axis=1)
+        apart = length > 0
+        unit = line[apart] / length[apart, None]
+        spread[a, apart] = np.sqrt(np.maximum(np.sum((unit @ cov) * unit, 1), 0.0))
+    return spread
+
+
+def separation(centers: np.ndarray, spread: np.ndarray) -> np.ndarray:
+    """Return the separation of every pair of labels.
+
+    S[a, b] = ||c_a - c_b|| / sqrt(spread[a, b]² + spread[b, a]²): the
+    distance between the centroids in standard deviations of the two
+    labels' rows along the line between them (the square root of
+    Fisher's discriminant ratio on that line).
+
+    Args:
+        centers: The centroid of every label, shape (m, d).
+        spread: line_spread of the labels, shape (m, m).
+
+    Returns:
+        S, shape (m, m), symmetric: 0 where the centroids coincide (the
+        diagonal too), inf where they differ and neither label spreads
+        along the line.
+    """
+    centers = np.asarray(centers, dtype=np.float64)
+    spread = np.asarray(spread, dtype=np.float64)
+    # Row by row, not by the Gram matrix: coinciding centroids must be
+    # exactly 0 apart.
+    distance = np.array([np.linalg.norm(centers - c, axis=1) for c in centers])
+    scale = np.sqrt(spread**2 + spread.T**2)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(distance == 0, 0.0, distance / scale)
+
+
+def overlap_pairs(
+    separation: np.ndarray, classes: np.ndarray, threshold: float
+) -> np.ndarray:
+    """Return the pairs of regions of different classes that overlap.
+
+    Args:
+        separation: The separation of every pair of regions, shape
+            (m, m), symmetric.
+        classes: The class of every region, shape (m,).
+        threshold: The separation a pair must lie under, > 0.
+
+    Returns:
+        The pairs (a, b), a < b, with separation[a, b] < threshold and
+        classes[a] != classes[b], by separation then a then b; shape
+        (p, 2), int64.
+    """
+    classes = np.asarray(classes)
+    under = (separation < threshold) & (classes[:, None] != classes[None, :])
+    a, b = np.nonzero(np.triu(under, 1))
+    order = np.lexsort((b, a, separation[a, b]))
+    return np.stack([a[order], b[order]], axis=1).astype(np.int64).reshape(-1, 2)
+
+
+def overlap_zones(
+    separation: np.ndarray, classes: np.ndarray, threshold: float
+) -> OverlapZones:
+    """Group the regions into overlap zones by single linkage.
+
+    The pairs of overlap_pairs join in their order (Kruskal): each that
+    links two groups makes a node over them, the group of a on the left.
+
+    Args:
+        separation: The separation of every pair of regions, shape
+            (m, m), symmetric.
+        classes: The class of every region, shape (m,).
+        threshold: The separation a pair must lie under, > 0.
+
+    Returns:
+        The zones; empty arrays when no pair overlaps.
+    """
+    m = len(classes)
+    group = np.arange(m)  # union-find over the regions
+
+    def find(x: int) -> int:
+        while group[x] != x:
+            group[x] = group[group[x]]
+            x = group[x]
+        return x
+
+    node = list(range(m))  # the top node of each group, by its representative
+    first = [np.inf] * m  # the first merge of each group
+    merges = []  # (left node, right node, separation, a, b); merge j is node m + j
+    for a, b in overlap_pairs(separation, classes, threshold):
+        top_a, top_b = find(a), find(b)
+        if top_a == top_b:
+            continue
+        merges.append((node[top_a], node[top_b], float(separation[a, b]), a, b))
+        group[top_b] = top_a
+        node[top_a] = m + len(merges) - 1
+        first[top_a] = min(first[top_a], first[top_b], len(merges) - 1)
+    tops = sorted(
+        (first[r], node[r]) for r in range(m) if find(r) == r and node[r] >= m
+    )
+    parent, zone, region, apart, link = [], [], [], [], []
+    for z, (_, top) in enumerate(tops):
+        stack = [(top, -1)]
+        while stack:
+            v, up = stack.pop()
+            parent.append(up)
+            zone.append(z)
+            if v < m:
+                region.append(v)
+                apart.append(np.nan)
+                link.append((-1, -1))
+                continue
+            left, right, value, a, b = merges[v - m]
+            stack += [(right, len(parent) - 1), (left, len(parent) - 1)]
+            region.append(-1)
+            apart.append(value)
+            link.append((a, b))
+    return OverlapZones(
+        parent=np.asarray(parent, dtype=np.int64),
+        zone=np.asarray(zone, dtype=np.int64),
+        region=np.asarray(region, dtype=np.int64),
+        separation=np.asarray(apart, dtype=np.float64),
+        link=np.asarray(link, dtype=np.int64).reshape(-1, 2),
+    )
 
 
 def _costs(
@@ -686,24 +693,6 @@ def _costs(
     var = np.where(count > 1, variance(count, mass, first, second), overall)
     noise = np.maximum(mean * (1 - mean), 1e-3) / count
     return mass / whole_mass * (var + noise)
-
-
-def _spread(
-    regions: np.ndarray, centers: np.ndarray, masses: np.ndarray, scatter: np.ndarray
-) -> tuple[np.ndarray, float]:
-    """Return the weighted centroid and the radius of the rows of some regions."""
-    weight = masses[regions]
-    mass = weight.sum()
-    center = weight @ centers[regions] / mass
-    ss = scatter[regions].sum() + weight @ np.sum((centers[regions] - center) ** 2, 1)
-    return center, float(np.sqrt(max(ss, 0.0) / mass))
-
-
-def _ratio(distance: float, radii: float) -> float:
-    """Return distance / radii: 0 on one point, inf apart when radii is 0."""
-    if radii > 0:
-        return float(distance / radii)
-    return 0.0 if distance == 0 else float("inf")
 
 
 def _leaf_ranges(

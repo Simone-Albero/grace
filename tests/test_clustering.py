@@ -1,4 +1,4 @@
-"""src.clustering: weighted Ward tree, cut, vote, loss, choice and overlaps."""
+"""src.clustering: weighted Ward tree, cut, vote, loss, choice and overlap zones."""
 
 import itertools
 
@@ -7,17 +7,19 @@ import pytest
 from scipy.cluster.hierarchy import fcluster, is_valid_linkage, ward
 from sklearn.metrics import adjusted_rand_score
 
+import src.clustering as clustering
 from src.clustering import (
     best_cut,
     centroids,
     cluster_class,
-    contacts,
     kdn,
-    overlap_tree,
+    line_spread,
+    overlap_pairs,
+    overlap_zones,
     region_loss,
+    separation,
     vote,
     ward_tree,
-    within_ss,
 )
 from src.graph import sample_rows
 
@@ -277,6 +279,7 @@ def test_cluster_class_on_every_row():
         hardness,
         min_cluster_floor=20,
         max_clusters=10,
+        region_cost=0.0,
         vote_k=5,
     )
     assert result.labels.shape == (300,) and result.labels.min() == 0
@@ -300,6 +303,7 @@ def test_cluster_class_votes_the_rows_outside_the_sample():
         hardness[scored],
         min_cluster_floor=20,
         max_clusters=10,
+        region_cost=0.0,
         vote_k=5,
     )
     assert result.labels.shape == (300,) and result.labels.min() == 0
@@ -318,133 +322,212 @@ def test_cluster_class_caps_the_regions_with_a_penalty():
         hardness,
         min_cluster_floor=20,
         max_clusters=2,
+        region_cost=0.0,
         vote_k=5,
     )
     assert result.labels.max() + 1 <= 2
     assert result.penalty > 0.0
 
 
-# --- overlaps ---
+def test_cluster_class_region_cost_keeps_only_the_splits_worth_it():
+    X, _, hardness = _blobs()
 
-
-def test_within_ss_by_hand():
-    X = np.array([[0.0, 0.0], [4.0, 0.0], [10.0, 10.0], [0.0, 3.0]])
-    labels = np.array([0, 0, 1, 0])
-    weights = np.array([3.0, 1.0, 2.0, 1.0])
-    _, centers = centroids(X, labels, weights)
-    expected = [
-        sum(
-            w * np.sum((x - centers[label]) ** 2)
-            for x, w, l in zip(X, weights, labels)
-            if l == label
+    def run(region_cost):
+        return cluster_class(
+            X,
+            np.ones(len(X)),
+            np.arange(len(X)),
+            hardness,
+            min_cluster_floor=20,
+            max_clusters=50,
+            region_cost=region_cost,
+            vote_k=5,
         )
-        for label in (0, 1)
-    ]
-    np.testing.assert_allclose(within_ss(X, labels, weights, centers), expected)
+
+    costs = [0.0, 1e-3, 1e-2, 1e-1, 1.0]
+    results = [run(cost) for cost in costs]
+    counts = [int(r.labels.max()) + 1 for r in results]
+    assert counts == sorted(counts, reverse=True)
+    assert counts[-1] == 1
+    for cost, count, result in zip(costs, counts, results):
+        assert result.penalty == pytest.approx(cost * result.whole_loss)
+        # The chosen cut is on the curve.
+        assert count in [c.n_clusters for c in result.candidates]
 
 
-def _regions(m: int, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Centroids, masses and scatters of m random regions."""
-    rng = np.random.default_rng(seed)
-    return (
-        rng.normal(0.0, 3.0, size=(m, 3)),
-        rng.integers(1, 50, size=m).astype(float),
-        rng.uniform(0.0, 20.0, size=m),
+# --- overlap zones ---
+
+
+def _spread_by_hand(X, labels, weights, centers, a, b) -> float:
+    """The weighted sd of a's rows along the line from c_a to c_b."""
+    line = centers[b] - centers[a]
+    if not np.linalg.norm(line):
+        return 0.0
+    line = line / np.linalg.norm(line)
+    rows = labels == a
+    along = (X[rows] - centers[a]) @ line
+    return float(np.sqrt(np.average(along**2, weights=weights[rows])))
+
+
+@pytest.mark.parametrize("chunk", [65536, 3])
+def test_line_spread_by_hand(monkeypatch, chunk):
+    monkeypatch.setattr(clustering, "_CHUNK", chunk)
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(40, 3)) * [3.0, 1.0, 0.2]
+    labels = rng.integers(0, 4, size=40)
+    labels[:4] = [0, 1, 2, 3]
+    weights = rng.integers(1, 6, size=40).astype(float)
+    _, centers = centroids(X, labels, weights)
+    centers[3] = centers[2]  # two coinciding centroids
+    spread = line_spread(X, labels, weights, centers)
+    assert spread.shape == (4, 4)
+    for a, b in itertools.product(range(4), repeat=2):
+        expected = 0.0 if a == b else _spread_by_hand(X, labels, weights, centers, a, b)
+        assert spread[a, b] == pytest.approx(expected, abs=1e-12)
+
+
+def test_separation_by_hand():
+    centers = np.array([[0.0, 0.0], [3.0, 4.0], [3.0, 4.0], [0.0, 1.0]])
+    spread = np.array(
+        [
+            [0.0, 1.0, 1.0, 0.0],
+            [2.0, 0.0, 0.0, 5.0],
+            [2.0, 0.0, 0.0, 5.0],
+            [0.0, 0.0, 0.0, 0.0],
+        ]
     )
+    apart = separation(centers, spread)
+    np.testing.assert_array_equal(apart, apart.T)
+    np.testing.assert_array_equal(np.diag(apart), 0.0)
+    assert apart[0, 1] == pytest.approx(5.0 / np.sqrt(1.0 + 4.0))
+    assert apart[1, 2] == 0.0  # the same centroid
+    assert apart[0, 3] == np.inf  # apart, and neither spreads along the line
+    assert apart[1, 3] == pytest.approx(np.sqrt(9.0 + 9.0) / 5.0)
 
 
-def _below(tree, node: int) -> list[int]:
-    """The regions of the leaves below node."""
-    kids: dict[int, list[int]] = {}
-    for v, parent in enumerate(tree.parent):
-        kids.setdefault(int(parent), []).append(v)
-    stack, regions = [node], []
+def test_separation_sees_blobs_apart_in_many_dimensions():
+    # Two blobs of sd 1 in 200 dimensions, their centroids 6 apart: far
+    # apart along the line between them, though the root mean square
+    # radius of each (about sqrt(200)) dwarfs the distance.
+    rng = np.random.default_rng(1)
+    d = 200
+    X = rng.normal(size=(2000, d))
+    X[1000:, 0] += 6.0
+    labels = np.repeat([0, 1], 1000)
+    weights = np.ones(2000)
+    _, centers = centroids(X, labels, weights)
+    apart = separation(centers, line_spread(X, labels, weights, centers))
+    assert apart[0, 1] == pytest.approx(6.0 / np.sqrt(2.0), rel=0.1)
+    X[1000:, 0] -= 5.5  # now 0.5 apart
+    _, centers = centroids(X, labels, weights)
+    apart = separation(centers, line_spread(X, labels, weights, centers))
+    assert apart[0, 1] < 1.0
+
+
+def _apart(m: int, pairs: dict[tuple[int, int], float], rest: float = 5.0):
+    """A symmetric separation matrix, rest off the given pairs, 0 on the diagonal."""
+    apart = np.full((m, m), rest)
+    np.fill_diagonal(apart, 0.0)
+    for (a, b), value in pairs.items():
+        apart[a, b] = apart[b, a] = value
+    return apart
+
+
+def test_overlap_pairs_by_hand():
+    apart = _apart(5, {(0, 1): 0.2, (1, 2): 0.5, (0, 2): 0.1, (3, 4): 0.5, (2, 4): 1.0})
+    classes = np.array([0, 1, 0, 2, 1])
+    pairs = overlap_pairs(apart, classes, 1.0)
+    # (0, 2) is one class; (2, 4) sits on the threshold.
+    assert pairs.tolist() == [[0, 1], [1, 2], [3, 4]]
+    assert pairs.dtype == np.int64
+    assert overlap_pairs(apart, classes, 0.1).shape == (0, 2)
+
+
+def test_overlap_zones_by_hand():
+    apart = _apart(6, {(0, 1): 0.2, (1, 2): 0.5, (0, 2): 0.1, (3, 4): 0.7, (2, 4): 1.0})
+    classes = np.array([0, 1, 0, 2, 1, 2])
+    zones = overlap_zones(apart, classes, 1.0)
+    # Zone 0: 0 and 1 meet at 0.2, then 2 joins 1 at 0.5 (0-2 is one
+    # class). Zone 1: 3 and 4 at 0.7. 2-4 sits on the threshold and 5
+    # is close to nothing.
+    assert zones.parent.tolist() == [-1, 0, 1, 1, 0, -1, 5, 5]
+    assert zones.zone.tolist() == [0, 0, 0, 0, 0, 1, 1, 1]
+    assert zones.region.tolist() == [-1, -1, 0, 1, 2, -1, 3, 4]
+    np.testing.assert_array_equal(
+        zones.separation, [0.5, 0.2, np.nan, np.nan, np.nan, 0.7, np.nan, np.nan]
+    )
+    assert zones.link.tolist() == [
+        [1, 2],
+        [0, 1],
+        [-1, -1],
+        [-1, -1],
+        [-1, -1],
+        [3, 4],
+        [-1, -1],
+        [-1, -1],
+    ]
+
+
+def test_overlap_zones_without_overlap_are_empty():
+    zones = overlap_zones(_apart(3, {}), np.array([0, 1, 2]), 1.0)
+    for array in (zones.parent, zones.zone, zones.region, zones.separation):
+        assert array.shape == (0,)
+    assert zones.link.shape == (0, 2)
+
+
+def _zone_below(zones, node: int) -> set[int]:
+    """The regions of the leaves below a node of the zones."""
+    stack, regions = [node], set()
     while stack:
         v = stack.pop()
-        if tree.region[v] >= 0:
-            regions.append(int(tree.region[v]))
-        stack += kids.get(v, [])
-    return sorted(regions)
+        if zones.region[v] >= 0:
+            regions.add(int(zones.region[v]))
+        stack += np.flatnonzero(zones.parent == v).tolist()
+    return regions
 
 
-def _spread(regions, centers, masses, scatter) -> tuple[np.ndarray, float, float]:
-    """Centroid, mass and radius of a group of regions, from its rows."""
-    mass = masses[regions].sum()
-    center = masses[regions] @ centers[regions] / mass
-    ss = scatter[regions].sum() + masses[regions] @ np.sum(
-        (centers[regions] - center) ** 2, axis=1
-    )
-    return center, mass, np.sqrt(ss / mass)
-
-
-def test_overlap_tree_of_one_region_is_a_leaf():
-    tree = overlap_tree(np.zeros((1, 2)), np.ones(1), np.zeros(1))
-    assert tree.parent.tolist() == [-1] and tree.region.tolist() == [0]
-    assert tree.height.tolist() == [0.0]
-    assert np.isnan(tree.distance).all() and np.isnan(tree.ratio).all()
-
-
-def test_overlap_tree_is_the_ward_tree_of_the_regions():
-    centers, masses, scatter = _regions(12, seed=1)
-    tree = overlap_tree(centers, masses, scatter)
-    m = len(tree.parent)
-    assert m == 2 * 12 - 1 and tree.parent[0] == -1
-    assert sorted(tree.region[tree.region >= 0].tolist()) == list(range(12))
-    internal = np.flatnonzero(tree.region < 0)
-    np.testing.assert_allclose(
-        np.sort(tree.height[internal]), ward_tree(centers, masses).heights
-    )
-    assert (tree.height[tree.region >= 0] == 0).all()
-    for v in range(1, m):
-        assert tree.parent[v] < v
-        assert tree.height[tree.parent[v]] >= tree.height[v]
+def test_overlap_zones_are_the_components_of_the_pairs():
+    rng = np.random.default_rng(4)
+    m = 30
+    upper = np.triu(rng.uniform(0.0, 4.0, size=(m, m)), 1)
+    apart = upper + upper.T
+    classes = rng.integers(0, 4, size=m)
+    zones = overlap_zones(apart, classes, 1.0)
+    pairs = overlap_pairs(apart, classes, 1.0)
+    leaves = np.flatnonzero(zones.region >= 0)
+    assert sorted(zones.region[leaves].tolist()) == sorted(set(pairs.ravel().tolist()))
+    zone_of = dict(zip(zones.region[leaves].tolist(), zones.zone[leaves].tolist()))
+    for a, b in pairs:
+        assert zone_of[a] == zone_of[b]
+    # A zone is connected by its pairs: each merge is one of them.
+    internal = np.flatnonzero(zones.region < 0)
+    for zone in np.unique(zones.zone):
+        n_leaves = np.sum(zones.zone[leaves] == zone)
+        assert np.sum(zones.zone[internal] == zone) == n_leaves - 1
+    first = [
+        np.nanmin(zones.separation[zones.zone == z]) for z in np.unique(zones.zone)
+    ]
+    assert first == sorted(first)
+    for v in range(len(zones.parent)):
+        up = zones.parent[v]
+        if up >= 0:
+            assert up < v and zones.zone[up] == zones.zone[v]
+        else:
+            assert v == 0 or zones.zone[v] == zones.zone[v - 1] + 1
     for v in internal:
-        left, right = np.flatnonzero(tree.parent == v)
-        c_l, _, r_l = _spread(_below(tree, left), centers, masses, scatter)
-        c_r, _, r_r = _spread(_below(tree, right), centers, masses, scatter)
-        distance = np.linalg.norm(c_l - c_r)
-        assert tree.distance[v] == pytest.approx(distance)
-        assert tree.ratio[v] == pytest.approx(distance / (r_l + r_r))
-    leaves = np.flatnonzero(tree.region >= 0)
-    assert np.isnan(tree.distance[leaves]).all() and np.isnan(tree.ratio[leaves]).all()
-
-
-def test_contacts_are_where_two_classes_first_meet():
-    centers, masses, scatter = _regions(16, seed=2)
-    classes = np.random.default_rng(3).integers(0, 3, size=16)
-    tree = overlap_tree(centers, masses, scatter)
-    met = contacts(tree, classes, centers, masses, scatter)
-    expected = []
-    for v in np.flatnonzero(tree.region < 0):
-        left, right = np.flatnonzero(tree.parent == v)
-        on_left = set(classes[_below(tree, left)].tolist())
-        on_right = set(classes[_below(tree, right)].tolist())
-        for a, b in itertools.product(sorted(on_left), sorted(on_right)):
-            if a != b and not {a, b} <= on_left and not {a, b} <= on_right:
-                expected.append((int(v), (a, b)))
-    assert [(c.node, c.classes) for c in met] == expected
-    for c in met:
-        regions = _below(tree, c.node)
-        parts = [[r for r in regions if classes[r] == k] for k in c.classes]
-        assert [p.tolist() for p in c.regions] == parts
-        c_a, _, r_a = _spread(parts[0], centers, masses, scatter)
-        c_b, _, r_b = _spread(parts[1], centers, masses, scatter)
-        distance = np.linalg.norm(c_a - c_b)
-        assert c.distance == pytest.approx(distance)
-        assert c.ratio == pytest.approx(distance / (r_a + r_b))
-
-
-def test_overlapping_classes_meet_below_apart_ones():
-    # Classes 0 and 1 share a place, class 2 is far: 0 and 1 meet first,
-    # at a ratio under 1, and 2 meets each of them at the root.
-    centers = np.array([[0.0, 0.0], [0.5, 0.0], [0.2, 0.3], [40.0, 0.0]])
-    masses = np.array([10.0, 10.0, 5.0, 10.0])
-    scatter = masses * 4.0  # radius 2 for every region
-    classes = np.array([0, 0, 1, 2])
-    tree = overlap_tree(centers, masses, scatter)
-    met = contacts(tree, classes, centers, masses, scatter)
-    pairs = {frozenset(c.classes): c for c in met}
-    assert set(pairs) == {frozenset({0, 1}), frozenset({0, 2}), frozenset({1, 2})}
-    assert pairs[frozenset({0, 1})].ratio < 1
-    assert pairs[frozenset({0, 2})].ratio > 1
-    assert pairs[frozenset({0, 2})].node == pairs[frozenset({1, 2})].node == 0
+        left, right = np.flatnonzero(zones.parent == v)
+        a, b = zones.link[v]
+        assert a in _zone_below(zones, left) and b in _zone_below(zones, right)
+        assert classes[a] != classes[b]
+        assert zones.separation[v] == apart[a, b] < 1.0
+        for kid in (left, right):
+            if zones.region[kid] < 0:
+                assert zones.separation[kid] <= zones.separation[v]
+        # Single linkage: no pair across the two sides is closer.
+        across = [
+            apart[x, y]
+            for x in _zone_below(zones, left)
+            for y in _zone_below(zones, right)
+            if classes[x] != classes[y]
+        ]
+        assert min(across) == zones.separation[v]

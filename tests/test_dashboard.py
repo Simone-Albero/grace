@@ -118,22 +118,24 @@ def test_region_map_of_an_unknown_node_is_404(client):
     assert client.get("/api/toy/regions/map?node=-5").status_code == 404
 
 
-def test_regions_carry_the_overlap_tree(client):
+def test_regions_carry_the_overlap_zones(client):
     data = _get(client, "/api/toy/regions")
-    assert len(data["overlap_tree"]) == 2 * len(data["regions"]) - 1
-    assert data["overlaps"]
-    assert {"class_a", "branch_a", "class_b", "branch_b", "ratio"} <= set(
+    assert data["stats"]["overlap_separation"] > 0
+    assert data["zones"] and data["overlaps"]
+    roots = [n for n in data["zones"] if n["parent"] == -1]
+    assert len(roots) == data["stats"]["n_zones"]
+    assert {"zone", "region_a", "region_b", "spread_a", "separation"} <= set(
         data["overlaps"][0]
     )
 
 
-def test_overlap_map_of_the_root_and_of_a_leaf(client):
-    nodes = _get(client, "/api/toy/regions")["overlap_tree"]
+def test_overlap_map_of_a_zone_and_of_a_leaf(client):
+    nodes = _get(client, "/api/toy/regions")["zones"]
     root = next(n for n in nodes if n["parent"] == -1)
     data = _get(client, f"/api/toy/regions/overlap_map?node={root['node']}")
     assert data["node"] == root["node"]
     regions = {p[2] for p in data["points"]}
-    leaves = [n for n in nodes if n["region"] is not None]
+    leaves = [n for n in nodes if n["region"] is not None and n["zone"] == root["zone"]]
     assert regions == {n["region"] for n in leaves}
     per_leaf = min(MAP_PER_LEAF, max(1, MAP_MAX_POINTS // len(leaves)))
     assert len(data["points"]) == sum(min(n["n_rows"], per_leaf) for n in leaves)

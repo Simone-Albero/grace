@@ -12,7 +12,7 @@ from src.complexity.measure import MEASURES
 from src.config import load_config
 from src.data import DUPLICATES, LABEL
 from src.prepare import MISSING, OTHER
-from stages.paths import read_points
+from stages.paths import read_points, read_weights
 
 
 def _rows(workspace: Workspace, sql: str) -> list[tuple]:
@@ -161,12 +161,14 @@ def test_regions_count_the_rows_of_the_csv(done):
     assert all(0 <= mean <= 1 and 0 <= std <= 0.5 for mean, std in hardness)
     logged = _rows(
         done,
-        "SELECT class, n_rows, n_read, n_regions, n_voted, penalty, loss "
-        "FROM class_clusterings",
+        "SELECT class, n_rows, n_read, n_regions, n_voted, penalty, loss, "
+        "relative_loss FROM class_clusterings",
     )
     assert {row[0] for row in logged} == set(classes)
     assert sum(row[3] for row in logged) == regions.height
-    assert all(row[4] >= 0 and row[5] >= 0 and row[6] >= 0 for row in logged)
+    assert all(row[4] >= 0 and row[5] > 0 and row[6] >= 0 for row in logged)
+    # A cut never loses more than the class as one region.
+    assert all(0 <= row[7] <= 1 + 1e-9 for row in logged)
     candidates = _rows(
         done, "SELECT class, penalty, n_clusters, loss FROM granularity_candidates"
     )
@@ -212,108 +214,130 @@ def test_region_tree_counts_the_rows_below_each_node(done):
         assert row["depth"] == parent["depth"] + 1
 
 
-def test_overlap_tree_counts_the_regions_below_each_node(done):
-    regions = _read(done, "regions.parquet")
-    classes = json.loads((done.output_dir / "classes.json").read_text())
-    columns = [
-        "node",
-        "parent",
-        "depth",
-        "height",
-        "region",
-        "class",
-        "n_classes",
-        "n_rows",
-        "n_read",
-        "distance",
-        "ratio",
-    ]
-    nodes = pl.DataFrame(
-        _rows(done, f"SELECT {', '.join(columns)} FROM overlap_tree ORDER BY node"),
-        schema=columns,
-        orient="row",
-    )
-    assert nodes.height == 2 * regions.height - 1
-    root = nodes.row(0, named=True)
-    assert root["parent"] == -1 and root["depth"] == 0
-    assert root["n_rows"] == regions["n_rows"].sum()
-    assert root["n_classes"] == len(classes) and root["class"] is None
-    leaves = nodes.filter(pl.col("region").is_not_null()).sort("region")
-    assert leaves["region"].to_list() == regions["region"].to_list()
-    assert leaves["n_rows"].to_list() == regions["n_rows"].to_list()
-    assert leaves["class"].to_list() == [classes[c] for c in regions["class"]]
-    assert (leaves["height"] == 0).all() and (leaves["n_classes"] == 1).all()
-    assert leaves["distance"].is_null().all()
-    by_node = {row["node"]: row for row in nodes.iter_rows(named=True)}
-    below: dict[int, list[dict]] = {}
-    for row in nodes.filter(pl.col("parent") >= 0).iter_rows(named=True):
-        parent = by_node[row["parent"]]
-        assert parent["node"] < row["node"] and row["depth"] == parent["depth"] + 1
-        assert parent["height"] >= row["height"]
-        below.setdefault(row["parent"], []).append(row)
-    for node, kids in below.items():
-        row = by_node[node]
-        assert len(kids) == 2 and row["region"] is None
-        assert row["n_rows"] == sum(k["n_rows"] for k in kids)
-        assert row["n_read"] == pytest.approx(sum(k["n_read"] for k in kids))
-        assert row["distance"] >= 0 and (row["ratio"] is None or row["ratio"] >= 0)
-        assert (row["class"] is None) == (row["n_classes"] > 1)
-        if row["class"] is not None:
-            assert all(k["class"] == row["class"] for k in kids)
-
-
-def test_class_overlaps_name_a_branch_of_each_class_tree(done):
-    columns = [
-        "node",
-        "class_a",
-        "branch_a",
-        "n_regions_a",
-        "n_rows_a",
-        "class_b",
-        "branch_b",
-        "n_regions_b",
-        "n_rows_b",
-        "ratio",
-    ]
-    overlaps = _rows(done, f"SELECT {', '.join(columns)} FROM class_overlaps")
-    assert overlaps
-    tree = {
-        node: (cls, parent, region)
-        for node, cls, parent, region in _rows(
-            done, "SELECT node, class, parent, region FROM region_tree"
-        )
-    }
-    joint = dict(_rows(done, "SELECT node, n_classes FROM overlap_tree"))
-    regions = dict(_rows(done, "SELECT region, n_rows FROM regions"))
-    for row in (dict(zip(columns, r)) for r in overlaps):
-        assert row["class_a"] != row["class_b"] and joint[row["node"]] >= 2
-        assert row["ratio"] is None or row["ratio"] >= 0
-        for side in "ab":
-            branch = tree[row[f"branch_{side}"]]
-            assert branch[0] == row[f"class_{side}"]
-            leaves = [
-                region
-                for node, (_, _, region) in tree.items()
-                if region is not None and _is_below(tree, node, row[f"branch_{side}"])
-            ]
-            assert row[f"n_regions_{side}"] <= len(leaves)
-            assert row[f"n_rows_{side}"] <= sum(regions[r] for r in leaves)
-
-
-def _is_below(tree: dict, node: int, ancestor: int) -> bool:
-    while node != -1:
-        if node == ancestor:
-            return True
-        node = tree[node][1]
-    return False
-
-
 def test_complexity_has_every_measure_of_every_population(done):
     table = _read(done, "complexity.parquet")
     regions = _read(done, "regions.parquet")
     region_rows = table.filter(pl.col("scope") == "region")
     assert region_rows.height == regions.height * len(MEASURES)
     assert table.filter(pl.col("scope") == "class").height == 9 * len(MEASURES)
+
+
+def _zones(done) -> pl.DataFrame:
+    columns = [
+        "node",
+        "zone",
+        "parent",
+        "depth",
+        "separation",
+        "region_a",
+        "region_b",
+        "region",
+        "class",
+        "n_classes",
+        "n_regions",
+        "n_rows",
+        "n_read",
+    ]
+    return pl.DataFrame(
+        _rows(done, f"SELECT {', '.join(columns)} FROM overlap_zones ORDER BY node"),
+        schema=columns,
+        orient="row",
+    )
+
+
+def test_overlap_zones_count_the_regions_below_each_node(done):
+    regions = _read(done, "regions.parquet")
+    classes = json.loads((done.output_dir / "classes.json").read_text())
+    ((threshold, n_zones),) = _rows(
+        done, "SELECT overlap_separation, n_zones FROM region_stats"
+    )
+    nodes = _zones(done)
+    assert nodes.height > 0, "the synthetic classes overlap somewhere"
+    assert nodes["node"].to_list() == list(range(nodes.height))
+    roots = nodes.filter(pl.col("parent") == -1)
+    assert roots["zone"].to_list() == list(range(n_zones))
+    assert (roots["depth"] == 0).all()
+    leaves = nodes.filter(pl.col("region").is_not_null())
+    by_region = {row["region"]: row for row in regions.iter_rows(named=True)}
+    for leaf in leaves.iter_rows(named=True):
+        region = by_region[leaf["region"]]
+        assert leaf["class"] == classes[region["class"]]
+        assert leaf["n_rows"] == region["n_rows"]
+        assert leaf["n_read"] == pytest.approx(region["n_read"])
+        assert leaf["n_regions"] == leaf["n_classes"] == 1
+        assert leaf["separation"] is None and leaf["region_a"] is None
+    assert leaves["region"].n_unique() == leaves.height
+    by_node = {row["node"]: row for row in nodes.iter_rows(named=True)}
+    below: dict[int, list[dict]] = {}
+    for row in nodes.filter(pl.col("parent") >= 0).iter_rows(named=True):
+        parent = by_node[row["parent"]]
+        assert parent["node"] < row["node"] and parent["zone"] == row["zone"]
+        assert row["depth"] == parent["depth"] + 1
+        below.setdefault(row["parent"], []).append(row)
+    for node, kids in below.items():
+        row = by_node[node]
+        assert len(kids) == 2 and row["region"] is None and row["class"] is None
+        assert 0 <= row["separation"] < threshold
+        assert all(
+            k["separation"] is None or k["separation"] <= row["separation"]
+            for k in kids
+        )
+        assert row["n_rows"] == sum(k["n_rows"] for k in kids)
+        assert row["n_regions"] == sum(k["n_regions"] for k in kids)
+        assert row["n_read"] == pytest.approx(sum(k["n_read"] for k in kids))
+        assert row["n_classes"] >= 2
+        a, b = by_region[row["region_a"]], by_region[row["region_b"]]
+        assert a["class"] != b["class"]
+
+
+def test_region_overlaps_are_the_pairs_under_the_threshold(done):
+    cfg = load_config(str(done.dataset), method=str(done.method))
+    regions = _read(done, "regions.parquet").sort("region")
+    centers = np.array(regions["centroid"].to_list())
+    region = _read(done, "assignments.parquet").sort("row")["region"].to_numpy()
+    points, _ = read_points(cfg)
+    weights = read_weights(cfg)
+    classes = json.loads((done.output_dir / "classes.json").read_text())
+    ((threshold,),) = _rows(done, "SELECT overlap_separation FROM region_stats")
+    columns = [
+        "zone",
+        "region_a",
+        "class_a",
+        "region_b",
+        "class_b",
+        "distance",
+        "spread_a",
+        "spread_b",
+        "separation",
+    ]
+    pairs = [
+        dict(zip(columns, r))
+        for r in _rows(done, f"SELECT {', '.join(columns)} FROM region_overlaps")
+    ]
+    assert pairs
+    nodes = _zones(done).filter(pl.col("region").is_not_null())
+    zone_of = dict(zip(nodes["region"].to_list(), nodes["zone"].to_list()))
+    assert {p["region_a"] for p in pairs} | {p["region_b"] for p in pairs} == set(
+        zone_of
+    )
+    for p in pairs:
+        a, b = p["region_a"], p["region_b"]
+        assert a < b and p["class_a"] != p["class_b"]
+        assert p["class_a"] == classes[regions["class"][a]]
+        assert p["class_b"] == classes[regions["class"][b]]
+        assert zone_of[a] == zone_of[b] == p["zone"]
+        line = centers[b] - centers[a]
+        assert p["distance"] == pytest.approx(np.linalg.norm(line))
+        line /= np.linalg.norm(line)
+        for side, own in (("a", a), ("b", b)):
+            rows = region == own
+            along = (points[rows] - centers[own]) @ line
+            spread = np.sqrt(np.average(along**2, weights=weights[rows]))
+            assert p[f"spread_{side}"] == pytest.approx(spread, rel=1e-6)
+        assert p["separation"] == pytest.approx(
+            p["distance"] / np.hypot(p["spread_a"], p["spread_b"])
+        )
+        assert p["separation"] < threshold
 
 
 def test_complexity_refuses_regions_of_other_data(copy_of_done):

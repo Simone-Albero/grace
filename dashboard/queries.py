@@ -111,18 +111,20 @@ def regions(cfg: DatasetConfig) -> dict[str, Any]:
         cfg: The dataset.
 
     Returns:
-        run; stats {n_regions, distance, n_graph_nodes}; classes
-        [{class, n_rows, n_read, n_regions, n_voted, penalty, loss}];
+        run; stats {n_regions, distance, n_graph_nodes,
+        overlap_separation, n_zones} (the last two null for a run older
+        than the overlap zones); classes
+        [{class, n_rows, n_read, n_regions, n_voted, penalty, loss,
+        relative_loss}];
         candidates [{class, penalty, n_clusters, loss}]; regions
         [{region, class, n_rows, n_read, hardness_mean, hardness_std}];
         tree [{node, class, parent,
-        depth, region, n_rows, n_read}] in pre-order per class;
-        overlap_tree [{node, parent, depth, height, region, class,
-        n_classes, n_rows, n_read, distance, ratio}] in pre-order;
-        overlaps [{node, height, class_a, branch_a, n_regions_a,
-        n_rows_a, n_read_a, class_b, branch_b, n_regions_b, n_rows_b,
-        n_read_b, distance, ratio}] (none with one class); both empty
-        for a run older than the overlap tree.
+        depth, region, n_rows, n_read}] in pre-order per class; zones
+        [{node, zone, parent, depth, separation, region_a, region_b,
+        region, class, n_classes, n_regions, n_rows, n_read}] zone by
+        zone in pre-order; overlaps [{zone, region_a, class_a, region_b,
+        class_b, distance, spread_a, spread_b, separation}]; both empty
+        when no regions overlap or the run is older than the zones.
     """
     with closing(_connect(cfg)) as conn:
         run = _latest_run(conn, "regions", cfg)
@@ -135,10 +137,8 @@ def regions(cfg: DatasetConfig) -> dict[str, Any]:
             "candidates": candidates,
             "regions": _rows(conn, "regions", "regions", run),
             "tree": _rows(conn, "regions", "region_tree", run),
-            "overlap_tree": _rows(
-                conn, "regions", "overlap_tree", run, missing_ok=True
-            ),
-            "overlaps": _rows(conn, "regions", "class_overlaps", run, missing_ok=True),
+            "zones": _rows(conn, "regions", "overlap_zones", run, missing_ok=True),
+            "overlaps": _rows(conn, "regions", "region_overlaps", run, missing_ok=True),
         }
 
 
@@ -170,22 +170,22 @@ def region_map(cfg: DatasetConfig, node: int) -> dict[str, Any]:
 
 
 def overlap_map(cfg: DatasetConfig, node: int) -> dict[str, Any]:
-    """Return the rows of one node of the overlap tree in their own plane.
+    """Return the rows of one node of the overlap zones in their own plane.
 
-    As region_map, with the regions below node in overlap_tree.
+    As region_map, with the regions below node in overlap_zones.
 
     Args:
         cfg: The dataset.
-        node: A node id of overlap_tree.
+        node: A node id of overlap_zones.
 
     Returns:
         node; shares [s1, s2]; points [[pc1, pc2, region]].
 
     Raises:
         LookupError: When regions has not run or node is not a node of
-            its overlap tree.
+            its overlap zones.
     """
-    return _map(cfg, "overlap_tree", node)
+    return _map(cfg, "overlap_zones", node)
 
 
 def _map(cfg: DatasetConfig, table: str, node: int) -> dict[str, Any]:

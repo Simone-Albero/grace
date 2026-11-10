@@ -73,6 +73,9 @@ def write_method_yaml(folder: Path) -> Path:
     method = yaml.safe_load((ROOT / "configs/method/default.yaml").read_text())
     method["graph"]["max_samples"] = 1500
     method["clustering"]["max_regions"] = 120
+    # The closest synthetic regions of different classes lie about 1.2 sd
+    # apart: under 2 a few zones form.
+    method["clustering"]["overlap_separation"] = 2.0
     method["complexity"]["top_k_clusters"] = 3
     method["complexity"]["max_sample_per_region"] = 50
     method["complexity"]["max_sample_per_class"] = 300
