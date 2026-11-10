@@ -39,9 +39,10 @@ Stages (each writes its files into the dataset's `output_dir` and its rows into 
   `complexity`, is euclidean on them. Builds the k-NN graph of a sample of them, then splits each class on its own
   (`src/clustering.py`): a Ward tree of its distinct rows (at most `clustering.max_fit_samples`), each weighted by
   `n_duplicates`, so it is the Ward tree of the rows as read; then the cut of least loss, branch by branch, the loss
-  being the kDN hardness spread a region hides plus the sampling noise of its mean hardness. A branch under
-  `min_cluster_floor` distinct rows is pruned. Its rows, and the rows outside the sample of the tree, take the
-  majority region of their `vote_k` nearest labelled rows. Past `max_regions` a penalty per region coarsens the cut.
+  being the kDN hardness spread a region hides plus the sampling noise of its mean hardness, measured on the sample.
+  A branch under `min_cluster_floor` distinct rows of the sample is pruned. Its rows, and the rows outside the sample
+  of the tree, take the majority region of their `vote_k` nearest labelled rows. Past `max_regions` a penalty per
+  region coarsens the cut.
   Writes `regions.parquet` (with `n_read`, the rows of the CSV), `assignments.parquet`, `graph.npz`.
 - `complexity`: 45 descriptors (feature overlap F1-F4, neighbourhood N1-N4, network density and hubs,
   dimensionality T2-T4, geometry, linearity L1-L3; `src/complexity/`) of every region and every class, on its rows

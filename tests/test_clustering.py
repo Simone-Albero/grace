@@ -100,7 +100,7 @@ def test_ward_tree_of_one_row_has_no_merge():
 # --- best_cut ---
 
 
-def _cost(rows, hardness, weights, scale):
+def _cost(rows, hardness, weights):
     """The cost of best_cut of one region, from its docstring."""
     total = weights.sum()
 
@@ -113,7 +113,7 @@ def _cost(rows, hardness, weights, scale):
     w, h = weights[rows], hardness[rows]
     mean = np.average(h, weights=w)
     var = variance(rows) if len(rows) > 1 else variance(np.arange(len(hardness)))
-    noise = max(mean * (1 - mean), 1e-3) / (len(rows) * scale)
+    noise = max(mean * (1 - mean), 1e-3) / len(rows)
     return w.sum() / total * (var + noise)
 
 
@@ -142,9 +142,9 @@ def _cuts(tree, n, floor):
     return options(2 * n - 2)
 
 
-def _objective(labels, hardness, weights, scale, penalty):
+def _objective(labels, hardness, weights, penalty):
     regions = [np.flatnonzero(labels == r) for r in np.unique(labels[labels >= 0])]
-    return sum(_cost(r, hardness, weights, scale) + penalty for r in regions)
+    return sum(_cost(r, hardness, weights) + penalty for r in regions)
 
 
 @pytest.mark.parametrize("floor", [1, 2, 3])
@@ -155,14 +155,12 @@ def test_best_cut_is_the_least_of_every_cut(floor, penalty):
     weights = rng.integers(1, 4, size=9).astype(float)
     hardness = rng.choice([0.0, 0.3, 1.0], size=9)
     tree = ward_tree(X, weights)
-    labels, _ = best_cut(
-        tree, weights, hardness, scale=2.0, floor=floor, penalty=penalty
-    )
+    labels, _ = best_cut(tree, weights, hardness, floor=floor, penalty=penalty)
     best = min(
-        sum(_cost(r, hardness, weights, 2.0) + penalty for r in cut)
+        sum(_cost(r, hardness, weights) + penalty for r in cut)
         for cut in _cuts(tree, 9, floor)
     )
-    got = _objective(labels, hardness, weights, 2.0, penalty)
+    got = _objective(labels, hardness, weights, penalty)
     assert got == pytest.approx(best)
 
 
@@ -191,9 +189,7 @@ def _region_tree_is_valid(tree, labels):
 def test_best_cut_splits_blobs_of_different_hardness():
     X, blob, hardness = _blobs()
     weights = np.ones(len(X))
-    labels, tree = best_cut(
-        ward_tree(X, weights), weights, hardness, scale=1.0, floor=20
-    )
+    labels, tree = best_cut(ward_tree(X, weights), weights, hardness, floor=20)
     _region_tree_is_valid(tree, labels)
     kept = labels >= 0
     for region in np.unique(labels[kept]):
@@ -206,7 +202,7 @@ def test_best_cut_keeps_homogeneous_hardness_whole():
     X, _, _ = _blobs()
     weights = np.ones(len(X))
     labels, tree = best_cut(
-        ward_tree(X, weights), weights, np.full(len(X), 0.2), scale=1.0, floor=5
+        ward_tree(X, weights), weights, np.full(len(X), 0.2), floor=5
     )
     assert labels.tolist() == [0] * len(X)
     assert tree.parent.tolist() == [-1] and tree.region.tolist() == [0]
@@ -219,9 +215,7 @@ def test_a_far_small_branch_is_pruned_without_blocking_its_sibling():
     )
     hardness = np.concatenate([np.zeros(50), np.ones(50), [0.5]])
     weights = np.ones(len(X))
-    labels, tree = best_cut(
-        ward_tree(X, weights), weights, hardness, scale=1.0, floor=5
-    )
+    labels, tree = best_cut(ward_tree(X, weights), weights, hardness, floor=5)
     assert labels[-1] == -1
     assert len(np.unique(labels[:50])) == 1 and len(np.unique(labels[50:100])) == 1
     assert labels[0] != labels[50]
@@ -237,7 +231,7 @@ def test_a_larger_penalty_never_gives_more_regions():
     counts = []
     for penalty in [0.0, 1e-4, 1e-3, 1e-2, 1e-1, 1.0]:
         labels, region_tree = best_cut(
-            tree, weights, hardness, scale=1.0, floor=3, penalty=penalty
+            tree, weights, hardness, floor=3, penalty=penalty
         )
         _region_tree_is_valid(region_tree, labels)
         counts.append(int((region_tree.region >= 0).sum()))
@@ -264,16 +258,8 @@ def test_region_loss_by_hand():
     first = 4 / 6 * (0.375 + 0.09375)
     # Region 1 has one row: the variance of all rows, 0.8333 / 6 · 3 / 2.
     second = 2 / 6 * (5 / 6 / 6 * 1.5 + 0.25)
-    loss = region_loss(labels, hardness, weights, scale=1.0)
+    loss = region_loss(labels, hardness, weights)
     assert loss == pytest.approx(first + second)
-
-
-def test_region_loss_scales_the_noise_by_the_class_rows():
-    labels = np.array([0, 0, 1, 1])
-    hardness = np.full(4, 0.5)
-    small = region_loss(labels, hardness, np.ones(4), scale=1.0)
-    large = region_loss(labels, hardness, np.ones(4), scale=10.0)
-    assert large == pytest.approx(small / 10)
 
 
 # --- cluster_class ---
@@ -316,6 +302,8 @@ def test_cluster_class_votes_the_rows_outside_the_sample():
     assert result.labels.shape == (300,) and result.labels.min() == 0
     assert result.n_voted >= 200
     _region_tree_is_valid(result.tree, result.labels)
+    # The floor counts scored rows, so no region is left with a handful.
+    assert np.bincount(result.labels[scored]).min() >= 20
 
 
 def test_cluster_class_caps_the_regions_with_a_penalty():

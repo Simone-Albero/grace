@@ -66,7 +66,7 @@
       <div class="card"><h2>Tree of a class</h2>
         <p class="note">Each class is split on its own by a Ward tree of its distinct rows, each weighted by its
           copies in the CSV. Every branch is cut where the loss is least: the hardness spread a region hides (kDN
-          variance) plus the sampling noise of its mean hardness. A branch under min_cluster_floor rows is pruned; its
+          variance) plus the sampling noise of its mean hardness. A branch under min_cluster_floor rows of the sample is pruned; its
           rows, and the rows outside the sample of the tree, take the region of their nearest labelled rows by vote.
           The tree shows the splits the cut keeps; each node counts the distinct rows of its regions (hover for the
           rows of the CSV). Click a node to map its rows.</p>

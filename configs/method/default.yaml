@@ -13,7 +13,7 @@ graph:                   # k-nearest-neighbour graph of the rows (src.graph)
 clustering:              # regions: a weighted Ward tree per class (weight: n_duplicates), cut where the loss is least
   max_fit_samples: 20000 # distinct rows of a class the tree is built on (quadratic time); the others are voted
   max_regions: 2500      # regions over all classes, shared equally between them; past it a penalty per region
-  min_cluster_floor: 20  # fewest rows of a region: a smaller branch is pruned and its rows voted
+  min_cluster_floor: 20  # fewest rows of a region in the tree's sample: a smaller branch is pruned, its rows voted
   hardness_k: 30         # neighbours behind the kDN hardness the granularity loss is judged on
   vote_k: 10             # labelled neighbours whose majority gives a region to a pruned or unsampled row
 

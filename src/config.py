@@ -67,8 +67,9 @@ class ClusteringConfig:
             and the cut scored on; the others are labelled by vote.
         max_regions: The regions over all classes, shared equally
             between them.
-        min_cluster_floor: The fewest rows of a region; a smaller
-            branch is pruned and its rows labelled by vote.
+        min_cluster_floor: The fewest scored rows (of the
+            max_fit_samples) of a region; a smaller branch is pruned
+            and its rows labelled by vote.
         hardness_k: The neighbours behind the kDN hardness.
         vote_k: The labelled neighbours that vote the region of an
             unlabelled row.

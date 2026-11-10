@@ -43,8 +43,8 @@ cat_cols:
   - DNS_QUERY_TYPE
   - FTP_COMMAND_RET_CODE
 
-min_class_count: 3000  # classes with fewer rows are dropped
-top_n: 128  # most frequent values of a categorical column with their own one-hot slot; the others share one
+min_class_count: 50  # classes with fewer rows are dropped
+top_n: 32  # most frequent values of a categorical column with their own one-hot slot; the others share one
 seed: 42
 output_dir: resources/processed/cic_2018_v2
 db_path: resources/processed/grace.db

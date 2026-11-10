@@ -230,16 +230,17 @@ def best_cut(
     weights: np.ndarray,
     hardness: np.ndarray,
     *,
-    scale: float,
     floor: float,
     penalty: float = 0.0,
 ) -> tuple[np.ndarray, RegionTree]:
     """Return the cut of the tree of least loss plus penalty per region.
 
     A node v taken as a region costs (W_v / W) · (var_v + max(h_v (1 -
-    h_v), 1e-3) / (n_v · scale)) + penalty: W the summed weights, h_v
-    and var_v the weighted mean and variance (times n_v / (n_v - 1)) of
-    the hardness of its n_v rows; the variance of all rows when n_v = 1.
+    h_v), 1e-3) / n_v) + penalty: W the summed weights, h_v and var_v
+    the weighted mean and variance (times n_v / (n_v - 1)) of the
+    hardness of its n_v rows; the variance of all rows when n_v = 1. The
+    noise counts the rows, not their weights: copies share one hardness
+    and add nothing to its estimate.
     A child with fewer than floor rows is no split: v divides as its
     other child does and the rows of the small one get no region. The
     least sum over every cut is found from the leaves up.
@@ -248,7 +249,6 @@ def best_cut(
         tree: The Ward tree of the rows.
         weights: The weight of every row, > 0.
         hardness: The hardness of every row, in [0, 1].
-        scale: Rows of the class per row of the tree.
         floor: The fewest rows of a region.
         penalty: The cost added per region, >= 0.
 
@@ -270,7 +270,7 @@ def best_cut(
         mass[v] = mass[a] + mass[b]
         first[v] = first[a] + first[b]
         second[v] = second[a] + second[b]
-    cost = _costs(count, mass, first, second, scale) + penalty
+    cost = _costs(count, mass, first, second) + penalty
     best, split = cost.copy(), np.full(n_nodes, np.inf)
     via = np.full(n_nodes, -1)  # the node whose two children a split keeps
     small = count < floor
@@ -342,9 +342,7 @@ def vote(X: np.ndarray, labels: np.ndarray, k: int) -> np.ndarray:
     return labels
 
 
-def region_loss(
-    labels: np.ndarray, hardness: np.ndarray, weights: np.ndarray, scale: float
-) -> float:
+def region_loss(labels: np.ndarray, hardness: np.ndarray, weights: np.ndarray) -> float:
     """Return the granularity loss of a partition.
 
     It is the cost of best_cut summed over the regions, without penalty.
@@ -353,7 +351,6 @@ def region_loss(
         labels: The region of every row, all >= 0.
         hardness: The hardness of every row.
         weights: The weight of every row, > 0.
-        scale: Rows of the class per row given.
 
     Returns:
         The loss, >= 0.
@@ -366,9 +363,7 @@ def region_loss(
     second = np.bincount(labels, weights=weights * hardness**2)
     used = count > 0
     whole = (len(labels), weights.sum(), first.sum(), second.sum())
-    costs = _costs(
-        count[used], mass[used], first[used], second[used], scale, whole=whole
-    )
+    costs = _costs(count[used], mass[used], first[used], second[used], whole=whole)
     return float(costs.sum())
 
 
@@ -384,11 +379,13 @@ def cluster_class(
 ) -> ClassClustering:
     """Split one class into the regions of least loss.
 
-    Order: ward_tree of X[scored] -> best_cut with scale = n /
-    len(scored), floor = max(1, min_cluster_floor / scale) and penalty
-    0, raised by bisection when it gives more than max_clusters regions
-    -> vote of every row without a region among the labelled scored
-    rows -> region_loss of the scored rows. The candidates are the cuts
+    Order: ward_tree of X[scored] -> best_cut with floor =
+    min_cluster_floor and penalty 0, raised by bisection when it gives
+    more than max_clusters regions -> vote of every row without a region
+    among the labelled scored rows -> region_loss of the scored rows.
+    The floor counts scored rows, whose hardness is measured, and the
+    vote only adds rows, so every region ends with at least
+    min_cluster_floor rows unless the class has fewer. The candidates are the cuts
     at penalty L · 2^-j, j = 0..15, and 0, L the loss of the whole class
     as one region; of the cuts with the same count of regions the one of
     least penalty, each scored after its vote.
@@ -398,7 +395,7 @@ def cluster_class(
         weights: The weight of every row, > 0.
         scored: The rows the tree is built on (graph.sample_rows).
         hardness: The kDN of every scored row.
-        min_cluster_floor: The fewest rows of a region in the class.
+        min_cluster_floor: The fewest scored rows of a region.
         max_clusters: The most regions, >= 1.
         vote_k: The labelled neighbours that vote.
 
@@ -407,21 +404,17 @@ def cluster_class(
     """
     n = len(X)
     sample, sample_weights = X[scored], weights[scored]
-    scale = n / len(scored)
-    floor = max(1.0, min_cluster_floor / scale)
     tree = ward_tree(sample, sample_weights)
 
     def cut(penalty: float) -> tuple[np.ndarray, RegionTree]:
         return best_cut(
-            tree, sample_weights, hardness, scale=scale, floor=floor, penalty=penalty
+            tree, sample_weights, hardness, floor=min_cluster_floor, penalty=penalty
         )
 
     def n_regions(region_tree: RegionTree) -> int:
         return int((region_tree.region >= 0).sum())
 
-    whole = region_loss(
-        np.zeros(len(scored), dtype=np.int64), hardness, sample_weights, scale
-    )
+    whole = region_loss(np.zeros(len(scored), dtype=np.int64), hardness, sample_weights)
     penalty = 0.0
     labels, region_tree = cut(penalty)
     if n_regions(region_tree) > max_clusters:
@@ -439,7 +432,7 @@ def cluster_class(
     every = np.full(n, -1, dtype=np.int64)
     every[scored] = labels
     voted = vote(X, every, vote_k)
-    loss = region_loss(voted[scored], hardness, sample_weights, scale)
+    loss = region_loss(voted[scored], hardness, sample_weights)
 
     by_count: dict[int, Candidate] = {}
     for tried in [*(whole * 2.0**-j for j in range(_CURVE_STEPS)), 0.0]:
@@ -448,7 +441,7 @@ def cluster_class(
         by_count[n_regions(tried_tree)] = Candidate(
             tried,
             n_regions(tried_tree),
-            region_loss(tried_labels, hardness, sample_weights, scale),
+            region_loss(tried_labels, hardness, sample_weights),
         )
     return ClassClustering(
         labels=voted,
@@ -470,7 +463,6 @@ def _costs(
     mass: np.ndarray,
     first: np.ndarray,
     second: np.ndarray,
-    scale: float,
     whole: tuple[float, float, float, float] | None = None,
 ) -> np.ndarray:
     """Return the cost of best_cut of every node from its sums.
@@ -490,7 +482,7 @@ def _costs(
     overall = variance(whole_count, whole_mass, whole_first, whole_second)
     mean = first / mass
     var = np.where(count > 1, variance(count, mass, first, second), overall)
-    noise = np.maximum(mean * (1 - mean), 1e-3) / (count * scale)
+    noise = np.maximum(mean * (1 - mean), 1e-3) / count
     return mass / whole_mass * (var + noise)
 
 
