@@ -12,6 +12,7 @@ import polars as pl
 from src import db
 from src.config import DatasetConfig
 from src.data import (
+    DUPLICATES,
     LABEL,
     constant_columns,
     drop_duplicates,
@@ -45,16 +46,17 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     stage prepare does it.
 
     Writes to output_dir: data.parquet (the kept num_cols as read, then
-    DUPLICATES, a numeric feature, then the kept cat_cols as read, then
-    LABEL as class code; row order = the CSV's order of first copies among the kept
-    rows, so a row's position is its id everywhere downstream),
+    DUPLICATES, the weight of the row and no feature, then the kept
+    cat_cols as read, then LABEL as class code; row order = the CSV's
+    order of first copies among the kept rows, so a row's position is
+    its id everywhere downstream),
     classes.json (the names, indexed by code).
     Logs: clean_summary (one row: n_raw, n_duplicate (copies dropped),
     n_rare, n_kept, n_classes, n_constant; n_kept = n_raw -
     n_duplicate - n_rare), dropped_classes (label, n_rows: distinct),
     dropped_columns (column), class_counts (label, n_read, n_rows:
     rows read and kept), features (column, kind "num" | "cat": the kept
-    ones, DUPLICATES included).
+    ones).
 
     Raises:
         ValueError: When a configured column is missing from the CSV, a
@@ -86,7 +88,7 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     codes = pl.col(cfg.label_col).replace_strict(
         {name: code for code, name in enumerate(classes)}, return_dtype=pl.Int64
     )
-    data = kept.select(*features.num, *features.cat, codes.alias(LABEL))
+    data = kept.select(*features.num, DUPLICATES, *features.cat, codes.alias(LABEL))
 
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     data.write_parquet(data_file(cfg))

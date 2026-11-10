@@ -133,3 +133,9 @@ h3 { margin: 0 0 8px; font-size: 12px; font-weight: 500; color: var(--muted); }
 svg .dot { cursor: default; }
 svg .dot.clickable { cursor: pointer; }
 svg .dot.selected { stroke: var(--text); stroke-width: 2; }
+
+/* region trees and maps */
+.tree .edge { stroke: var(--axis); stroke-width: 1.5; }
+.tree .node { cursor: pointer; }
+.zoomable { cursor: grab; touch-action: none; user-select: none; }
+.zoomable.dragging { cursor: grabbing; }

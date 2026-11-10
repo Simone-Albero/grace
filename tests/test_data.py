@@ -37,7 +37,7 @@ def test_feature_cols_keep_the_present_ones_in_order():
     features = feature_cols(["c", "b", "label"], ["a", "b"], ["c", "d"])
     assert features == Features(num=("b",), cat=("c",))
     with_count = feature_cols(["c", "b", DUPLICATES, "label"], ["a", "b"], ["c"])
-    assert with_count == Features(num=("b", DUPLICATES), cat=("c",))
+    assert with_count == Features(num=("b",), cat=("c",))
 
 
 def test_drop_duplicates_counts_copies_within_a_label():

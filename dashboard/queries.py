@@ -10,8 +10,17 @@ NaN).
 
 from __future__ import annotations
 
-__all__ = ["clean", "complexity", "prepare", "regions"]
+__all__ = [
+    "MAP_MAX_POINTS",
+    "MAP_PER_LEAF",
+    "clean",
+    "complexity",
+    "prepare",
+    "region_map",
+    "regions",
+]
 
+import dataclasses
 import json
 import math
 import sqlite3
@@ -21,9 +30,20 @@ from contextlib import closing
 from typing import Any
 
 import numpy as np
+import polars as pl
+from sklearn.decomposition import PCA
 
 from src.config import DatasetConfig
-from stages.paths import read_classes
+from stages.paths import (
+    assignments_file,
+    need,
+    prepared_file,
+    read_classes,
+    read_points,
+)
+
+MAP_PER_LEAF = 2000  # most rows of one region in a node's map
+MAP_MAX_POINTS = 20000  # most rows of a node's map
 
 
 def clean(cfg: DatasetConfig) -> dict[str, Any]:
@@ -91,24 +111,97 @@ def regions(cfg: DatasetConfig) -> dict[str, Any]:
         cfg: The dataset.
 
     Returns:
-        run; stats {n_regions, algorithm, distance, n_graph_nodes};
-        classes [{class, n_rows, n_regions, loss, params}]; candidates
-        [{class, params, n_clusters, loss}]; regions [{region, class,
-        n_rows}].
+        run; stats {n_regions, distance, n_graph_nodes}; classes
+        [{class, n_rows, n_read, n_regions, n_voted, penalty, loss}];
+        candidates [{class, penalty, n_clusters, loss}]; regions
+        [{region, class, n_rows, n_read, hardness_mean, hardness_std}];
+        tree [{node, class, parent,
+        depth, region, n_rows, n_read}] in pre-order per class.
     """
     with closing(_connect(cfg)) as conn:
         run = _latest_run(conn, "regions", cfg)
         classes = _rows(conn, "regions", "class_clusterings", run)
         candidates = _rows(conn, "regions", "granularity_candidates", run)
-        for row in classes + candidates:
-            row["params"] = json.loads(row["params"])
         return {
             "run": _public(run),
             "stats": _rows(conn, "regions", "region_stats", run)[0],
             "classes": classes,
             "candidates": candidates,
             "regions": _rows(conn, "regions", "regions", run),
+            "tree": _rows(conn, "regions", "region_tree", run),
         }
+
+
+def region_map(cfg: DatasetConfig, node: int) -> dict[str, Any]:
+    """Return the rows of one node of the region trees in their own plane.
+
+    The rows of the regions below node (assignments.parquet of the last
+    regions run's tree) are sampled at random (seed cfg.seed): at most
+    per_leaf = min(MAP_PER_LEAF, max(1, MAP_MAX_POINTS // regions))
+    of each region. A PCA fitted on the sample, in the space the regions
+    were built in (graph.space_points of the prepared file with the
+    distance of that run's method, not of cfg's), gives their first two
+    components. The prepared points are cached per file and mtime.
+
+    Args:
+        cfg: The dataset.
+        node: A node id of region_tree.
+
+    Returns:
+        node; shares [s1, s2] (the variance of each component, 0 when
+        it does not exist); points [[pc1, pc2, region]], pc rounded to 4
+        decimals.
+
+    Raises:
+        LookupError: When regions has not run or node is not a node of
+            its tree.
+    """
+    with closing(_connect(cfg)) as conn:
+        run = _latest_run(conn, "regions", cfg)
+        (config,) = conn.execute(
+            "SELECT config FROM runs WHERE id = ?", (run["id"],)
+        ).fetchone()
+        tree = _rows(conn, "regions", "region_tree", run)
+    children = defaultdict(list)
+    for row in tree:
+        children[row["parent"]].append(row)
+    by_node = {row["node"]: row for row in tree}
+    if node not in by_node:
+        raise LookupError(f"no node {node} in the region trees")
+    leaves, stack = [], [by_node[node]]
+    while stack:
+        row = stack.pop()
+        if row["region"] is not None:
+            leaves.append(row["region"])
+        stack += children[row["node"]]
+    region = pl.read_parquet(need(assignments_file(cfg), "regions"))
+    region = region.sort("row")["region"].to_numpy()
+    rows = np.flatnonzero(np.isin(region, leaves))
+    rows = rows[np.argsort(region[rows], kind="stable")]
+    bounds = np.flatnonzero(np.diff(region[rows])) + 1
+    per_leaf = min(MAP_PER_LEAF, max(1, MAP_MAX_POINTS // len(leaves)))
+    rng = np.random.default_rng(cfg.seed)
+    take = np.sort(
+        np.concatenate(
+            [rng.permutation(group)[:per_leaf] for group in np.split(rows, bounds)]
+        )
+    )
+    distance = json.loads(config)["method"]["distance"]
+    points = _space(cfg, distance)[take]
+    plane = np.zeros((len(points), 2))
+    shares = [0.0, 0.0]
+    if len(points) >= 2:
+        pca = PCA(n_components=min(2, *points.shape), random_state=cfg.seed)
+        plane[:, : pca.n_components] = pca.fit_transform(points)
+        shares[: pca.n_components] = [float(s) for s in pca.explained_variance_ratio_]
+    return {
+        "node": node,
+        "shares": shares,
+        "points": [
+            [round(float(a), 4), round(float(b), 4), int(r)]
+            for (a, b), r in zip(plane, region[take])
+        ],
+    }
 
 
 def complexity(cfg: DatasetConfig, measure: str | None) -> dict[str, Any]:
@@ -245,3 +338,19 @@ def _classes(cfg: DatasetConfig) -> list[str]:
         return read_classes(cfg)
     except FileNotFoundError as e:
         raise LookupError(str(e)) from e
+
+
+_SPACE: dict[tuple, np.ndarray] = {}  # the points of the last prepared files read
+
+
+def _space(cfg: DatasetConfig, distance: str) -> np.ndarray:
+    """Return paths.read_points under distance, cached per file and mtime."""
+    path = need(prepared_file(cfg), "prepare")
+    key = (str(path), path.stat().st_mtime_ns, distance)
+    if key not in _SPACE:
+        method = dataclasses.replace(cfg.method, distance=distance)
+        points, _ = read_points(dataclasses.replace(cfg, method=method))
+        if len(_SPACE) >= 2:
+            _SPACE.clear()
+        _SPACE[key] = points
+    return _SPACE[key]

@@ -1,10 +1,12 @@
 """The dashboard API over the done workspace."""
 
+import numpy as np
 import pytest
 import yaml
 from fastapi.testclient import TestClient
 
 from dashboard.app import create_app
+from dashboard.queries import MAP_MAX_POINTS, MAP_PER_LEAF
 
 
 @pytest.fixture(scope="module")
@@ -43,7 +45,7 @@ def test_clean(client):
     assert len(data["classes"]) == 9
     assert sum(c["n_rows"] for c in data["classes"]) == data["summary"]["n_kept"]
     assert data["summary"]["n_duplicate"] > 0
-    assert "n_duplicates" in data["features"]["num"]
+    assert "n_duplicates" not in data["features"]["num"]
     assert data["dropped_columns"] == ["flat"]
     assert "flat" not in data["features"]["num"]
     assert set(data["features"]) == {"num", "cat"}
@@ -56,15 +58,64 @@ def test_prepare(client):
     assert summary["n_columns"] == len(columns)
     (missing,) = [c for c in columns if c["kind"] == "missing"]
     assert missing["n_rows"] == summary["n_missing_rows"] > 0
-    assert [c["source"] for c in columns if c["kind"] == "num"][-1] == "n_duplicates"
+    assert "n_duplicates" not in [c["source"] for c in columns]
     cat = [c for c in columns if c["kind"] == "cat"]
     assert len({c["source"] for c in cat}) == summary["n_cat"]
 
 
 def test_regions(client):
     data = _get(client, "/api/toy/regions")
-    assert set(data) >= {"run", "stats", "classes", "candidates", "regions"}
+    assert set(data) >= {"run", "stats", "classes", "candidates", "regions", "tree"}
     assert data["stats"]["n_regions"] == len(data["regions"])
+    assert "algorithm" not in data["stats"]
+    assert all("params" not in c for c in data["classes"] + data["candidates"])
+    leaves = [n for n in data["tree"] if n["region"] is not None]
+    assert len(leaves) == len(data["regions"])
+    assert all({"hardness_mean", "hardness_std"} <= set(r) for r in data["regions"])
+
+
+def _below(tree: list[dict], node: int) -> set[int]:
+    """The regions under a node."""
+    kids = {}
+    for n in tree:
+        kids.setdefault(n["parent"], []).append(n)
+    by_node = {n["node"]: n for n in tree}
+    stack, regions = [by_node[node]], set()
+    while stack:
+        n = stack.pop()
+        if n["region"] is not None:
+            regions.add(n["region"])
+        stack += kids.get(n["node"], [])
+    return regions
+
+
+def test_region_map_of_a_root_and_of_a_leaf(client):
+    tree = _get(client, "/api/toy/regions")["tree"]
+    root = max(
+        (n for n in tree if n["parent"] == -1),
+        key=lambda n: len(_below(tree, n["node"])),
+    )
+    data = _get(client, f"/api/toy/regions/map?node={root['node']}")
+    assert data["node"] == root["node"]
+    points = np.array(data["points"])
+    regions = points[:, 2].astype(int)
+    assert set(regions) <= _below(tree, root["node"])
+    leaves = [n for n in tree if n["region"] in _below(tree, root["node"])]
+    per_leaf = min(MAP_PER_LEAF, max(1, MAP_MAX_POINTS // len(leaves)))
+    assert len(points) == sum(min(n["n_rows"], per_leaf) for n in leaves)
+    for n in leaves:
+        assert (regions == n["region"]).sum() == min(n["n_rows"], per_leaf)
+    s1, s2 = data["shares"]
+    assert 0 <= s2 <= s1 <= 1 and s1 + s2 <= 1 + 1e-9
+    assert np.isfinite(points[:, :2]).all()
+    leaf = next(n for n in tree if n["region"] is not None)
+    data = _get(client, f"/api/toy/regions/map?node={leaf['node']}")
+    assert {p[2] for p in data["points"]} == {leaf["region"]}
+    assert len(data["points"]) == min(leaf["n_rows"], MAP_PER_LEAF)
+
+
+def test_region_map_of_an_unknown_node_is_404(client):
+    assert client.get("/api/toy/regions/map?node=-5").status_code == 404
 
 
 def test_complexity(client):

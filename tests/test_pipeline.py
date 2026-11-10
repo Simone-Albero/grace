@@ -64,8 +64,8 @@ def test_clean_keeps_one_copy_of_each_row_and_counts_them(done):
     assert not data.drop(DUPLICATES).is_duplicated().any()
     # Row 51 under another class: same features, two rows.
     assert features.is_duplicated().sum() == 2
-    (kind,) = _rows(done, f"SELECT kind FROM features WHERE column = '{DUPLICATES}'")[0]
-    assert kind == "num"
+    logged = _rows(done, f"SELECT kind FROM features WHERE column = '{DUPLICATES}'")
+    assert logged == []
 
 
 def test_prepare_has_one_finite_row_per_data_row(done):
@@ -76,7 +76,8 @@ def test_prepare_has_one_finite_row_per_data_row(done):
     features = prepared.drop(LABEL)
     assert set(features.dtypes) == {pl.Float64}
     assert np.isfinite(features.to_numpy()).all()
-    numbers = [c for c in data.columns if c.startswith("num_")] + [DUPLICATES]
+    numbers = [c for c in data.columns if c.startswith("num_")]
+    assert DUPLICATES not in features.columns
     assert features.columns[: len(numbers) + 1] == [*numbers, MISSING]
     numeric = data.select(numbers).to_numpy().astype(float)
     n_missing = (~np.isfinite(numeric)).sum(axis=1)
@@ -144,6 +145,71 @@ def test_assignments_cover_every_row_and_keep_its_class(done):
     labels = data[LABEL].to_list()
     assert [region_class[r] for r in assignments["region"].to_list()] == labels
     assert regions["n_rows"].sum() == data.height
+
+
+def test_regions_count_the_rows_of_the_csv(done):
+    regions = _read(done, "regions.parquet")
+    data = _read(done, "data.parquet")
+    read = dict(_rows(done, "SELECT label, n_read FROM class_counts"))
+    classes = json.loads((done.output_dir / "classes.json").read_text())
+    per_class = regions.group_by("class").agg(pl.col("n_read").sum())
+    for code, n_read in per_class.iter_rows():
+        assert n_read == read[classes[code]]
+    assert regions["n_read"].sum() == data[DUPLICATES].sum()
+    hardness = _rows(done, "SELECT hardness_mean, hardness_std FROM regions")
+    assert len(hardness) == regions.height
+    assert all(0 <= mean <= 1 and 0 <= std <= 0.5 for mean, std in hardness)
+    logged = _rows(
+        done,
+        "SELECT class, n_rows, n_read, n_regions, n_voted, penalty, loss "
+        "FROM class_clusterings",
+    )
+    assert {row[0] for row in logged} == set(classes)
+    assert sum(row[3] for row in logged) == regions.height
+    assert all(row[4] >= 0 and row[5] >= 0 and row[6] >= 0 for row in logged)
+    candidates = _rows(
+        done, "SELECT class, penalty, n_clusters, loss FROM granularity_candidates"
+    )
+    assert {row[0] for row in candidates} == set(classes)
+
+
+def test_region_tree_counts_the_rows_below_each_node(done):
+    regions = _read(done, "regions.parquet")
+    classes = json.loads((done.output_dir / "classes.json").read_text())
+    data = _read(done, "data.parquet")
+    nodes = pl.DataFrame(
+        _rows(
+            done,
+            "SELECT node, class, parent, depth, region, n_rows, n_read "
+            "FROM region_tree ORDER BY node",
+        ),
+        schema=["node", "class", "parent", "depth", "region", "n_rows", "n_read"],
+        orient="row",
+    )
+    roots = nodes.filter(pl.col("parent") == -1)
+    assert sorted(roots["class"].to_list()) == sorted(classes)
+    assert (roots["depth"] == 0).all()
+    class_rows = data.group_by(LABEL).len()
+    expected = {classes[code]: n for code, n in class_rows.iter_rows()}
+    assert dict(zip(roots["class"], roots["n_rows"])) == expected
+    leaves = nodes.filter(pl.col("region").is_not_null()).sort("region")
+    assert leaves["region"].to_list() == regions["region"].to_list()
+    assert leaves["n_rows"].to_list() == regions["n_rows"].to_list()
+    np.testing.assert_allclose(leaves["n_read"], regions["n_read"])
+    by_node = {row["node"]: row for row in nodes.iter_rows(named=True)}
+    children = (
+        nodes.filter(pl.col("parent") >= 0)
+        .group_by("parent")
+        .agg(pl.col("n_rows").sum(), pl.col("n_read").sum(), pl.len())
+    )
+    for parent, n_rows, n_read, n_children in children.iter_rows():
+        node = by_node[parent]
+        assert node["region"] is None and n_children == 2
+        assert node["n_rows"] == n_rows and node["n_read"] == pytest.approx(n_read)
+    for row in nodes.filter(pl.col("parent") >= 0).iter_rows(named=True):
+        parent = by_node[row["parent"]]
+        assert parent["class"] == row["class"] and parent["node"] < row["node"]
+        assert row["depth"] == parent["depth"] + 1
 
 
 def test_complexity_has_every_measure_of_every_population(done):

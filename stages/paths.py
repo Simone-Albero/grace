@@ -17,6 +17,7 @@ __all__ = [
     "read_classes",
     "read_data",
     "read_points",
+    "read_weights",
     "regions_file",
 ]
 
@@ -27,7 +28,7 @@ import numpy as np
 import polars as pl
 
 from src.config import DatasetConfig
-from src.data import LABEL, feature_cols
+from src.data import DUPLICATES, LABEL, feature_cols
 from src.graph import space_points
 from src.prepare import MISSING
 
@@ -175,6 +176,23 @@ def read_points(cfg: DatasetConfig) -> tuple[np.ndarray, np.ndarray]:
         prepared.select(numeric).to_numpy(), slots.to_numpy(), cfg.method.distance
     )
     return points, prepared[LABEL].to_numpy()
+
+
+def read_weights(cfg: DatasetConfig) -> np.ndarray:
+    """Return the weight of every row: its copies in the CSV.
+
+    Args:
+        cfg: The dataset config.
+
+    Returns:
+        DUPLICATES of the data file as Float64, shape (n,). Row i is
+        row i of the data file.
+
+    Raises:
+        FileNotFoundError: When stage clean has not run.
+    """
+    rows = pl.read_parquet(need(data_file(cfg), "clean"), columns=[DUPLICATES])
+    return rows[DUPLICATES].cast(pl.Float64).to_numpy()
 
 
 def read_classes(cfg: DatasetConfig) -> list[str]:

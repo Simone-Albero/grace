@@ -24,17 +24,11 @@ def _method(tmp_path, **changes) -> str:
     return str(path)
 
 
-def test_unknown_clustering_param_fails(tmp_path):
-    with pytest.raises(ValueError, match="bogus"):
+@pytest.mark.parametrize("key", ["name", "params"])
+def test_the_dropped_clustering_keys_are_unknown(tmp_path, key):
+    with pytest.raises(ValueError, match=f"clustering.{key}"):
         load_config(
-            "synthetic_test", method=_method(tmp_path, clustering__params={"bogus": 1})
-        )
-
-
-def test_unknown_clustering_fails(tmp_path):
-    with pytest.raises(ValueError, match="dbscan"):
-        load_config(
-            "synthetic_test", method=_method(tmp_path, clustering__name="dbscan")
+            "synthetic_test", method=_method(tmp_path, **{f"clustering__{key}": 1})
         )
 
 
@@ -46,6 +40,8 @@ def test_degenerate_counts_fail(tmp_path):
         )
     with pytest.raises(ValueError, match="graph.k"):
         load_config("synthetic_test", method=_method(tmp_path, graph__k=0))
+    with pytest.raises(ValueError, match="vote_k"):
+        load_config("synthetic_test", method=_method(tmp_path, clustering__vote_k=0))
 
 
 def test_degenerate_preparation_fails(tmp_path):

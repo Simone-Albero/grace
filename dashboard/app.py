@@ -70,6 +70,10 @@ def create_app(dataset_dir: Path = DATASET_DIR) -> FastAPI:
     def regions(dataset: str) -> Any:
         return _query(queries.regions, load_dataset(dataset))
 
+    @app.get("/api/{dataset}/regions/map")
+    def region_map(dataset: str, node: int) -> Any:
+        return _query(queries.region_map, load_dataset(dataset), node)
+
     @app.get("/api/{dataset}/complexity")
     def complexity(dataset: str, measure: str | None = None) -> Any:
         return _query(queries.complexity, load_dataset(dataset), measure)

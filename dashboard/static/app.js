@@ -2,9 +2,10 @@
 
 /**
  * UI state.
- * @type {{dataset: string|null, tab: "clean"|"prepare"|"regions"|"complexity", cls: string|null, measure: string|null}}
+ * @type {{dataset: string|null, tab: "clean"|"prepare"|"regions"|"complexity", cls: string|null, node: number|null,
+ *   measure: string|null}} node: the region tree node whose map is shown (null: the root of state.cls)
  */
-const state = { dataset: null, tab: "clean", cls: null, measure: null };
+const state = { dataset: null, tab: "clean", cls: null, node: null, measure: null };
 
 const last = { regions: null }; // last responses, for the controls that only redraw
 let loadId = 0; // drops answers of superseded requests
@@ -19,7 +20,6 @@ const num = (v) => (v == null ? "–" : Number(v).toLocaleString("en-US"));
 const dec = (v, d = 3) => (v == null ? "–" : Number(v).toFixed(d));
 const short = (v) => (v == null ? "–" : String(Number(Number(v).toPrecision(3))));
 const when = (iso) => (iso ? `${iso.replace("T", " ").slice(0, 16)} UTC` : "–");
-const params = (p) => Object.entries(p).map(([k, v]) => `${k}=${v}`).join(", ") || "defaults";
 
 // --- dom helpers ---
 
@@ -105,12 +105,13 @@ async function api(path) {
 async function init() {
   const opts = await api("/options");
   $("dataset").replaceChildren(...opts.datasets.map((v) => h("option", {}, v)));
-  const [tab, dataset] = location.hash.slice(1).split("/").map(decodeURIComponent);
+  const [tab, dataset, cls, node] = location.hash.slice(1).split("/").map(decodeURIComponent);
   if ([...document.querySelectorAll(".tabs button")].some((b) => b.dataset.tab === tab)) state.tab = tab;
   state.dataset = opts.datasets.includes(dataset) ? dataset : opts.datasets[0];
+  if (state.tab === "regions") { state.cls = cls || null; state.node = node ? Number(node) : null; }
   $("dataset").value = state.dataset;
-  $("dataset").onchange = (e) => { state.dataset = e.target.value; state.cls = state.measure = null; load(); };
-  $("rg-class").onchange = (e) => { state.cls = e.target.value; if (last.regions) drawCandidates(last.regions); };
+  $("dataset").onchange = (e) => { state.dataset = e.target.value; state.cls = state.node = state.measure = null; load(); };
+  $("rg-class").onchange = (e) => selectClass(e.target.value);
   $("cx-measure").onchange = (e) => { state.measure = e.target.value; load(); };
   for (const b of document.querySelectorAll(".tabs button")) b.onclick = () => showTab(b.dataset.tab);
   showTab(state.tab);
@@ -124,11 +125,18 @@ function showTab(tab) {
   load();
 }
 
+/** Keep tab, dataset and, on the regions tab, class and node in the URL hash. */
+function saveHash() {
+  const parts = [state.tab, state.dataset];
+  if (state.tab === "regions" && state.cls != null) parts.push(state.cls, ...(state.node == null ? [] : [state.node]));
+  history.replaceState(null, "", `#${parts.map((p) => encodeURIComponent(p)).join("/")}`);
+}
+
 /** Fetch the data of state.tab and render it; on error show the message in the tab's empty state. */
 async function load() {
   const id = ++loadId;
   const tab = state.tab;
-  history.replaceState(null, "", `#${[tab, state.dataset].map(encodeURIComponent).join("/")}`);
+  saveHash();
   const panel = $(`tab-${tab}`);
   const empty = panel.querySelector(".empty");
   const d = `/${encodeURIComponent(state.dataset)}`;
@@ -213,49 +221,302 @@ function renderPrepare(data) {
   ], data.columns.filter((c) => c.kind === "cat"));
 }
 
-/** Tiles, granularity per class, candidates of a class, regions table. @param {object} data response of /regions */
+/** Tiles, class tree and map, granularity per class, regions. @param {object} data response of /regions */
 function renderRegions(data) {
   last.regions = data;
   const s = data.stats;
+  const voted = data.classes.reduce((a, c) => a + c.n_voted, 0);
+  const rows = data.classes.reduce((a, c) => a + c.n_rows, 0);
   fill("rg-tiles",
     tile("regions", num(s.n_regions)),
-    tile("algorithm", s.algorithm),
+    tile("rows voted", num(voted), `${pct(voted / rows)} of ${num(rows)}`),
     tile("distance", s.distance),
     tile("graph nodes", num(s.n_graph_nodes)));
   sortable($("rg-classes"), [
     { key: "class", label: "class" },
     { key: "n_rows", label: "rows", format: num },
+    { key: "n_read", label: "CSV rows", format: num },
     { key: "n_regions", label: "regions", format: num },
+    { key: "n_voted", label: "voted", format: num },
+    { key: "penalty", label: "penalty", format: short },
     { key: "loss", label: "loss", format: (v) => dec(v, 4) },
-    { key: "params", label: "chosen", format: params },
-  ], data.classes, { onClick: (r) => { state.cls = r.class; $("rg-class").value = r.class; drawCandidates(data); } });
+  ], data.classes, { onClick: (r) => selectClass(r.class), selected: (r) => r.class === state.cls });
   const classes = data.classes.map((c) => c.class);
-  if (!classes.includes(state.cls)) state.cls = classes[0];
-  $("rg-class").replaceChildren(...classes.map((c) => h("option", {}, c)));
-  $("rg-class").value = state.cls;
-  drawCandidates(data);
+  if (!classes.includes(state.cls)) { state.cls = classes[0]; state.node = null; }
+  $("rg-class").replaceChildren(...data.classes.map((c) =>
+    h("option", { value: c.class }, `${c.class} · ${c.n_regions} ${c.n_regions > 1 ? "regions" : "region"}`)));
   const sizes = data.regions.map((r) => r.n_rows);
   const edges = Array.from({ length: 21 }, (_, i) => (Math.max(...sizes, 1) * i) / 20);
   histogram($("rg-sizes"), edges, [{
     name: "regions by rows", color: "var(--accent)",
     values: edges.slice(0, -1).map((lo, i) => sizes.filter((v) => v >= lo && (v < edges[i + 1] || i === 19)).length),
   }], { format: num });
+  const leafOf = new Map(data.tree.filter((n) => n.region != null).map((n) => [n.region, n.node]));
   sortable($("rg-table"), [
     { key: "region", label: "region" },
     { key: "class", label: "class" },
     { key: "n_rows", label: "rows", format: num },
-  ], data.regions);
+    { key: "n_read", label: "CSV rows", format: num },
+    { key: "hardness_mean", label: "hardness mean", format: (v) => dec(v, 3) },
+    { key: "hardness_std", label: "hardness sd", format: (v) => dec(v, 3) },
+  ], data.regions, {
+    onClick: (r) => { selectNode(leafOf.get(r.region)); $("rg-map-title").scrollIntoView({ behavior: "smooth", block: "start" }); },
+  });
+  drawClass();
 }
 
-/** Loss of every candidate of state.cls against its clusters, the chosen one marked. @param {object} data response of /regions */
+/** Show the tree of a class, mapped from its root. @param {string} cls */
+function selectClass(cls) {
+  state.cls = cls;
+  state.node = null;
+  drawClass();
+}
+
+/** Show a node of the region trees: its class becomes state.cls. @param {number} node */
+function selectNode(node) {
+  state.cls = last.regions.tree.find((n) => n.node === node).class;
+  state.node = node;
+  drawClass();
+}
+
+/** Tree, map and candidates of state.cls; state.node falls back to the root of the class. */
+function drawClass() {
+  const nodes = last.regions.tree.filter((n) => n.class === state.cls);
+  if (!nodes.some((n) => n.node === state.node)) state.node = nodes.find((n) => n.parent < 0)?.node ?? null;
+  $("rg-class").value = state.cls;
+  saveHash();
+  const colors = leafColor(nodes, state.node);
+  treeDiagram($("rg-tree"), nodes, colors);
+  drawCandidates(last.regions);
+  drawMap(nodes, colors);
+}
+
+/** Loss of the cut of state.cls at every penalty against its regions, the chosen cut marked. @param {object} data response of /regions */
 function drawCandidates(data) {
   const rows = data.candidates.filter((c) => c.class === state.cls);
   const chosen = data.classes.find((c) => c.class === state.cls);
-  const isChosen = (c) => JSON.stringify(c.params) === JSON.stringify(chosen?.params);
+  const isChosen = (c) => c.n_clusters === chosen?.n_regions;
   scatter($("rg-loss"), rows.map((c) => ({
     x: c.n_clusters, y: c.loss, selected: isChosen(c),
-    tip: `${params(c.params)} → ${c.n_clusters} clusters, loss ${dec(c.loss, 5)}${isChosen(c) ? " (chosen)" : ""}`,
-  })), { xLabel: "clusters after the merge", yLabel: "granularity loss", line: true });
+    tip: `penalty ${short(c.penalty)} → ${num(c.n_clusters)} regions, loss ${dec(c.loss, 5)}${isChosen(c) ? " (chosen)" : ""}`,
+  })), { xLabel: `regions of ${state.cls}`, yLabel: "granularity loss", line: true });
+}
+
+// categorical slots for the map, in fixed order; validated on the dark surface (series-8 reads gray: left out)
+const SERIES = ["var(--accent)", "var(--series-2)", "var(--series-3)", "var(--series-4)", "var(--series-5)",
+  "var(--series-6)", "var(--series-7)"];
+
+/** Children of every node of one class tree, in pre-order. @param {object[]} nodes @returns {Map<number, number[]>} */
+function childrenOf(nodes) {
+  const kids = new Map();
+  for (const n of nodes) if (n.parent >= 0) kids.set(n.parent, [...(kids.get(n.parent) ?? []), n.node]);
+  return kids;
+}
+
+/**
+ * The colour groups of the selected node: its leaves when they fit the palette, else the fewest subtrees below it that
+ * do, splitting the largest first. Groups keep pre-order and take the palette in that fixed order.
+ * @param {object[]} nodes the region_tree rows of one class, in pre-order
+ * @param {number} selected the node whose rows are mapped
+ * @returns {{groups: {node: number, color: string}[], byRegion: Map<number, {node: number, color: string}>}}
+ */
+function leafColor(nodes, selected) {
+  const kids = childrenOf(nodes);
+  const byId = new Map(nodes.map((n) => [n.node, n]));
+  const order = new Map(nodes.map((n, i) => [n.node, i]));
+  let groups = [selected];
+  for (;;) {
+    const open = groups.filter((g) => kids.has(g)).sort((a, b) => byId.get(b).n_rows - byId.get(a).n_rows);
+    if (!open.length || groups.length + 1 > SERIES.length) break;
+    groups = groups.flatMap((g) => (g === open[0] ? kids.get(g) : [g]));
+  }
+  groups.sort((a, b) => order.get(a) - order.get(b));
+  const colored = groups.map((node, i) => ({ node, color: SERIES[i] }));
+  const byRegion = new Map();
+  for (const g of colored) {
+    const stack = [g.node];
+    while (stack.length) {
+      const id = stack.pop();
+      const n = byId.get(id);
+      if (n.region != null) byRegion.set(n.region, g);
+      stack.push(...(kids.get(id) ?? []));
+    }
+  }
+  return { groups: colored, byRegion };
+}
+
+/** Tooltip text of a tree node: only its counts (and the region of a leaf). */
+function nodeTip(n) {
+  return `${n.region != null ? `region ${n.region} · ` : ""}${num(n.n_rows)} rows · ${num(n.n_read)} CSV rows`;
+}
+
+/**
+ * Node-link drawing of one class tree, root on top (port of bruno's treeDiagram): leaves at 0, 1, 2, ... in pre-order,
+ * a parent at the mean of its children, one row per depth; squares for leaves, circles for internal nodes, size by
+ * sqrt(n_rows); leaves below state.node take their map colour, the other nodes stay neutral; n_rows under a node when
+ * the spacing allows, rows and CSV rows in the tooltip; state.node outlined; a click selects a node.
+ * @param {HTMLElement} el container, replaced
+ * @param {object[]} nodes the region_tree rows of one class, in pre-order
+ * @param {{groups: object[], byRegion: Map<number, {node: number, color: string}>}} colors from leafColor
+ */
+function treeDiagram(el, nodes, colors) {
+  const kids = childrenOf(nodes);
+  const posX = new Map();
+  let next = 0;
+  const place = (id) => {
+    const below = kids.get(id) ?? [];
+    below.forEach(place);
+    posX.set(id, below.length ? below.reduce((a, c) => a + posX.get(c), 0) / below.length : next++);
+  };
+  nodes.filter((n) => n.parent < 0).forEach((n) => place(n.node));
+  const depth = Math.max(...nodes.map((n) => n.depth));
+  const step = Math.max(14, 1100 / Math.max(next, 1)); // room per leaf; wider trees scroll
+  const W = Math.max(1100, step * next), m = 30;
+  const rowH = Math.max(22, Math.min(64, 640 / Math.max(depth, 1)));
+  const H = depth * rowH + 2 * m + 14;
+  const x = (id) => (next > 1 ? m + (posX.get(id) / (next - 1)) * (W - 2 * m) : W / 2);
+  const y = (d) => m + d * rowH;
+  const byId = new Map(nodes.map((n) => [n.node, n]));
+  const biggest = Math.max(...nodes.map((n) => n.n_rows), 1);
+  const labelled = step >= 44;
+  const groupOf = new Map(colors.groups.map((g) => [g.node, g.color]));
+  const edges = nodes.filter((n) => byId.has(n.parent)).map((n) =>
+    sv("line", { class: "edge", x1: x(n.parent), y1: y(byId.get(n.parent).depth), x2: x(n.node), y2: y(n.depth) }));
+  const marks = nodes.map((n) => {
+    const size = Math.min(step * 0.9, 6 + 18 * Math.sqrt(n.n_rows / biggest));
+    const picked = n.node === state.node;
+    const fill = n.region != null ? colors.byRegion.get(n.region)?.color ?? "var(--axis)" : "var(--surface)";
+    const ring = picked ? "var(--text)" : groupOf.get(n.node) ?? (n.region != null ? "var(--surface)" : "var(--muted)");
+    const style = `fill:${fill};stroke:${ring};stroke-width:${picked ? 2.5 : 1.5}`;
+    const mark = n.region != null
+      ? sv("rect", { x: x(n.node) - size / 2, y: y(n.depth) - size / 2, width: size, height: size, rx: 2, style })
+      : sv("circle", { cx: x(n.node), cy: y(n.depth), r: size / 2, style });
+    const label = labelled || picked || groupOf.has(n.node)
+      ? sv("text", { x: x(n.node), y: y(n.depth) + size / 2 + 12, "text-anchor": "middle" }, num(n.n_rows))
+      : null;
+    const g = sv("g", { class: "node" }, mark, label);
+    g.onmousemove = (ev) => tip(ev, nodeTip(n));
+    g.onmouseleave = () => tip(null);
+    g.onclick = () => selectNode(n.node);
+    return g;
+  });
+  el.replaceChildren(h("div", { class: "table-wrap" },
+    sv("svg", { class: "tree", viewBox: `0 0 ${W} ${H}`, width: W, role: "img", style: "max-width:none" }, edges, marks)));
+}
+
+let mapId = 0; // drops map answers of superseded requests
+
+/**
+ * Fetch the map of state.node and draw it (port of bruno's drawMap): its sampled rows in the plane of their own first
+ * two principal components, coloured by their group of leafColor; one scale for both axes, framed on the 1st to 99th
+ * percentiles; navigable with panZoom; answers of a node selected in the meantime are dropped.
+ * @param {object[]} nodes the region_tree rows of state.cls
+ * @param {{groups: object[], byRegion: Map<number, {node: number, color: string}>}} colors from leafColor
+ */
+async function drawMap(nodes, colors) {
+  const id = ++mapId;
+  const el = $("rg-map");
+  const sel = nodes.find((n) => n.node === state.node);
+  const what = sel.parent < 0 ? `class ${sel.class}` : sel.region != null ? `region ${sel.region}` : `node ${sel.node}`;
+  $("rg-map-title").textContent = `Map of ${what}`;
+  let data;
+  try {
+    data = await api(`/${encodeURIComponent(state.dataset)}/regions/map?node=${sel.node}`);
+  } catch (e) {
+    if (id === mapId) { el.replaceChildren(h("p", { class: "note" }, e.message)); $("rg-map-note").textContent = ""; }
+    return;
+  }
+  if (id !== mapId) return;
+  const byId = new Map(nodes.map((n) => [n.node, n]));
+  const regionNode = new Map(nodes.filter((n) => n.region != null).map((n) => [n.region, n]));
+  const leaves = nodes.filter((n) => colors.byRegion.has(n.region)).length;
+  $("rg-map-note").textContent = `${num(data.points.length)} random rows of ${what} (at most 2,000 per region, ` +
+    `20,000 in all), on the first two principal components of these rows, in the space of the regions. ` +
+    (colors.groups.length < leaves
+      ? `Its ${num(leaves)} regions are coloured by the ${colors.groups.length} subtrees ringed in the tree; click one to go deeper. `
+      : "Each region has its colour. ") +
+    "Hover a point for its region; drag to pan, pinch or ctrl + scroll to zoom, double click to reset.";
+  const legend = h("div", { class: "legend" }, colors.groups.map((g) => {
+    const n = byId.get(g.node);
+    const name = n.region != null ? `region ${n.region}` : `node ${n.node}`;
+    return h("span", {}, h("i", { style: `background:${g.color}` }), `${name} · ${num(n.n_rows)} rows`);
+  }));
+  const pts = data.points.map(([a, b, region]) => ({ a, b, region }));
+  const frame = (vals) => {
+    const lo = percentile(vals, 1), hi = percentile(vals, 99), pad = 0.2 * (hi - lo || 1);
+    return [lo - pad, hi + pad];
+  };
+  const [xa, xb] = frame(pts.map((p) => p.a)), [ya, yb] = frame(pts.map((p) => p.b));
+  const W = 1100, H = 520, m = { l: 48, r: 12, t: 12, b: 36 };
+  const k = Math.min((W - m.l - m.r) / (xb - xa), (H - m.t - m.b) / (yb - ya)); // one scale for both axes
+  const cx = (W - m.l - m.r - k * (xb - xa)) / 2 + m.l, cy = (H - m.t - m.b - k * (yb - ya)) / 2 + m.t;
+  const X = (v) => cx + (v - xa) * k, Y = (v) => cy + (yb - v) * k;
+  const dots = pts.map((p) => sv("circle", {
+    r: 2.5, "data-region": p.region,
+    style: `fill:${colors.byRegion.get(p.region)?.color ?? "var(--muted)"};opacity:0.8`,
+  }));
+  const clip = `map-clip-${id}`;
+  const svg = sv("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", class: "zoomable", style: "min-width:640px" },
+    sv("defs", {}, sv("clipPath", { id: clip }, sv("rect", { x: m.l, y: m.t, width: W - m.l - m.r, height: H - m.t - m.b }))),
+    sv("rect", { x: m.l, y: m.t, width: W - m.l - m.r, height: H - m.t - m.b, fill: "none", style: "stroke:var(--grid)" }),
+    sv("g", { "clip-path": `url(#${clip})` }, dots),
+    sv("text", { x: (W + m.l) / 2, y: H - 10, "text-anchor": "middle" }, `PC 1 · ${pct(data.shares[0], 0)} of the variance`),
+    sv("text", { transform: `translate(16, ${(H - m.b + m.t) / 2}) rotate(-90)`, "text-anchor": "middle" },
+      `PC 2 · ${pct(data.shares[1], 0)} of the variance`));
+  svg.onmousemove = (ev) => {
+    const region = ev.target.getAttribute?.("data-region");
+    const n = region == null ? null : regionNode.get(Number(region));
+    tip(ev, n ? nodeTip(n) : null);
+  };
+  svg.onmouseleave = () => tip(null);
+  const bx = pts.map((p) => X(p.a)), by = pts.map((p) => Y(p.b));
+  panZoom(svg, (t) => dots.forEach((d, i) => {
+    d.setAttribute("cx", (t.k * bx[i] + t.x).toFixed(1));
+    d.setAttribute("cy", (t.k * by[i] + t.y).toFixed(1));
+  }));
+  el.replaceChildren(legend, h("div", { class: "table-wrap" }, svg));
+}
+
+/** p-th percentile (0-100) of values, linear between ranks. */
+function percentile(values, p) {
+  const v = [...values].sort((a, b) => a - b);
+  const i = (v.length - 1) * p / 100, lo = Math.floor(i);
+  return lo + 1 < v.length ? v[lo] + (v[lo + 1] - v[lo]) * (i - lo) : v[lo];
+}
+
+/**
+ * Pan (drag) and zoom (pinch or ctrl + wheel) of an SVG, reset on double click (port of bruno's panZoom).
+ * @param {SVGSVGElement} svg
+ * @param {(t: {k: number, x: number, y: number}) => void} draw redraws the marks under the transform t
+ */
+function panZoom(svg, draw) {
+  let t = { k: 1, x: 0, y: 0 }, drag = null, frame = 0;
+  const render = () => { cancelAnimationFrame(frame); frame = requestAnimationFrame(() => draw(t)); };
+  const at = (ev) => new DOMPoint(ev.clientX, ev.clientY).matrixTransform(svg.getScreenCTM().inverse()); // viewBox units
+  svg.addEventListener("wheel", (ev) => {
+    if (!ev.ctrlKey && !ev.metaKey) return; // a pinch arrives as ctrl + wheel
+    ev.preventDefault();
+    const p = at(ev), d = Math.max(-50, Math.min(50, ev.deltaY * (ev.deltaMode === 1 ? 20 : 1)));
+    const k = Math.max(1, Math.min(64, t.k * Math.exp(-d * 0.01)));
+    t = { k, x: p.x - ((p.x - t.x) * k) / t.k, y: p.y - ((p.y - t.y) * k) / t.k };
+    render();
+  }, { passive: false });
+  svg.addEventListener("pointerdown", (ev) => {
+    drag = { p: at(ev), t };
+    svg.setPointerCapture(ev.pointerId);
+    svg.classList.add("dragging");
+  });
+  svg.addEventListener("pointermove", (ev) => {
+    if (!drag) return;
+    const p = at(ev);
+    t = { k: drag.t.k, x: drag.t.x + p.x - drag.p.x, y: drag.t.y + p.y - drag.p.y };
+    render();
+  });
+  const end = () => { drag = null; svg.classList.remove("dragging"); };
+  svg.addEventListener("pointerup", end);
+  svg.addEventListener("pointercancel", end);
+  svg.addEventListener("dblclick", () => { t = { k: 1, x: 0, y: 0 }; render(); });
+  draw(t);
 }
 
 /** Strip of the measure by class with the class value, and the summary of every measure. @param {object} data response of /complexity */

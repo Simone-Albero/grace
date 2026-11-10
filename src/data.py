@@ -18,7 +18,9 @@ from dataclasses import dataclass
 import polars as pl
 
 LABEL = "label"  # class code column of the data file
-DUPLICATES = "n_duplicates"  # copies of each kept row in the CSV, 1 when unique
+DUPLICATES = (
+    "n_duplicates"  # copies of each kept row in the CSV, 1 when unique: its weight
+)
 
 
 @dataclass(frozen=True)
@@ -37,10 +39,11 @@ class Features:
 def feature_cols(
     columns: Sequence[str], num_cols: Sequence[str], cat_cols: Sequence[str]
 ) -> Features:
-    """Return the configured columns that columns holds, and DUPLICATES.
+    """Return the configured columns that columns holds.
 
     Stage clean drops the constant columns, so the data file may lack
-    some of the configured ones; it adds DUPLICATES, a numeric feature.
+    some of the configured ones. DUPLICATES is never a feature: it is
+    the weight of the row.
 
     Args:
         columns: The columns of the data file.
@@ -48,15 +51,11 @@ def feature_cols(
         cat_cols: The configured categorical columns.
 
     Returns:
-        The present ones, in configured order; DUPLICATES last among
-        the numeric ones when columns holds it.
+        The present ones, in configured order.
     """
     present = set(columns)
-    num = [column for column in num_cols if column in present]
-    if DUPLICATES in present:
-        num.append(DUPLICATES)
     return Features(
-        num=tuple(num),
+        num=tuple(column for column in num_cols if column in present),
         cat=tuple(column for column in cat_cols if column in present),
     )
 

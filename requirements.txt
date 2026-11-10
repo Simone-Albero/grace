@@ -33,8 +33,6 @@ h11==0.16.0
     # via
     #   httpcore
     #   uvicorn
-hdbscan==0.8.44
-    # via -r requirements.in
 httpcore==1.0.9
     # via httpx
 httpx==0.28.1
@@ -50,7 +48,6 @@ isort==9.0.2
 joblib==1.6.0
     # via
     #   -r requirements.in
-    #   hdbscan
     #   scikit-learn
 mypy-extensions==1.2.0
     # via
@@ -61,7 +58,6 @@ narwhals==2.28.0
 numpy==2.5.4
     # via
     #   -r requirements.in
-    #   hdbscan
     #   pandas
     #   scikit-learn
     #   scipy
@@ -110,13 +106,10 @@ pytokens==0.4.1
 pyyaml==6.0.3
     # via -r requirements.in
 scikit-learn==1.9.1
-    # via
-    #   -r requirements.in
-    #   hdbscan
+    # via -r requirements.in
 scipy==1.18.1
     # via
     #   -r requirements.in
-    #   hdbscan
     #   scikit-learn
 starlette==1.10.0
     # via fastapi

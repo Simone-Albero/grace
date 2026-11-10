@@ -25,9 +25,9 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     """Prepare the cleaned rows for the clustering.
 
     Reads the data file. Order: data.feature_cols of its columns (the
-    kept num_cols and DUPLICATES numeric, the kept cat_cols
-    categorical) -> prepare.fit_preparation on every row (top_n,
-    method.prepare.cat_cost) -> prepare.transform.
+    kept num_cols numeric, the kept cat_cols categorical; DUPLICATES is
+    a weight, read by stage regions) -> prepare.fit_preparation on
+    every row (top_n, method.prepare.cat_cost) -> prepare.transform.
 
     Writes to output_dir: prepared.parquet (the columns of
     prepare.column_names, Float64, MISSING included, then LABEL as in

@@ -29,9 +29,10 @@
       <p class="empty">Select a dataset.</p>
       <div id="sp-tiles" class="tiles"></div>
       <div class="card"><h2>Classes</h2>
-        <p class="note">Rows equal on every column, the class included, are kept once; the n_duplicates feature
-          counts their copies (1 when unique). Then the classes under min_class_count distinct rows are dropped. Rows
-          with a missing or infinite value are kept: stage prepare puts them on the mean.</p>
+        <p class="note">Rows equal on every column, the class included, are kept once; n_duplicates counts their
+          copies (1 when unique) and is the row's weight in the regions, not a feature. Then the classes under
+          min_class_count distinct rows are dropped. Rows with a missing or infinite value are kept: stage prepare puts
+          them on the mean.</p>
         <div id="sp-classes" class="table-wrap"></div></div>
       <div class="card"><h2>Dropped classes</h2><div id="sp-dropped" class="chips"></div></div>
       <div class="card"><h2>Dropped columns</h2>
@@ -62,12 +63,22 @@
     <section id="tab-regions" class="panel" hidden>
       <p class="empty">Select a dataset.</p>
       <div id="rg-tiles" class="tiles"></div>
-      <div class="card"><h2>Granularity per class</h2>
-        <p class="note">Each class is clustered on its own. A candidate's loss adds the hardness spread its regions
-          hide (kDN variance) to the sampling noise of their mean hardness; the least loss wins.</p>
-        <div id="rg-classes" class="table-wrap"></div></div>
-      <div class="card"><h2>Candidates of a class</h2>
+      <div class="card"><h2>Tree of a class</h2>
+        <p class="note">Each class is split on its own by a Ward tree of its distinct rows, each weighted by its
+          copies in the CSV. Every branch is cut where the loss is least: the hardness spread a region hides (kDN
+          variance) plus the sampling noise of its mean hardness. A branch under min_cluster_floor rows is pruned; its
+          rows, and the rows outside the sample of the tree, take the region of their nearest labelled rows by vote.
+          The tree shows the splits the cut keeps; each node counts the distinct rows of its regions (hover for the
+          rows of the CSV). Click a node to map its rows.</p>
         <div class="filters"><label class="inline">class <select id="rg-class"></select></label></div>
+        <div id="rg-tree"></div>
+        <h3 id="rg-map-title">Map</h3>
+        <p class="note" id="rg-map-note"></p>
+        <div id="rg-map"></div></div>
+      <div class="card"><h2>Granularity per class</h2>
+        <p class="note">The cut of least loss per class, and its loss against its regions when a penalty per region
+          coarsens it (the penalty is above 0 only when the class had to be capped at max_regions).</p>
+        <div id="rg-classes" class="table-wrap"></div>
         <div id="rg-loss"></div></div>
       <div class="card"><h2>Regions</h2>
         <div id="rg-sizes"></div>

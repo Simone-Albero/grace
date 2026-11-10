@@ -1,218 +1,112 @@
-"""Regions: each class clustered at its least-loss granularity.
+"""Regions: each class split by a weighted Ward tree, cut at least loss.
 
-A finer partition hides less of the spread of its rows' hardness inside
-each region's mean, but leaves each region fewer rows to estimate that
-mean on. The granularity loss adds the two; the candidate of least loss
-wins. Hardness is kDN: the share of a row's nearest graph
-nodes of another class.
+The rows of a class are deduplicated, each weighted by its copies in
+the CSV, so the weighted Ward tree of the distinct rows is the Ward
+tree of the rows as read. The tree is cut where the granularity loss
+is least, branch by branch: a finer region hides less of the spread of
+its rows' hardness inside its mean, but leaves fewer rows to estimate
+that mean on. Branches with fewer distinct rows than the floor are
+pruned; their rows, and the rows of the class outside the sample the
+tree was built on, take the region of their nearest labelled rows by
+vote. Hardness is kDN: the share of a row's nearest graph nodes of
+another class.
 """
 
 from __future__ import annotations
 
 __all__ = [
-    "ALGORITHMS",
-    "assign_nearest",
-    "candidate_grid",
+    "Candidate",
+    "ClassClustering",
+    "RegionTree",
+    "WardTree",
+    "best_cut",
     "centroids",
     "cluster_class",
-    "fit_hdbscan",
-    "fit_kmeans",
-    "granularity_loss",
     "kdn",
-    "merge_small_clusters",
-    "n_clusters_grid",
-    "takes_n_clusters",
-    "tunable_params",
+    "region_loss",
+    "vote",
+    "ward_tree",
 ]
 
-import inspect
-import itertools
-from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
 
-import hdbscan
 import numpy as np
-from sklearn.cluster import Birch, KMeans, SpectralClustering
-from sklearn.metrics import pairwise_distances
 from sklearn.neighbors import NearestNeighbors
 
-from src.graph import sample_rows
 
-FitFn = Callable[..., np.ndarray]
-RESERVED = ("n_clusters", "max_fit_samples", "random_state")
-GRANULARITY_LEVELS = 7
-_ASSIGN_ROWS = 50_000  # rows assigned at once
+@dataclass(frozen=True)
+class WardTree:
+    """The merges of a Ward tree, in scipy's numbering.
 
+    Node i < n is row i; node n + j is the cluster made by merge j.
 
-def fit_kmeans(
-    X: np.ndarray,
-    *,
-    n_clusters: int = 8,
-    max_fit_samples: int,
-    random_state: int,
-) -> np.ndarray:
-    """Return KMeans labels, fitted on at most max_fit_samples rows.
-
-    Args:
-        X: The points, shape (n, d).
-        n_clusters: Clamped to [2, min(n, max_fit_samples) - 1].
-        max_fit_samples: The most rows the fit sees (graph.sample_rows).
-        random_state: The seed of the sample and of KMeans.
-
-    Returns:
-        The label of every row, >= 0.
+    Attributes:
+        children: The two nodes each merge joins, shape (n - 1, 2),
+            int64; a merge comes after the merges of its children.
+        heights: The height of each merge, sqrt(2 Δ) with Δ the
+            increase of the weighted within-cluster sum of squares
+            (scipy's convention), shape (n - 1,), ascending.
     """
-    n_clusters = _clamp(n_clusters, len(X), max_fit_samples)
-    model = KMeans(n_clusters=n_clusters, random_state=random_state)
-    if len(X) <= max_fit_samples:
-        return model.fit_predict(X)
-    return model.fit(X[sample_rows(len(X), max_fit_samples, random_state)]).predict(X)
+
+    children: np.ndarray
+    heights: np.ndarray
 
 
-def fit_birch(
-    X: np.ndarray,
-    *,
-    n_clusters: int = 8,
-    threshold: float = 0.5,
-    branching_factor: int = 50,
-    max_fit_samples: int,
-    random_state: int,
-) -> np.ndarray:
-    """Return Birch labels, fitted on at most max_fit_samples rows.
+@dataclass(frozen=True)
+class RegionTree:
+    """The tree a cut keeps: the root, the splits it makes, its regions.
 
-    Args:
-        X: The points, shape (n, d).
-        n_clusters: Clamped as in fit_kmeans.
-        threshold: Birch's subcluster radius.
-        branching_factor: Birch's most subclusters per node.
-        max_fit_samples: The most rows the fit sees.
-        random_state: The seed of the sample.
+    Nodes are in pre-order, the left child first, so a parent comes
+    before its children and the leaves come in region order.
 
-    Returns:
-        The label of every row, >= 0.
+    Attributes:
+        parent: The parent of each node, -1 at the root, shape (m,),
+            int64.
+        region: The region of each leaf, 0.. in pre-order; -1 at an
+            internal node. Shape (m,), int64.
     """
-    n_clusters = _clamp(n_clusters, len(X), max_fit_samples)
-    model = Birch(
-        threshold=threshold, branching_factor=branching_factor, n_clusters=n_clusters
-    )
-    if len(X) <= max_fit_samples:
-        return model.fit_predict(X)
-    return model.fit(X[sample_rows(len(X), max_fit_samples, random_state)]).predict(X)
+
+    parent: np.ndarray
+    region: np.ndarray
 
 
-def fit_spectral(
-    X: np.ndarray,
-    *,
-    n_clusters: int = 8,
-    n_neighbors: int = 10,
-    max_fit_samples: int,
-    random_state: int,
-) -> np.ndarray:
-    """Return spectral labels, fitted on at most max_fit_samples rows.
+@dataclass(frozen=True)
+class Candidate:
+    """One penalty of the granularity curve of a class.
 
-    The affinity is a k-NN graph. Rows outside the fitted sample take
-    the label of their nearest sampled row.
-
-    Args:
-        X: The points, shape (n, d).
-        n_clusters: Clamped as in fit_kmeans.
-        n_neighbors: Neighbours of the affinity graph.
-        max_fit_samples: The most rows the fit sees.
-        random_state: The seed of the sample and of the embedding.
-
-    Returns:
-        The label of every row, >= 0.
+    Attributes:
+        penalty: The penalty per region of the cut.
+        n_clusters: The regions of the cut.
+        loss: region_loss of the scored rows after the vote.
     """
-    n_clusters = _clamp(n_clusters, len(X), max_fit_samples)
-    model = SpectralClustering(
-        n_clusters=n_clusters,
-        affinity="nearest_neighbors",
-        n_neighbors=n_neighbors,
-        assign_labels="kmeans",
-        eigen_solver="arpack",
-        random_state=random_state,
-    )
-    if len(X) <= max_fit_samples:
-        return model.fit_predict(X)
-    sample = X[sample_rows(len(X), max_fit_samples, random_state)]
-    labels = model.fit_predict(sample)
-    nearest = NearestNeighbors(n_neighbors=1).fit(sample).kneighbors(X)[1]
-    return labels[nearest.ravel()]
+
+    penalty: float
+    n_clusters: int
+    loss: float
 
 
-def fit_hdbscan(
-    X: np.ndarray,
-    *,
-    min_cluster_size: int = 50,
-    min_samples: int | None = None,
-    cluster_selection_method: str = "leaf",
-    max_fit_samples: int,
-    random_state: int,
-) -> np.ndarray:
-    """Return HDBSCAN labels, fitted on at most max_fit_samples rows.
+@dataclass(frozen=True)
+class ClassClustering:
+    """The regions of one class.
 
-    Rows outside the fitted sample are labelled by approximate_predict.
-
-    Args:
-        X: The points, shape (n, d).
-        min_cluster_size: HDBSCAN's smallest cluster.
-        min_samples: HDBSCAN's core neighbours; None is
-            min_cluster_size.
-        cluster_selection_method: "leaf" or "eom".
-        max_fit_samples: The most rows the fit sees.
-        random_state: The seed of the sample.
-
-    Returns:
-        The label of every row; -1 is noise.
+    Attributes:
+        labels: The region of every row of the class, 0.. in the leaf
+            order of tree, no gap.
+        tree: The tree of the cut.
+        penalty: The penalty per region of the cut (0 unless the
+            regions had to be capped).
+        loss: region_loss of the scored rows after the vote.
+        n_voted: The rows labelled by vote: the pruned scored rows and
+            the rows outside the sample.
+        candidates: The granularity curve, by descending penalty.
     """
-    model = hdbscan.HDBSCAN(
-        min_cluster_size=min_cluster_size,
-        min_samples=min_samples,
-        cluster_selection_method=cluster_selection_method,
-        prediction_data=True,
-    )
-    if len(X) <= max_fit_samples:
-        return model.fit_predict(X)
-    model.fit(X[sample_rows(len(X), max_fit_samples, random_state)])
-    return hdbscan.approximate_predict(model, X)[0]
 
-
-ALGORITHMS: dict[str, FitFn] = {
-    "kmeans": fit_kmeans,
-    "birch": fit_birch,
-    "spectral": fit_spectral,
-    "hdbscan": fit_hdbscan,
-}
-
-
-def tunable_params(algorithm: FitFn) -> tuple[str, ...]:
-    """Return the parameters of a fit function a config may set.
-
-    Args:
-        algorithm: A value of ALGORITHMS.
-
-    Returns:
-        Its keyword-only parameter names except RESERVED, in signature
-        order.
-    """
-    return tuple(
-        name
-        for name, parameter in inspect.signature(algorithm).parameters.items()
-        if parameter.kind is inspect.Parameter.KEYWORD_ONLY and name not in RESERVED
-    )
-
-
-def takes_n_clusters(algorithm: FitFn) -> bool:
-    """Return whether a fit function takes n_clusters.
-
-    Args:
-        algorithm: A value of ALGORITHMS.
-
-    Returns:
-        Whether n_clusters is one of its parameters.
-    """
-    return "n_clusters" in inspect.signature(algorithm).parameters
+    labels: np.ndarray
+    tree: RegionTree
+    penalty: float
+    loss: float
+    n_voted: int
+    candidates: list[Candidate]
 
 
 def kdn(neighbor_labels: np.ndarray, label: int) -> np.ndarray:
@@ -229,288 +123,396 @@ def kdn(neighbor_labels: np.ndarray, label: int) -> np.ndarray:
     return (neighbor_labels != label).mean(axis=1)
 
 
-def centroids(X: np.ndarray, labels: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Return the mean point of every label.
+def centroids(
+    X: np.ndarray, labels: np.ndarray, weights: np.ndarray | None = None
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the weighted mean point of every label.
 
     Args:
         X: The points, shape (n, d).
         labels: The label of every row; -1 rows are ignored.
+        weights: The weight of every row, > 0; None weighs every row 1.
 
     Returns:
         The labels, ascending, and their centroids, shape (m, d).
     """
-    ids = np.unique(labels[labels != -1])
-    centers = np.stack([X[labels == i].mean(axis=0) for i in ids])
-    return ids, centers
+    X = np.asarray(X, dtype=np.float64)
+    weights = np.ones(len(X)) if weights is None else np.asarray(weights, float)
+    kept = labels != -1
+    ids, index = np.unique(labels[kept], return_inverse=True)
+    mass = np.bincount(index, weights=weights[kept], minlength=len(ids))
+    sums = np.zeros((len(ids), X.shape[1]))
+    np.add.at(sums, index, X[kept] * weights[kept, None])
+    return ids, sums / mass[:, None]
 
 
-def merge_small_clusters(
-    X: np.ndarray, labels: np.ndarray, min_size: float
-) -> np.ndarray:
-    """Move noise and small clusters to the nearest surviving centroid.
+def ward_tree(X: np.ndarray, weights: np.ndarray) -> WardTree:
+    """Build the weighted Ward tree of the rows.
 
-    A cluster is small with fewer than min_size rows.
+    Merging clusters a and b costs Δ = w_a w_b / (w_a + w_b) ·
+    ||c_a - c_b||², with w the summed weight and c the weighted centroid
+    of a cluster: with integer weights, the tree of the rows repeated
+    as many times. Built by the nearest-neighbour chain on the centroids
+    (memory O(n d)); Ward is reducible, so sorting the merges by height
+    (stably: the chain keeps a child's merge before its parent's) gives
+    a valid order.
 
-    Ids are not renumbered. When no cluster has min_size rows, every row
-    gets label 0.
+    Args:
+        X: The points, shape (n, d), n >= 1.
+        weights: The weight of every row, > 0.
+
+    Returns:
+        The tree; no merge when n = 1.
+    """
+    centers = np.array(X, dtype=np.float64)
+    mass = np.array(weights, dtype=np.float64)
+    n = len(centers)
+    if n < 2:
+        return WardTree(np.empty((0, 2), dtype=np.int64), np.empty(0))
+    norms = np.einsum("ij,ij->i", centers, centers)
+    slot = np.arange(n)  # the row whose position a cluster holds
+    alive = np.ones(n, dtype=bool)
+    made = np.zeros(n)  # the height of the merge that made each row's cluster
+    pairs, heights, chain = [], [], []
+    remaining = n
+    while remaining > 1:
+        if 2 * remaining < len(centers) and len(centers) > 256:
+            # Keep only the live clusters: the scans below cost their count.
+            keep = np.flatnonzero(alive)
+            position = np.full(len(centers), -1)
+            position[keep] = np.arange(len(keep))
+            centers, mass, norms, slot = (
+                centers[keep],
+                mass[keep],
+                norms[keep],
+                slot[keep],
+            )
+            alive = np.ones(len(keep), dtype=bool)
+            chain = [int(position[c]) for c in chain]
+        if not chain:
+            chain.append(int(np.flatnonzero(alive)[0]))
+        a = chain[-1]
+        squared = np.maximum(norms + norms[a] - 2.0 * (centers @ centers[a]), 0.0)
+        cost = squared * (mass * mass[a] / (mass + mass[a]))
+        cost[~alive] = np.inf
+        cost[a] = np.inf
+        b = int(np.argmin(cost))
+        # The previous link of the chain wins ties, so the chain ends.
+        if len(chain) > 1 and cost[chain[-2]] <= cost[b]:
+            b = chain[-2]
+        if len(chain) == 1 or b != chain[-2]:
+            chain.append(b)
+            continue
+        del chain[-2:]
+        total = mass[a] + mass[b]
+        centers[a] = (mass[a] * centers[a] + mass[b] * centers[b]) / total
+        mass[a] = total
+        norms[a] = centers[a] @ centers[a]
+        alive[b] = False
+        # Rounding can put a merge a hair under its children's.
+        height = max(np.sqrt(2.0 * cost[b]), made[slot[a]], made[slot[b]])
+        made[slot[a]] = height
+        pairs.append((slot[a], slot[b]))
+        heights.append(height)
+        remaining -= 1
+    order = np.argsort(heights, kind="stable")
+    node = np.arange(n)  # the tree node each row's cluster is now
+    children = np.empty((n - 1, 2), dtype=np.int64)
+    for j, i in enumerate(order):
+        a, b = pairs[i]
+        children[j] = sorted((node[a], node[b]))
+        node[a] = n + j
+    return WardTree(children, np.asarray(heights)[order])
+
+
+def best_cut(
+    tree: WardTree,
+    weights: np.ndarray,
+    hardness: np.ndarray,
+    *,
+    scale: float,
+    floor: float,
+    penalty: float = 0.0,
+) -> tuple[np.ndarray, RegionTree]:
+    """Return the cut of the tree of least loss plus penalty per region.
+
+    A node v taken as a region costs (W_v / W) · (var_v + max(h_v (1 -
+    h_v), 1e-3) / (n_v · scale)) + penalty: W the summed weights, h_v
+    and var_v the weighted mean and variance (times n_v / (n_v - 1)) of
+    the hardness of its n_v rows; the variance of all rows when n_v = 1.
+    A child with fewer than floor rows is no split: v divides as its
+    other child does and the rows of the small one get no region. The
+    least sum over every cut is found from the leaves up.
+
+    Args:
+        tree: The Ward tree of the rows.
+        weights: The weight of every row, > 0.
+        hardness: The hardness of every row, in [0, 1].
+        scale: Rows of the class per row of the tree.
+        floor: The fewest rows of a region.
+        penalty: The cost added per region, >= 0.
+
+    Returns:
+        The region of every row (-1 for a pruned one; 0.. in the leaf
+        order of the tree) and the tree of the cut.
+    """
+    weights = np.asarray(weights, dtype=np.float64)
+    hardness = np.asarray(hardness, dtype=np.float64)
+    n = len(weights)
+    n_nodes = 2 * n - 1
+    count, mass = np.ones(n_nodes), np.empty(n_nodes)
+    first, second = np.empty(n_nodes), np.empty(n_nodes)
+    mass[:n], first[:n] = weights, weights * hardness
+    second[:n] = weights * hardness**2
+    for j, (a, b) in enumerate(tree.children):
+        v = n + j
+        count[v] = count[a] + count[b]
+        mass[v] = mass[a] + mass[b]
+        first[v] = first[a] + first[b]
+        second[v] = second[a] + second[b]
+    cost = _costs(count, mass, first, second, scale) + penalty
+    best, split = cost.copy(), np.full(n_nodes, np.inf)
+    via = np.full(n_nodes, -1)  # the node whose two children a split keeps
+    small = count < floor
+    for j, (a, b) in enumerate(tree.children):
+        v = n + j
+        if small[a] and small[b]:
+            continue
+        if small[a] or small[b]:
+            big = b if small[a] else a
+            split[v], via[v] = split[big], via[big]
+        else:
+            split[v], via[v] = best[a] + best[b], v
+        best[v] = min(cost[v], split[v])
+    # The rows below each node are a range of the leaves in pre-order.
+    leaves, start, stop = _leaf_ranges(tree.children, n)
+    labels = np.full(n, -1, dtype=np.int64)
+    parent, region = [], []
+    n_regions = 0
+    stack = [(n_nodes - 1, -1)]
+    while stack:
+        v, up = stack.pop()
+        parent.append(up)
+        if split[v] < cost[v]:
+            region.append(-1)
+            here = len(parent) - 1
+            a, b = tree.children[via[v] - n]
+            stack += [(b, here), (a, here)]
+        else:
+            labels[leaves[start[v] : stop[v]]] = n_regions
+            region.append(n_regions)
+            n_regions += 1
+    return labels, RegionTree(
+        np.asarray(parent, dtype=np.int64), np.asarray(region, dtype=np.int64)
+    )
+
+
+def vote(X: np.ndarray, labels: np.ndarray, k: int) -> np.ndarray:
+    """Label the unlabelled rows by the majority of their nearest labelled rows.
+
+    Ties go to the label of the nearest among the tied.
 
     Args:
         X: The points, shape (n, d).
-        labels: The label of every row; -1 is noise.
-        min_size: The fewest rows a cluster keeps.
+        labels: The label of every row, -1 to vote; at least one >= 0.
+        k: The labelled neighbours that vote.
 
     Returns:
-        The new labels, all >= 0.
+        The labels, every one >= 0; labelled rows keep theirs.
     """
-    ids, counts = np.unique(labels[labels != -1], return_counts=True)
-    absorbed = np.isin(labels, ids[counts < min_size]) | (labels == -1)
-    if not absorbed.any():
-        return labels.copy()
-    if absorbed.all():
-        return np.zeros_like(labels)
-    survivors, centers = centroids(X[~absorbed], labels[~absorbed])
-    merged = labels.copy()
-    merged[absorbed] = survivors[assign_nearest(X[absorbed], centers)]
-    return merged
+    labels = np.asarray(labels, dtype=np.int64).copy()
+    known = np.flatnonzero(labels >= 0)
+    unknown = np.flatnonzero(labels < 0)
+    if len(unknown) == 0:
+        return labels
+    if len(np.unique(labels[known])) == 1:
+        labels[unknown] = labels[known[0]]
+        return labels
+    search = NearestNeighbors(
+        n_neighbors=min(k, len(known)), algorithm="brute", n_jobs=-1
+    ).fit(X[known])
+    for start in range(0, len(unknown), _VOTE_ROWS):
+        rows = unknown[start : start + _VOTE_ROWS]
+        votes = labels[known][search.kneighbors(X[rows], return_distance=False)]
+        # Neighbours come nearest first: the first label of the most
+        # votes is the nearest of the tied.
+        support = (votes[:, :, None] == votes[:, None, :]).sum(axis=2)
+        winner = np.argmax(support == support.max(axis=1, keepdims=True), axis=1)
+        labels[rows] = votes[np.arange(len(rows)), winner]
+    return labels
 
 
-def granularity_loss(labels: np.ndarray, hardness: np.ndarray, scale: float) -> float:
-    """Return the loss of a partition of a class's scored rows.
+def region_loss(
+    labels: np.ndarray, hardness: np.ndarray, weights: np.ndarray, scale: float
+) -> float:
+    """Return the granularity loss of a partition.
 
-    With w_c = n_c / N over the clusters c of the N scored rows, h_c
-    their mean hardness and v_c its variance (ddof=1; the n_c-weighted
-    mean of the known v_c for a single-row cluster, or of all rows when
-    none is known):
-        within = Σ w_c · v_c
-        noise = Σ w_c · max(h_c (1 - h_c), 1e-3)
-                / max(n_c · scale, 1e-9)
-    and the loss is within + noise. n_c · scale estimates the rows of
-    the region in the whole class.
+    It is the cost of best_cut summed over the regions, without penalty.
 
     Args:
-        labels: The final label of every scored row, all >= 0.
-        hardness: The kDN of every scored row.
-        scale: Rows of the class per scored row (n_class / N).
+        labels: The region of every row, all >= 0.
+        hardness: The hardness of every row.
+        weights: The weight of every row, > 0.
+        scale: Rows of the class per row given.
 
     Returns:
         The loss, >= 0.
     """
-    clusters, sizes = np.unique(labels, return_counts=True)
-    weights = sizes / len(labels)
-    means = np.array([hardness[labels == c].mean() for c in clusters])
-    variances = np.array(
-        [
-            hardness[labels == c].var(ddof=1) if n > 1 else np.nan
-            for c, n in zip(clusters, sizes)
-        ]
+    weights = np.asarray(weights, dtype=np.float64)
+    hardness = np.asarray(hardness, dtype=np.float64)
+    count = np.bincount(labels).astype(np.float64)
+    mass = np.bincount(labels, weights=weights)
+    first = np.bincount(labels, weights=weights * hardness)
+    second = np.bincount(labels, weights=weights * hardness**2)
+    used = count > 0
+    whole = (len(labels), weights.sum(), first.sum(), second.sum())
+    costs = _costs(
+        count[used], mass[used], first[used], second[used], scale, whole=whole
     )
-    known = ~np.isnan(variances)
-    if known.any():
-        pooled = np.average(variances[known], weights=sizes[known])
-    else:
-        pooled = hardness.var(ddof=1) if len(hardness) > 1 else 0.0
-    within = np.sum(weights * np.where(known, variances, pooled))
-    spread = np.maximum(means * (1 - means), 1e-3)
-    noise = np.sum(weights * spread / np.maximum(sizes * scale, 1e-9))
-    return float(within + noise)
-
-
-def n_clusters_grid(n_rows: int, floor: float, max_n: int) -> list[int]:
-    """Return the n_clusters candidates of a class.
-
-    Args:
-        n_rows: The rows of the class.
-        floor: The rows of the finest cluster.
-        max_n: The most clusters.
-
-    Returns:
-        Sorted distinct values min(max_n, max(2, round(n_rows / (floor ·
-        2**l)))) for l in range(GRANULARITY_LEVELS).
-    """
-    return sorted(
-        {
-            min(max_n, max(2, round(n_rows / (floor * 2**level))))
-            for level in range(GRANULARITY_LEVELS)
-        }
-    )
-
-
-def candidate_grid(
-    algorithm: FitFn, params: Mapping[str, Any], n_clusters: Sequence[int]
-) -> list[dict[str, Any]]:
-    """Return every parameter combination to try.
-
-    A list-valued param is swept, any other value fixed; when algorithm
-    takes n_clusters, it is swept last over n_clusters.
-
-    Args:
-        algorithm: The fit function.
-        params: The configured params.
-        n_clusters: The n_clusters candidates (ignored when algorithm
-            takes none).
-
-    Returns:
-        The combinations, in product order of params then n_clusters.
-    """
-    grid = {k: v if isinstance(v, list) else [v] for k, v in params.items()}
-    if takes_n_clusters(algorithm):
-        grid["n_clusters"] = list(n_clusters)
-    return [
-        dict(zip(grid, combination))
-        for combination in itertools.product(*grid.values())
-    ]
-
-
-@dataclass(frozen=True)
-class Candidate:
-    """One scored combination of the grid of a class.
-
-    Attributes:
-        params: The combination.
-        n_clusters: The clusters after the merge.
-        loss: Its granularity loss.
-    """
-
-    params: dict[str, Any]
-    n_clusters: int
-    loss: float
-
-
-@dataclass(frozen=True)
-class ClassClustering:
-    """The chosen partition of one class.
-
-    Attributes:
-        labels: The label of every row of the class, >= 0, gaps
-            allowed.
-        params: The winning combination.
-        loss: Its loss on the scored rows.
-        candidates: Every combination that fitted, in grid order.
-    """
-
-    labels: np.ndarray
-    params: dict[str, Any]
-    loss: float
-    candidates: list[Candidate]
+    return float(costs.sum())
 
 
 def cluster_class(
     X: np.ndarray,
+    weights: np.ndarray,
     scored: np.ndarray,
     hardness: np.ndarray,
     *,
-    algorithm: FitFn,
-    params: Mapping[str, Any],
-    max_fit_samples: int,
     min_cluster_floor: int,
     max_clusters: int,
-    seed: int,
+    vote_k: int,
 ) -> ClassClustering:
-    """Cluster one class at the granularity of least loss.
+    """Split one class into the regions of least loss.
 
-    Every combination of candidate_grid (n_clusters from n_clusters_grid
-    with max_n = max(2, min(max_fit_samples // min_cluster_floor,
-    max_clusters))) is fitted on X[scored], merged with floor
-    min_cluster_floor · len(scored) / len(X), and scored by
-    granularity_loss. A fit that raises anything but TypeError is
-    skipped. The least loss among those with at most max_clusters
-    clusters wins (ties: the first). When scored is every row, its
-    labels are kept; otherwise algorithm is refit on X and merged with
-    min_cluster_floor.
+    Order: ward_tree of X[scored] -> best_cut with scale = n /
+    len(scored), floor = max(1, min_cluster_floor / scale) and penalty
+    0, raised by bisection when it gives more than max_clusters regions
+    -> vote of every row without a region among the labelled scored
+    rows -> region_loss of the scored rows. The candidates are the cuts
+    at penalty L · 2^-j, j = 0..15, and 0, L the loss of the whole class
+    as one region; of the cuts with the same count of regions the one of
+    least penalty, each scored after its vote.
 
     Args:
         X: The points of the class, shape (n, d).
-        scored: The rows the candidates are scored on (graph.sample_rows
-            of n with max_fit_samples).
+        weights: The weight of every row, > 0.
+        scored: The rows the tree is built on (graph.sample_rows).
         hardness: The kDN of every scored row.
-        algorithm: A value of ALGORITHMS.
-        params: Its configured params.
-        max_fit_samples: Passed to algorithm.
-        min_cluster_floor: The merge floor on the whole class.
-        max_clusters: The most clusters of the class.
-        seed: Passed to algorithm as random_state.
+        min_cluster_floor: The fewest rows of a region in the class.
+        max_clusters: The most regions, >= 1.
+        vote_k: The labelled neighbours that vote.
 
     Returns:
-        The chosen partition.
-
-    Raises:
-        RuntimeError: When every combination fails.
-        ValueError: When no combination has at most max_clusters
-            clusters.
+        The regions.
     """
-    n_rows = len(X)
-    max_n = max(2, min(max_fit_samples // min_cluster_floor, max_clusters))
-    grid = candidate_grid(
-        algorithm, params, n_clusters_grid(n_rows, min_cluster_floor, max_n)
+    n = len(X)
+    sample, sample_weights = X[scored], weights[scored]
+    scale = n / len(scored)
+    floor = max(1.0, min_cluster_floor / scale)
+    tree = ward_tree(sample, sample_weights)
+
+    def cut(penalty: float) -> tuple[np.ndarray, RegionTree]:
+        return best_cut(
+            tree, sample_weights, hardness, scale=scale, floor=floor, penalty=penalty
+        )
+
+    def n_regions(region_tree: RegionTree) -> int:
+        return int((region_tree.region >= 0).sum())
+
+    whole = region_loss(
+        np.zeros(len(scored), dtype=np.int64), hardness, sample_weights, scale
     )
-    sample = X[scored]
-    scale = n_rows / len(scored)
-    candidates, candidate_labels = [], []
-    for combination in grid:
-        try:
-            labels = algorithm(
-                sample,
-                max_fit_samples=max_fit_samples,
-                random_state=seed,
-                **combination,
-            )
-        # A TypeError is a bad param: a config error, which every other
-        # candidate would repeat, not a candidate that failed to fit.
-        except TypeError:
-            raise
-        except Exception as e:
-            print(f"[regions] skipped {combination}: {e}", flush=True)
+    penalty = 0.0
+    labels, region_tree = cut(penalty)
+    if n_regions(region_tree) > max_clusters:
+        # A penalty of the whole loss leaves one region; the count of
+        # regions never grows with the penalty.
+        low, high = 0.0, whole
+        for _ in range(_BISECTIONS):
+            middle = (low + high) / 2
+            if n_regions(cut(middle)[1]) > max_clusters:
+                low = middle
+            else:
+                high = middle
+        penalty = high
+        labels, region_tree = cut(penalty)
+    every = np.full(n, -1, dtype=np.int64)
+    every[scored] = labels
+    voted = vote(X, every, vote_k)
+    loss = region_loss(voted[scored], hardness, sample_weights, scale)
+
+    by_count: dict[int, Candidate] = {}
+    for tried in [*(whole * 2.0**-j for j in range(_CURVE_STEPS)), 0.0]:
+        tried_labels, tried_tree = cut(tried)
+        tried_labels = vote(sample, tried_labels, vote_k)
+        by_count[n_regions(tried_tree)] = Candidate(
+            tried,
+            n_regions(tried_tree),
+            region_loss(tried_labels, hardness, sample_weights, scale),
+        )
+    return ClassClustering(
+        labels=voted,
+        tree=region_tree,
+        penalty=penalty,
+        loss=loss,
+        n_voted=int((every < 0).sum()),
+        candidates=sorted(by_count.values(), key=lambda c: -c.penalty),
+    )
+
+
+_VOTE_ROWS = 100_000  # rows voted at once
+_BISECTIONS = 50  # halvings of the penalty that caps the regions
+_CURVE_STEPS = 16  # penalties of the granularity curve, halving from the whole loss
+
+
+def _costs(
+    count: np.ndarray,
+    mass: np.ndarray,
+    first: np.ndarray,
+    second: np.ndarray,
+    scale: float,
+    whole: tuple[float, float, float, float] | None = None,
+) -> np.ndarray:
+    """Return the cost of best_cut of every node from its sums.
+
+    count, mass, first and second are the rows, the weights, and the
+    weighted sums of the hardness and of its square of each node; whole
+    those of all rows, by default the last node (the root of a tree).
+    """
+    whole_count, whole_mass, whole_first, whole_second = (
+        whole if whole is not None else (count[-1], mass[-1], first[-1], second[-1])
+    )
+
+    def variance(n, w, s1, s2):
+        spread = np.maximum(s2 / w - (s1 / w) ** 2, 0.0)
+        return spread * n / np.maximum(n - 1, 1)
+
+    overall = variance(whole_count, whole_mass, whole_first, whole_second)
+    mean = first / mass
+    var = np.where(count > 1, variance(count, mass, first, second), overall)
+    noise = np.maximum(mean * (1 - mean), 1e-3) / (count * scale)
+    return mass / whole_mass * (var + noise)
+
+
+def _leaf_ranges(
+    children: np.ndarray, n: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return the leaves in pre-order, and where each node's leaves start and stop."""
+    n_nodes = 2 * n - 1
+    start, stop = np.zeros(n_nodes, dtype=np.int64), np.zeros(n_nodes, dtype=np.int64)
+    leaves = np.empty(n, dtype=np.int64)
+    size = np.ones(n_nodes, dtype=np.int64)
+    for j, (a, b) in enumerate(children):
+        size[n + j] = size[a] + size[b]
+    stack = [n_nodes - 1]
+    while stack:
+        v = stack.pop()
+        if v < n:
+            leaves[start[v]] = v
+            stop[v] = start[v] + 1
             continue
-        labels = merge_small_clusters(sample, labels, min_cluster_floor / scale)
-        loss = granularity_loss(labels, hardness, scale)
-        candidates.append(Candidate(combination, len(np.unique(labels)), loss))
-        candidate_labels.append(labels)
-    if not candidates:
-        raise RuntimeError(f"every one of the {len(grid)} clustering candidates failed")
-    allowed = [
-        i
-        for i, candidate in enumerate(candidates)
-        if candidate.n_clusters <= max_clusters
-    ]
-    if not allowed:
-        raise ValueError(
-            f"no candidate has at most max_clusters={max_clusters} clusters, "
-            f"least: {min(c.n_clusters for c in candidates)}"
-        )
-    best = min(allowed, key=lambda i: candidates[i].loss)
-    chosen = candidates[best]
-    if len(scored) == n_rows:
-        labels = candidate_labels[best]
-    else:
-        labels = algorithm(
-            X, max_fit_samples=max_fit_samples, random_state=seed, **chosen.params
-        )
-        labels = merge_small_clusters(X, labels, min_cluster_floor)
-    return ClassClustering(labels, chosen.params, chosen.loss, candidates)
-
-
-def assign_nearest(points: np.ndarray, centers: np.ndarray) -> np.ndarray:
-    """Return the index of the nearest center of every point.
-
-    Args:
-        points: Shape (n, d).
-        centers: Shape (m, d).
-
-    Returns:
-        Indices into centers (ties: the first), int64.
-    """
-    # In chunks: the rows against every centre may not fit in memory.
-    return np.concatenate(
-        [
-            pairwise_distances(points[start : start + _ASSIGN_ROWS], centers)
-            .argmin(axis=1)
-            .astype(np.int64)
-            for start in range(0, len(points), _ASSIGN_ROWS)
-        ]
-        or [np.empty(0, dtype=np.int64)]
-    )
-
-
-def _clamp(n_clusters: int, n_rows: int, max_fit_samples: int) -> int:
-    """Bound n_clusters by the rows the model is fitted on."""
-    return max(2, min(int(n_clusters), min(n_rows, max_fit_samples) - 1))
+        a, b = children[v - n]
+        start[a], start[b] = start[v], start[v] + size[a]
+        stop[v] = start[v] + size[v]
+        stack += [b, a]
+    return leaves, start, stop

@@ -21,7 +21,6 @@ from typing import Any
 
 import yaml
 
-from src.clustering import ALGORITHMS, tunable_params
 from src.data import DUPLICATES
 from src.prepare import MISSING
 
@@ -61,25 +60,25 @@ class GraphConfig:
 
 @dataclass(frozen=True)
 class ClusteringConfig:
-    """The per-class clustering of the regions (`src.clustering`).
+    """The per-class weighted Ward regions (`src.clustering`).
 
     Attributes:
-        name: The key of `src.clustering.ALGORITHMS`.
-        params: The keyword-only params of the fit function; a list is
-            swept.
-        max_fit_samples: The rows a candidate is fitted and scored on.
+        max_fit_samples: The distinct rows of a class the tree is built
+            and the cut scored on; the others are labelled by vote.
         max_regions: The regions over all classes, shared equally
             between them.
-        min_cluster_floor: The finest granularity and the merge floor.
+        min_cluster_floor: The fewest rows of a region; a smaller
+            branch is pruned and its rows labelled by vote.
         hardness_k: The neighbours behind the kDN hardness.
+        vote_k: The labelled neighbours that vote the region of an
+            unlabelled row.
     """
 
-    name: str
-    params: Mapping[str, Any]
     max_fit_samples: int
     max_regions: int
     min_cluster_floor: int
     hardness_k: int
+    vote_k: int
 
 
 @dataclass(frozen=True)
@@ -187,9 +186,11 @@ def _check(condition: bool, message: str) -> None:
         raise ValueError(message)
 
 
-def _check_keys(raw: Mapping[str, Any], config: type, path: Path) -> None:
+def _check_keys(
+    raw: Mapping[str, Any], config: type, path: Path, prefix: str = ""
+) -> None:
     known = {field.name for field in fields(config)} - {"method"}
-    unknown = sorted(set(raw) - known)
+    unknown = sorted(f"{prefix}{key}" for key in set(raw) - known)
     _check(not unknown, f"unknown keys in {path}: {unknown}")
 
 
@@ -199,18 +200,6 @@ def _validate_method(method: MethodConfig) -> None:
         f"distance must be one of {DISTANCES}, got {method.distance!r}",
     )
     clustering = method.clustering
-    _check(
-        clustering.name in ALGORITHMS,
-        f"clustering.name must be one of {sorted(ALGORITHMS)}, "
-        f"got {clustering.name!r}",
-    )
-    allowed = tunable_params(ALGORITHMS[clustering.name])
-    unknown = sorted(set(clustering.params) - set(allowed))
-    _check(
-        not unknown,
-        f"clustering.params of {clustering.name} must be among {list(allowed)}, "
-        f"got {unknown}",
-    )
     positive = {
         "graph.k": method.graph.k,
         "graph.max_samples": method.graph.max_samples,
@@ -218,6 +207,7 @@ def _validate_method(method: MethodConfig) -> None:
         "clustering.max_regions": clustering.max_regions,
         "clustering.min_cluster_floor": clustering.min_cluster_floor,
         "clustering.hardness_k": clustering.hardness_k,
+        "clustering.vote_k": clustering.vote_k,
         "complexity.top_k_clusters": method.complexity.top_k_clusters,
     }
     for key, value in positive.items():
@@ -242,14 +232,17 @@ def load_method_config(name_or_path: str = "default") -> MethodConfig:
     path = _path(name_or_path, METHOD_DIR)
     raw = _yaml(path)
     _check_keys(raw, MethodConfig, path)
-    clustering = dict(raw["clustering"])
-    clustering["params"] = clustering.get("params") or {}
+    sections = {
+        "prepare": PrepareConfig,
+        "graph": GraphConfig,
+        "clustering": ClusteringConfig,
+        "complexity": ComplexityConfig,
+    }
+    for key, section in sections.items():
+        _check_keys(raw[key], section, path, prefix=f"{key}.")
     method = MethodConfig(
         distance=raw["distance"],
-        prepare=PrepareConfig(**raw["prepare"]),
-        graph=GraphConfig(**raw["graph"]),
-        clustering=ClusteringConfig(**clustering),
-        complexity=ComplexityConfig(**raw["complexity"]),
+        **{key: section(**raw[key]) for key, section in sections.items()},
     )
     _validate_method(method)
     return method
