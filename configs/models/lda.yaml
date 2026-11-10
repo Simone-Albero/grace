@@ -1,3 +1,0 @@
-name: lda
-params:
-  solver: svd

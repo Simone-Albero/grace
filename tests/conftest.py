@@ -1,6 +1,6 @@
 """Shared fixtures: a small synthetic dataset through every stage."""
 
-__all__ = ["MODEL", "ROOT", "STAGE_ORDER", "Workspace", "make_workspace"]
+__all__ = ["N_DUPLICATES", "ROOT", "STAGE_ORDER", "Workspace", "make_workspace"]
 
 import shutil
 import subprocess
@@ -13,19 +13,10 @@ import pytest
 import yaml
 
 from main import main
-from stages import MODEL_STAGES
 
 ROOT = Path(__file__).resolve().parents[1]
-MODEL = "naive_bayes"
-STAGE_ORDER = (
-    "split",
-    "regions",
-    "complexity",
-    "train",
-    "failures",
-    "regress",
-    "ablation",
-)
+STAGE_ORDER = ("clean", "regions", "complexity")
+N_DUPLICATES = 52  # copies synthetic_csv appends
 
 
 @dataclass(frozen=True)
@@ -46,21 +37,17 @@ class Workspace:
     output_dir: Path
     db_path: Path
 
-    def run(self, stage: str, model: str | None = MODEL) -> int:
+    def run(self, stage: str) -> int:
         """Run one stage through main, as the CLI does.
 
         Args:
             stage: A key of STAGES.
-            model: The model of the stages of MODEL_STAGES; None
-                passes no --model.
 
         Returns:
             The exit code of main.
         """
         argv = ["--stage", stage, "--dataset", str(self.dataset)]
         argv += ["--method", str(self.method)]
-        if model is not None and stage in MODEL_STAGES:
-            argv += ["--model", model]
         return main(argv)
 
 
@@ -72,7 +59,6 @@ def write_dataset_yaml(folder: Path, csv: Path, name: str = "toy") -> Path:
         path=str(csv),
         num_cols=[*base["num_cols"], "flat"],
         min_class_count=600,
-        max_per_class=300,
         top_n=16,
         hash_buckets=16,
         output_dir=str(folder / "out"),
@@ -91,12 +77,6 @@ def write_method_yaml(folder: Path) -> Path:
     method["complexity"]["top_k_clusters"] = 3
     method["complexity"]["max_sample_per_region"] = 50
     method["complexity"]["max_sample_per_class"] = 300
-    method["regressor"].update(
-        n_outer_splits=3,
-        n_inner_splits=2,
-        n_iter=2,
-        param_grid={"n_estimators": [50], "min_samples_leaf": [1, 3]},
-    )
     path = folder / "method.yaml"
     path.write_text(yaml.safe_dump(method, sort_keys=False))
     return path
@@ -106,7 +86,9 @@ def write_method_yaml(folder: Path) -> Path:
 def synthetic_csv(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """A 12000-row synthetic CSV; class_10 keeps 500 rows, too few.
 
-    A constant column, flat, is added for stage split to drop.
+    A constant column, flat, is added for stage clean to drop, and
+    N_DUPLICATES copies at the end: rows 0-49 once more, row 50 twice
+    more. Row 51 comes back under another class, which is not a copy.
     """
     csv = tmp_path_factory.mktemp("data") / "synthetic.csv"
     subprocess.run(
@@ -115,8 +97,15 @@ def synthetic_csv(tmp_path_factory: pytest.TempPathFactory) -> Path:
         check=True,
         capture_output=True,
     )
-    rows = pl.read_csv(csv, infer_schema=False)
-    rows.with_columns(pl.lit("1").alias("flat")).write_csv(csv)
+    rows = pl.read_csv(csv, infer_schema=False).with_columns(pl.lit("1").alias("flat"))
+    other_class = (
+        pl.when(pl.col("label") == "class_1")
+        .then(pl.lit("class_2"))
+        .otherwise(pl.lit("class_1"))
+    )
+    relabelled = rows.slice(51, 1).with_columns(other_class.alias("label"))
+    copies = [rows.head(50), rows.slice(50, 1), rows.slice(50, 1)]
+    pl.concat([rows, *copies, relabelled]).write_csv(csv)
     return csv
 
 
@@ -134,7 +123,7 @@ def make_workspace(folder: Path, csv: Path) -> Workspace:
 
 @pytest.fixture(scope="session")
 def done(tmp_path_factory: pytest.TempPathFactory, synthetic_csv: Path) -> Workspace:
-    """A workspace where every stage ran once, in order, with MODEL."""
+    """A workspace where every stage ran once, in order."""
     workspace = make_workspace(tmp_path_factory.mktemp("done"), synthetic_csv)
     for stage in STAGE_ORDER:
         workspace.run(stage)

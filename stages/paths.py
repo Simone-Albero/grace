@@ -1,29 +1,22 @@
 """The files of every stage, shared with the dashboard.
 
 Every rerun of a stage overwrites its files, so the files always belong
-to the latest run of that stage (and model).
+to the latest run of that stage.
 """
 
 from __future__ import annotations
 
 __all__ = [
-    "ablation_file",
     "assignments_file",
     "classes_file",
     "complexity_file",
-    "contributions_file",
-    "estimates_file",
-    "failures_file",
+    "data_file",
     "graph_file",
-    "model_file",
     "need",
-    "predictions_file",
     "read_classes",
-    "read_split",
+    "read_data",
     "regions_file",
-    "regressor_file",
     "space_file",
-    "split_file",
 ]
 
 import json
@@ -53,21 +46,20 @@ def need(path: Path, stage: str) -> Path:
     return path
 
 
-def split_file(cfg: DatasetConfig, name: str) -> Path:
-    """Return the file of the rows of one split (stage split).
+def data_file(cfg: DatasetConfig) -> Path:
+    """Return the file of the cleaned rows (stage clean).
 
     Args:
         cfg: The dataset config.
-        name: The split name.
 
     Returns:
         The parquet path.
     """
-    return cfg.output_dir / f"{name}.parquet"
+    return cfg.output_dir / "data.parquet"
 
 
 def classes_file(cfg: DatasetConfig) -> Path:
-    """Return the file of the class names (stage split).
+    """Return the file of the class names (stage clean).
 
     Args:
         cfg: The dataset config.
@@ -97,7 +89,7 @@ def assignments_file(cfg: DatasetConfig) -> Path:
         cfg: The dataset config.
 
     Returns:
-        The parquet path; it covers every row of every split.
+        The parquet path; it covers every row of the data.
     """
     return cfg.output_dir / "assignments.parquet"
 
@@ -138,133 +130,19 @@ def complexity_file(cfg: DatasetConfig) -> Path:
     return cfg.output_dir / "complexity.parquet"
 
 
-def model_file(cfg: DatasetConfig) -> Path:
-    """Return the file of the fitted classifier (stage train).
+def read_data(cfg: DatasetConfig) -> pl.DataFrame:
+    """Return the cleaned rows.
 
     Args:
         cfg: The dataset config.
 
     Returns:
-        The joblib path of the pipeline of cfg.model.
+        The rows, as stage clean wrote them.
 
     Raises:
-        ValueError: When cfg.model is None.
+        FileNotFoundError: When stage clean has not run.
     """
-    return cfg.output_dir / "models" / f"{_model(cfg)}.joblib"
-
-
-def predictions_file(cfg: DatasetConfig, split: str) -> Path:
-    """Return the file of the predictions on a split (stage train).
-
-    Args:
-        cfg: The dataset config.
-        split: "val" or "test".
-
-    Returns:
-        The parquet path of the predictions of cfg.model.
-
-    Raises:
-        ValueError: When cfg.model is None.
-    """
-    return cfg.output_dir / f"pred_{_model(cfg)}_{split}.parquet"
-
-
-def failures_file(cfg: DatasetConfig) -> Path:
-    """Return the file of the failure rates (stage failures).
-
-    Args:
-        cfg: The dataset config.
-
-    Returns:
-        The parquet path of the observed and baseline rates per region.
-
-    Raises:
-        ValueError: When cfg.model is None.
-    """
-    return cfg.output_dir / f"failures_{_model(cfg)}.parquet"
-
-
-def estimates_file(cfg: DatasetConfig) -> Path:
-    """Return the file of the estimates (stage regress).
-
-    Args:
-        cfg: The dataset config.
-
-    Returns:
-        The parquet path of the out-of-fold estimate per used region.
-
-    Raises:
-        ValueError: When cfg.model is None.
-    """
-    return cfg.output_dir / f"regress_{_model(cfg)}_estimates.parquet"
-
-
-def contributions_file(cfg: DatasetConfig) -> Path:
-    """Return the file of the contributions (stage regress).
-
-    Args:
-        cfg: The dataset config.
-
-    Returns:
-        The parquet path of the TreeSHAP contributions per region.
-
-    Raises:
-        ValueError: When cfg.model is None.
-    """
-    return cfg.output_dir / f"regress_{_model(cfg)}_contributions.parquet"
-
-
-def regressor_file(cfg: DatasetConfig) -> Path:
-    """Return the file of the refit forest (stage regress).
-
-    Args:
-        cfg: The dataset config.
-
-    Returns:
-        The joblib path of the Random Forest of cfg.model.
-
-    Raises:
-        ValueError: When cfg.model is None.
-    """
-    return cfg.output_dir / f"regress_{_model(cfg)}.joblib"
-
-
-def ablation_file(cfg: DatasetConfig) -> Path:
-    """Return the file of the ablation's estimates (stage ablation).
-
-    Args:
-        cfg: The dataset config.
-
-    Returns:
-        The parquet path of the out-of-fold estimate of every feature
-        set per used region.
-
-    Raises:
-        ValueError: When cfg.model is None.
-    """
-    return cfg.output_dir / f"ablation_{_model(cfg)}_estimates.parquet"
-
-
-def _model(cfg: DatasetConfig) -> str:
-    if cfg.model is None:
-        raise ValueError(f"dataset {cfg.name}: this file needs a model, got none")
-    return cfg.model.name
-
-
-def read_split(cfg: DatasetConfig, name: str) -> pl.DataFrame:
-    """Return the rows of one split.
-
-    Args:
-        cfg: The dataset config.
-        name: The split name.
-
-    Returns:
-        The rows, as stage split wrote them.
-
-    Raises:
-        FileNotFoundError: When stage split has not run.
-    """
-    return pl.read_parquet(need(split_file(cfg, name), "split"))
+    return pl.read_parquet(need(data_file(cfg), "clean"))
 
 
 def read_classes(cfg: DatasetConfig) -> list[str]:
@@ -277,6 +155,6 @@ def read_classes(cfg: DatasetConfig) -> list[str]:
         The names, indexed by class code.
 
     Raises:
-        FileNotFoundError: When stage split has not run.
+        FileNotFoundError: When stage clean has not run.
     """
-    return json.loads(need(classes_file(cfg), "split").read_text())
+    return json.loads(need(classes_file(cfg), "clean").read_text())

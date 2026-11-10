@@ -24,18 +24,18 @@ from stages.paths import (
     complexity_file,
     graph_file,
     need,
-    read_split,
+    read_data,
     regions_file,
     space_file,
 )
 
 
 def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
-    """Describe every region and every class on its train rows.
+    """Describe every region and every class on its rows.
 
-    Reads train, regions.parquet, the train rows of assignments.parquet,
-    space.joblib and graph.npz. When the graph samples train (fewer
-    nodes than train rows), a region is measured on at most
+    Reads the data file, regions.parquet, assignments.parquet,
+    space.joblib and graph.npz. When the graph samples the rows (fewer
+    nodes than rows), a region is measured on at most
     max_sample_per_region of its rows and a class on
     max_sample_per_class (one generator seeded by seed per scope,
     populations in ascending id); otherwise on every row, reusing the
@@ -51,24 +51,21 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     Logs: complexity (the same rows).
     """
     method = cfg.method
-    train = read_split(cfg, "train")
+    data = read_data(cfg)
     space = joblib.load(need(space_file(cfg), "regions"))
     with np.load(need(graph_file(cfg), "regions")) as stored:
         graph = Graph(**{name: stored[name] for name in stored.files})
     regions = pl.read_parquet(need(regions_file(cfg), "regions"))
     assignments = pl.read_parquet(need(assignments_file(cfg), "regions"))
-    region = assignments.filter(pl.col("split") == "train").sort("row")["region"]
-    region = region.to_numpy()
-    label = train[LABEL].to_numpy()
+    region = assignments.sort("row")["region"].to_numpy()
+    label = data[LABEL].to_numpy()
     region_class = dict(zip(regions["region"].to_list(), regions["class"].to_list()))
     if len(region) != len(label) or any(
         region_class[r] != c for r, c in zip(region.tolist(), label.tolist())
     ):
-        raise ValueError(
-            "the regions were built on another train split: run regions again"
-        )
-    points = embed(space, train)
-    sampled = len(graph.rows) < train.height
+        raise ValueError("the regions were built on other data: run regions again")
+    points = embed(space, data)
+    sampled = len(graph.rows) < data.height
     caps = {
         "region": method.complexity.max_sample_per_region if sampled else None,
         "class": method.complexity.max_sample_per_class if sampled else None,

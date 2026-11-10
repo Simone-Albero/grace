@@ -75,12 +75,12 @@ def compute_population_complexity(
     """Return every complexity family for each population.
 
     Args:
-        graph: The graph of the train rows.
+        graph: The graph of the rows.
         graph_population: The population id of every graph node.
         sample: The sampled rows with their graph neighbours.
         population_class: The class of every population id.
         centroids: The centroid of every population id.
-        sizes: The train rows of every population id.
+        sizes: The rows of every population id.
         top_k_clusters: The nearest rivals per population.
         metric: The distance of the clustering space.
         silhouette_max_samples: The silhouette subsample cap.

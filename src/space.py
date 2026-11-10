@@ -1,12 +1,12 @@
 """The euclidean space every distance of the method is measured in.
 
-Fitted on the raw columns of train by stage regions. A number becomes
-sign(x) · log1p(|x|), minus its train median, divided by its train
+Fitted on the raw columns of the data by stage regions. A number
+becomes sign(x) · log1p(|x|), minus its median, divided by its
 interquartile range (scikit-learn RobustScaler); a missing or
 non-finite number lands on the median, 0. A categorical column becomes
 an integer code (TopNHashEncoder: frequent values their own code, the
 rest hashed), then a one-hot block over its top_k most frequent codes
-of train and one shared "other" slot. A slot is worth sqrt(cat_cost /
+and one shared "other" slot. A slot is worth sqrt(cat_cost /
 2), so two rows that differ on one categorical column are cat_cost
 apart in squared distance. Under the cosine distance every row is then
 scaled to unit length.
@@ -69,10 +69,10 @@ def hash_bucket(column: str, value: str, buckets: int) -> int:
 
 
 class TopNHashEncoder:
-    """Integer codes of one categorical column, fitted on train.
+    """Integer codes of one categorical column, fitted on the data.
 
     Code 0 is null; codes 1..top_n are the top_n most frequent values of
-    train, the most frequent first (ties: the smaller value first);
+    the data, the most frequent first (ties: the smaller value first);
     every other value, unseen ones included, is 1 + top_n +
     hash_bucket(...) when hash_buckets > 0, else 0. So the codes lie in
     [0, 1 + top_n + hash_buckets).
@@ -93,7 +93,7 @@ class TopNHashEncoder:
         """Learn the top_n most frequent non-null values.
 
         Args:
-            values: The column on train, as text.
+            values: The column, as text.
 
         Returns:
             self.
@@ -132,7 +132,7 @@ class TopNHashEncoder:
 
 @dataclass(frozen=True)
 class Space:
-    """Everything fitted on train that places a row in the space.
+    """Everything fitted on the data that places a row in the space.
 
     Attributes:
         num_cols: The numeric columns, in point order.
@@ -153,7 +153,7 @@ class Space:
 
 
 def fit_space(
-    train: pl.DataFrame,
+    rows: pl.DataFrame,
     num_cols: Sequence[str],
     cat_cols: Sequence[str],
     *,
@@ -163,10 +163,10 @@ def fit_space(
     cat_cost: float,
     metric: str,
 ) -> Space:
-    """Fit the space on the train rows.
+    """Fit the space on the rows.
 
     Args:
-        train: The train rows of a split file.
+        rows: The rows of the data file.
         num_cols: The numeric columns, at least one.
         cat_cols: The categorical columns, as text; may be empty.
         top_n: The values of a categorical column with their own code.
@@ -179,12 +179,12 @@ def fit_space(
     Returns:
         The fitted space.
     """
-    scaler = RobustScaler().fit(_signed_log(train, num_cols))
+    scaler = RobustScaler().fit(_signed_log(rows, num_cols))
     encoders = tuple(
-        TopNHashEncoder(name, top_n, hash_buckets).fit(train[name]) for name in cat_cols
+        TopNHashEncoder(name, top_n, hash_buckets).fit(rows[name]) for name in cat_cols
     )
     kept = []
-    for column in _codes(encoders, train).T:
+    for column in _codes(encoders, rows).T:
         codes, counts = np.unique(column, return_counts=True)
         order = np.lexsort((codes, -counts))
         kept.append(np.sort(codes[order[:top_k]]))
@@ -203,7 +203,7 @@ def embed(space: Space, rows: pl.DataFrame) -> np.ndarray:
 
     Args:
         space: The fitted space.
-        rows: Rows of a split file.
+        rows: Rows of the data file.
 
     Returns:
         Float64 points of shape (n, n_num + Σ (len(kept) + 1)): the

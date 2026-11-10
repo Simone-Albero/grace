@@ -6,12 +6,10 @@ import sqlite3
 import numpy as np
 import polars as pl
 import pytest
-from conftest import MODEL, STAGE_ORDER, Workspace, make_workspace
+from conftest import N_DUPLICATES, STAGE_ORDER, Workspace, make_workspace
 
-from main import main
-from src.baselines import BASELINES
 from src.complexity.measure import MEASURES
-from src.data import LABEL
+from src.data import DUPLICATES, LABEL
 
 
 def _rows(workspace: Workspace, sql: str) -> list[tuple]:
@@ -24,57 +22,58 @@ def _read(workspace: Workspace, name: str) -> pl.DataFrame:
 
 
 def test_every_run_is_ok(done):
-    runs = _rows(done, "SELECT stage, status, model FROM runs ORDER BY id")
+    runs = _rows(done, "SELECT stage, status FROM runs ORDER BY id")
     assert [r[0] for r in runs] == list(STAGE_ORDER)
     assert {r[1] for r in runs} == {"ok"}
-    assert [r[2] for r in runs] == [None] * 3 + [MODEL] * 4
 
 
-def test_split_drops_the_rare_class_and_the_constant_column_only(done):
+def test_clean_drops_the_rare_class_and_the_constant_column_only(done):
     classes = json.loads((done.output_dir / "classes.json").read_text())
     assert "class_10" not in classes and len(classes) == 9
     dropped = _rows(done, "SELECT label FROM dropped_classes")
     assert dropped == [("class_10",)]
     assert _rows(done, "SELECT column FROM dropped_columns") == [("flat",)]
-    splits = [_read(done, f"{name}.parquet") for name in ("train", "val", "test")]
-    n_raw, n_rare, n_kept = _rows(
-        done, "SELECT n_raw, n_rare, n_kept FROM split_summary"
+    data = _read(done, "data.parquet")
+    n_raw, n_duplicate, n_rare, n_kept = _rows(
+        done, "SELECT n_raw, n_duplicate, n_rare, n_kept FROM clean_summary"
     )[0]
-    assert sum(split.height for split in splits) == n_kept == n_raw - n_rare
-    numbers = pl.concat(splits).select(pl.selectors.starts_with("num_"))
+    assert n_duplicate == N_DUPLICATES
+    assert data.height == n_kept == n_raw - n_duplicate - n_rare
+    counts = dict(_rows(done, "SELECT label, n_rows FROM class_counts"))
+    per_code = dict(data[LABEL].value_counts().iter_rows())
+    assert counts == {name: per_code[code] for code, name in enumerate(classes)}
+    (n_read,) = _rows(done, "SELECT sum(n_read) FROM class_counts")[0]
+    assert data[DUPLICATES].sum() == n_read
+    numbers = data.select(pl.selectors.starts_with("num_"))
     assert numbers.select(pl.any_horizontal(pl.all().is_infinite().any())).item()
     assert numbers.null_count().sum_horizontal().item() > 0
-    train = splits[0]
-    assert "flat" not in train.columns
-    assert train["cat_1"].dtype == pl.String
-    assert train.columns[-1] == LABEL
-    assert set(train[LABEL].unique().to_list()) == set(range(9))
+    assert "flat" not in data.columns
+    assert data["cat_1"].dtype == pl.String
+    assert data.columns[-1] == LABEL
+    assert set(data[LABEL].unique().to_list()) == set(range(9))
 
 
-def test_train_fits_on_the_capped_train_and_predicts_every_row(done):
-    n_train, n_fit, max_per_class = _rows(
-        done, "SELECT n_train, n_fit, max_per_class FROM train_stats"
-    )[0]
-    per_class = _read(done, "train.parquet")[LABEL].value_counts()["count"]
-    assert max_per_class == 300
-    assert n_train == per_class.sum()
-    assert n_fit == per_class.clip(upper_bound=max_per_class).sum() < n_train
+def test_clean_keeps_one_copy_of_each_row_and_counts_them(done):
+    data = _read(done, "data.parquet")
+    assert data[DUPLICATES].dtype == pl.Int64
+    assert set(data[DUPLICATES].unique().to_list()) == {1, 2, 3}
+    features = data.drop(DUPLICATES, LABEL)
+    assert not data.drop(DUPLICATES).is_duplicated().any()
+    # Row 51 under another class: same features, two rows.
+    assert features.is_duplicated().sum() == 2
+    (kind,) = _rows(done, f"SELECT kind FROM features WHERE column = '{DUPLICATES}'")[0]
+    assert kind == "num"
 
 
-def test_assignments_cover_every_row_and_train_keeps_its_class(done):
-    assignments = _read(done, "assignments.parquet")
+def test_assignments_cover_every_row_and_keep_its_class(done):
+    assignments = _read(done, "assignments.parquet").sort("row")
     regions = _read(done, "regions.parquet")
-    for name in ("train", "val", "test"):
-        rows = assignments.filter(pl.col("split") == name).sort("row")
-        assert rows["row"].to_list() == list(
-            range(_read(done, f"{name}.parquet").height)
-        )
-        assert set(rows["region"].to_list()) <= set(regions["region"].to_list())
-    train = assignments.filter(pl.col("split") == "train").sort("row")
+    data = _read(done, "data.parquet")
+    assert assignments["row"].to_list() == list(range(data.height))
     region_class = dict(zip(regions["region"].to_list(), regions["class"].to_list()))
-    labels = _read(done, "train.parquet")[LABEL].to_list()
-    assert [region_class[r] for r in train["region"].to_list()] == labels
-    assert regions["n_test"].sum() == _read(done, "test.parquet").height
+    labels = data[LABEL].to_list()
+    assert [region_class[r] for r in assignments["region"].to_list()] == labels
+    assert regions["n_rows"].sum() == data.height
 
 
 def test_complexity_has_every_measure_of_every_population(done):
@@ -85,119 +84,27 @@ def test_complexity_has_every_measure_of_every_population(done):
     assert table.filter(pl.col("scope") == "class").height == 9 * len(MEASURES)
 
 
-def test_predictions_line_up_with_the_splits(done):
-    for name in ("val", "test"):
-        pred = _read(done, f"pred_{MODEL}_{name}.parquet")
-        split = _read(done, f"{name}.parquet")
-        assert pred["row"].to_list() == list(range(split.height))
-        assert pred["label"].to_list() == split[LABEL].to_list()
-        proba = pred.select(pl.selectors.starts_with("proba_")).to_numpy()
-        assert proba.shape[1] == 9
-        np.testing.assert_allclose(proba.sum(axis=1), 1.0, atol=1e-6)
-        np.testing.assert_array_equal(proba.argmax(axis=1), pred["pred"].to_numpy())
-
-
-def test_failures_count_every_test_row(done):
-    failures = _read(done, f"failures_{MODEL}.parquet")
-    regions = _read(done, "regions.parquet")
-    assert failures["region"].to_list() == regions["region"].to_list()
-    test = _read(done, f"pred_{MODEL}_test.parquet")
-    assert failures["n_eval"].sum() == test.height
-    assert failures["n_error"].sum() == (test["label"] != test["pred"]).sum()
-    (n_used,) = _rows(done, "SELECT n_used FROM failure_stats")[0]
-    assert n_used == failures["used"].sum() > 0
-    baselines = BASELINES
-    assert failures["n_val"].sum() == _read(done, f"pred_{MODEL}_val.parquet").height
-    with_rows = failures.filter(pl.col("n_eval") > 0)
-    for name in baselines:
-        assert with_rows[name].is_between(0, 1).all()
-    scored = dict(_rows(done, "SELECT predictor, wmae FROM baseline_scores"))
-    assert set(scored) == set(baselines)
-    assert all(0 <= value <= 1 for value in scored.values())
-
-
-def test_regress_estimates_every_used_region(done):
-    estimates = _read(done, f"regress_{MODEL}_estimates.parquet")
-    failures = _read(done, f"failures_{MODEL}.parquet").filter(pl.col("used"))
-    assert sorted(estimates["region"].to_list()) == sorted(failures["region"].to_list())
-    contributions = _read(done, f"regress_{MODEL}_contributions.parquet")
-    assert set(contributions["region"].to_list()) == set(estimates["region"].to_list())
-    signals = {d for d in contributions["descriptor"] if d.startswith("signal_")}
-    assert signals == {f"signal_{b}" for b in BASELINES}
-    scores = dict(_rows(done, "SELECT predictor, spearman FROM regress_scores"))
-    baselines = set(BASELINES)
-    assert set(scores) == {"rf", *baselines, *(f"rf+{b}" for b in baselines)}
-    assert scores["rf"] > 0
-    np.testing.assert_allclose(
-        estimates["rf+atc"], (estimates["predicted"] + estimates["atc"]) / 2
-    )
-
-
-def test_ablation_fits_every_feature_set(done):
-    sets = {"geometry", "signals", "geometry+signals"}
-    sets |= {*BASELINES, *(f"geometry+{b}" for b in BASELINES)}
-    fits = set(_rows(done, "SELECT feature_set, cv FROM ablation_scores"))
-    grouped = {"geometry", "signals", "geometry+signals"}
-    assert fits == {(s, "strata") for s in sets} | {(s, "class") for s in grouped}
-    gains = _rows(
-        done, "SELECT signal, cv, d_mae_lo, d_mae, d_mae_hi FROM ablation_gains"
-    )
-    assert {(g[0], g[1]) for g in gains} == {
-        *((b, "strata") for b in (*BASELINES, "signals")),
-        ("signals", "class"),
-    }
-    assert all(lo <= hi for _, _, lo, _, hi in gains)
-    ((share,),) = _rows(done, "SELECT geometry_shap_share FROM ablation_stats")
-    assert 0 <= share <= 1
-    estimates = _read(done, f"ablation_{MODEL}_estimates.parquet")
-    assert estimates.width == 4 + len(fits)
-
-
-def test_regions_never_read_the_test_labels(copy_of_done):
-    before = _read(copy_of_done, "assignments.parquet")
-    test_file = copy_of_done.output_dir / "test.parquet"
-    test = pl.read_parquet(test_file)
-    shuffled = np.random.default_rng(0).permutation(test[LABEL].to_numpy())
-    test.with_columns(pl.Series(LABEL, shuffled)).write_parquet(test_file)
-    copy_of_done.run("regions")
-    after = _read(copy_of_done, "assignments.parquet")
-    assert before.equals(after)
+def test_complexity_refuses_regions_of_other_data(copy_of_done):
+    data_file = copy_of_done.output_dir / "data.parquet"
+    data = pl.read_parquet(data_file)
+    shuffled = np.random.default_rng(0).permutation(data[LABEL].to_numpy())
+    data.with_columns(pl.Series(LABEL, shuffled)).write_parquet(data_file)
+    with pytest.raises(ValueError, match="run regions again"):
+        copy_of_done.run("complexity")
 
 
 def test_a_stage_without_its_input_fails_and_is_logged(tmp_path, synthetic_csv):
     workspace = make_workspace(tmp_path, synthetic_csv)
-    with pytest.raises(FileNotFoundError, match="run split first"):
-        workspace.run("train")
-    assert _rows(workspace, "SELECT stage, status FROM runs") == [("train", "failed")]
+    with pytest.raises(FileNotFoundError, match="run clean first"):
+        workspace.run("regions")
+    assert _rows(workspace, "SELECT stage, status FROM runs") == [("regions", "failed")]
 
 
-def test_split_refuses_rows_without_a_label(tmp_path, synthetic_csv):
+def test_clean_refuses_rows_without_a_label(tmp_path, synthetic_csv):
     csv = tmp_path / "unlabelled.csv"
     rows = pl.read_csv(synthetic_csv, infer_schema=False)
     unlabelled = pl.when(pl.int_range(pl.len()) < 2).then(None).otherwise("label")
     rows.with_columns(unlabelled.alias("label")).write_csv(csv)
     workspace = make_workspace(tmp_path, csv)
     with pytest.raises(ValueError, match="2 rows .* have no label"):
-        workspace.run("split")
-
-
-def test_model_stages_need_a_model(done):
-    with pytest.raises(SystemExit):
-        main(["--stage", "train", "--dataset", str(done.dataset)])
-
-
-def test_failures_refuse_predictions_of_another_split(copy_of_done):
-    test_file = copy_of_done.output_dir / "test.parquet"
-    test = pl.read_parquet(test_file)
-    shuffled = np.random.default_rng(0).permutation(test[LABEL].to_numpy())
-    test.with_columns(pl.Series(LABEL, shuffled)).write_parquet(test_file)
-    with pytest.raises(ValueError, match="run train again"):
-        copy_of_done.run("failures")
-
-
-def test_regress_refuses_descriptors_of_other_regions(copy_of_done):
-    complexity_file = copy_of_done.output_dir / "complexity.parquet"
-    complexity = pl.read_parquet(complexity_file)
-    complexity.filter(pl.col("id") != 0).write_parquet(complexity_file)
-    with pytest.raises(ValueError, match="run complexity and failures again"):
-        copy_of_done.run("regress")
+        workspace.run("clean")

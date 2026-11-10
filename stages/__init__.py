@@ -2,23 +2,18 @@
 
 from __future__ import annotations
 
-__all__ = ["MODEL_STAGES", "STAGES"]
+__all__ = ["STAGES"]
 
 import sqlite3
 from collections.abc import Callable
 
 from src.config import DatasetConfig
-from stages import ablation, complexity, failures, regions, regress, split, train
+from stages import clean, complexity, regions
 
 StageFn = Callable[[DatasetConfig, sqlite3.Connection, int], None]
 
 STAGES: dict[str, StageFn] = {
-    "split": split.run,
+    "clean": clean.run,
     "regions": regions.run,
     "complexity": complexity.run,
-    "train": train.run,
-    "failures": failures.run,
-    "regress": regress.run,
-    "ablation": ablation.run,
 }
-MODEL_STAGES = ("train", "failures", "regress", "ablation")  # need --model

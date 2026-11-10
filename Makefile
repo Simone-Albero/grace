@@ -1,12 +1,11 @@
-# grace. The pipeline is `python main.py --stage <stage> --dataset <name> [--model <name>]`;
+# grace. The pipeline is `python main.py --stage <stage> --dataset <name>`;
 # these targets are shortcuts.
 .DEFAULT_GOAL := help
 PYTHON ?= $(if $(wildcard venv/bin/python),venv/bin/python,python)
 DATA ?= synthetic_test
-MODEL ?= random_forest
 PORT ?= 8000
 
-.PHONY: help test format generate run ablation dashboard
+.PHONY: help test format generate run dashboard
 
 ## help: this list
 help:
@@ -25,18 +24,11 @@ format:
 generate:
 	$(PYTHON) generate_synthetic.py $(if $(ROWS),--rows $(ROWS),)
 
-## run: every stage in order on DATA (default synthetic_test) with MODEL (default random_forest)
+## run: every stage in order on DATA (default synthetic_test)
 run:
-	$(PYTHON) main.py --stage split --dataset $(DATA)
+	$(PYTHON) main.py --stage clean --dataset $(DATA)
 	$(PYTHON) main.py --stage regions --dataset $(DATA)
 	$(PYTHON) main.py --stage complexity --dataset $(DATA)
-	$(PYTHON) main.py --stage train --dataset $(DATA) --model $(MODEL)
-	$(PYTHON) main.py --stage failures --dataset $(DATA) --model $(MODEL)
-	$(PYTHON) main.py --stage regress --dataset $(DATA) --model $(MODEL)
-
-## ablation: the ablation of geometry and signals on DATA with MODEL, after run (slow: one regress per feature set)
-ablation:
-	$(PYTHON) main.py --stage ablation --dataset $(DATA) --model $(MODEL)
 
 ## dashboard: the read-only dashboard on 127.0.0.1:PORT (default 8000)
 dashboard:

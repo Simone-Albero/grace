@@ -1,6 +1,6 @@
-"""The k-nearest-neighbour graph of train and its minimum spanning tree.
+"""The k-nearest-neighbour graph of the rows and its minimum spanning tree.
 
-Its nodes are a uniform sample of train. The clustering reads it for the
+Its nodes are a uniform sample of the rows. The clustering reads it for the
 kDN hardness, the complexity measures for the neighbourhoods, the MST
 and the hubs.
 """
@@ -23,11 +23,11 @@ _CHUNK_ROWS = 20_000  # rows of queries whose neighbour offsets are held at once
 class Graph:
     """The nodes, their neighbours and the spanning tree.
 
-    rows[i] is the train position of node i; knn_idx and mst hold node
-    indices, not train positions.
+    rows[i] is the row position of node i; knn_idx and mst hold node
+    indices, not row positions.
 
     Attributes:
-        rows: The train positions of the nodes, shape (n,), ascending.
+        rows: The row positions of the nodes, shape (n,), ascending.
         points: The scaled points of the nodes, shape (n, d).
         knn_idx: The nearest other nodes, shape (n, k), nearest first.
         knn_dist: Their distances, shape (n, k).
@@ -123,7 +123,7 @@ def build_graph(points: np.ndarray, rows: np.ndarray, k: int) -> Graph:
 
     Args:
         points: The node points, shape (n, d), n >= 2.
-        rows: Their train positions.
+        rows: Their row positions.
         k: The neighbours per node.
 
     Returns:

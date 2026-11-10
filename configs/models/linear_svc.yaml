@@ -1,3 +1,0 @@
-name: linear_svc
-params:
-  max_iter: 2000

@@ -9,7 +9,7 @@ from src import db
 
 def test_column_types_come_from_the_first_value_that_is_not_none(tmp_path):
     conn = db.connect(tmp_path / "x.db")
-    run_id = db.start_run(conn, "s", "d", None, {})
+    run_id = db.start_run(conn, "s", "d", {})
     db.log_table(
         conn,
         run_id,
@@ -35,10 +35,10 @@ def test_column_types_come_from_the_first_value_that_is_not_none(tmp_path):
 
 def test_runs_record_their_status(tmp_path):
     conn = db.connect(tmp_path / "x.db")
-    run_id = db.start_run(conn, "split", "toy", None, {"seed": 1})
+    run_id = db.start_run(conn, "clean", "toy", {"seed": 1})
     db.finish_run(conn, run_id, "ok")
     assert conn.execute("SELECT stage, status FROM runs").fetchall() == [
-        ("split", "ok")
+        ("clean", "ok")
     ]
     assert isinstance(conn, sqlite3.Connection)
     conn.close()

@@ -18,7 +18,7 @@ _IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
-    id INTEGER PRIMARY KEY, stage TEXT, dataset TEXT, model TEXT, config TEXT,
+    id INTEGER PRIMARY KEY, stage TEXT, dataset TEXT, config TEXT,
     status TEXT, started TEXT, finished TEXT);
 """
 
@@ -59,7 +59,6 @@ def start_run(
     conn: sqlite3.Connection,
     stage: str,
     dataset: str,
-    model: str | None,
     config: Mapping[str, Any],
 ) -> int:
     """Log a new run with status "running".
@@ -68,7 +67,6 @@ def start_run(
         conn: The open db.
         stage: The stage name.
         dataset: The dataset name.
-        model: The model name, None for the stages without a model.
         config: The whole config of the run, stored as JSON.
 
     Returns:
@@ -76,9 +74,9 @@ def start_run(
     """
     with conn:
         cursor = conn.execute(
-            "INSERT INTO runs (stage, dataset, model, config, status, started) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (stage, dataset, model, json.dumps(config, default=str), "running", _now()),
+            "INSERT INTO runs (stage, dataset, config, status, started) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (stage, dataset, json.dumps(config, default=str), "running", _now()),
         )
     return cursor.lastrowid
 

@@ -1,23 +1,83 @@
-"""Clean, split and cap the raw rows: polars frames in and out."""
+"""Clean the raw rows: polars frames in and out."""
 
 from __future__ import annotations
 
 __all__ = [
+    "DUPLICATES",
     "LABEL",
-    "SPLITS",
-    "cap_per_class",
+    "Features",
     "constant_columns",
+    "drop_duplicates",
     "drop_rare_classes",
-    "stratified_split",
+    "feature_cols",
 ]
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
+from dataclasses import dataclass
 
 import polars as pl
 
-SPLITS = ("train", "val", "test")
-LABEL = "label"  # class code column of every split file
-_POSITION = "_position"
+LABEL = "label"  # class code column of the data file
+DUPLICATES = "n_duplicates"  # copies of each kept row in the CSV, 1 when unique
+
+
+@dataclass(frozen=True)
+class Features:
+    """The input columns the data file holds.
+
+    Attributes:
+        num: The numeric columns.
+        cat: The categorical columns, as text.
+    """
+
+    num: tuple[str, ...]
+    cat: tuple[str, ...]
+
+
+def feature_cols(
+    columns: Sequence[str], num_cols: Sequence[str], cat_cols: Sequence[str]
+) -> Features:
+    """Return the configured columns that columns holds, and DUPLICATES.
+
+    Stage clean drops the constant columns, so the data file may lack
+    some of the configured ones; it adds DUPLICATES, a numeric feature.
+
+    Args:
+        columns: The columns of the data file.
+        num_cols: The configured numeric columns.
+        cat_cols: The configured categorical columns.
+
+    Returns:
+        The present ones, in configured order; DUPLICATES last among
+        the numeric ones when columns holds it.
+    """
+    present = set(columns)
+    num = [column for column in num_cols if column in present]
+    if DUPLICATES in present:
+        num.append(DUPLICATES)
+    return Features(
+        num=tuple(num),
+        cat=tuple(column for column in cat_cols if column in present),
+    )
+
+
+def drop_duplicates(rows: pl.DataFrame) -> pl.DataFrame:
+    """Keep one copy of each distinct row and count its copies.
+
+    Two rows are copies when every column is equal, the label included,
+    so equal features under different labels stay apart; null equals
+    null and NaN equals NaN.
+
+    Args:
+        rows: The rows, without a DUPLICATES column.
+
+    Returns:
+        The first copy of each distinct row, in order of first
+        appearance, with DUPLICATES appended: its number of copies
+        (Int64), 1 for a row without duplicates.
+    """
+    count = pl.len().cast(pl.Int64).alias(DUPLICATES)
+    return rows.group_by(rows.columns, maintain_order=True).agg(count)
 
 
 def drop_rare_classes(
@@ -53,64 +113,3 @@ def constant_columns(rows: pl.DataFrame, columns: Sequence[str]) -> list[str]:
         and a value is not.
     """
     return [column for column in columns if rows[column].n_unique() == 1]
-
-
-def _hash_rank(seed: int, label_col: str) -> pl.Expr:
-    """Rank each row in its class by a seeded hash of its position."""
-    return pl.col(_POSITION).hash(seed).rank("ordinal").over(label_col)
-
-
-def stratified_split(
-    rows: pl.DataFrame, label_col: str, shares: Mapping[str, float], seed: int
-) -> dict[str, pl.DataFrame]:
-    """Split the rows into train, val and test, stratified by class.
-
-    Within each class the rows are ranked by a hash of their position
-    seeded by seed; the first ceil(train · n) ranks go to train, the
-    next up to ceil((train + val) · n) to val, the rest to test. So
-    every split holds each class in proportion, and the result depends
-    on the seed only.
-
-    Args:
-        rows: The rows.
-        label_col: The class column.
-        shares: The share of each of SPLITS; they sum to 1.
-        seed: The hash seed.
-
-    Returns:
-        One frame per name of SPLITS, disjoint, together every row of
-        rows, each in the original row order.
-    """
-    share = (_hash_rank(seed, label_col) - 1) / pl.len().over(label_col)
-    train, val = shares["train"], shares["train"] + shares["val"]
-    split = (
-        pl.when(share < train)
-        .then(pl.lit("train"))
-        .when(share < val)
-        .then(pl.lit("val"))
-        .otherwise(pl.lit("test"))
-    )
-    assigned = rows.with_row_index(_POSITION).select(split.alias("split"))["split"]
-    return {name: rows.filter(assigned == name) for name in SPLITS}
-
-
-def cap_per_class(
-    rows: pl.DataFrame, label_col: str, cap: int, seed: int
-) -> pl.DataFrame:
-    """Keep at most cap rows per class, drawn without replacement.
-
-    The draw ranks the rows of each class by a hash of their position
-    seeded by seed, so it depends on the seed only.
-
-    Args:
-        rows: The rows.
-        label_col: The class column.
-        cap: The most rows a class keeps, > 0; a smaller class is kept
-            whole.
-        seed: The hash seed.
-
-    Returns:
-        The kept rows, in their original order.
-    """
-    kept = rows.with_row_index(_POSITION).filter(_hash_rank(seed, label_col) <= cap)
-    return kept.drop(_POSITION)

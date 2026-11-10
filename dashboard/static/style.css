@@ -80,10 +80,7 @@ main { max-width: 1200px; margin: 0 auto; padding: 24px 16px 64px; }
 .tile .value { margin-top: 2px; font-size: 24px; font-weight: 500; line-height: 1.2; }
 .tile .sub { color: var(--muted); font-size: 12px; }
 
-/* key-value, chips */
-.kv { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px 24px; margin: 0; }
-.kv dt { color: var(--muted); font-size: 12px; }
-.kv dd { margin: 0; font-family: var(--mono); font-size: 13px; }
+/* chips */
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .chips:empty::after { content: "none"; color: var(--muted); }
 .chip { border: 1px solid var(--border); border-radius: 999px; padding: 1px 10px; color: var(--text-2); font-size: 12px; }
@@ -103,12 +100,8 @@ svg text { fill: var(--muted); font: 11px var(--font); }
 svg .grid { stroke: var(--grid); stroke-width: 1; }
 svg .axis { stroke: var(--axis); stroke-width: 1; }
 svg .diagonal { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 4 4; }
-svg .cell:hover { stroke: var(--text); stroke-width: 1; }
 .legend { display: flex; gap: 16px; margin-bottom: 8px; color: var(--text-2); font-size: 12px; }
 .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
-.toggle { display: inline-flex; margin-bottom: 12px; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
-.toggle button { background: none; border: 0; color: var(--muted); padding: 4px 12px; font: inherit; font-size: 12px; cursor: pointer; }
-.toggle button[aria-pressed="true"] { background: rgba(57, 135, 229, 0.18); color: var(--text); }
 
 #tooltip {
   position: fixed; z-index: 10; pointer-events: none;
@@ -136,7 +129,6 @@ th[aria-sort="descending"]::after { content: " ▼"; }
 /* layout of charts */
 .filters { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 12px; }
 .legend { flex-wrap: wrap; }
-.pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
 h3 { margin: 0 0 8px; font-size: 12px; font-weight: 500; color: var(--muted); }
 svg .dot { cursor: default; }
 svg .dot.clickable { cursor: pointer; }

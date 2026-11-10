@@ -6,17 +6,16 @@ __all__ = ["app", "create_app"]
 
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from dashboard import queries
-from src.config import DATASET_DIR, DatasetConfig, load_config, model_names
+from src.config import DATASET_DIR, DatasetConfig, load_config
 
 STATIC = Path(__file__).parent / "static"
-ModelName = Literal[tuple(model_names())]
 
 
 def _query(query: Callable[..., Any], *args: Any) -> Any:
@@ -57,11 +56,11 @@ def create_app(dataset_dir: Path = DATASET_DIR) -> FastAPI:
 
     @app.get("/api/options")
     def options() -> dict[str, list[str]]:
-        return {"datasets": offered_datasets(), "models": model_names()}
+        return {"datasets": offered_datasets()}
 
-    @app.get("/api/{dataset}/split")
-    def split(dataset: str) -> Any:
-        return _query(queries.split, load_dataset(dataset))
+    @app.get("/api/{dataset}/clean")
+    def clean(dataset: str) -> Any:
+        return _query(queries.clean, load_dataset(dataset))
 
     @app.get("/api/{dataset}/regions")
     def regions(dataset: str) -> Any:
@@ -70,28 +69,6 @@ def create_app(dataset_dir: Path = DATASET_DIR) -> FastAPI:
     @app.get("/api/{dataset}/complexity")
     def complexity(dataset: str, measure: str | None = None) -> Any:
         return _query(queries.complexity, load_dataset(dataset), measure)
-
-    @app.get("/api/{dataset}/train")
-    def train(
-        dataset: str, model: ModelName, split: Literal["val", "test"] = "test"
-    ) -> Any:
-        return _query(queries.train, load_dataset(dataset), model, split)
-
-    @app.get("/api/{dataset}/failures")
-    def failures(dataset: str, model: ModelName) -> Any:
-        return _query(queries.failures, load_dataset(dataset), model)
-
-    @app.get("/api/{dataset}/regress")
-    def regress(dataset: str, model: ModelName) -> Any:
-        return _query(queries.regress, load_dataset(dataset), model)
-
-    @app.get("/api/{dataset}/ablation")
-    def ablation(dataset: str, model: ModelName) -> Any:
-        return _query(queries.ablation, load_dataset(dataset), model)
-
-    @app.get("/api/{dataset}/regress/region")
-    def region(dataset: str, model: ModelName, region: int) -> Any:
-        return _query(queries.region, load_dataset(dataset), model, region)
 
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
     return app

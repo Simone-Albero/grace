@@ -1,4 +1,4 @@
-"""src.clustering: hardness, merge, loss, grid, choice and routing."""
+"""src.clustering: hardness, merge, loss, grid, choice and assignment."""
 
 import numpy as np
 import pytest
@@ -63,22 +63,22 @@ def test_granularity_loss_by_hand():
     labels = np.array([0, 0, 1, 1])
     hardness = np.array([0.0, 0.5, 1.0, 1.0])
     # within 0.5 · 0.125; noise 0.5 · 0.1875 / 2 + 0.5 · 1e-3 / 2
-    loss = granularity_loss(labels, hardness, scale=1.0, eval_ratio=1.0)
+    loss = granularity_loss(labels, hardness, scale=1.0)
     assert loss == pytest.approx(0.0625 + 0.046875 + 0.00025)
 
 
 def test_granularity_loss_pools_the_variance_of_a_singleton():
     labels = np.array([0, 0, 1])
     hardness = np.array([0.0, 1.0, 0.5])
-    loss = granularity_loss(labels, hardness, scale=1.0, eval_ratio=1.0)
+    loss = granularity_loss(labels, hardness, scale=1.0)
     assert loss == pytest.approx(0.5 + 0.25 / 2 * 2 / 3 + 0.25 * 1 / 3)
 
 
-def test_granularity_loss_scales_the_noise_by_the_test_rows():
+def test_granularity_loss_scales_the_noise_by_the_class_rows():
     labels = np.array([0, 0, 1, 1])
     hardness = np.array([0.5, 0.5, 0.5, 0.5])
-    small = granularity_loss(labels, hardness, scale=1.0, eval_ratio=1.0)
-    large = granularity_loss(labels, hardness, scale=2.0, eval_ratio=5.0)
+    small = granularity_loss(labels, hardness, scale=1.0)
+    large = granularity_loss(labels, hardness, scale=10.0)
     assert large == pytest.approx(small / 10)
 
 
@@ -133,7 +133,6 @@ def test_cluster_class_never_mixes_blobs():
         max_fit_samples=1000,
         min_cluster_floor=20,
         max_clusters=10,
-        eval_ratio=1.0,
         metric="euclidean",
         seed=0,
     )
@@ -157,7 +156,6 @@ def test_cluster_class_respects_max_clusters_and_refits_past_the_sample():
         max_fit_samples=100,
         min_cluster_floor=20,
         max_clusters=2,
-        eval_ratio=1.0,
         metric="euclidean",
         seed=0,
     )

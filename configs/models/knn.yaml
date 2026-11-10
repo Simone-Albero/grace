@@ -1,3 +1,0 @@
-name: knn
-params:
-  n_neighbors: 5

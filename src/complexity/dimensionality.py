@@ -1,6 +1,6 @@
 """T2-T4 and anisotropy: how many features there are relative to rows.
 
-With d features, n the population's true train size and n95 the
+With d features, n the population's true size and n95 the
 principal components that reach 95% of the variance of its sampled,
 scaled rows: t2 = d / n, t3 = n95 / n, t4 = n95 / d, anisotropy = share
 of variance of the first component. With one feature: t3 = 1 / n, t4 =

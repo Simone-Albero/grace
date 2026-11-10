@@ -1,4 +1,4 @@
-"""Stage split: clean and split the raw rows."""
+"""Stage clean: read the raw rows, drop duplicates, rare classes and constant columns."""
 
 from __future__ import annotations
 
@@ -13,13 +13,12 @@ from src import db
 from src.config import DatasetConfig
 from src.data import (
     LABEL,
-    SPLITS,
     constant_columns,
+    drop_duplicates,
     drop_rare_classes,
-    stratified_split,
+    feature_cols,
 )
-from src.preprocessing import feature_cols
-from stages.paths import classes_file, split_file
+from stages.paths import classes_file, data_file
 
 
 def _read(cfg: DatasetConfig) -> pl.DataFrame:
@@ -33,36 +32,41 @@ def _read(cfg: DatasetConfig) -> pl.DataFrame:
 
 
 def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
-    """Read the CSV, drop rare classes and constant columns, split.
+    """Read the CSV, drop duplicates, rare classes and constant columns.
 
     Order: read num_cols (Float64; a value that is not a number becomes
     null) and cat_cols and label_col (text) of cfg.path ->
-    data.drop_rare_classes(min_class_count) -> data.constant_columns of
-    num_cols and cat_cols, dropped -> classes sorted, label_col replaced
-    by its code in LABEL -> data.stratified_split(cfg.split, seed). No
-    row is dropped for a missing or non-finite value, and nothing is
-    scaled or encoded: the classifier pipeline and the region space are
-    fitted on train by their own stages.
+    data.drop_duplicates (one copy of each row equal on every column,
+    the label included, with DUPLICATES = its copies, 1 when unique) ->
+    data.drop_rare_classes(min_class_count), on the distinct rows ->
+    data.constant_columns of num_cols and cat_cols, dropped -> classes
+    sorted, label_col replaced by its code in LABEL. No row is dropped
+    for a missing or non-finite value, and nothing is scaled or encoded:
+    the region space is fitted by stage regions.
 
-    Writes to output_dir: {train,val,test}.parquet (the kept num_cols
-    and cat_cols as read, then LABEL as class code; row order = the
-    split's order, so a row's position is its id everywhere
-    downstream), classes.json (the names, indexed by code).
-    Logs: split_summary (one row: n_raw, n_rare, n_kept, n_classes,
-    n_constant), dropped_classes (label, n_rows), dropped_columns
-    (column), split_class_counts (label, train, val, test), features
-    (column, kind "num" | "cat": the kept ones).
+    Writes to output_dir: data.parquet (the kept num_cols as read, then
+    DUPLICATES, a numeric feature, then the kept cat_cols as read, then
+    LABEL as class code; row order = the CSV's order of first copies among the kept
+    rows, so a row's position is its id everywhere downstream),
+    classes.json (the names, indexed by code).
+    Logs: clean_summary (one row: n_raw, n_duplicate (copies dropped),
+    n_rare, n_kept, n_classes, n_constant; n_kept = n_raw -
+    n_duplicate - n_rare), dropped_classes (label, n_rows: distinct),
+    dropped_columns (column), class_counts (label, n_read, n_rows:
+    rows read and kept), features (column, kind "num" | "cat": the kept
+    ones, DUPLICATES included).
 
     Raises:
         ValueError: When a configured column is missing from the CSV, a
             row has no label, or no class survives.
     """
-    print(f"[split] reading {cfg.path}", flush=True)
+    print(f"[clean] reading {cfg.path}", flush=True)
     raw = _read(cfg)
     n_unlabelled = raw[cfg.label_col].null_count()
     if n_unlabelled:
         raise ValueError(f"{n_unlabelled} rows of {cfg.path} have no {cfg.label_col}")
-    kept, rare_classes = drop_rare_classes(raw, cfg.label_col, cfg.min_class_count)
+    distinct = drop_duplicates(raw)
+    kept, rare_classes = drop_rare_classes(distinct, cfg.label_col, cfg.min_class_count)
     if kept.is_empty():
         raise ValueError(f"no class has min_class_count={cfg.min_class_count} rows")
     constant_cols = constant_columns(kept, [*cfg.num_cols, *cfg.cat_cols])
@@ -71,8 +75,10 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
         cfg.num_cols,
         cfg.cat_cols,
     )
+    n_duplicate = raw.height - distinct.height
+    n_rare = distinct.height - kept.height
     print(
-        f"[split] {raw.height} rows, {raw.height - kept.height} in "
+        f"[clean] {raw.height} rows, {n_duplicate} duplicates, {n_rare} in "
         f"{len(rare_classes)} rare classes, {len(constant_cols)} constant columns",
         flush=True,
     )
@@ -80,27 +86,24 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     codes = pl.col(cfg.label_col).replace_strict(
         {name: code for code, name in enumerate(classes)}, return_dtype=pl.Int64
     )
-    coded = kept.select(*features.num, *features.cat, codes.alias(LABEL))
-    shares = {"train": cfg.split.train, "val": cfg.split.val, "test": cfg.split.test}
-    parts = stratified_split(coded, LABEL, shares, cfg.seed)
+    data = kept.select(*features.num, *features.cat, codes.alias(LABEL))
 
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
-    counts = {}
-    for name in SPLITS:
-        parts[name].write_parquet(split_file(cfg, name))
-        counts[name] = dict(parts[name][LABEL].value_counts().iter_rows())
-        print(f"[split] saved {name}: {parts[name].height} rows", flush=True)
+    data.write_parquet(data_file(cfg))
     classes_file(cfg).write_text(json.dumps(classes))
+    print(f"[clean] saved {data.height} rows", flush=True)
 
     raw_counts = dict(raw[cfg.label_col].value_counts().iter_rows())
+    distinct_counts = dict(distinct[cfg.label_col].value_counts().iter_rows())
     db.log_table(
         conn,
         run_id,
-        "split_summary",
+        "clean_summary",
         [
             {
                 "n_raw": raw.height,
-                "n_rare": raw.height - kept.height,
+                "n_duplicate": n_duplicate,
+                "n_rare": n_rare,
                 "n_kept": kept.height,
                 "n_classes": len(classes),
                 "n_constant": len(constant_cols),
@@ -111,7 +114,7 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
         conn,
         run_id,
         "dropped_classes",
-        [{"label": label, "n_rows": raw_counts[label]} for label in rare_classes],
+        [{"label": label, "n_rows": distinct_counts[label]} for label in rare_classes],
     )
     db.log_table(
         conn,
@@ -122,10 +125,14 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     db.log_table(
         conn,
         run_id,
-        "split_class_counts",
+        "class_counts",
         [
-            {"label": label, **{split: counts[split].get(code, 0) for split in SPLITS}}
-            for code, label in enumerate(classes)
+            {
+                "label": label,
+                "n_read": raw_counts[label],
+                "n_rows": distinct_counts[label],
+            }
+            for label in classes
         ],
     )
     db.log_table(

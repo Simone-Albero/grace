@@ -2,12 +2,9 @@
 
 import pytest
 import yaml
-from conftest import MODEL
 from fastapi.testclient import TestClient
 
 from dashboard.app import create_app
-
-BASELINES = {"val_rate", "mcp", "atc", "mcp_cal", "atc_cal", "meta"}
 
 
 @pytest.fixture(scope="module")
@@ -37,14 +34,16 @@ def _get(client: TestClient, path: str) -> dict:
 def test_index_and_options(client):
     assert client.get("/").status_code == 200
     options = _get(client, "/api/options")
-    assert options["datasets"] == ["empty", "toy"]
-    assert MODEL in options["models"]
+    assert options == {"datasets": ["empty", "toy"]}
 
 
-def test_split(client):
-    data = _get(client, "/api/toy/split")
+def test_clean(client):
+    data = _get(client, "/api/toy/clean")
     assert set(data) >= {"run", "summary", "classes", "dropped_classes", "features"}
     assert len(data["classes"]) == 9
+    assert sum(c["n_rows"] for c in data["classes"]) == data["summary"]["n_kept"]
+    assert data["summary"]["n_duplicate"] > 0
+    assert "n_duplicates" in data["features"]["num"]
     assert data["dropped_columns"] == ["flat"]
     assert "flat" not in data["features"]["num"]
     assert set(data["features"]) == {"num", "cat"}
@@ -65,46 +64,7 @@ def test_complexity(client):
     assert client.get("/api/toy/complexity?measure=nope").status_code == 404
 
 
-def test_train(client):
-    for split in ("val", "test"):
-        data = _get(client, f"/api/toy/train?model={MODEL}&split={split}")
-        assert set(data["overall"]) == {"accuracy", "macro_f1", "weighted_f1"}
-        assert len(data["confusion"]["counts"]) == 9
-        assert len(data["confidence"]["edges"]) == 21
-        assert data["models"] == [MODEL]
-
-
-def test_failures(client):
-    data = _get(client, f"/api/toy/failures?model={MODEL}")
-    assert {s["predictor"] for s in data["scores"]} == BASELINES
-    assert set(data["stats"]) >= {"n_regions", "n_used", "atc_threshold", "temperature"}
-
-
-def test_regress_and_region(client):
-    data = _get(client, f"/api/toy/regress?model={MODEL}")
-    pairs = {f"rf+{name}" for name in BASELINES}
-    assert {s["predictor"] for s in data["scores"]} == {"rf", *BASELINES, *pairs}
-    region = data["estimates"][0]["region"]
-    detail = _get(client, f"/api/toy/regress/region?model={MODEL}&region={region}")
-    assert detail["region"]["region"] == region
-    assert detail["contributions"]
-    assert detail["descriptors"]
-    missing = f"/api/toy/regress/region?model={MODEL}&region=-5"
-    assert client.get(missing).status_code == 404
-
-
-def test_ablation(client):
-    data = _get(client, f"/api/toy/ablation?model={MODEL}")
-    assert {(s["feature_set"], s["cv"]) for s in data["scores"]} >= {
-        ("geometry", "strata"),
-        ("geometry+signals", "class"),
-    }
-    assert {g["signal"] for g in data["gains"]} == {*BASELINES, "signals"}
-    assert 0 <= data["stats"]["geometry_shap_share"] <= 1
-
-
 def test_missing_runs_are_404(client):
-    assert client.get("/api/empty/split").status_code == 404
-    assert client.get("/api/toy/train?model=knn").status_code == 404
-    assert client.get("/api/nope/split").status_code == 404
-    assert client.get("/api/toy/train?model=nope").status_code == 422
+    assert client.get("/api/empty/clean").status_code == 404
+    assert client.get("/api/empty/regions").status_code == 404
+    assert client.get("/api/nope/clean").status_code == 404

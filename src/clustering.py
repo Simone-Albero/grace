@@ -1,9 +1,9 @@
-"""Regions: each class of train clustered at its least-loss granularity.
+"""Regions: each class clustered at its least-loss granularity.
 
 A finer partition hides less of the spread of its rows' hardness inside
-each region's mean, but leaves each region fewer test rows to measure
-its failure rate on. The granularity loss adds the two; the candidate of
-least loss wins. Hardness is kDN: the share of a row's nearest graph
+each region's mean, but leaves each region fewer rows to estimate that
+mean on. The granularity loss adds the two; the candidate of least loss
+wins. Hardness is kDN: the share of a row's nearest graph
 nodes of another class.
 """
 
@@ -43,7 +43,7 @@ from src.space import scale_for_metric
 FitFn = Callable[..., np.ndarray]
 RESERVED = ("n_clusters", "max_fit_samples", "random_state")
 GRANULARITY_LEVELS = 7
-_ROUTE_ROWS = 50_000  # rows routed at once
+_ASSIGN_ROWS = 50_000  # rows assigned at once
 
 
 def fit_kmeans(
@@ -279,9 +279,7 @@ def merge_small_clusters(
     return merged
 
 
-def granularity_loss(
-    labels: np.ndarray, hardness: np.ndarray, scale: float, eval_ratio: float
-) -> float:
+def granularity_loss(labels: np.ndarray, hardness: np.ndarray, scale: float) -> float:
     """Return the loss of a partition of a class's scored rows.
 
     With w_c = n_c / N over the clusters c of the N scored rows, h_c
@@ -290,15 +288,14 @@ def granularity_loss(
     none is known):
         within = Σ w_c · v_c
         noise = Σ w_c · max(h_c (1 - h_c), 1e-3)
-                / max(n_c · scale · eval_ratio, 1e-9)
-    and the loss is within + noise. n_c · scale · eval_ratio estimates
-    the test rows the region will receive.
+                / max(n_c · scale, 1e-9)
+    and the loss is within + noise. n_c · scale estimates the rows of
+    the region in the whole class.
 
     Args:
         labels: The final label of every scored row, all >= 0.
         hardness: The kDN of every scored row.
         scale: Rows of the class per scored row (n_class / N).
-        eval_ratio: Test rows per train row.
 
     Returns:
         The loss, >= 0.
@@ -319,7 +316,7 @@ def granularity_loss(
         pooled = hardness.var(ddof=1) if len(hardness) > 1 else 0.0
     within = np.sum(weights * np.where(known, variances, pooled))
     spread = np.maximum(means * (1 - means), 1e-3)
-    noise = np.sum(weights * spread / np.maximum(sizes * scale * eval_ratio, 1e-9))
+    noise = np.sum(weights * spread / np.maximum(sizes * scale, 1e-9))
     return float(within + noise)
 
 
@@ -412,7 +409,6 @@ def cluster_class(
     max_fit_samples: int,
     min_cluster_floor: int,
     max_clusters: int,
-    eval_ratio: float,
     metric: str,
     seed: int,
 ) -> ClassClustering:
@@ -438,7 +434,6 @@ def cluster_class(
         max_fit_samples: Passed to algorithm.
         min_cluster_floor: The merge floor on the whole class.
         max_clusters: The most clusters of the class.
-        eval_ratio: Test rows per train row.
         metric: The distance of the merge.
         seed: Passed to algorithm as random_state.
 
@@ -474,7 +469,7 @@ def cluster_class(
             print(f"[regions] skipped {combination}: {e}", flush=True)
             continue
         labels = merge_small_clusters(sample, labels, min_cluster_floor / scale, metric)
-        loss = granularity_loss(labels, hardness, scale, eval_ratio)
+        loss = granularity_loss(labels, hardness, scale)
         candidates.append(Candidate(combination, len(np.unique(labels)), loss))
         candidate_labels.append(labels)
     if not candidates:
@@ -512,15 +507,15 @@ def assign_nearest(points: np.ndarray, centers: np.ndarray, metric: str) -> np.n
     Returns:
         Indices into centers (ties: the first), int64.
     """
-    # In chunks: a split against every centre may not fit in memory.
+    # In chunks: the rows against every centre may not fit in memory.
     return np.concatenate(
         [
             pairwise_distances(
-                points[start : start + _ROUTE_ROWS], centers, metric=metric
+                points[start : start + _ASSIGN_ROWS], centers, metric=metric
             )
             .argmin(axis=1)
             .astype(np.int64)
-            for start in range(0, len(points), _ROUTE_ROWS)
+            for start in range(0, len(points), _ASSIGN_ROWS)
         ]
         or [np.empty(0, dtype=np.int64)]
     )

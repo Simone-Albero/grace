@@ -4,9 +4,7 @@ numpy
 pandas
 scipy
 scikit-learn
-xgboost
 hdbscan
-shap
 joblib
 pyyaml
 fastapi
