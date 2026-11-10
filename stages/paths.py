@@ -7,6 +7,7 @@ to the latest run of that stage (and model).
 from __future__ import annotations
 
 __all__ = [
+    "ablation_file",
     "assignments_file",
     "classes_file",
     "complexity_file",
@@ -226,6 +227,22 @@ def regressor_file(cfg: DatasetConfig) -> Path:
         ValueError: When cfg.model is None.
     """
     return cfg.output_dir / f"regress_{_model(cfg)}.joblib"
+
+
+def ablation_file(cfg: DatasetConfig) -> Path:
+    """Return the file of the ablation's estimates (stage ablation).
+
+    Args:
+        cfg: The dataset config.
+
+    Returns:
+        The parquet path of the out-of-fold estimate of every feature
+        set per used region.
+
+    Raises:
+        ValueError: When cfg.model is None.
+    """
+    return cfg.output_dir / f"ablation_{_model(cfg)}_estimates.parquet"
 
 
 def _model(cfg: DatasetConfig) -> str:

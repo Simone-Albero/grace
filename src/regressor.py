@@ -4,15 +4,20 @@ Nested cross-validation: each outer fold refits a RandomizedSearchCV
 over the other regions and predicts the held-out ones, so every region's
 estimate comes from a forest that never saw it, and TreeSHAP of that
 same forest explains it. A final refit on every region is the model
-kept.
+kept. Every forest may weigh the regions, in its fit and in the score
+of its search alike.
 """
 
 from __future__ import annotations
 
-__all__ = ["FailureRegressor", "fit_failure_regressor", "region_descriptors"]
+__all__ = [
+    "FailureRegressor",
+    "fit_failure_regressor",
+    "region_descriptors",
+    "region_signals",
+]
 
 import json
-import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -21,9 +26,11 @@ import numpy as np
 import pandas as pd
 import polars as pl
 import shap
+from sklearn import config_context
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import make_scorer, r2_score
 from sklearn.model_selection import (
+    GroupKFold,
     KFold,
     ParameterGrid,
     RandomizedSearchCV,
@@ -85,6 +92,23 @@ def region_descriptors(
     return X, names
 
 
+def region_signals(
+    failures: pl.DataFrame, signals: Sequence[str]
+) -> tuple[np.ndarray, list[str]]:
+    """Return the classifier's signals of regions, as descriptors.
+
+    Args:
+        failures: The rows of failures_<model>.parquet to describe.
+        signals: Columns of failures, each a baseline's estimate.
+
+    Returns:
+        X of shape (failures.height, len(signals)) and its column names,
+        signal_<name>.
+    """
+    X = failures.select(signals).to_numpy().astype(np.float64)
+    return X.reshape(failures.height, len(signals)), [f"signal_{s}" for s in signals]
+
+
 @dataclass(frozen=True)
 class FailureRegressor:
     """The fitted regressor and its out-of-fold results per region.
@@ -124,17 +148,21 @@ def fit_failure_regressor(
     n_inner_splits: int,
     n_iter: int,
     seed: int,
+    weight: np.ndarray | None = None,
+    groups: np.ndarray | None = None,
 ) -> FailureRegressor:
     """Fit the regressor under nested cross-validation.
 
     Outer: StratifiedKFold on the quantile bins of y (shuffled, seed)
     with min(n_outer_splits, smallest bin) folds;
-    KFold(min(n_outer_splits, n)) when that is below 2. Inner:
-    KFold(min(n_inner_splits, n - ceil(n / n_outer))), and no search
-    when that is below 2. Each search is a RandomizedSearchCV over
-    param_grid with min(n_iter, grid size) draws, scored by the r2 of
-    the clipped prediction, random_state seed + fold; the refit uses
-    seed + number of outer folds.
+    KFold(min(n_outer_splits, n)) when that is below 2; with groups,
+    GroupKFold(min(n_outer_splits, number of groups)) (shuffled, seed),
+    so that no group is both fitted and held out. Inner:
+    KFold(min(n_inner_splits, smallest outer fit)), and no search when
+    that is below 2. Each search is a RandomizedSearchCV over
+    param_grid with min(n_iter, grid size) draws, scored by the
+    weighted r2 of the clipped prediction, random_state seed + fold;
+    the refit uses seed + number of outer folds.
 
     Args:
         X: The descriptors, shape (n, f); NaN allowed.
@@ -146,13 +174,17 @@ def fit_failure_regressor(
         n_inner_splits: The most inner folds.
         n_iter: The most search draws.
         seed: The seed of the folds, the searches and the forests.
+        weight: The weight of every region in the fits and the search
+            scores, shape (n,); None weighs them equally.
+        groups: The group of every region, shape (n,); None mixes the
+            groups in the outer folds.
 
     Returns:
         The fitted regressor.
 
     Raises:
-        ValueError: With fewer than 2 regions or a constant y (std <
-            1e-9).
+        ValueError: With fewer than 2 regions, a constant y (std <
+            1e-9) or, given groups, fewer than 2 groups.
     """
     n = len(y)
     if n < 2 or float(np.std(y)) < 1e-9:
@@ -160,21 +192,37 @@ def fit_failure_regressor(
             f"the failure regressor needs 2+ regions whose rates differ, got {n} "
             f"region(s) with rate std {float(np.std(y)) if n else 0.0:.3g}"
         )
-    outer, strata = _outer_cv(y, n_outer_splits, seed)
-    n_outer = outer.get_n_splits()
-    n_inner = _usable_splits(n - math.ceil(n / n_outer), n_inner_splits)
+    if groups is None:
+        outer, strata = _outer_cv(y, n_outer_splits, seed)
+    else:
+        n_groups = len(np.unique(groups))
+        if n_groups < 2:
+            raise ValueError(f"grouped folds need 2+ groups, got {n_groups}")
+        outer = GroupKFold(
+            min(n_outer_splits, n_groups), shuffle=True, random_state=seed
+        )
+        strata = None
+    splits = list(outer.split(X, strata, groups))
+    n_outer = len(splits)
+    smallest_fit = min(len(fit_rows) for fit_rows, _ in splits)
+    n_inner = _usable_splits(smallest_fit, n_inner_splits)
     inner = KFold(n_inner, shuffle=True, random_state=seed) if n_inner else None
     search_settings = dict(
         params=params, param_grid=param_grid, inner=inner, n_iter=n_iter, seed=seed
     )
+    weight = np.ones(n) if weight is None else np.asarray(weight, dtype=np.float64)
 
     predicted, base = np.empty(n), np.empty(n)
     fold_of = np.empty(n, dtype=np.int64)
     contributions = np.empty(X.shape)
     folds, importances = [], []
-    for fold, (fit_rows, held_out) in enumerate(outer.split(X, strata)):
+    for fold, (fit_rows, held_out) in enumerate(splits):
         forest, best_params, best_score = _fit_forest(
-            X[fit_rows], y[fit_rows], search_seed=seed + fold, **search_settings
+            X[fit_rows],
+            y[fit_rows],
+            weight[fit_rows],
+            search_seed=seed + fold,
+            **search_settings,
         )
         # Clipped as the inner scorer clips, so the fold scores match.
         predicted[held_out] = np.clip(forest.predict(X[held_out]), 0.0, 1.0)
@@ -194,7 +242,7 @@ def fit_failure_regressor(
             }
         )
     model, refit_params, refit_score = _fit_forest(
-        X, y, search_seed=seed + n_outer, **search_settings
+        X, y, weight, search_seed=seed + n_outer, **search_settings
     )
     folds.append(
         {
@@ -238,13 +286,16 @@ def _outer_cv(
     return KFold(n_outer, shuffle=True, random_state=seed), None
 
 
-def _clipped_r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    return r2_score(y_true, np.clip(y_pred, 0.0, 1.0))
+def _clipped_r2(
+    y_true: np.ndarray, y_pred: np.ndarray, sample_weight: np.ndarray | None = None
+) -> float:
+    return r2_score(y_true, np.clip(y_pred, 0.0, 1.0), sample_weight=sample_weight)
 
 
 def _fit_forest(
     X: np.ndarray,
     y: np.ndarray,
+    weight: np.ndarray,
     *,
     params: Mapping[str, Any],
     param_grid: Mapping[str, Sequence[Any]],
@@ -256,22 +307,25 @@ def _fit_forest(
     """Fit one forest; without an inner CV, on its params, no search."""
     forest = RandomForestRegressor(**{**params, "random_state": seed})
     if inner is None:
-        forest.fit(X, y)
+        forest.fit(X, y, sample_weight=weight)
         fitted = forest.get_params()
         return forest, {k: fitted[k] for k in param_grid}, None
-    search = RandomizedSearchCV(
-        forest,
-        param_distributions=dict(param_grid),
-        # A grid smaller than the budget is searched whole.
-        n_iter=min(n_iter, len(ParameterGrid(dict(param_grid)))),
-        cv=inner,
-        # Scored clipped, as reported: tuned as the predictor it is
-        # judged as.
-        scoring=make_scorer(_clipped_r2),
-        # Each fit draws its own combinations: at one seed every search
-        # would draw the same ones.
-        random_state=search_seed,
-        n_jobs=-1,
-    )
-    search.fit(X, y)
+    # Routing hands each inner fold its slice of the weights, to the
+    # forest and to the scorer alike.
+    with config_context(enable_metadata_routing=True):
+        search = RandomizedSearchCV(
+            forest.set_fit_request(sample_weight=True),
+            param_distributions=dict(param_grid),
+            # A grid smaller than the budget is searched whole.
+            n_iter=min(n_iter, len(ParameterGrid(dict(param_grid)))),
+            cv=inner,
+            # Scored clipped, as reported: tuned as the predictor it is
+            # judged as.
+            scoring=make_scorer(_clipped_r2).set_score_request(sample_weight=True),
+            # Each fit draws its own combinations: at one seed every
+            # search would draw the same ones.
+            random_state=search_seed,
+            n_jobs=-1,
+        )
+        search.fit(X, y, sample_weight=weight)
     return search.best_estimator_, dict(search.best_params_), float(search.best_score_)

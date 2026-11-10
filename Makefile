@@ -6,7 +6,7 @@ DATA ?= synthetic_test
 MODEL ?= random_forest
 PORT ?= 8000
 
-.PHONY: help test format generate run dashboard
+.PHONY: help test format generate run ablation dashboard
 
 ## help: this list
 help:
@@ -33,6 +33,10 @@ run:
 	$(PYTHON) main.py --stage train --dataset $(DATA) --model $(MODEL)
 	$(PYTHON) main.py --stage failures --dataset $(DATA) --model $(MODEL)
 	$(PYTHON) main.py --stage regress --dataset $(DATA) --model $(MODEL)
+
+## ablation: the ablation of geometry and signals on DATA with MODEL, after run (slow: one regress per feature set)
+ablation:
+	$(PYTHON) main.py --stage ablation --dataset $(DATA) --model $(MODEL)
 
 ## dashboard: the read-only dashboard on 127.0.0.1:PORT (default 8000)
 dashboard:

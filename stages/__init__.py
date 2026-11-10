@@ -8,7 +8,7 @@ import sqlite3
 from collections.abc import Callable
 
 from src.config import DatasetConfig
-from stages import complexity, failures, regions, regress, split, train
+from stages import ablation, complexity, failures, regions, regress, split, train
 
 StageFn = Callable[[DatasetConfig, sqlite3.Connection, int], None]
 
@@ -19,5 +19,6 @@ STAGES: dict[str, StageFn] = {
     "train": train.run,
     "failures": failures.run,
     "regress": regress.run,
+    "ablation": ablation.run,
 }
-MODEL_STAGES = ("train", "failures", "regress")  # need --model
+MODEL_STAGES = ("train", "failures", "regress", "ablation")  # need --model

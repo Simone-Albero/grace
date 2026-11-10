@@ -3,18 +3,20 @@
 Where a trained classifier fails, estimated without the labels of the rows in question: each class of
 train is clustered into regions, every val and test row is routed to the nearest region without its
 label, each region is described by 45 data-complexity descriptors, and a Random Forest learns each
-region's test failure rate from them, next to five baselines (MCP and ATC, raw and calibrated, and a model of the
-classifier's errors) and to the mean of its estimate with each of them.
+region's test failure rate from them and from the estimates of six baselines (the region's failure rate on val, MCP
+and ATC, raw and calibrated, and a model of the classifier's errors), scored next to each baseline and to the mean of
+its estimate with each of them. An ablation measures what the descriptors add to the baselines.
 
 ```
 make generate                                                    # resources/raw_data/synthetic/synthetic_test.csv
-make run DATA=synthetic_test MODEL=random_forest                 # the six stages below, in order
+make run DATA=synthetic_test MODEL=random_forest                 # the six stages below, in order (not ablation)
 python main.py --stage split --dataset synthetic_test
 python main.py --stage regions --dataset synthetic_test          # after split
 python main.py --stage complexity --dataset synthetic_test       # after regions
 python main.py --stage train --dataset synthetic_test --model random_forest      # after split
 python main.py --stage failures --dataset synthetic_test --model random_forest   # after regions, train
 python main.py --stage regress --dataset synthetic_test --model random_forest    # after complexity, failures
+python main.py --stage ablation --dataset synthetic_test --model random_forest   # after complexity, failures; slow
 make dashboard                                                   # http://127.0.0.1:8000
 ```
 
@@ -47,29 +49,38 @@ Stages (each writes its files into the dataset's `output_dir` and its rows into 
   `top_n` most frequent values of each categorical column plus one for the rest, and the train median for a missing
   number when the classifier cannot read it), and predicts val and test whole. Writes `models/<model>.joblib`,
   `pred_<model>_{val,test}.parquet`. Reads the val and test labels only to score the predictions.
-- `failures`: counts the test errors of each region (its failure rate) and the five baselines on the same rows:
-  MCP, the mean of 1 − confidence; ATC, the share of rows under a confidence threshold fitted on val; `mcp_cal` and
+- `failures`: counts the test errors of each region (its failure rate) and the six baselines on the same rows:
+  `val_rate`, the region's failure rate on val (its class's when no val row reaches it); MCP, the mean of
+  1 − confidence; ATC, the share of rows under a confidence threshold fitted on val; `mcp_cal` and
   `atc_cal`, the same two on the probability of the predicted class after bias-corrected temperature scaling fitted
   on val (one temperature, one bias per class: it undoes the prior `max_per_class` gives train); and meta, the
   mean P(error) of a HistGradientBoostingClassifier (`error_model`) fitted on val (a uniform sample of at most
   `max_samples` rows) to predict the classifier's errors from the row's columns, the classifier's probabilities,
   its confidence and its predicted class, as the post-hoc error predictors of the literature do. A region with fewer than `regressor.min_eval_support` test rows
   is not *used*: no predictor is scored on it. Writes `failures_<model>.parquet`. Reads the test labels (the rates)
-  and the val labels (the ATC thresholds, the calibration and the errors meta learns).
+  and the val labels (`val_rate`, the ATC thresholds, the calibration and the errors meta learns).
 - `regress`: a Random Forest from each used region's descriptors and its class's (`region_<m>` and `class_<m>` for
-  the `regressor.measures`) to its test failure rate, under nested cross-validation (a randomized search inside each
+  the `regressor.measures`) and from the baselines' estimates (`signal_<b>` for the `regressor.signals`) to its test
+  failure rate, each region weighted by the square root of its test rows, under nested cross-validation (a randomized search inside each
   outer fold), so every region's estimate comes from a forest that never saw it; TreeSHAP of that same forest
   explains it. A final refit on every region is kept. The estimates are scored (Spearman, R², MAE, MSE) against the
-  observed rates next to each baseline and to `rf+<baseline>`, the mean of the estimate and that baseline. Writes `regress_<model>_estimates.parquet`,
+  observed rates next to each baseline and to `rf+<baseline>`, the mean of the estimate and that baseline; `wmae`
+  is the MAE with each region weighted by its test rows. Writes `regress_<model>_estimates.parquet`,
   `regress_<model>_contributions.parquet`, `regress_<model>.joblib`. Reads the test labels through the rates of
   `failures`.
+- `ablation` (`make ablation`; not in `make run`, it fits the regressor of `regress` 18 times): the same regressor
+  on the descriptors alone, the signals alone and both, and on every signal alone and with the descriptors, all on
+  the same outer folds; the first three again with whole classes held out. For every pair with and without the
+  descriptors, the gain in MAE, `wmae` and Spearman with a 95% paired bootstrap interval over the regions
+  (`ablation.n_bootstrap`), and the correlation of the residuals of the descriptors alone with those of the signal
+  alone. Writes `ablation_<model>_estimates.parquet`. Reads what `regress` reads.
 
 The studied classifier never trains on val; only the calibration and meta, the model of its errors, do. The test labels fit nothing but the regressor, which learns each region's rate from the
 other regions' rates and is scored out of fold.
 
 Measured on synthetic_test (69,500 rows, 9 classes after the rare one is dropped) with random_forest: about a
-minute and a half for `make run`, test accuracy 0.89, 56 regions, all used; Spearman with the observed rates
-RF 0.83, MCP 0.86, ATC 0.89.
+minute and a half for `make run` and ten minutes for `ablation`, test accuracy 0.89, 56 regions, all used; Spearman
+with the observed rates RF 0.84, val_rate 0.78, MCP 0.86, ATC 0.89, meta 0.87.
 
 Configs:
 - `configs/datasets/`: one yaml per dataset: `name`, `path`, `label_col`, `num_cols`, `cat_cols`, `split`,
@@ -80,7 +91,7 @@ Configs:
 - `configs/models/`: ten classifiers, `name` (a key of `MODELS` in `src/models.py`) and `params`.
 - `configs/method/default.yaml`: the method, shared by every dataset and model: `distance` (`euclidean` or
   `cosine`), `space`, `graph`, `clustering` (`name`: `kmeans`, `birch`, `spectral` or `hdbscan`),
-  `complexity`, `regressor` and `error_model`, each key commented. Another method is a copy of it passed as `--method <path>`.
+  `complexity`, `regressor`, `error_model` and `ablation`, each key commented. Another method is a copy of it passed as `--method <path>`.
 
 `src/config.py` loads the three into frozen dataclasses and validates them before any stage reads data.
 
@@ -91,7 +102,7 @@ model, the whole config as JSON, status `running`, `ok` or `failed`, start and e
 `dropped_columns`, `split_class_counts`, `features` (split); `regions`, `class_clusterings`,
 `granularity_candidates`, `region_stats` (regions); `complexity`; `model_metrics`, `confusion`, `train_stats`
 (train); `failures`, `baseline_scores`, `failure_stats`, `calibration` (failures); `estimates`, `contributions`, `regressor_folds`,
-`importances`, `regress_scores` (regress). There are no migrations: after a change of a table, delete the DB.
+`importances`, `regress_scores` (regress); `ablation_scores`, `ablation_gains`, `ablation_stats` (ablation). There are no migrations: after a change of a table, delete the DB.
 
 Dashboard: `make dashboard` (`PORT=` to change it) or `python -m uvicorn dashboard.app:app` serves a read-only page
 on 127.0.0.1, one tab per stage, for the datasets of `configs/datasets/` and the models of `configs/models/`. Each
@@ -103,7 +114,7 @@ Layout:
 - `main.py`: the CLI, one stage per call inside a logged run
 - `stages/`: one file per stage, `run(cfg, conn, run_id)`; `stages/paths.py` names every file a stage writes
 - `src/`: config and DB logging, then the method on arrays and frames: data, preprocessing, space, graph, clustering,
-  complexity/, models, baselines, regressor, evaluation
+  complexity/, models, baselines, regressor, ablation, evaluation
 - `dashboard/`: FastAPI `app.py`, read-only `queries.py`, `static/` (one page, hand-made SVG charts)
 - `generate_synthetic.py`: the synthetic dataset, a ladder of sub-groups per class that overlap their rivals by
   known margins (the `true_subgroup` column records it; no stage reads it)

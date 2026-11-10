@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 from dashboard.app import create_app
 
-BASELINES = {"mcp", "atc", "mcp_cal", "atc_cal", "meta"}
+BASELINES = {"val_rate", "mcp", "atc", "mcp_cal", "atc_cal", "meta"}
 
 
 @pytest.fixture(scope="module")
@@ -91,6 +91,16 @@ def test_regress_and_region(client):
     assert detail["descriptors"]
     missing = f"/api/toy/regress/region?model={MODEL}&region=-5"
     assert client.get(missing).status_code == 404
+
+
+def test_ablation(client):
+    data = _get(client, f"/api/toy/ablation?model={MODEL}")
+    assert {(s["feature_set"], s["cv"]) for s in data["scores"]} >= {
+        ("geometry", "strata"),
+        ("geometry+signals", "class"),
+    }
+    assert {g["signal"] for g in data["gains"]} == {*BASELINES, "signals"}
+    assert 0 <= data["stats"]["geometry_shap_share"] <= 1
 
 
 def test_missing_runs_are_404(client):

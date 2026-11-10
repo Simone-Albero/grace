@@ -3,14 +3,14 @@
 /**
  * UI state.
  * @type {{dataset: string|null, model: string|null, split: "val"|"test",
- *   tab: "split"|"regions"|"complexity"|"train"|"failures"|"regress",
+ *   tab: "split"|"regions"|"complexity"|"train"|"failures"|"regress"|"ablation",
  *   mode: "count"|"row", cls: string|null, measure: string|null, region: number|null}}
  */
 const state = {
   dataset: null, model: null, split: "test", tab: "split",
   mode: "count", cls: null, measure: null, region: null,
 };
-const MODEL_TABS = ["train", "failures", "regress"];
+const MODEL_TABS = ["train", "failures", "regress", "ablation"];
 
 const last = { train: null, regions: null }; // last responses, for the controls that only redraw
 let loadId = 0; // drops answers of superseded requests
@@ -72,7 +72,7 @@ function sortable(el, columns, rows, opts = {}) {
       return th;
     });
     const body = sorted.map((r) => {
-      const tr = h("tr", {}, columns.map((c) => h("td", {}, (c.format ?? String)(r[c.key]))));
+      const tr = h("tr", {}, columns.map((c) => h("td", {}, (c.format ?? String)(r[c.key], r))));
       if (opts.onClick) { tr.classList.add("clickable"); tr.onclick = () => opts.onClick(r); }
       if (opts.selected?.(r)) tr.classList.add("selected");
       return tr;
@@ -160,6 +160,7 @@ async function load() {
     train: `${d}/train?${m}&split=${state.split}`,
     failures: `${d}/failures?${m}`,
     regress: `${d}/regress?${m}`,
+    ablation: `${d}/ablation?${m}`,
   }[tab];
   try {
     const data = await api(path);
@@ -169,6 +170,7 @@ async function load() {
     ({
       split: renderSplit, regions: renderRegions, complexity: renderComplexity,
       train: renderTrain, failures: renderFailures, regress: renderRegress,
+      ablation: renderAblation,
     })[tab](data);
     renderRun(data.run);
   } catch (e) {
@@ -322,10 +324,11 @@ const SCORE_COLUMNS = [
   { key: "r2", label: "R²", format: dec },
   { key: "mae", label: "MAE", format: dec },
   { key: "mse", label: "MSE", format: (v) => dec(v, 4) },
+  { key: "wmae", label: "MAE per test row", format: dec },
 ];
 
 /** The baselines of stage failures: column key and display name. */
-const BASELINES = [["mcp", "MCP"], ["atc", "ATC"], ["mcp_cal", "MCP cal"], ["atc_cal", "ATC cal"], ["meta", "Meta"]];
+const BASELINES = [["val_rate", "Val rate"], ["mcp", "MCP"], ["atc", "ATC"], ["mcp_cal", "MCP cal"], ["atc_cal", "ATC cal"], ["meta", "Meta"]];
 
 /** RF and the baselines: key, display name, bar color. The rf+<baseline> means are in the scores table only. */
 const PREDICTORS = [
@@ -408,6 +411,56 @@ function renderRegress(data) {
   else $("rr-region-card").hidden = true;
 }
 
+/** The feature sets compared in the bars and the tiles: key, display name, color. */
+const ABLATION_SETS = [
+  ["geometry", "geometry", "var(--accent)"],
+  ["signals", "signals", "var(--series-2)"],
+  ["geometry+signals", "geometry + signals", "var(--series-3)"],
+];
+
+/** Tiles, scores of the main feature sets, forest plots of the gains of the geometry, tables. @param {object} data response of /ablation */
+function renderAblation(data) {
+  setModels(data.models);
+  const score = (set, cv) => data.scores.find((r) => r.feature_set === set && r.cv === cv);
+  const gain = (signal, cv) => data.gains.find((g) => g.signal === signal && g.cv === cv);
+  const interval = (g, k, d = 4) => (g ? `${dec(g[k], d)} [${dec(g[`${k}_lo`], d)}, ${dec(g[`${k}_hi`], d)}]` : "–");
+  fill("ab-tiles",
+    tile("regions", num(data.stats.n_regions), `${num(data.stats.n_classes)} classes`),
+    tile("geometry share of |SHAP|", pct(data.stats.geometry_shap_share), "in geometry + signals"),
+    ...["strata", "class"].map((cv) => tile(`ΔMAE of the geometry (${cv} folds)`, dec(gain("signals", cv)?.d_mae, 4),
+      `geometry + signals − signals, 95% ${interval(gain("signals", cv), "d_mae")}`)),
+    ...ABLATION_SETS.map(([key, name]) => tile(`${name} MAE`, dec(score(key, "strata")?.mae, 4),
+      `class folds ${dec(score(key, "class")?.mae, 4)}`)));
+  const metrics = ["spearman", "within_spearman", "r2", "mae", "wmae"];
+  groupedBars($("ab-scores"), metrics, ABLATION_SETS.map(([key, name, color]) => (
+    { name, color, values: metrics.map((k) => score(key, "strata")?.[k]) })));
+  const label = (g) => `${g.with_geometry} vs ${g.without}${g.cv === "class" ? " (class folds)" : ""}`;
+  fill("ab-gains", ["d_mae", "d_wmae"].map((key) => {
+    const el = h("div", {});
+    intervals(el, data.gains.map((g) => ({ label: label(g), value: g[key], lo: g[`${key}_lo`], hi: g[`${key}_hi`] })));
+    return h("div", {}, h("h3", {}, key === "d_mae" ? "Δ MAE" : "Δ MAE per test row"), el);
+  }));
+  sortable($("ab-score-table"), [
+    { key: "feature_set", label: "feature set" },
+    { key: "cv", label: "folds" },
+    { key: "n_features", label: "columns", format: num },
+    { key: "spearman", label: "Spearman ρ", format: dec },
+    { key: "within_spearman", label: "ρ within class", format: dec },
+    { key: "r2", label: "R²", format: dec },
+    { key: "mae", label: "MAE", format: (v) => dec(v, 4) },
+    { key: "wmae", label: "MAE per test row", format: (v) => dec(v, 4) },
+  ], data.scores);
+  sortable($("ab-gain-table"), [
+    { key: "with_geometry", label: "with geometry" },
+    { key: "without", label: "without" },
+    { key: "cv", label: "folds" },
+    { key: "residual_corr", label: "residual corr.", format: dec },
+    { key: "d_mae", label: "Δ MAE [95%]", format: (v, r) => interval(r, "d_mae") },
+    { key: "d_wmae", label: "Δ MAE per row [95%]", format: (v, r) => interval(r, "d_wmae") },
+    { key: "d_spearman", label: "Δ Spearman [95%]", format: (v, r) => interval(r, "d_spearman", 3) },
+  ], data.gains);
+}
+
 /** Waterfall of the TreeSHAP contributions and the descriptors of one region. @param {number} region */
 async function drawRegion(region) {
   const d = `/${encodeURIComponent(state.dataset)}`;
@@ -455,6 +508,35 @@ function barsH(el, rows, opts = {}) {
   });
   const axis = sv("line", { class: "axis", x1: labelW, x2: labelW, y1: 0, y2: rows.length * rowH });
   el.replaceChildren(sv("svg", { viewBox: `0 0 ${W} ${Math.max(rows.length * rowH, 1)}`, role: "img" }, axis, kids));
+}
+
+/**
+ * Forest plot: one point and its interval per row, around a zero line.
+ * Accent when the interval lies below 0 (the geometry lowers the error), the second series above it.
+ * @param {HTMLElement} el
+ * @param {{label: string, value: number, lo: number, hi: number}[]} rows
+ */
+function intervals(el, rows) {
+  const W = 800, labelW = 330, rowH = 26, right = 24;
+  const ends = rows.flatMap((r) => [r.lo, r.hi, r.value]).filter((v) => v != null);
+  const reach = Math.max(...ends.map(Math.abs), 1e-9);
+  const x = (v) => labelW + ((v + reach) / (2 * reach)) * (W - labelW - right);
+  const kids = rows.flatMap((r, i) => {
+    const y = i * rowH + rowH / 2;
+    const color = r.hi < 0 ? "var(--accent)" : r.lo > 0 ? "var(--series-2)" : "var(--muted)";
+    const g = sv("g", {},
+      sv("rect", { x: 0, y: i * rowH, width: W, height: rowH, fill: "transparent" }),
+      sv("text", { x: labelW - 12, y: y + 4, "text-anchor": "end", style: "fill:var(--text-2)" }, r.label),
+      sv("line", { x1: x(r.lo), x2: x(r.hi), y1: y, y2: y, style: `stroke:${color}; stroke-width:2` }),
+      sv("circle", { cx: x(r.value), cy: y, r: 4, style: `fill:${color}` }));
+    g.onmousemove = (ev) => tip(ev, `${r.label}: ${dec(r.value, 4)} [${dec(r.lo, 4)}, ${dec(r.hi, 4)}]`);
+    g.onmouseleave = () => tip(null);
+    return g;
+  });
+  const height = Math.max(rows.length * rowH, 1);
+  const zero = sv("line", { class: "axis", x1: x(0), x2: x(0), y1: 0, y2: height });
+  const scale = [-reach, reach].map((v, k) => sv("text", { x: x(v), y: height + 14, "text-anchor": k ? "end" : "start" }, dec(v, 4)));
+  el.replaceChildren(sv("svg", { viewBox: `0 0 ${W} ${height + 20}`, role: "img" }, zero, kids, scale));
 }
 
 /** Smallest 1, 2, 5 or 10 times a power of ten that is >= v, so the ticks are round. */

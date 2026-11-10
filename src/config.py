@@ -25,6 +25,7 @@ from typing import Any
 
 import yaml
 
+from src.baselines import BASELINES
 from src.clustering import ALGORITHMS, tunable_params
 from src.models import MODELS
 
@@ -153,6 +154,8 @@ class RegressorConfig:
         params: The fixed RandomForestRegressor params.
         param_grid: The searched RandomForestRegressor params.
         measures: The complexity measures used; None uses all.
+        signals: The baselines whose estimates the forest reads next
+            to the measures; empty for the measures alone.
     """
 
     min_eval_support: int
@@ -162,6 +165,7 @@ class RegressorConfig:
     params: Mapping[str, Any]
     param_grid: Mapping[str, list[Any]]
     measures: tuple[str, ...] | None
+    signals: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -179,6 +183,17 @@ class ErrorModelConfig:
 
 
 @dataclass(frozen=True)
+class AblationConfig:
+    """The ablation of geometry and signals (`src.ablation`).
+
+    Attributes:
+        n_bootstrap: The draws of each paired bootstrap.
+    """
+
+    n_bootstrap: int
+
+
+@dataclass(frozen=True)
 class MethodConfig:
     """Parameters of the method, shared by every dataset.
 
@@ -190,6 +205,7 @@ class MethodConfig:
         complexity: The descriptors.
         regressor: The failure regressor.
         error_model: The meta baseline.
+        ablation: The ablation of geometry and signals.
     """
 
     distance: str
@@ -199,6 +215,7 @@ class MethodConfig:
     complexity: ComplexityConfig
     regressor: RegressorConfig
     error_model: ErrorModelConfig
+    ablation: AblationConfig
 
 
 @dataclass(frozen=True)
@@ -315,6 +332,11 @@ def _validate_method(method: MethodConfig) -> None:
         measures is None or len(measures) > 0,
         "regressor.measures must be null or a non-empty list, got []",
     )
+    unknown_signals = sorted(set(method.regressor.signals) - set(BASELINES))
+    _check(
+        not unknown_signals,
+        f"regressor.signals must be among {list(BASELINES)}, got {unknown_signals}",
+    )
     positive = {
         "graph.k": method.graph.k,
         "graph.max_samples": method.graph.max_samples,
@@ -325,6 +347,7 @@ def _validate_method(method: MethodConfig) -> None:
         "complexity.top_k_clusters": method.complexity.top_k_clusters,
         "regressor.n_iter": method.regressor.n_iter,
         "error_model.max_samples": method.error_model.max_samples,
+        "ablation.n_bootstrap": method.ablation.n_bootstrap,
     }
     for key, value in positive.items():
         _check(value >= 1, f"{key} must be >= 1, got {value}")
@@ -377,6 +400,7 @@ def load_method_config(name_or_path: str = "default") -> MethodConfig:
     regressor = dict(raw["regressor"])
     if regressor["measures"] is not None:
         regressor["measures"] = tuple(regressor["measures"])
+    regressor["signals"] = tuple(regressor["signals"] or ())
     clustering = dict(raw["clustering"])
     clustering["params"] = clustering.get("params") or {}
     method = MethodConfig(
@@ -390,6 +414,7 @@ def load_method_config(name_or_path: str = "default") -> MethodConfig:
             params=raw["error_model"]["params"] or {},
             max_samples=raw["error_model"]["max_samples"],
         ),
+        ablation=AblationConfig(**raw["ablation"]),
     )
     _validate_method(method)
     return method

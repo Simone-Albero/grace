@@ -26,6 +26,7 @@
       <button role="tab" data-tab="train" aria-selected="false">train</button>
       <button role="tab" data-tab="failures" aria-selected="false">failures</button>
       <button role="tab" data-tab="regress" aria-selected="false">regress</button>
+      <button role="tab" data-tab="ablation" aria-selected="false">ablation</button>
     </nav>
   </header>
 
@@ -94,11 +95,12 @@
       <p class="empty">Select a dataset and a model.</p>
       <div id="fl-tiles" class="tiles"></div>
       <div class="card"><h2>Baselines against the observed rate</h2>
-        <p class="note">Test failure rate of every used region against MCP (mean of 1 − confidence), ATC (share
+        <p class="note">Test failure rate of every used region against Val rate (the region's failure rate on val,
+          its class's when no val row reaches it), MCP (mean of 1 − confidence), ATC (share
           of rows under a confidence threshold fitted on val), the same two on the probability of the predicted class
           after bias-corrected temperature scaling fitted on val (MCP cal, ATC cal), and Meta (mean P(error) of a
           gradient boosting fitted on val to predict the classifier's errors from the row and the classifier's
-          output). Dashed: y = x.</p>
+          output). MAE per test row weighs each region by its test rows. Dashed: y = x.</p>
         <div id="fl-scores" class="table-wrap"></div>
         <div id="fl-scatter" class="pair"></div></div>
       <div class="card"><h2>Failure rate by class</h2>
@@ -112,8 +114,10 @@
       <p class="empty">Select a dataset and a model.</p>
       <div id="rr-tiles" class="tiles"></div>
       <div class="card"><h2>Scores</h2>
-        <p class="note">The Random Forest estimates come from outer folds that never saw the region; the baselines
-          are scored on the same regions. RF+X, in the table, is the mean of the RF estimate and baseline X.</p>
+        <p class="note">The Random Forest reads the region's descriptors and the baselines' estimates (signal_*),
+          is fitted with each region weighted by the square root of its test rows, and its estimates come from outer
+          folds that never saw the region; the baselines are scored on the same regions. RF+X, in the table, is the
+          mean of the RF estimate and baseline X.</p>
         <div id="rr-scores"></div>
         <div id="rr-score-table" class="table-wrap"></div></div>
       <div class="card"><h2>Estimated against observed</h2>
@@ -127,6 +131,25 @@
       <div class="card"><h2>Importances</h2><div id="rr-importances" class="pair"></div></div>
       <div class="card"><h2>Folds</h2><p class="note">Fold −1 is the refit on every region.</p>
         <div id="rr-folds" class="table-wrap"></div></div>
+    </section>
+
+    <!-- ablation -->
+    <section id="tab-ablation" class="panel" hidden>
+      <p class="empty">Select a dataset and a model.</p>
+      <div id="ab-tiles" class="tiles"></div>
+      <div class="card"><h2>Feature sets</h2>
+        <p class="note">The regressor of stage regress fitted on the geometric descriptors alone, on the classifier's
+          signals (the baselines' estimates) alone and on both, all on the same outer folds. Class folds hold out
+          whole classes: no region is estimated from the rates of its sister regions.</p>
+        <div id="ab-scores"></div>
+        <div id="ab-score-table" class="table-wrap"></div></div>
+      <div class="card"><h2>What the geometry adds</h2>
+        <p class="note">Error with the geometry minus error without, region by region, with a 95% paired bootstrap
+          interval: blue when the geometry lowers it for sure, orange when it raises it, grey when unsure. Residual
+          corr. is the correlation of the errors of the geometry alone with those of the signal alone: low means
+          the two fail on different regions.</p>
+        <div id="ab-gains" class="pair"></div>
+        <div id="ab-gain-table" class="table-wrap"></div></div>
     </section>
   </main>
 

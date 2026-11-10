@@ -36,6 +36,14 @@ def test_unknown_clustering_param_fails(tmp_path):
         )
 
 
+def test_unknown_regressor_signal_fails(tmp_path):
+    with pytest.raises(ValueError, match="bogus"):
+        load_config(
+            "synthetic_test",
+            method=_method(tmp_path, regressor__signals=["mcp", "bogus"]),
+        )
+
+
 def test_unknown_clustering_fails(tmp_path):
     with pytest.raises(ValueError, match="dbscan"):
         load_config(

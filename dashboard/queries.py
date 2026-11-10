@@ -11,6 +11,7 @@ NaN).
 from __future__ import annotations
 
 __all__ = [
+    "ablation",
     "complexity",
     "failures",
     "region",
@@ -232,9 +233,9 @@ def failures(cfg: DatasetConfig, model: str) -> dict[str, Any]:
         run; models [models with an ok failures run]; stats {n_regions,
         n_used, n_empty, n_small, error_rate, error_rate_used,
         atc_threshold, atc_cal_threshold, temperature}; scores
-        [{predictor, spearman, r2, mae, mse}]; regions [{region, class,
-        n_eval, n_error, failure_rate, used, mcp, atc, mcp_cal, atc_cal,
-        meta}].
+        [{predictor, spearman, r2, mae, mse, wmae}]; regions [{region,
+        class, n_eval, n_error, failure_rate, used, n_val, then each of
+        baselines.BASELINES}].
     """
     with closing(_connect(cfg)) as conn:
         run = _latest_run(conn, "failures", cfg, model)
@@ -259,8 +260,8 @@ def regress(cfg: DatasetConfig, model: str) -> dict[str, Any]:
 
     Returns:
         run; models [models with an ok regress run]; scores [{predictor,
-        spearman, r2, mae, mse}] (rf, each of baselines.BASELINES and
-        each rf+<baseline>); estimates [{region, class, observed,
+        spearman, r2, mae, mse, wmae}] (rf, each of baselines.BASELINES
+        and each rf+<baseline>); estimates [{region, class, observed,
         predicted, fold, base, the baselines, the rf+<baseline>}];
         importances
         [{descriptor, mdi, mean_abs_shap}] by mdi descending; folds
@@ -289,6 +290,32 @@ def regress(cfg: DatasetConfig, model: str) -> dict[str, Any]:
         "importances": sorted(importances, key=lambda r: -r["mdi"]),
         "folds": [{**f, "params": json.loads(f["params"])} for f in folds],
     }
+
+
+def ablation(cfg: DatasetConfig, model: str) -> dict[str, Any]:
+    """Return the last ablation run of model.
+
+    Args:
+        cfg: The dataset.
+        model: A model name.
+
+    Returns:
+        run; models [models with an ok ablation run]; stats {n_regions,
+        n_classes, n_geometry, n_signals, geometry_shap_share}; scores
+        [{feature_set, cv, n_features, spearman, r2, mae, mse, wmae,
+        within_spearman}]; gains [{cv, signal, with_geometry, without,
+        residual_corr, d_mae, d_wmae, d_spearman, each with _lo and
+        _hi}].
+    """
+    with closing(_connect(cfg)) as conn:
+        run = _latest_run(conn, "ablation", cfg, model)
+        return {
+            "run": _public(run),
+            "models": _models_with_run(conn, "ablation", cfg),
+            "stats": _rows(conn, "ablation", "ablation_stats", run)[0],
+            "scores": _rows(conn, "ablation", "ablation_scores", run),
+            "gains": _rows(conn, "ablation", "ablation_gains", run),
+        }
 
 
 def region(cfg: DatasetConfig, model: str, region_id: int) -> dict[str, Any]:

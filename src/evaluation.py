@@ -75,16 +75,21 @@ def confusion(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int) -> np.ndar
     return confusion_matrix(y_true, y_pred, labels=list(range(n_classes)))
 
 
-def rate_scores(predicted: np.ndarray, observed: np.ndarray) -> dict[str, float]:
+def rate_scores(
+    predicted: np.ndarray, observed: np.ndarray, weight: np.ndarray | None = None
+) -> dict[str, float]:
     """Score predicted against observed failure rates of regions.
 
     Args:
         predicted: The predicted rates.
         observed: The observed rates, same length.
+        weight: The weight of every region in wmae; None weighs them
+            equally.
 
     Returns:
         spearman (NaN when either side has std <= 1e-12), r2 (NaN with
-        fewer than 2 values or a constant observed side), mae and mse.
+        fewer than 2 values or a constant observed side), mae, mse and
+        wmae, the mean absolute error weighted by weight.
     """
     predicted = np.asarray(predicted, dtype=np.float64)
     observed = np.asarray(observed, dtype=np.float64)
@@ -101,4 +106,5 @@ def rate_scores(predicted: np.ndarray, observed: np.ndarray) -> dict[str, float]
         "r2": float(r2),
         "mae": float(np.abs(error).mean()),
         "mse": float((error**2).mean()),
+        "wmae": float(np.average(np.abs(error), weights=weight)),
     }

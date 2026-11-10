@@ -17,7 +17,15 @@ from stages import MODEL_STAGES
 
 ROOT = Path(__file__).resolve().parents[1]
 MODEL = "naive_bayes"
-STAGE_ORDER = ("split", "regions", "complexity", "train", "failures", "regress")
+STAGE_ORDER = (
+    "split",
+    "regions",
+    "complexity",
+    "train",
+    "failures",
+    "regress",
+    "ablation",
+)
 
 
 @dataclass(frozen=True)

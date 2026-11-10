@@ -85,6 +85,10 @@ def create_app(dataset_dir: Path = DATASET_DIR) -> FastAPI:
     def regress(dataset: str, model: ModelName) -> Any:
         return _query(queries.regress, load_dataset(dataset), model)
 
+    @app.get("/api/{dataset}/ablation")
+    def ablation(dataset: str, model: ModelName) -> Any:
+        return _query(queries.ablation, load_dataset(dataset), model)
+
     @app.get("/api/{dataset}/regress/region")
     def region(dataset: str, model: ModelName, region: int) -> Any:
         return _query(queries.region, load_dataset(dataset), model, region)

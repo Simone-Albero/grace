@@ -20,6 +20,7 @@ from src.baselines import (
     fit_bcts,
     mcp_rate,
     meta_rate,
+    val_rate,
 )
 from src.config import DatasetConfig
 from src.data import LABEL
@@ -42,22 +43,25 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     Reads regions.parquet, the val and test rows of assignments.parquet
     and pred_<model>_{val,test}.parquet (rows must line up by position),
     and the val and test split files. The failure rate is counted on
-    test only. Fitted on val: the ATC threshold on the confidence, the
-    BCTS calibration (baselines.fit_bcts) and a second ATC threshold on
-    the calibrated confidence, and meta (baselines.error_probability on
+    test only. Counted on val: val_rate (baselines.val_rate). Fitted on
+    val: the ATC threshold on the confidence, the BCTS calibration
+    (baselines.fit_bcts) and a second ATC threshold on the calibrated
+    confidence, and meta (baselines.error_probability on
     baselines.error_inputs, error_model, top_n, seed). A region is used
     when it has at least regressor.min_eval_support test rows; each of
     baselines.BASELINES is scored (evaluation.rate_scores) against the
-    observed rates of the used regions.
+    observed rates of the used regions, weighted by n_eval for wmae.
 
     Writes to output_dir: failures_<model>.parquet (region, class,
-    n_eval, n_error, failure_rate, used, then one column per baseline),
-    one row per region in the order of regions.parquet.
+    n_eval, n_error, failure_rate, used, n_val (its val rows), then one
+    column per baseline), one row per region in the order of
+    regions.parquet.
     Logs: failures (the same rows, class as name), baseline_scores
-    (predictor: a baseline, spearman, r2, mae, mse), failure_stats (one
-    row: n_regions, n_used, n_empty, n_small, error_rate,
-    error_rate_used, atc_threshold, atc_cal_threshold, temperature),
-    calibration (class, bias: the BCTS bias, minus its mean).
+    (predictor: a baseline, spearman, r2, mae, mse, wmae),
+    failure_stats (one row: n_regions, n_used, n_empty, n_small,
+    error_rate, error_rate_used, atc_threshold, atc_cal_threshold,
+    temperature), calibration (class, bias: the BCTS bias, minus its
+    mean).
 
     Raises:
         ValueError: When cfg.model is None, the predictions do not line
@@ -113,6 +117,9 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
         for split, frame in predictions.items()
     }
     cal_threshold = atc_threshold(calibrated["val"], ~val_error)
+    n_val, val_rates = val_rate(
+        region["val"], val_error, ids, regions["class"].to_numpy()
+    )
     features = feature_cols(rows["val"].columns, cfg.num_cols, cfg.cat_cols)
     val_inputs, inputs = error_inputs(rows["val"], val, features)
     test_inputs, _ = error_inputs(rows["test"], test, features)
@@ -136,6 +143,8 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
             "n_error": n_error,
             "failure_rate": rate,
             "used": used,
+            "n_val": n_val,
+            "val_rate": val_rates,
             "mcp": mcp_rate(confidence, region["test"], ids),
             "atc": atc_rate(confidence, region["test"], ids, threshold),
             "mcp_cal": mcp_rate(calibrated["test"], region["test"], ids),
@@ -146,7 +155,10 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     failures.write_parquet(failures_file(cfg))
     observed = rate[used]
     scores = [
-        {"predictor": name, **rate_scores(failures[name].to_numpy()[used], observed)}
+        {
+            "predictor": name,
+            **rate_scores(failures[name].to_numpy()[used], observed, n_eval[used]),
+        }
         for name in BASELINES
     ]
     print(

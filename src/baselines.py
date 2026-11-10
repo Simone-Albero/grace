@@ -1,16 +1,17 @@
 """Failure rates per region: observed, and from the classifier's output.
 
-MCP and ATC read only the classifier's maximum probability; mcp_cal
-and atc_cal read the probability of its predicted class after
-bias-corrected temperature scaling (BCTS, Alexandari et al. 2020)
-fitted on val: one temperature for its overconfidence, one bias per
-class for a prior other than the one it was fitted on (max_per_class
-balances train). Meta is a model of the classifier's errors, fitted on
-labelled rows (val): it reads the row's columns next to the
-classifier's probabilities, its confidence and its predicted class, as
-the post-hoc error predictors of the literature do (Risk Advisor,
-RED). The observed rate is the
-target of every predictor; it needs the test labels.
+val_rate is the region's failure rate on val, the rate of its class on
+val when no val row reaches it. MCP and ATC read only the classifier's
+maximum probability; mcp_cal and atc_cal read the probability of its
+predicted class after bias-corrected temperature scaling (BCTS,
+Alexandari et al. 2020) fitted on val: one temperature for its
+overconfidence, one bias per class for a prior other than the one it
+was fitted on (max_per_class balances train). Meta is a model of the
+classifier's errors, fitted on labelled rows (val): it reads the row's
+columns next to the classifier's probabilities, its confidence and its
+predicted class, as the post-hoc error predictors of the literature do
+(Risk Advisor, RED). The observed rate is the target of every
+predictor; it needs the test labels.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ __all__ = [
     "fit_bcts",
     "mcp_rate",
     "meta_rate",
+    "val_rate",
 ]
 
 from collections.abc import Callable, Mapping
@@ -41,7 +43,7 @@ from src.models import build_pipeline, predict_proba
 from src.preprocessing import Features
 
 # The column of each baseline in failures_<model>.
-BASELINES = ("mcp", "atc", "mcp_cal", "atc_cal", "meta")
+BASELINES = ("val_rate", "mcp", "atc", "mcp_cal", "atc_cal", "meta")
 ERROR_MODEL = "hist_gradient_boosting"  # the key of models.MODELS of meta
 
 
@@ -64,6 +66,37 @@ def failure_rates(
     with np.errstate(invalid="ignore", divide="ignore"):
         rate = np.where(n_eval > 0, n_error / n_eval, np.nan)
     return n_eval, n_error.astype(np.int64), rate
+
+
+def val_rate(
+    region: np.ndarray,
+    error: np.ndarray,
+    regions: np.ndarray,
+    region_class: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the failure rate of every region on labelled rows (val).
+
+    A region no row reaches gets the rate of the rows of the regions of
+    its class; a class no row reaches, the rate of all rows.
+
+    Args:
+        region: The region of every row.
+        error: Whether the classifier got every row wrong.
+        regions: The regions to report, in output order.
+        region_class: The class of every region of regions.
+
+    Returns:
+        The rows of every region (int64) and its rate.
+    """
+    n_rows, n_error, rate = failure_rates(region, error, regions)
+    classes = np.unique(region_class)
+    rows_of = _by_region(n_rows.astype(np.float64), region_class, classes, np.sum)
+    errors_of = _by_region(n_error.astype(np.float64), region_class, classes, np.sum)
+    overall = float(np.mean(error)) if len(error) else np.nan
+    with np.errstate(invalid="ignore", divide="ignore"):
+        class_rate = np.where(rows_of > 0, errors_of / rows_of, overall)
+    fallback = class_rate[np.searchsorted(classes, region_class)]
+    return n_rows, np.where(n_rows > 0, rate, fallback)
 
 
 def mcp_rate(

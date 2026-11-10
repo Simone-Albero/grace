@@ -9,6 +9,7 @@ import pytest
 from conftest import MODEL, STAGE_ORDER, Workspace, make_workspace
 
 from main import main
+from src.baselines import BASELINES
 from src.complexity.measure import MEASURES
 from src.data import LABEL
 
@@ -26,7 +27,7 @@ def test_every_run_is_ok(done):
     runs = _rows(done, "SELECT stage, status, model FROM runs ORDER BY id")
     assert [r[0] for r in runs] == list(STAGE_ORDER)
     assert {r[1] for r in runs} == {"ok"}
-    assert [r[2] for r in runs] == [None] * 3 + [MODEL] * 3
+    assert [r[2] for r in runs] == [None] * 3 + [MODEL] * 4
 
 
 def test_split_drops_the_rare_class_and_the_constant_column_only(done):
@@ -105,12 +106,14 @@ def test_failures_count_every_test_row(done):
     assert failures["n_error"].sum() == (test["label"] != test["pred"]).sum()
     (n_used,) = _rows(done, "SELECT n_used FROM failure_stats")[0]
     assert n_used == failures["used"].sum() > 0
-    baselines = ("mcp", "atc", "mcp_cal", "atc_cal", "meta")
+    baselines = BASELINES
+    assert failures["n_val"].sum() == _read(done, f"pred_{MODEL}_val.parquet").height
     with_rows = failures.filter(pl.col("n_eval") > 0)
     for name in baselines:
         assert with_rows[name].is_between(0, 1).all()
-    (scored,) = zip(*_rows(done, "SELECT predictor FROM baseline_scores"))
+    scored = dict(_rows(done, "SELECT predictor, wmae FROM baseline_scores"))
     assert set(scored) == set(baselines)
+    assert all(0 <= value <= 1 for value in scored.values())
 
 
 def test_regress_estimates_every_used_region(done):
@@ -119,13 +122,35 @@ def test_regress_estimates_every_used_region(done):
     assert sorted(estimates["region"].to_list()) == sorted(failures["region"].to_list())
     contributions = _read(done, f"regress_{MODEL}_contributions.parquet")
     assert set(contributions["region"].to_list()) == set(estimates["region"].to_list())
+    signals = {d for d in contributions["descriptor"] if d.startswith("signal_")}
+    assert signals == {f"signal_{b}" for b in BASELINES}
     scores = dict(_rows(done, "SELECT predictor, spearman FROM regress_scores"))
-    baselines = {"mcp", "atc", "mcp_cal", "atc_cal", "meta"}
+    baselines = set(BASELINES)
     assert set(scores) == {"rf", *baselines, *(f"rf+{b}" for b in baselines)}
     assert scores["rf"] > 0
     np.testing.assert_allclose(
         estimates["rf+atc"], (estimates["predicted"] + estimates["atc"]) / 2
     )
+
+
+def test_ablation_fits_every_feature_set(done):
+    sets = {"geometry", "signals", "geometry+signals"}
+    sets |= {*BASELINES, *(f"geometry+{b}" for b in BASELINES)}
+    fits = set(_rows(done, "SELECT feature_set, cv FROM ablation_scores"))
+    grouped = {"geometry", "signals", "geometry+signals"}
+    assert fits == {(s, "strata") for s in sets} | {(s, "class") for s in grouped}
+    gains = _rows(
+        done, "SELECT signal, cv, d_mae_lo, d_mae, d_mae_hi FROM ablation_gains"
+    )
+    assert {(g[0], g[1]) for g in gains} == {
+        *((b, "strata") for b in (*BASELINES, "signals")),
+        ("signals", "class"),
+    }
+    assert all(lo <= hi for _, _, lo, _, hi in gains)
+    ((share,),) = _rows(done, "SELECT geometry_shap_share FROM ablation_stats")
+    assert 0 <= share <= 1
+    estimates = _read(done, f"ablation_{MODEL}_estimates.parquet")
+    assert estimates.width == 4 + len(fits)
 
 
 def test_regions_never_read_the_test_labels(copy_of_done):

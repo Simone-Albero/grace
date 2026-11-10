@@ -14,6 +14,7 @@ from src.baselines import (
     fit_bcts,
     mcp_rate,
     meta_rate,
+    val_rate,
 )
 from src.evaluation import classification_metrics, confusion, rate_scores
 from src.models import MODELS, build_pipeline, predict_proba
@@ -92,6 +93,9 @@ def test_rate_scores():
     assert scores["mse"] == pytest.approx(np.mean((observed / 2) ** 2))
     assert np.isnan(rate_scores(np.full(4, 0.3), observed)["spearman"])
     assert np.isnan(rate_scores(observed, np.full(4, 0.3))["r2"])
+    assert scores["wmae"] == pytest.approx(scores["mae"])
+    weighted = rate_scores(observed / 2, observed, np.array([0, 0, 0, 1]))
+    assert weighted["wmae"] == pytest.approx(0.4)
 
 
 def test_failure_rates():
@@ -103,6 +107,18 @@ def test_failure_rates():
     assert n_eval.tolist() == [2, 3, 0]
     assert n_error.tolist() == [1, 1, 0]
     np.testing.assert_allclose(rate, [0.5, 1 / 3, np.nan])
+
+
+def test_val_rate_falls_back_on_the_class_then_on_all_rows():
+    region = np.array([1, 1, 2, 3])
+    error = np.array([True, False, True, False])
+    regions = np.array([1, 2, 4, 5])
+    region_class = np.array([0, 0, 0, 1])
+    n_val, rate = val_rate(region, error, regions, region_class)
+    assert n_val.tolist() == [2, 1, 0, 0]
+    # Region 4: its class's rows (regions 1 and 2), 2 errors of 3; the
+    # class of region 5 has no row, so all four rows: 2 of 4.
+    np.testing.assert_allclose(rate, [0.5, 1.0, 2 / 3, 0.5])
 
 
 def test_mcp_and_atc_rates():

@@ -28,11 +28,12 @@ complexity:              # descriptors of every region and class (src.complexity
   silhouette_min_per_cluster: 50 # rows per population kept even past silhouette_max_samples
 
 regressor:               # Random Forest from descriptors to failure rate (src.regressor)
-  min_eval_support: 5    # regions with fewer test rows are scored by no predictor (RF, MCP, ATC)
+  min_eval_support: 5    # regions with fewer test rows are scored by no predictor (RF and the baselines)
   n_outer_splits: 5      # outer CV folds: each region's rate is predicted by a fit that never saw it
   n_inner_splits: 5      # inner CV folds of the hyper-parameter search
   n_iter: 40             # RandomizedSearchCV draws per fit; a smaller grid is searched whole
   params: {}             # fixed RandomForestRegressor parameters (random_state comes from the dataset seed)
+  signals: [val_rate, mcp, atc, mcp_cal, atc_cal, meta]  # baselines read as descriptors (signal_<name>); [] for the measures alone
   param_grid:
     n_estimators: [100, 200, 300, 500]
     max_depth: [null, 3, 5, 10, 20]
@@ -61,3 +62,6 @@ error_model:             # the meta baseline: a model of the classifier's errors
     max_iter: 200
     learning_rate: 0.1
   max_samples: 200000    # val rows it is fitted on: a uniform sample above this (the one-hot matrix is dense)
+
+ablation:                # does the geometry add to the classifier's signals? (stage ablation, src.ablation)
+  n_bootstrap: 1000      # draws of each paired bootstrap over the regions
