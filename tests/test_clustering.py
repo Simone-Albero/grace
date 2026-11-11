@@ -1,4 +1,4 @@
-"""src.clustering: weighted Ward tree, cut, vote, loss, choice and overlap zones."""
+"""src.clustering: weighted Ward tree, halves, separation, cut, sewing, regions, overlap zones."""
 
 import itertools
 
@@ -9,24 +9,23 @@ from sklearn.metrics import adjusted_rand_score
 
 import src.clustering as clustering
 from src.clustering import (
-    best_cut,
     centroids,
     cluster_class,
-    kdn,
     line_spread,
+    merge_pieces,
+    node_members,
+    node_separation,
     overlap_pairs,
     overlap_zones,
-    region_loss,
+    pair_separation,
+    region_stability,
+    regions_tree,
+    separated_cut,
     separation,
+    split_halves,
     vote,
     ward_tree,
 )
-from src.graph import sample_rows
-
-
-def test_kdn():
-    labels = np.array([[0, 1, 1], [0, 0, 0]])
-    np.testing.assert_allclose(kdn(labels, 0), [2 / 3, 0.0])
 
 
 def test_centroids_skip_noise():
@@ -102,81 +101,298 @@ def test_ward_tree_of_one_row_has_no_merge():
     assert tree.children.shape == (0, 2) and len(tree.heights) == 0
 
 
-# --- best_cut ---
+# --- vote ---
 
 
-def _cost(rows, hardness, weights):
-    """The cost of best_cut of one region, from its docstring."""
-    total = weights.sum()
-
-    def variance(index):
-        w, h = weights[index], hardness[index]
-        mean = np.average(h, weights=w)
-        return np.average((h - mean) ** 2, weights=w) * len(index) / (len(index) - 1)
-
-    rows = np.asarray(rows)
-    w, h = weights[rows], hardness[rows]
-    mean = np.average(h, weights=w)
-    var = variance(rows) if len(rows) > 1 else variance(np.arange(len(hardness)))
-    noise = max(mean * (1 - mean), 1e-3) / len(rows)
-    return w.sum() / total * (var + noise)
+def test_vote_takes_the_majority_then_the_nearest():
+    X = np.array([[0.0], [1.0], [1.1], [0.2]])
+    labels = np.array([0, 1, 1, -1])
+    assert vote(X, labels, 3).tolist() == [0, 1, 1, 1]
+    assert vote(X, labels, 2).tolist() == [0, 1, 1, 0]
+    assert vote(X, np.array([2, -1, -1, -1]), 5).tolist() == [2, 2, 2, 2]
 
 
-def _cuts(tree, n, floor):
-    """Every cut of the tree under the pruning rule: lists of regions."""
-    members = [[i] for i in range(n)]
-    for a, b in tree.children:
-        members.append(members[a] + members[b])
-
-    def splits(v):
-        if v < n:
-            return []
-        a, b = tree.children[v - n]
-        small = [len(members[c]) < floor for c in (a, b)]
-        if all(small):
-            return []
-        if small[0]:
-            return splits(b)
-        if small[1]:
-            return splits(a)
-        return [x + y for x, y in itertools.product(options(a), options(b))]
-
-    def options(v):
-        return [[members[v]], *splits(v)]
-
-    return options(2 * n - 2)
+# --- halves and members ---
 
 
-def _objective(labels, hardness, weights, penalty):
-    regions = [np.flatnonzero(labels == r) for r in np.unique(labels[labels >= 0])]
-    return sum(_cost(r, hardness, weights) + penalty for r in regions)
+def test_split_halves():
+    A, B = split_halves(101, 1000, 0)
+    assert (len(A), len(B)) == (51, 50)
+    assert sorted(np.r_[A, B].tolist()) == list(range(101))
+    assert A.tolist() == sorted(A.tolist()) and B.tolist() == sorted(B.tolist())
+    assert A.dtype == np.int64 and B.dtype == np.int64
+    again = split_halves(101, 1000, 0)
+    assert A.tolist() == again[0].tolist() and B.tolist() == again[1].tolist()
+    A, B = split_halves(10, 3, 1)
+    assert (len(A), len(B)) == (3, 3) and not set(A) & set(B)
+    A, B = split_halves(1, 5, 0)
+    assert A.tolist() == [0] and B.tolist() == []
 
 
-@pytest.mark.parametrize("floor", [1, 2, 3])
-@pytest.mark.parametrize("penalty", [0.0, 0.01])
-def test_best_cut_is_the_least_of_every_cut(floor, penalty):
-    rng = np.random.default_rng(3)
-    X = rng.normal(size=(9, 2))
-    weights = rng.integers(1, 4, size=9).astype(float)
-    hardness = rng.choice([0.0, 0.3, 1.0], size=9)
-    tree = ward_tree(X, weights)
-    labels, _ = best_cut(tree, weights, hardness, floor=floor, penalty=penalty)
-    best = min(
-        sum(_cost(r, hardness, weights) + penalty for r in cut)
-        for cut in _cuts(tree, 9, floor)
+def _below(tree, n: int, v: int) -> set[int]:
+    """The rows (leaves) below node v of a WardTree of n rows."""
+    if v < n:
+        return {v}
+    a, b = tree.children[v - n]
+    return _below(tree, n, a) | _below(tree, n, b)
+
+
+def test_node_members_attach_each_row_of_B_to_its_nearest_row_of_A():
+    rng = np.random.default_rng(0)
+    XA, XB = rng.normal(size=(30, 2)), rng.normal(size=(50, 2))
+    tree = ward_tree(XA, np.ones(30))
+    members = node_members(XA, XB, tree)
+    nearest = np.argmin(((XB[:, None, :] - XA[None, :, :]) ** 2).sum(2), axis=1)
+    assert members.assign.tolist() == nearest.tolist()
+    for v in range(2 * 30 - 1):
+        rows = set(members.order[members.start[v] : members.stop[v]].tolist())
+        below = _below(tree, 30, v)
+        assert rows == {b for b in range(50) if nearest[b] in below}
+
+
+# --- separation ---
+
+
+def test_pair_separation_by_hand():
+    # The line runs along x (from the centroids of A); y plays no part.
+    tree_a, tree_b = np.array([[0.0, 0.0], [0.0, 2.0]]), np.array([[1.0, 1.0]])
+    measure_a = np.array([[-1.0, 5.0], [1.0, -5.0]])  # mean 0, variance 1
+    measure_b = np.array([[3.0, 100.0], [5.0, -100.0]])  # mean 4, variance 1
+    S, low = pair_separation(tree_a, tree_b, measure_a, measure_b)
+    assert S == pytest.approx(4 / np.sqrt(2))
+    # Var(S) = (1/2 + 1/2) / 2 + 16 / (4 · 8) · 0 (fourth moment 1 = V²).
+    assert low == pytest.approx(4 / np.sqrt(2) - 2 * np.sqrt(0.5))
+
+
+def test_pair_separation_edge_cases():
+    a, b = np.array([[0.0]]), np.array([[1.0]])
+    spread = np.array([[-1.0], [1.0]])
+    assert pair_separation(a, a, spread, spread + 3) == (0.0, -np.inf)
+    assert pair_separation(
+        a, b, np.array([[0.0], [0.0]]), np.array([[2.0], [2.0]])
+    ) == (
+        np.inf,
+        np.inf,
     )
-    got = _objective(labels, hardness, weights, penalty)
-    assert got == pytest.approx(best)
+    S, low = pair_separation(a, b, spread + 3, spread)  # B lies the other way
+    assert S == 0.0 and low < 0.0
 
 
-def _blobs(seed: int = 0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Three far blobs of 100 rows; hardness 0, 1, then 0/1 in turn."""
+def test_pair_separation_standard_error_matches_repeated_draws():
+    rng = np.random.default_rng(1)
+    a, b = np.array([[0.0, 0.0]]), np.array([[1.0, 0.0]])
+    draws = [
+        pair_separation(
+            a, b, rng.normal(size=(200, 2)), rng.normal(size=(200, 2)) + [3.0, 0.0]
+        )
+        for _ in range(400)
+    ]
+    S = np.array([d[0] for d in draws])
+    se = (S - np.array([d[1] for d in draws])) / 2
+    assert S.mean() == pytest.approx(3 / np.sqrt(2), rel=0.05)
+    assert se.mean() == pytest.approx(S.std(), rel=0.15)
+
+
+def test_node_separation_judges_only_merges_with_floor_rows_of_B():
+    rng = np.random.default_rng(2)
+    X = np.vstack([rng.normal(size=(300, 2)), rng.normal(size=(300, 2)) + [8.0, 0.0]])
+    A, B = split_halves(len(X), 10_000, 0)
+    tree = ward_tree(X[A], np.ones(len(A)))
+    members = node_members(X[A], X[B], tree)
+    S, low = node_separation(X[A], X[B], tree, members, 20)
+    n = len(A)
+    count = members.stop - members.start
+    for j, (a, b) in enumerate(tree.children):
+        judged = count[a] >= 20 and count[b] >= 20
+        assert np.isnan(S[j]) != judged and np.isnan(low[j]) != judged
+    a, b = tree.children[-1]
+    rows = lambda v: members.order[members.start[v] : members.stop[v]]  # noqa: E731
+    expected = pair_separation(
+        X[A][sorted(_below(tree, n, a))],
+        X[A][sorted(_below(tree, n, b))],
+        X[B][rows(a)],
+        X[B][rows(b)],
+    )
+    assert (S[-1], low[-1]) == pytest.approx(expected)
+    assert low[-1] > 4.0  # the two blobs, 8 sd apart
+
+
+# --- cut and sewing ---
+
+
+def _line(
+    k: int, n: int, d: int, gap: float, seed: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """k blobs of n rows, sd 1 in d dimensions, gap apart along the first axis."""
     rng = np.random.default_rng(seed)
-    centers = np.array([[0.0, 0.0], [50.0, 0.0], [0.0, 50.0]])
-    X = np.vstack([rng.normal(c, 1.0, (100, 2)) for c in centers])
-    blob = np.repeat([0, 1, 2], 100)
-    hardness = np.concatenate([np.zeros(100), np.ones(100), np.tile([0.0, 1.0], 50)])
-    return X, blob, hardness
+    X = np.vstack(
+        [rng.normal(size=(n, d)) + np.r_[gap * i, np.zeros(d - 1)] for i in range(k)]
+    )
+    return X, np.repeat(np.arange(k), n)
+
+
+def _cut_of(X, floor=20, threshold=4.0, seed=0):
+    A, B = split_halves(len(X), 10_000, seed)
+    tree = ward_tree(X[A], np.ones(len(A)))
+    members = node_members(X[A], X[B], tree)
+    S, low = node_separation(X[A], X[B], tree, members, floor)
+    pieces = separated_cut(tree, members, floor, low, threshold)
+    return A, B, tree, members, low, pieces
+
+
+def test_separated_cut_goes_from_the_leaves_up():
+    # Three blobs in a line: the root splits one blob from the other two,
+    # whose spread along the line hides the gap; the split below does not.
+    X, blob = _line(3, 600, 5, 8.0, 3)
+    A, _, tree, _, low, pieces = _cut_of(X)
+    assert low[-1] < 4.0
+    kept = pieces >= 0
+    for p in np.unique(pieces[kept]):
+        # A row of a blob's tail may sit with the next blob.
+        assert np.bincount(blob[A][pieces == p]).max() / np.sum(pieces == p) > 0.99
+    assert set(blob[A][kept].tolist()) == {0, 1, 2}
+    assert pieces[kept].min() == 0 and len(np.unique(pieces[kept])) == pieces.max() + 1
+
+
+def test_separated_cut_prunes_a_small_far_branch_without_blocking_its_sibling():
+    rng = np.random.default_rng(4)
+    X = np.vstack(
+        [
+            rng.normal(size=(200, 2)),
+            rng.normal(size=(200, 2)) + [10, 0],
+            rng.normal(size=(6, 2)) * 0.1 + 500,
+        ]
+    )
+    A, _, _, _, _, pieces = _cut_of(X)
+    far = A >= 400
+    assert (pieces[far] == -1).all()
+    first, second = pieces[A < 200], pieces[(A >= 200) & (A < 400)]
+    assert len(np.unique(first)) == 1 and len(np.unique(second)) == 1
+    assert first[0] != second[0] and first[0] >= 0
+
+
+def test_merge_pieces_sews_a_shattered_blob():
+    # A satellite of 1% at 6 sd, which Ward joins deep inside the big
+    # blob: reaching it cuts the big blob in pieces that are sewn back.
+    rng = np.random.default_rng(1007)
+    X = np.vstack([rng.normal(size=(7920, 2)), rng.normal(size=(80, 2)) + [6.0, 0.0]])
+    A, B, _, members, _, pieces = _cut_of(X, threshold=3.0)
+    regions, used = merge_pieces(X[A], X[B], pieces, members.assign, 3.0, 50)
+    assert used == 3.0
+    kept = regions >= 0
+    assert regions[kept].max() == 1
+    satellite = regions[kept & (A >= 7920)]
+    big = regions[kept & (A < 7920)]
+    own, home = np.bincount(satellite).argmax(), np.bincount(big).argmax()
+    assert own != home
+    assert np.mean(satellite == own) > 0.9 and np.mean(big == home) > 0.99
+
+
+def test_merge_pieces_keeps_blobs_in_a_line_and_obeys_the_cap():
+    X, blob = _line(3, 600, 5, 8.0, 3)
+    A, B, _, members, _, pieces = _cut_of(X)
+    regions, used = merge_pieces(X[A], X[B], pieces, members.assign, 4.0, 50)
+    assert used == 4.0 and regions.max() == 2
+    assert adjusted_rand_score(blob[A][regions >= 0], regions[regions >= 0]) > 0.99
+    capped, used = merge_pieces(X[A], X[B], pieces, members.assign, 4.0, 2)
+    assert capped.max() == 1 and used > 4.0
+
+
+# --- cluster_class ---
+
+
+def _class(X, numeric=None, weights=None, **changes):
+    options = dict(
+        max_fit_samples=20_000,
+        min_cluster_floor=20,
+        max_clusters=50,
+        split_separation=4.0,
+        vote_k=10,
+        seed=0,
+    )
+    options.update(changes)
+    numeric = np.ones(X.shape[1], dtype=bool) if numeric is None else numeric
+    weights = np.ones(len(X)) if weights is None else weights
+    return cluster_class(X, numeric, weights, **options)
+
+
+def test_cluster_class_finds_the_blobs():
+    X, blob = _line(3, 600, 5, 8.0, 3)
+    result = _class(X)
+    assert result.labels.shape == (1800,) and result.labels.min() == 0
+    assert adjusted_rand_score(blob, result.labels) > 0.99
+    assert result.threshold == 4.0 and result.n_pieces >= 3
+    assert result.sample.tolist() == list(range(1800))  # every row in a half
+    thresholds, counts = result.curve
+    assert thresholds.tolist() == sorted(thresholds.tolist()) and 4.0 in thresholds
+    assert counts.tolist() == sorted(counts.tolist(), reverse=True)
+
+
+def test_cluster_class_one_gaussian_is_one_region():
+    X = np.random.default_rng(5).normal(size=(4000, 5))
+    assert _class(X).labels.max() == 0
+
+
+def test_cluster_class_does_not_judge_a_split_on_the_rows_it_was_made_on():
+    # 80 rows of one Gaussian in 60 dimensions: on the rows Ward built it
+    # on, the root split looks far apart; on the other half it does not.
+    X = np.random.default_rng(6).normal(size=(80, 60))
+    A, B = split_halves(80, 10_000, 0)
+    tree = ward_tree(X[A], np.ones(len(A)))
+    a, b = tree.children[-1]
+    left, right = sorted(_below(tree, len(A), a)), sorted(_below(tree, len(A), b))
+    in_sample, _ = pair_separation(X[A][left], X[A][right], X[A][left], X[A][right])
+    assert in_sample > 3.0
+    assert _class(X, min_cluster_floor=5, split_separation=3.0).labels.max() == 0
+
+
+def test_cluster_class_measures_the_numbers_only():
+    # Two groups apart only on a one-hot column: the same numbers.
+    rng = np.random.default_rng(7)
+    numbers = rng.normal(size=(2000, 3))
+    slots = np.zeros((2000, 2))
+    slots[:1000, 0] = slots[1000:, 1] = np.sqrt(2.0)
+    X = np.hstack([numbers, slots])
+    numeric = np.array([True, True, True, False, False])
+    assert _class(X, numeric).labels.max() == 0
+    assert _class(X).labels.max() == 1  # judged on the slots too, they split
+
+
+def test_cluster_class_copies_do_not_make_regions():
+    rng = np.random.default_rng(8)
+    X = rng.normal(size=(3000, 2))
+    weights = np.ones(3000)
+    weights[rng.choice(3000, 5, replace=False)] = 1000.0
+    assert _class(X, weights=weights).labels.max() == 0
+
+
+def test_cluster_class_labels_only_the_rows_asked_and_votes_the_rest():
+    X, _ = _line(2, 30_000, 2, 10.0, 9)  # 60000 rows: halves of 20000
+    result = _class(X)
+    assert len(result.sample) == 40_000
+    assert result.n_voted >= 20_000
+    only = result.sample[::7]
+    again = _class(X, seed=1, only=only)
+    assert again.labels.shape == only.shape
+
+
+def test_cluster_class_caps_the_regions():
+    X, _ = _line(3, 600, 5, 8.0, 3)
+    result = _class(X, max_clusters=2)
+    assert result.labels.max() == 1 and result.threshold > 4.0
+
+
+# --- regions of a class ---
+
+
+def test_region_stability_by_hand():
+    labels = np.array([0, 0, 0, 0, 1, 1])
+    np.testing.assert_allclose(region_stability(labels, labels), [1.0, 1.0])
+    other = np.array([0, 0, 1, 1, 2, 2])
+    np.testing.assert_allclose(region_stability(labels, other), [0.5, 1.0])
+    np.testing.assert_allclose(
+        region_stability(labels, np.zeros(6, int)), [4 / 6, 2 / 6]
+    )
 
 
 def _region_tree_is_valid(tree, labels):
@@ -188,171 +404,18 @@ def _region_tree_is_valid(tree, labels):
     assert set(children[~leaf].tolist()) <= {2}
     assert (tree.region[~leaf] == -1).all()
     assert tree.region[leaf].tolist() == list(range(leaf.sum()))
-    assert set(labels[labels >= 0].tolist()) == set(range(leaf.sum()))
+    assert set(labels.tolist()) == set(range(leaf.sum()))
 
 
-def test_best_cut_splits_blobs_of_different_hardness():
-    X, blob, hardness = _blobs()
-    weights = np.ones(len(X))
-    labels, tree = best_cut(ward_tree(X, weights), weights, hardness, floor=20)
-    _region_tree_is_valid(tree, labels)
-    kept = labels >= 0
-    for region in np.unique(labels[kept]):
-        assert len(np.unique(blob[kept][labels[kept] == region])) == 1
-    for b in (0, 1):
-        assert len(np.unique(labels[(blob == b) & kept])) == 1
-
-
-def test_best_cut_keeps_homogeneous_hardness_whole():
-    X, _, _ = _blobs()
-    weights = np.ones(len(X))
-    labels, tree = best_cut(
-        ward_tree(X, weights), weights, np.full(len(X), 0.2), floor=5
-    )
-    assert labels.tolist() == [0] * len(X)
-    assert tree.parent.tolist() == [-1] and tree.region.tolist() == [0]
-
-
-def test_a_far_small_branch_is_pruned_without_blocking_its_sibling():
-    rng = np.random.default_rng(4)
-    X = np.vstack(
-        [rng.normal(0, 0.3, (50, 2)), rng.normal([3, 0], 0.3, (50, 2)), [[500, 500]]]
-    )
-    hardness = np.concatenate([np.zeros(50), np.ones(50), [0.5]])
-    weights = np.ones(len(X))
-    labels, tree = best_cut(ward_tree(X, weights), weights, hardness, floor=5)
-    assert labels[-1] == -1
-    assert len(np.unique(labels[:50])) == 1 and len(np.unique(labels[50:100])) == 1
-    assert labels[0] != labels[50]
-    assert len(tree.parent) == 3
-
-
-def test_a_larger_penalty_never_gives_more_regions():
-    X = _cloud(150, 5)
-    rng = np.random.default_rng(5)
-    hardness = rng.random(len(X)) * (X[:, 0] > 2)
-    weights = rng.integers(1, 5, size=len(X)).astype(float)
-    tree = ward_tree(X, weights)
-    counts = []
-    for penalty in [0.0, 1e-4, 1e-3, 1e-2, 1e-1, 1.0]:
-        labels, region_tree = best_cut(
-            tree, weights, hardness, floor=3, penalty=penalty
-        )
-        _region_tree_is_valid(region_tree, labels)
-        counts.append(int((region_tree.region >= 0).sum()))
-    assert counts == sorted(counts, reverse=True)
-    assert counts[-1] == 1
-
-
-# --- vote and loss ---
-
-
-def test_vote_takes_the_majority_then_the_nearest():
-    X = np.array([[0.0], [1.0], [1.1], [0.2]])
-    labels = np.array([0, 1, 1, -1])
-    assert vote(X, labels, 3).tolist() == [0, 1, 1, 1]
-    assert vote(X, labels, 2).tolist() == [0, 1, 1, 0]
-    assert vote(X, np.array([2, -1, -1, -1]), 5).tolist() == [2, 2, 2, 2]
-
-
-def test_region_loss_by_hand():
-    labels = np.array([0, 0, 1])
-    hardness = np.array([0.0, 1.0, 0.5])
-    weights = np.array([1.0, 3.0, 2.0])
-    # Region 0: W 4/6, mean 0.75, variance 0.1875 · 2, noise 0.1875 / 2.
-    first = 4 / 6 * (0.375 + 0.09375)
-    # Region 1 has one row: the variance of all rows, 0.8333 / 6 · 3 / 2.
-    second = 2 / 6 * (5 / 6 / 6 * 1.5 + 0.25)
-    loss = region_loss(labels, hardness, weights)
-    assert loss == pytest.approx(first + second)
-
-
-# --- cluster_class ---
-
-
-def test_cluster_class_on_every_row():
-    X, blob, hardness = _blobs()
-    result = cluster_class(
-        X,
-        np.ones(len(X)),
-        np.arange(len(X)),
-        hardness,
-        min_cluster_floor=20,
-        max_clusters=10,
-        region_cost=0.0,
-        vote_k=5,
-    )
-    assert result.labels.shape == (300,) and result.labels.min() == 0
-    _region_tree_is_valid(result.tree, result.labels)
-    assert result.labels.max() + 1 <= 10
-    assert result.penalty == 0.0
-    for region in np.unique(result.labels):
-        assert len(np.unique(blob[result.labels == region])) == 1
-    penalties = [c.penalty for c in result.candidates]
-    assert penalties == sorted(penalties, reverse=True) and penalties[-1] == 0.0
-    assert result.candidates[0].n_clusters == 1
-
-
-def test_cluster_class_votes_the_rows_outside_the_sample():
-    X, _, hardness = _blobs()
-    scored = sample_rows(300, 100, 0)
-    result = cluster_class(
-        X,
-        np.ones(len(X)),
-        scored,
-        hardness[scored],
-        min_cluster_floor=20,
-        max_clusters=10,
-        region_cost=0.0,
-        vote_k=5,
-    )
-    assert result.labels.shape == (300,) and result.labels.min() == 0
-    assert result.n_voted >= 200
-    _region_tree_is_valid(result.tree, result.labels)
-    # The floor counts scored rows, so no region is left with a handful.
-    assert np.bincount(result.labels[scored]).min() >= 20
-
-
-def test_cluster_class_caps_the_regions_with_a_penalty():
-    X, _, hardness = _blobs()
-    result = cluster_class(
-        X,
-        np.ones(len(X)),
-        np.arange(len(X)),
-        hardness,
-        min_cluster_floor=20,
-        max_clusters=2,
-        region_cost=0.0,
-        vote_k=5,
-    )
-    assert result.labels.max() + 1 <= 2
-    assert result.penalty > 0.0
-
-
-def test_cluster_class_region_cost_keeps_only_the_splits_worth_it():
-    X, _, hardness = _blobs()
-
-    def run(region_cost):
-        return cluster_class(
-            X,
-            np.ones(len(X)),
-            np.arange(len(X)),
-            hardness,
-            min_cluster_floor=20,
-            max_clusters=50,
-            region_cost=region_cost,
-            vote_k=5,
-        )
-
-    costs = [0.0, 1e-3, 1e-2, 1e-1, 1.0]
-    results = [run(cost) for cost in costs]
-    counts = [int(r.labels.max()) + 1 for r in results]
-    assert counts == sorted(counts, reverse=True)
-    assert counts[-1] == 1
-    for cost, count, result in zip(costs, counts, results):
-        assert result.penalty == pytest.approx(cost * result.whole_loss)
-        # The chosen cut is on the curve.
-        assert count in [c.n_clusters for c in result.candidates]
+def test_regions_tree_leaves_are_the_regions_in_pre_order():
+    X, blob = _line(4, 50, 2, 10.0, 10)
+    labels = np.array([2, 0, 3, 1])[blob]
+    renamed, tree = regions_tree(X, np.ones(len(X)), labels)
+    _region_tree_is_valid(tree, renamed)
+    assert adjusted_rand_score(labels, renamed) == 1.0
+    one, single = regions_tree(X, np.ones(len(X)), np.zeros(len(X), int))
+    assert one.tolist() == [0] * len(X)
+    assert single.parent.tolist() == [-1] and single.region.tolist() == [0]
 
 
 # --- overlap zones ---

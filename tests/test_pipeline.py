@@ -156,23 +156,29 @@ def test_regions_count_the_rows_of_the_csv(done):
     for code, n_read in per_class.iter_rows():
         assert n_read == read[classes[code]]
     assert regions["n_read"].sum() == data[DUPLICATES].sum()
-    hardness = _rows(done, "SELECT hardness_mean, hardness_std FROM regions")
-    assert len(hardness) == regions.height
-    assert all(0 <= mean <= 1 and 0 <= std <= 0.5 for mean, std in hardness)
+    stability = [row[0] for row in _rows(done, "SELECT stability FROM regions")]
+    assert len(stability) == regions.height
+    assert all(0 <= value <= 1 for value in stability)
     logged = _rows(
         done,
-        "SELECT class, n_rows, n_read, n_regions, n_voted, penalty, loss, "
-        "relative_loss FROM class_clusterings",
+        "SELECT class, n_rows, n_read, n_regions, n_pieces, n_voted, "
+        "split_separation, stability FROM class_clusterings",
     )
+    method = load_config(str(done.dataset), method=str(done.method)).method
     assert {row[0] for row in logged} == set(classes)
     assert sum(row[3] for row in logged) == regions.height
-    assert all(row[4] >= 0 and row[5] > 0 and row[6] >= 0 for row in logged)
-    # A cut never loses more than the class as one region.
-    assert all(0 <= row[7] <= 1 + 1e-9 for row in logged)
-    candidates = _rows(
-        done, "SELECT class, penalty, n_clusters, loss FROM granularity_candidates"
+    assert all(row[4] >= row[3] and row[5] >= 0 for row in logged)
+    assert all(row[6] >= method.clustering.split_separation for row in logged)
+    assert all(0 <= row[7] <= 1 for row in logged)
+    curve = _rows(
+        done,
+        "SELECT class, threshold, n_regions FROM granularity_candidates "
+        "ORDER BY class, threshold",
     )
-    assert {row[0] for row in candidates} == set(classes)
+    assert {row[0] for row in curve} == set(classes)
+    for name in classes:
+        counts = [row[2] for row in curve if row[0] == name]
+        assert counts == sorted(counts, reverse=True)
 
 
 def test_region_tree_counts_the_rows_below_each_node(done):

@@ -228,17 +228,36 @@ function renderPrepare(data) {
   ], data.columns.filter((c) => c.kind === "cat"));
 }
 
+// a region found again on other halves at Jaccard >= STABLE is stable, under DOUBTFUL not to be trusted (Hennig 2007)
+const STABLE = 0.75;
+const DOUBTFUL = 0.6;
+
+/** The stability of a region, marked when doubtful or unreliable. @param {number|null} v */
+function stability(v) {
+  if (v == null) return "–";
+  const text = dec(v, 2);
+  if (v >= STABLE) return text;
+  const word = v >= DOUBTFUL ? "doubtful" : "unreliable";
+  return h("span", { class: "flag", title: `${word}: found again on other halves at Jaccard ${text}` },
+    h("b", { class: "sign", "aria-label": word }, "▲"), `${text} ${word}`);
+}
+
 /** Tiles, class tree and map, granularity per class, regions. @param {object} data response of /regions */
 function renderRegions(data) {
   last.regions = data;
   const s = data.stats;
   const voted = data.classes.reduce((a, c) => a + c.n_voted, 0);
   const rows = data.classes.reduce((a, c) => a + c.n_rows, 0);
+  const measured = data.regions.filter((r) => r.stability != null);
+  const shaky = measured.filter((r) => r.stability < STABLE);
+  const lost = shaky.filter((r) => r.stability < DOUBTFUL);
   fill("rg-tiles",
     tile("regions", num(s.n_regions)),
     tile("rows voted", num(voted), `${pct(voted / rows)} of ${num(rows)}`),
+    tile("split separation", short(s.split_separation), "sd along the line, less 2 standard errors"),
+    ...(measured.length ? [tile("regions not stable", num(shaky.length),
+      `${num(lost.length)} unreliable (Jaccard < ${DOUBTFUL}), ${num(shaky.length - lost.length)} doubtful`)] : []),
     tile("distance", s.distance),
-    tile("kDN reference rows", num(s.n_graph_nodes)),
     ...(s.n_zones == null ? [] : [tile("overlap zones", num(s.n_zones),
       `${num(data.overlaps.length)} ${data.overlaps.length === 1 ? "pair" : "pairs"} of regions under ${s.overlap_separation} sd`)]));
   sortable($("rg-classes"), [
@@ -246,10 +265,11 @@ function renderRegions(data) {
     { key: "n_rows", label: "rows", format: num },
     { key: "n_read", label: "CSV rows", format: num },
     { key: "n_regions", label: "regions", format: num },
+    { key: "n_pieces", label: "pieces cut", format: num },
     { key: "n_voted", label: "voted", format: num },
-    { key: "penalty", label: "penalty", format: short },
-    { key: "loss", label: "loss", format: (v) => dec(v, 4) },
-    { key: "relative_loss", label: "loss / one region", format: (v) => dec(v, 3) },
+    { key: "split_separation", label: "sewn at",
+      format: (v) => flagged(short(v), v > s.split_separation) },
+    { key: "stability", label: "stability", format: stability },
   ], data.classes, { onClick: (r) => selectClass(r.class), selected: (r) => r.class === state.cls });
   const classes = data.classes.map((c) => c.class);
   if (!classes.includes(state.cls)) { state.cls = classes[0]; state.node = null; }
@@ -267,8 +287,7 @@ function renderRegions(data) {
     { key: "class", label: "class" },
     { key: "n_rows", label: "rows", format: num },
     { key: "n_read", label: "CSV rows", format: num },
-    { key: "hardness_mean", label: "hardness mean", format: (v) => dec(v, 3) },
-    { key: "hardness_std", label: "hardness sd", format: (v) => dec(v, 3) },
+    { key: "stability", label: "stability", format: stability },
   ], data.regions, {
     onClick: (r) => { selectNode(leafOf.get(r.region)); $("rg-map-title").scrollIntoView({ behavior: "smooth", block: "start" }); },
   });
@@ -298,19 +317,18 @@ function drawClass() {
   saveHash();
   const colors = leafColor(nodes, state.node);
   treeDiagram($("rg-tree"), nodes, colors);
-  drawCandidates(last.regions);
+  drawCurve(last.regions);
   drawMap(nodes, colors);
 }
 
-/** Loss of the cut of state.cls at every penalty against its regions, the chosen cut marked. @param {object} data response of /regions */
-function drawCandidates(data) {
+/** The regions of state.cls at every threshold of its curve, the one used marked. @param {object} data response of /regions */
+function drawCurve(data) {
   const rows = data.candidates.filter((c) => c.class === state.cls);
-  const chosen = data.classes.find((c) => c.class === state.cls);
-  const isChosen = (c) => c.n_clusters === chosen?.n_regions;
-  scatter($("rg-loss"), rows.map((c) => ({
-    x: c.n_clusters, y: c.loss, selected: isChosen(c),
-    tip: `penalty ${short(c.penalty)} → ${num(c.n_clusters)} regions, loss ${dec(c.loss, 5)}${isChosen(c) ? " (chosen)" : ""}`,
-  })), { xLabel: `regions of ${state.cls}`, yLabel: "granularity loss", line: true });
+  const used = data.stats.split_separation;
+  scatter($("rg-curve"), rows.map((c) => ({
+    x: c.threshold, y: c.n_regions, selected: c.threshold === used,
+    tip: `separation ${short(c.threshold)} → ${num(c.n_regions)} ${c.n_regions === 1 ? "region" : "regions"}${c.threshold === used ? " (used)" : ""}`,
+  })), { xLabel: `split separation (${state.cls})`, yLabel: "regions", line: true });
 }
 
 // categorical slots, in fixed order; validated on the dark surface: every adjacent pair passes (worst CVD ΔE 8.4),

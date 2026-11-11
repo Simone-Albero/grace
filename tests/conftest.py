@@ -72,7 +72,6 @@ def write_dataset_yaml(folder: Path, csv: Path, name: str = "toy") -> Path:
 def write_method_yaml(folder: Path) -> Path:
     """Write a method yaml of the defaults, scaled down for speed."""
     method = yaml.safe_load((ROOT / "configs/method/default.yaml").read_text())
-    method["graph"]["max_samples"] = 1500
     method["clustering"]["max_regions"] = 120
     # The closest synthetic regions of different classes lie about 1.2 sd
     # apart: under 2 a few zones form.

@@ -11,20 +11,22 @@ import polars as pl
 
 from src import db
 from src.clustering import (
+    ClassClustering,
     OverlapZones,
     RegionTree,
     centroids,
     cluster_class,
-    kdn,
     line_spread,
     overlap_pairs,
     overlap_zones,
+    region_stability,
+    regions_tree,
     separation,
 )
 from src.config import DatasetConfig
-from src.graph import nearest_neighbors, sample_rows
 from stages.paths import (
     assignments_file,
+    prepared_columns,
     read_classes,
     read_points,
     read_weights,
@@ -37,89 +39,93 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
 
     Reads the points of the prepared file (paths.read_points: the
     numbers scaled for distance, the categorical slots, not MISSING;
-    every distance from here on is euclidean on them) and the weight of
-    every row (paths.read_weights: its copies in the CSV). Order: the
-    reference rows, graph.sample_rows(n_rows, graph.max_samples, seed)
-    -> per class, ascending: its kDN on its
-    graph.sample_rows(n_class, max_fit_samples, seed) rows (hardness_k
-    nearest reference rows, never itself) -> clustering.cluster_class with
-    max_clusters = max(1, max_regions // n_classes) and region_cost ->
-    region id = label + offset, offset += the class's regions; tree
-    node id = node + node offset -> weighted centroids of the regions ->
-    clustering.line_spread of every region (weighted by its CSV rows)
-    -> clustering.separation of every pair -> clustering.overlap_zones
-    and clustering.overlap_pairs under overlap_separation.
+    every distance from here on is euclidean on them), which of their
+    columns are numeric (paths.prepared_columns against num_cols) and
+    the weight of every row (paths.read_weights: its copies in the CSV).
+    Per class, ascending: clustering.cluster_class with seed, max_clusters
+    = max(1, max_regions // n_classes) and split_separation ->
+    clustering.regions_tree (the regions renumbered in its pre-order) ->
+    stability_repeats times cluster_class again with seed + i on the
+    rows of the first halves (sample), clustering.region_stability of
+    each region against each repeat, averaged (1 when there is no
+    repeat) -> region id = label + offset, offset += the class's
+    regions; tree node id = node + node offset. Then, over every
+    region: weighted centroids -> clustering.line_spread (weighted by
+    its CSV rows) -> clustering.separation of every pair ->
+    clustering.overlap_zones and clustering.overlap_pairs under
+    overlap_separation.
 
     Writes to output_dir: regions.parquet (region, class, n_rows,
     n_read, centroid as a list of floats), assignments.parquet (row,
     region for every row).
-    Logs: regions (region, class name, n_rows, n_read, hardness_mean and
-    hardness_std: the mean and standard deviation of the kDN of its
-    scored rows, weighted by their copies), region_tree
-    (node, class, parent (-1 at a root), depth (0 at a root), region
-    (null at an internal node), n_rows and n_read of the regions below;
-    nodes in pre-order), class_clusterings (class, n_rows, n_read,
-    n_regions, n_voted, penalty, loss, relative_loss: loss over the loss
-    of the class as one region), granularity_candidates (class,
-    penalty, n_clusters, loss), overlap_zones (node, zone, parent (-1
-    at the root of a zone), depth, separation and region_a, region_b of
-    the pair that made an internal node (null at a leaf), region (null
-    at an internal node), class (null at an internal node), n_classes,
-    n_regions, n_rows, n_read of the regions below; zone by zone, nodes
-    in pre-order; no row without an overlap), region_overlaps (zone,
-    region_a, class_a, region_b, class_b, distance between the
-    centroids, spread_a and spread_b along the line between them,
-    separation; one row per clustering.overlap_pairs), region_stats (one
-    row: n_regions, distance, n_graph_nodes, overlap_separation,
-    n_zones). n_rows counts distinct rows, n_read rows of the CSV (the
-    summed weights).
+    Logs: regions (region, class name, n_rows, n_read, stability; null
+    when stability_repeats is 0), region_tree (node, class, parent (-1
+    at a root), depth (0 at a root), region (null at an internal node),
+    n_rows and n_read of the regions below; nodes in pre-order),
+    class_clusterings (class, n_rows, n_read, n_regions, n_pieces,
+    n_voted, split_separation: the threshold the regions were sewn at,
+    stability: the mean of its regions' weighted by their rows),
+    granularity_candidates (class, threshold, n_regions: the curve),
+    overlap_zones (node, zone, parent (-1 at the root of a zone),
+    depth, separation and region_a, region_b of the pair that made an
+    internal node (null at a leaf), region (null at an internal node),
+    class (null at an internal node), n_classes, n_regions, n_rows,
+    n_read of the regions below; zone by zone, nodes in pre-order; no
+    row without an overlap), region_overlaps (zone, region_a, class_a,
+    region_b, class_b, distance between the centroids, spread_a and
+    spread_b along the line between them, separation; one row per
+    clustering.overlap_pairs), region_stats (one row: n_regions,
+    distance, split_separation, overlap_separation, n_zones). n_rows
+    counts distinct rows, n_read rows of the CSV (the summed weights).
     """
     method, clustering = cfg.method, cfg.method.clustering
     points, labels = read_points(cfg)
+    numeric = np.isin(prepared_columns(cfg), cfg.num_cols)
     weights = read_weights(cfg)
     n_rows = len(labels)
-    graph_rows = sample_rows(n_rows, method.graph.max_samples, cfg.seed)
-    print(f"[regions] {len(graph_rows)} reference rows", flush=True)
-    graph_points = points[graph_rows]
-    graph_labels = labels[graph_rows]
 
     classes = read_classes(cfg)
     max_clusters = max(1, clustering.max_regions // len(classes))
     region = np.empty(n_rows, dtype=np.int64)
-    class_rows, candidate_rows, tree_rows = [], [], []
-    hardness_mean, hardness_std = [], []
+    class_rows, candidate_rows, tree_rows, stability = [], [], [], []
     offset = node_offset = 0
     for code, name in enumerate(classes):
         rows = np.flatnonzero(labels == code)
         X, w = points[rows], weights[rows]
-        scored = sample_rows(len(rows), clustering.max_fit_samples, cfg.seed)
-        neighbors, _ = nearest_neighbors(
-            graph_points, graph_rows, X[scored], rows[scored], clustering.hardness_k
-        )
-        hardness = kdn(graph_labels[neighbors], code)
-        chosen = cluster_class(
-            X,
-            w,
-            scored,
-            hardness,
-            min_cluster_floor=clustering.min_cluster_floor,
-            max_clusters=max_clusters,
-            region_cost=clustering.region_cost,
-            vote_k=clustering.vote_k,
-        )
-        n_regions = int(chosen.labels.max()) + 1
-        region[rows] = chosen.labels + offset
-        mean, std = _hardness_stats(chosen.labels[scored], hardness, w[scored])
-        hardness_mean += mean.tolist()
-        hardness_std += std.tolist()
-        tree_rows += _tree_rows(
-            chosen.tree, chosen.labels, w, name, offset, node_offset
-        )
+
+        def regions_of(seed: int, only: np.ndarray | None = None) -> ClassClustering:
+            return cluster_class(
+                X,
+                numeric,
+                w,
+                max_fit_samples=clustering.max_fit_samples,
+                min_cluster_floor=clustering.min_cluster_floor,
+                max_clusters=max_clusters,
+                split_separation=clustering.split_separation,
+                vote_k=clustering.vote_k,
+                seed=seed,
+                only=only,
+            )
+
+        chosen = regions_of(cfg.seed)
+        class_labels, tree = regions_tree(X, w, chosen.labels)
+        n_regions = int(class_labels.max()) + 1
+        own = class_labels[chosen.sample]
+        repeats = [
+            region_stability(own, regions_of(cfg.seed + i, chosen.sample).labels)
+            for i in range(1, clustering.stability_repeats + 1)
+        ]
+        held = np.mean(repeats, axis=0) if repeats else np.full(n_regions, np.nan)
+        stability += held.tolist()
+        region[rows] = class_labels + offset
+        tree_rows += _tree_rows(tree, class_labels, w, name, offset, node_offset)
         offset += n_regions
-        node_offset += len(chosen.tree.parent)
+        node_offset += len(tree.parent)
+        sizes = np.bincount(class_labels, minlength=n_regions)
+        mean_stability = float(np.average(held, weights=sizes)) if repeats else None
         print(
-            f"[regions] {name}: {n_regions} regions, {chosen.n_voted} rows voted, "
-            f"loss {chosen.loss:.4g}",
+            f"[regions] {name}: {n_regions} regions from {chosen.n_pieces} pieces, "
+            f"{chosen.n_voted} rows voted, stability {mean_stability}",
             flush=True,
         )
         class_rows.append(
@@ -128,20 +134,15 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
                 "n_rows": len(rows),
                 "n_read": float(w.sum()),
                 "n_regions": n_regions,
+                "n_pieces": chosen.n_pieces,
                 "n_voted": chosen.n_voted,
-                "penalty": chosen.penalty,
-                "loss": chosen.loss,
-                "relative_loss": chosen.loss / chosen.whole_loss,
+                "split_separation": chosen.threshold,
+                "stability": mean_stability,
             }
         )
         candidate_rows += [
-            {
-                "class": name,
-                "penalty": candidate.penalty,
-                "n_clusters": candidate.n_clusters,
-                "loss": candidate.loss,
-            }
-            for candidate in chosen.candidates
+            {"class": name, "threshold": float(t), "n_regions": int(k)}
+            for t, k in zip(*chosen.curve)
         ]
 
     ids, centers = centroids(points, region, weights)
@@ -182,11 +183,10 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
                 "class": classes[code],
                 "n_rows": int(size),
                 "n_read": float(read),
-                "hardness_mean": mean,
-                "hardness_std": std,
+                "stability": None if np.isnan(held) else float(held),
             }
-            for region_id, code, size, read, mean, std in zip(
-                ids, region_class, sizes, reads, hardness_mean, hardness_std
+            for region_id, code, size, read, held in zip(
+                ids, region_class, sizes, reads, stability
             )
         ],
     )
@@ -213,26 +213,12 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
             {
                 "n_regions": len(ids),
                 "distance": method.distance,
-                "n_graph_nodes": len(graph_rows),
+                "split_separation": clustering.split_separation,
                 "overlap_separation": threshold,
                 "n_zones": n_zones,
             }
         ],
     )
-
-
-def _hardness_stats(
-    labels: np.ndarray, hardness: np.ndarray, weights: np.ndarray
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return the weighted mean and standard deviation of the hardness per label.
-
-    Every label 0..max holds a row: the regions are leaves of the tree
-    of these rows.
-    """
-    mass = np.bincount(labels, weights=weights)
-    mean = np.bincount(labels, weights=weights * hardness) / mass
-    second = np.bincount(labels, weights=weights * hardness**2) / mass
-    return mean, np.sqrt(np.maximum(second - mean**2, 0.0))
 
 
 def _tree_rows(

@@ -37,19 +37,35 @@ Stages (each writes its files into the dataset's `output_dir` and its rows into 
   class code; same rows as `data.parquet`).
 - `regions`: builds the points of the space (`graph.space_points`): the prepared numbers, at unit length under
   `cosine`, then the categorical slots unchanged, `n_missing` left out. Every distance from there on, here and in
-  `quality_report`, is euclidean on them. Draws a sample of them as the reference rows of the kDN hardness
-  (`graph.max_samples`), then splits each class on its own
-  (`src/clustering.py`): a Ward tree of its distinct rows (at most `clustering.max_fit_samples`), each weighted by
-  `n_duplicates`, so it is the Ward tree of the rows as read; then the cut of least loss, branch by branch, the loss
-  being the kDN hardness spread a region hides plus the sampling noise of its mean hardness, measured on the sample.
-  Each region costs `region_cost` times the loss of its class as one region, so a split is kept only when it lowers
-  the loss by at least that share. A branch under `min_cluster_floor` distinct rows of the sample is pruned. Its rows,
-  and the rows outside the sample of the tree, take the majority region of their `vote_k` nearest labelled rows. Past
-  `max_regions` the cost of a region rises until the class fits. Last, where the classes overlap, judged on the
-  regions alone: the separation of two regions is the distance between their centroids in standard deviations of
-  their rows (weighted) along the line between them. Two regions of different classes overlap under
-  `overlap_separation`; single linkage on these pairs groups the regions into overlap zones, and a region close to no
-  other class is in none.
+  `quality_report`, is euclidean on them. Then splits each class on its own, by geometry alone (`src/clustering.py`):
+  - two disjoint halves of its distinct rows (at most `clustering.max_fit_samples` each): a Ward tree of half A, each
+    row weighted by `n_duplicates` (so it is the Ward tree of the rows as read), proposes the splits; half B, each row
+    attached to the node of its nearest row of A, judges them. Ward always splits where a split looks best on the rows
+    it was built on, so a split is never judged on them;
+  - the separation of the two sides of a split is the distance between their centroids (on A) in standard deviations
+    of B's rows along the line between them, Ashman's D over √2, on the numeric columns only (a categorical value is a
+    constant block of slots: two values always look far apart) and each distinct row counted once (a row of many
+    copies is not a tight group), less two standard errors (delta method). It measures how far apart two groups are;
+    it is not a test, since B's rows are themselves sorted by the split (Gao, Bien & Witten, JASA 2024): a split of
+    one group already gives about 1.5–2.5, hence `split_separation` well above it;
+  - the tree is cut from the leaves up wherever a split reaches `split_separation` (so a gap hidden inside a larger
+    branch is still found), then the pieces are sewn back, the least separated pair of neighbouring pieces first
+    (each against its 10 nearest), while they are under `split_separation` on the whole pieces (Hennig 2010): what is
+    left are the regions. A branch under `min_cluster_floor` rows of B is pruned. Its rows, and the rows outside the
+    halves, take the majority region of their `vote_k` nearest labelled rows. Past `max_regions` the pieces keep
+    being sewn until the class fits;
+  - the regions are made again `stability_repeats` times on other halves, and each region gets its stability: the
+    Jaccard of its rows with its most similar new region (Hennig 2007), stable from 0.75, doubtful from 0.6,
+    unreliable under it. A stable region is not proven, an unstable one is suspect;
+  - the regions are numbered by a Ward tree of their centroids, which the dashboard draws.
+
+  Limits: the standard error takes the rows as independent (flows of one session are not); Ward in many dimensions
+  misses groups only a few sd apart; a single row of many copies is never a region of its own (the quality report
+  counts the copies); the categorical columns weigh in every distance but not in the separation.
+  Last, where the classes overlap, judged on the regions alone: the separation of two regions is the distance between
+  their centroids in standard deviations of their rows (weighted) along the line between them. Two regions of
+  different classes overlap under `overlap_separation`; single linkage on these pairs groups the regions into overlap
+  zones, and a region close to no other class is in none.
   Writes `regions.parquet` (with `n_read`, the rows of the CSV) and `assignments.parquet`.
 - `quality_report`: the quality of the regions and of the pairs of regions of different classes (`src/quality.py`),
   after the smells of Flood et al. but per region rather than per class. The pairs measured are those whose
@@ -72,7 +88,7 @@ Configs:
   `letter_recognition`, `statlog_landsat_satellite`, `thyroid_disease`) and `synthetic_test`; their CSVs are not in
   the repo.
 - `configs/method/default.yaml`: the method, shared by every dataset: `distance` (`euclidean` or `cosine`), `prepare`,
-  `graph`, `clustering` (the weighted Ward regions) and `quality` (the report), each key commented.
+  `clustering` (the regions) and `quality` (the report), each key commented.
   Another method is a copy of it passed as `--method <path>`.
 
 `src/config.py` loads both into frozen dataclasses and validates them before any stage reads data.
@@ -81,10 +97,10 @@ Outputs: the files of a dataset in its `output_dir` (`resources/processed/<datas
 SQLite file, `db_path` (`resources/processed/grace.db`). Table `runs` holds one row per stage run (stage, dataset, the
 whole config as JSON, status `running`, `ok` or `failed`, start and end); every other table carries the `run_id` of the
 run that wrote it and is created by its first insert: `clean_summary`, `dropped_classes`, `dropped_columns`,
-`class_counts`, `features` (clean); `prepare_summary`, `prepared_columns` (prepare); `regions` (with the mean and
-standard deviation of the kDN hardness of each region), `region_tree` (the tree each class's cut keeps, each node with
-the distinct and CSV rows below it), `class_clusterings` (with the loss over that of the class as one region),
-`granularity_candidates`, `overlap_zones` (the tree of each
+`class_counts`, `features` (clean); `prepare_summary`, `prepared_columns` (prepare); `regions` (with the stability of
+each region), `region_tree` (the Ward tree of each class's regions, each node with the distinct and CSV rows below it),
+`class_clusterings` (with the pieces cut before sewing, the separation the regions keep and the mean stability),
+`granularity_candidates` (the regions of each class at other thresholds), `overlap_zones` (the tree of each
 overlap zone, each merge at the separation of the pair that made it), `region_overlaps` (every pair of regions of
 different classes under `overlap_separation`), `region_stats` (regions); `quality_pairs`, `quality_regions`,
 `quality_classes`, `label_conflict_groups` (every row in a label conflict, with its group), `quality_stats`

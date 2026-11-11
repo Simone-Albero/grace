@@ -71,7 +71,8 @@ def test_regions(client):
     assert all("params" not in c for c in data["classes"] + data["candidates"])
     leaves = [n for n in data["tree"] if n["region"] is not None]
     assert len(leaves) == len(data["regions"])
-    assert all({"hardness_mean", "hardness_std"} <= set(r) for r in data["regions"])
+    assert all("stability" in r for r in data["regions"])
+    assert all({"threshold", "n_regions"} <= set(c) for c in data["candidates"])
 
 
 def _below(tree: list[dict], node: int) -> set[int]:

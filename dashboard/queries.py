@@ -111,14 +111,12 @@ def regions(cfg: DatasetConfig) -> dict[str, Any]:
         cfg: The dataset.
 
     Returns:
-        run; stats {n_regions, distance, n_graph_nodes,
-        overlap_separation, n_zones} (the last two null for a run older
-        than the overlap zones); classes
-        [{class, n_rows, n_read, n_regions, n_voted, penalty, loss,
-        relative_loss}];
-        candidates [{class, penalty, n_clusters, loss}]; regions
-        [{region, class, n_rows, n_read, hardness_mean, hardness_std}];
-        tree [{node, class, parent,
+        run; stats {n_regions, distance, split_separation,
+        overlap_separation, n_zones}; classes [{class, n_rows, n_read,
+        n_regions, n_pieces, n_voted, split_separation, stability}];
+        candidates [{class, threshold, n_regions}] (the curve); regions
+        [{region, class, n_rows, n_read, stability}] (stability null
+        when it was not measured); tree [{node, class, parent,
         depth, region, n_rows, n_read}] in pre-order per class; zones
         [{node, zone, parent, depth, separation, region_a, region_b,
         region, class, n_classes, n_regions, n_rows, n_read}] zone by

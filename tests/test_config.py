@@ -32,19 +32,35 @@ def test_the_dropped_clustering_keys_are_unknown(tmp_path, key):
         )
 
 
+def test_the_kdn_reference_is_gone(tmp_path):
+    method = yaml.safe_load((ROOT / "configs/method/default.yaml").read_text())
+    method["graph"] = {"max_samples": 1000}
+    path = tmp_path / "method.yaml"
+    path.write_text(yaml.safe_dump(method))
+    with pytest.raises(ValueError, match="unknown keys"):
+        load_config("synthetic_test", method=str(path))
+
+
 def test_degenerate_counts_fail(tmp_path):
     with pytest.raises(ValueError, match="min_cluster_floor"):
         load_config(
             "synthetic_test",
             method=_method(tmp_path, clustering__min_cluster_floor=0),
         )
-    with pytest.raises(ValueError, match="graph.max_samples"):
-        load_config("synthetic_test", method=_method(tmp_path, graph__max_samples=0))
     with pytest.raises(ValueError, match="vote_k"):
         load_config("synthetic_test", method=_method(tmp_path, clustering__vote_k=0))
-    with pytest.raises(ValueError, match="region_cost"):
+    with pytest.raises(ValueError, match="min_cluster_floor"):
         load_config(
-            "synthetic_test", method=_method(tmp_path, clustering__region_cost=-0.1)
+            "synthetic_test",
+            method=_method(tmp_path, clustering__min_cluster_floor=1),
+        )
+    with pytest.raises(ValueError, match="split_separation"):
+        load_config(
+            "synthetic_test", method=_method(tmp_path, clustering__split_separation=0)
+        )
+    with pytest.raises(ValueError, match="stability_repeats"):
+        load_config(
+            "synthetic_test", method=_method(tmp_path, clustering__stability_repeats=-1)
         )
     with pytest.raises(ValueError, match="overlap_separation"):
         load_config(

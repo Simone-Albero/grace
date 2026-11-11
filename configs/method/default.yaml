@@ -6,17 +6,15 @@ prepare:                 # the features every distance is measured on (src.prepa
   cat_cost: 1.0          # weight of each categorical column against a numeric one, on average over pairs of rows;
                          #   the mismatch cost of a column grows as its values concentrate (2 · cat_cost / (1 - Σ p²))
 
-graph:                   # reference rows of the kDN hardness (src.graph)
-  max_samples: 50000     # reference rows: a uniform sample above this
-
-clustering:              # regions: a weighted Ward tree per class (weight: n_duplicates), cut where the loss is least
-  max_fit_samples: 20000 # distinct rows of a class the tree is built on (quadratic time); the others are voted
-  max_regions: 2500      # regions over all classes, shared equally between them; past it the cost of a region rises
-  region_cost: 0.003     # cost of a region, as a share of the loss of its class as one region: a split must lower the
-                         #   loss by at least that much (0: every split that lowers it)
-  min_cluster_floor: 20  # fewest rows of a region in the tree's sample: a smaller branch is pruned, its rows voted
-  hardness_k: 30         # neighbours behind the kDN hardness the granularity loss is judged on
+clustering:              # regions: a weighted Ward tree per class (weight: n_duplicates) on half A of its rows, its
+                         #   splits judged on half B, cut where the two sides are separated, then the pieces sewn back
+  max_fit_samples: 20000 # most distinct rows of each half (the tree takes quadratic time); the other rows are voted
+  max_regions: 2500      # regions over all classes, shared equally between them; past it the pieces keep being sewn
+  split_separation: 4.0  # separation two regions of a class must keep: centroids apart by this many sd of half B's
+                         #   rows along the line between them, on the numbers only, less 2 standard errors
+  min_cluster_floor: 20  # fewest rows of half B on each side of a split judged: a smaller branch is pruned, its rows voted
   vote_k: 10             # labelled neighbours whose majority gives a region to a pruned or unsampled row
+  stability_repeats: 1   # times the regions are made again on other halves to measure each region's stability (0: none)
   overlap_separation: 1.0  # two regions of different classes overlap when their centroids lie closer than this many
                            #   standard deviations of their rows along the line between them
 

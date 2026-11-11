@@ -64,12 +64,17 @@
       <p class="empty">Select a dataset.</p>
       <div id="rg-tiles" class="tiles"></div>
       <div class="card"><h2>Tree of a class</h2>
-        <p class="note">Each class is split on its own by a Ward tree of its distinct rows, each weighted by its
-          copies in the CSV. Every branch is cut where the loss is least: the hardness spread a region hides (kDN
-          variance) plus the sampling noise of its mean hardness. A branch under min_cluster_floor rows of the sample is pruned; its
-          rows, and the rows outside the sample of the tree, take the region of their nearest labelled rows by vote.
-          The tree shows the splits the cut keeps; each node counts the distinct rows of its regions (hover for the
-          rows of the CSV). Click a node to map its rows.</p>
+        <p class="note">Each class is split on its own, by geometry alone. A Ward tree of half of its distinct rows
+          (each weighted by its copies in the CSV) proposes the splits; the other half judges them, so a split is never
+          judged on the rows that made it. The separation of the two sides of a split is the distance between their
+          centroids in standard deviations of the other half's rows along the line between them, on the numbers only
+          and each distinct row counted once, less two standard errors (Ashman's D over √2: a measure of how far
+          apart, not a test). The tree is cut from the leaves up wherever a split reaches split_separation, then the
+          pieces not that far apart are sewn back, the closest pair first. A branch under min_cluster_floor rows of
+          the judging half is pruned; its rows, and the rows outside the two halves, take the region of their
+          nearest labelled rows by vote. The tree drawn here is a Ward tree of the regions' centroids: it shows how the
+          regions group, its leaves are the regions; each node counts their distinct rows (hover for the rows of the
+          CSV). Click a node to map its rows.</p>
         <div class="filters"><label class="inline">class <select id="rg-class"></select></label></div>
         <div id="rg-tree"></div>
         <h3 id="rg-map-title">Map</h3>
@@ -94,12 +99,14 @@
           Click a row to select the lowest node above both regions.</p>
         <div id="rg-overlaps" class="table-wrap"></div></div>
       <div class="card"><h2>Granularity per class</h2>
-        <p class="note">The cut of least loss plus a penalty per region, region_cost times the loss of the class as
-          one region: a split is kept only when it lowers the loss by at least that share. The penalty rises further
-          when the class had to be capped at max_regions. Loss / one region is the loss of the cut over that of the
-          class as one region. The curve is the loss of the cut against its regions as the penalty falls.</p>
+        <p class="note">Pieces cut are the regions before sewing; sewn at is the separation the regions keep,
+          split_separation unless the class had to be capped at max_regions (then marked). Stability: the regions are
+          made again on other halves and each is matched to its most similar new region (Jaccard, Hennig 2007),
+          stable from 0.75, doubtful from 0.6, unreliable under it; a class's is the mean of its regions', by rows.
+          Stable is not proof: an unstable region is suspect, a stable one is not sure. The curve is how many regions
+          the same tree gives at other thresholds.</p>
         <div id="rg-classes" class="table-wrap"></div>
-        <div id="rg-loss"></div></div>
+        <div id="rg-curve"></div></div>
       <div class="card"><h2>Regions</h2>
         <div id="rg-sizes"></div>
         <div id="rg-table" class="table-wrap"></div></div>

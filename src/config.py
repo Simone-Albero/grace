@@ -46,35 +46,26 @@ class PrepareConfig:
 
 
 @dataclass(frozen=True)
-class GraphConfig:
-    """The reference rows of the kDN hardness (`src.graph`).
-
-    Attributes:
-        max_samples: The reference rows, a uniform sample above this.
-    """
-
-    max_samples: int
-
-
-@dataclass(frozen=True)
 class ClusteringConfig:
     """The per-class weighted Ward regions (`src.clustering`).
 
     Attributes:
-        max_fit_samples: The distinct rows of a class the tree is built
-            and the cut scored on; the others are labelled by vote.
+        max_fit_samples: The most distinct rows of each half of a
+            class: the tree is built on half A, its splits judged on
+            half B; the other rows are labelled by vote.
         max_regions: The regions over all classes, shared equally
             between them.
-        region_cost: The cost of a region, as a share of the loss of
-            its class as one region: a split is kept only when it
-            lowers the loss by at least that much. 0 keeps every split
-            that lowers it.
-        min_cluster_floor: The fewest scored rows (of the
-            max_fit_samples) of a region; a smaller branch is pruned
-            and its rows labelled by vote.
-        hardness_k: The neighbours behind the kDN hardness.
+        split_separation: The separation (S_low, `clustering.
+            pair_separation`) two regions of a class must keep: a
+            split is cut, and two pieces stay apart, at it or over.
+        min_cluster_floor: The fewest rows of half B of each side of a
+            split judged; a smaller branch is pruned and its rows
+            labelled by vote.
         vote_k: The labelled neighbours that vote the region of an
             unlabelled row.
+        stability_repeats: The times the regions of a class are made
+            again on other halves to measure the stability of each
+            region; 0 measures none.
         overlap_separation: Two regions of different classes overlap
             when their centroids lie closer than this many standard
             deviations of their rows along the line between them
@@ -83,10 +74,10 @@ class ClusteringConfig:
 
     max_fit_samples: int
     max_regions: int
-    region_cost: float
+    split_separation: float
     min_cluster_floor: int
-    hardness_k: int
     vote_k: int
+    stability_repeats: int
     overlap_separation: float
 
 
@@ -127,14 +118,12 @@ class MethodConfig:
         distance: One of DISTANCES: how the numeric columns are
             compared (graph.space_points).
         prepare: The prepared features.
-        graph: The reference rows of the kDN hardness.
         clustering: The per-class clustering.
         quality: The quality report.
     """
 
     distance: str
     prepare: PrepareConfig
-    graph: GraphConfig
     clustering: ClusteringConfig
     quality: QualityConfig
 
@@ -218,11 +207,9 @@ def _validate_method(method: MethodConfig) -> None:
     )
     clustering = method.clustering
     positive = {
-        "graph.max_samples": method.graph.max_samples,
         "clustering.max_fit_samples": clustering.max_fit_samples,
         "clustering.max_regions": clustering.max_regions,
         "clustering.min_cluster_floor": clustering.min_cluster_floor,
-        "clustering.hardness_k": clustering.hardness_k,
         "clustering.vote_k": clustering.vote_k,
         "quality.max_rows_per_region": method.quality.max_rows_per_region,
         "quality.k": method.quality.k,
@@ -230,8 +217,14 @@ def _validate_method(method: MethodConfig) -> None:
     }
     for key, value in positive.items():
         _check(value >= 1, f"{key} must be >= 1, got {value}")
-    region_cost = clustering.region_cost
-    _check(region_cost >= 0, f"clustering.region_cost must be >= 0, got {region_cost}")
+    split = clustering.split_separation
+    _check(split > 0, f"clustering.split_separation must be > 0, got {split}")
+    repeats = clustering.stability_repeats
+    _check(repeats >= 0, f"clustering.stability_repeats must be >= 0, got {repeats}")
+    _check(
+        clustering.min_cluster_floor >= 2,
+        f"clustering.min_cluster_floor must be >= 2, got {clustering.min_cluster_floor}",
+    )
     separation = clustering.overlap_separation
     _check(
         separation > 0,
@@ -271,7 +264,6 @@ def load_method_config(name_or_path: str = "default") -> MethodConfig:
     _check_keys(raw, MethodConfig, path)
     sections = {
         "prepare": PrepareConfig,
-        "graph": GraphConfig,
         "clustering": ClusteringConfig,
         "quality": QualityConfig,
     }
