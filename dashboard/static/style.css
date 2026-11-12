@@ -151,3 +151,34 @@ button.chip:hover { color: var(--text); border-color: var(--muted); }
 td .chips { display: inline-flex; flex-wrap: nowrap; }
 td .chips:empty::after { content: "–"; }
 button.chip[aria-pressed="true"] { color: var(--text); border-color: var(--accent); background: rgba(57, 135, 229, 0.12); }
+
+/* quality: two panels, a region's detail */
+.stack { display: grid; gap: 16px; min-width: 0; }
+.panel > *, .stack > * { min-width: 0; }
+.summary { margin: 0; color: var(--text-2); }
+.summary b { color: var(--text); font-weight: 500; }
+.howto { padding: 10px 16px; }
+.howto summary { cursor: pointer; color: var(--text-2); font-size: 13px; }
+.howto dl { margin: 12px 0 0; display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; font-size: 13px; }
+.howto dt { color: var(--text); font-family: var(--mono); font-size: 12px; }
+.howto dd { margin: 0; color: var(--text-2); }
+.view-switch { margin: 0; }
+.view-switch .chip { padding: 4px 14px; font-size: 13px; }
+td.wrap { white-space: normal; min-width: 120px; max-width: 320px; }
+#tab-quality td, #tab-quality th { padding: 6px 8px; }
+.detail-head .chips { display: inline-flex; vertical-align: middle; }
+.cell-wrap { display: inline-block; min-width: 260px; max-width: 420px; white-space: normal; }
+td.text, td.wrap, th.text { text-align: left; }
+td.wrap .chips { flex-wrap: wrap; }
+.detail-head { margin: -4px 0 16px; color: var(--text-2); }
+#qr-detail h3 { margin-top: 20px; color: var(--text-2); }
+@media (max-width: 600px) {
+  .howto dl { grid-template-columns: 1fr; }
+}
+#qr-detail-title { display: flex; align-items: center; justify-content: space-between; }
+#qr-detail-title .close { text-transform: none; letter-spacing: 0; }
+.panel, .stack { grid-template-columns: minmax(0, 1fr); }
+/* identical rows: the classes of a group stay in view while its values scroll */
+#qr-conflicts th:first-child, #qr-conflicts td:first-child { position: sticky; left: 0; z-index: 1; background: var(--surface); box-shadow: 1px 0 0 var(--axis); }
+#qr-neighbours td.wrap { min-width: 96px; }
+#qr-neighbours th { white-space: normal; vertical-align: bottom; }

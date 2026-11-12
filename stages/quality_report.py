@@ -18,6 +18,7 @@ from src.config import DatasetConfig, QualityConfig
 from src.data import DUPLICATES, KINDS, LABEL
 from src.quality import (
     ISSUES,
+    REASONS,
     VERDICTS,
     Pair,
     candidate_pairs,
@@ -26,10 +27,10 @@ from src.quality import (
     feature_dependence,
     invalid_values,
     label_conflicts,
-    one_feature,
     pair_conflicts,
     region_issues,
     region_samples,
+    single_column,
     verdict,
 )
 from stages.paths import (
@@ -56,14 +57,14 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     points (paths.read_points, as stage regions), regions.parquet and
     assignments.parquet, which must be of the same rows ("run regions
     again" otherwise). With q = method.quality, tau =
-    q.thresholds["error"]. Order: quality.diversity of every class on
+    q.thresholds["nn_error"]. Order: quality.diversity of every class on
     the points (q.diversity_pairs, seed) -> quality.region_samples
     (q.max_rows_per_region, seed) -> the weighted centroids of the
     regions -> clustering.line_spread -> clustering.separation ->
     quality.invalid_values -> quality.label_conflicts on every feature
     -> quality.pair_conflicts -> quality.candidate_pairs under
     q.candidate_separation -> per pair, on the sampled rows:
-    quality.one_feature (q.thresholds["one_feature"]),
+    quality.single_column (q.thresholds["single_column_acc"]),
     quality.feature_dependence (q.max_group, seed (seed, a, b)) and
     quality.verdict (tau; null when a side has fewer than 4 sampled
     rows) -> per region: its rival, its pairs' verdicts,
@@ -72,33 +73,35 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     collapse (tc >= q.thresholds["tc"]).
 
     Logs: quality_pairs (region_a, class_a, region_b, class_b, reasons
-    joined by ",", sep, n_conflicts, n_conflicts_read; err_a, err_b,
-    err (their mean), err_low (quality.cover_hart_low of err); removed
-    (the columns removed, joined by ",": the group's first columns the
-    shortcut rests on, the whole group otherwise), without_a, without_b,
-    err_without (the errors without them), delta = err_without - err,
-    verdict; one_feature_a, one_feature_b, one_feature (their mean),
-    one_feature_col, n_separating), quality_regions (region, class,
+    joined by ",", sep, n_conflicts, n_conflicts_read; nn_error_a,
+    nn_error_b, nn_error (their mean), bayes_error_low
+    (quality.cover_hart_low of nn_error); shortcut_columns (the columns
+    removed, joined by ",": the group's first columns the shortcut
+    depends on, the whole group otherwise), nn_error_without_a,
+    nn_error_without_b, nn_error_without (the errors without them),
+    nn_error_rise = nn_error_without - nn_error, verdict;
+    single_column_acc_a, single_column_acc_b, single_column_acc (their
+    mean), single_column, n_single_columns), quality_regions (region, class,
     n_rows, n_read, n_duplicates = n_read - n_rows, dup_share = 1 -
     n_rows / n_read, conflict_rows, conflict_read, missing_rows and
     missing_read (rows with a null or invalid value), then per kind of
     data.KINDS <kind>_rows; rival: the region of the pair where this
-    region's side errs the most (ties to the lower id), with err,
-    err_low, one_feature, one_feature_col of its own side and the
-    pair's verdict, depends_on (removed when the verdict is
+    region's side errs the most (ties to the lower id), with nn_error,
+    bayes_error_low, single_column_acc, single_column of its own side
+    and the pair's verdict, shortcut_columns (when the verdict is
     "shortcut"); pairs_<verdict>: its pairs by verdict; issues joined
     by ",", status "solid" or "flagged"), quality_classes (class,
     n_rows, n_read, n_duplicates, dup_share, conflict_share and
-    missing_share over n_read, err: its regions' weighted by n_rows,
-    one_feature and one_feature_col: the most over its pairs that at
-    most one column separates (null without), pdd, tc, issues of
+    missing_share over n_read, nn_error: its regions' weighted by
+    n_rows, single_column_acc and single_column: the most over its
+    pairs that at most one column separates (null without), pdd, tc, issues of
     low_diversity and collapse, solid_share and share_<issue> of its
     CSV rows, pairs_<verdict>, n_pairs), region_missing (region,
     column, kind, n_rows, n_read: the null and invalid cells; no row
     without one), label_conflict_groups (group, row, class, region,
     n_read), quality_stats (one row: thresholds as JSON,
     candidate_separation, max_rows_per_region, diversity_pairs,
-    max_group, n_pairs, n_near, n_conflict, n_nearest, n_groups,
+    max_group, n_pairs, n_near, n_label_conflict, n_nearest, n_groups,
     n_regions, n_solid, solid_share and share_<issue> of the CSV rows,
     pairs_<verdict>). n_rows counts distinct rows, n_read rows of the
     CSV.
@@ -209,7 +212,7 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
                 "n_pairs": len(pairs),
                 **{
                     f"n_{reason}": sum(reason in p.reasons for p in pairs)
-                    for reason in ("near", "conflict", "nearest")
+                    for reason in REASONS
                 },
                 "n_groups": int(groups.max()) + 1,
                 "n_regions": len(region_rows),
@@ -233,14 +236,17 @@ def _pair_measures(
 ) -> dict[str, object]:
     """Return the measures of one pair on its regions' sampled rows."""
     Xa, Xb = rows_of[pair.a], rows_of[pair.b]
-    tau = quality.thresholds["error"]
-    one = one_feature(Xa, Xb, column_of, numeric, quality.thresholds["one_feature"])
+    tau = quality.thresholds["nn_error"]
+    one = single_column(
+        Xa, Xb, column_of, numeric, quality.thresholds["single_column_acc"]
+    )
     dependence = feature_dependence(
         Xa, Xb, column_of, quality.max_group, (seed, pair.a, pair.b)
     )
     row: dict[str, object] = dict.fromkeys(
-        ("err_a", "err_b", "err", "err_low", "removed", "without_a", "without_b")
-        + ("err_without", "delta", "verdict")
+        ("nn_error_a", "nn_error_b", "nn_error", "bayes_error_low")
+        + ("shortcut_columns", "nn_error_without_a", "nn_error_without_b")
+        + ("nn_error_without", "nn_error_rise", "verdict")
     )
     if dependence is not None:
         errors = dependence.errors
@@ -248,24 +254,24 @@ def _pair_measures(
         last = k if judged == "shortcut" else len(dependence.group)
         err, without = float(errors[0].mean()), float(errors[last].mean())
         row.update(
-            err_a=float(errors[0, 0]),
-            err_b=float(errors[0, 1]),
-            err=err,
-            err_low=cover_hart_low(err),
-            removed=",".join(columns[c] for c in dependence.group[:last]),
-            without_a=float(errors[last, 0]),
-            without_b=float(errors[last, 1]),
-            err_without=without,
-            delta=without - err,
+            nn_error_a=float(errors[0, 0]),
+            nn_error_b=float(errors[0, 1]),
+            nn_error=err,
+            bayes_error_low=cover_hart_low(err),
+            shortcut_columns=",".join(columns[c] for c in dependence.group[:last]),
+            nn_error_without_a=float(errors[last, 0]),
+            nn_error_without_b=float(errors[last, 1]),
+            nn_error_without=without,
+            nn_error_rise=without - err,
             verdict=judged,
         )
     return {
         **row,
-        "one_feature_a": one.side_a,
-        "one_feature_b": one.side_b,
-        "one_feature": one.share,
-        "one_feature_col": columns[one.column] if one.column >= 0 else None,
-        "n_separating": one.n_separating,
+        "single_column_acc_a": one.side_a,
+        "single_column_acc_b": one.side_b,
+        "single_column_acc": one.share,
+        "single_column": columns[one.column] if one.column >= 0 else None,
+        "n_single_columns": one.n_single_columns,
     }
 
 
@@ -321,8 +327,8 @@ def _region_rows(
                 {
                     **p,
                     "rival": p[other],
-                    "own_err": p[f"err_{s}"],
-                    "own_one": p[f"one_feature_{s}"],
+                    "own_err": p[f"nn_error_{s}"],
+                    "own_one": p[f"single_column_acc_{s}"],
                 }
             )
     rows = []
@@ -353,13 +359,15 @@ def _region_rows(
                 "missing_read": float(missing_read[r]),
                 **{f"{kind}_rows": int(by_kind[kind][r]) for kind in KINDS},
                 "rival": None if rival is None else rival["rival"],
-                "err": None if rival is None else rival["own_err"],
-                "err_low": None if rival is None else cover_hart_low(rival["own_err"]),
-                "one_feature": None if rival is None else rival["own_one"],
-                "one_feature_col": None if rival is None else rival["one_feature_col"],
+                "nn_error": None if rival is None else rival["own_err"],
+                "bayes_error_low": (
+                    None if rival is None else cover_hart_low(rival["own_err"])
+                ),
+                "single_column_acc": None if rival is None else rival["own_one"],
+                "single_column": None if rival is None else rival["single_column"],
                 "verdict": None if rival is None else rival["verdict"],
-                "depends_on": (
-                    rival["removed"]
+                "shortcut_columns": (
+                    rival["shortcut_columns"]
                     if rival is not None and rival["verdict"] == "shortcut"
                     else None
                 ),
@@ -388,9 +396,9 @@ def _class_rows(
         n_rows = sum(r["n_rows"] for r in own)
         n_read = sum(r["n_read"] for r in own)
         pairs = [p for p in pair_rows if name in (p["class_a"], p["class_b"])]
-        single = [p for p in pairs if p["n_separating"] <= 1]
-        best = max(single, key=lambda p: p["one_feature"], default=None)
-        known = [r for r in own if r["err"] is not None]
+        single = [p for p in pairs if p["n_single_columns"] <= 1]
+        best = max(single, key=lambda p: p["single_column_acc"], default=None)
+        known = [r for r in own if r["nn_error"] is not None]
         issues = [
             issue
             for issue, value, key in zip(
@@ -407,14 +415,16 @@ def _class_rows(
                 "dup_share": 1 - n_rows / n_read,
                 "conflict_share": sum(r["conflict_read"] for r in own) / n_read,
                 "missing_share": sum(r["missing_read"] for r in own) / n_read,
-                "err": _number(
-                    sum(r["err"] * r["n_rows"] for r in known)
+                "nn_error": _number(
+                    sum(r["nn_error"] * r["n_rows"] for r in known)
                     / sum(r["n_rows"] for r in known)
                     if known
                     else None
                 ),
-                "one_feature": None if best is None else best["one_feature"],
-                "one_feature_col": None if best is None else best["one_feature_col"],
+                "single_column_acc": (
+                    None if best is None else best["single_column_acc"]
+                ),
+                "single_column": None if best is None else best["single_column"],
                 "pdd": float(pdd[code]),
                 "tc": float(tc[code]),
                 "issues": ",".join(issues) or None,

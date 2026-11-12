@@ -21,7 +21,9 @@ yaml; `--method` defaults to `default`. `make help` lists the targets; `make tes
 tracked: a fresh clone has no data, and the synthetic generator is the only dataset that works out of the box.
 
 Stages (each writes its files into the dataset's `output_dir` and its rows into the DB):
-- `clean`: reads the configured columns of the CSV, keeps one copy of the rows equal on every column (the class
+- `clean`: reads the configured columns of the CSV (`path`; a glob such as `resources/raw_data/cic_2018/*.csv` reads
+  every file it matches, in sorted order, as one dataset: the files may differ in their other columns, and a header
+  line a file repeats inside is dropped; the `sources` table logs each file's rows and dropped headers), keeps one copy of the rows equal on every column (the class
   included: equal features under different classes stay apart) and records their copies in `n_duplicates` (1 for a row
   without copies), the row's weight in stage regions and no feature, then drops the classes under `min_class_count`
   distinct rows and the configured columns that hold a single value, and codes the class. A numeric cell whose text is
@@ -76,18 +78,21 @@ Stages (each writes its files into the dataset's `output_dir` and its rows into 
   is under `quality.candidate_separation`, those that share label conflicts, and each region's nearest rival, each on
   at most `quality.max_rows_per_region` distinct rows per region, unweighted. Every pair measure is per side (`_a`,
   `_b`), its summary the mean of the two, so a large region does not hide a small one (Barella et al. 2021):
-  - 1-NN error: the share of a side's rows whose nearest row (leave-one-out) is of the other side; rows tied at the
-    least distance share the vote, so the error does not depend on the order of the rows. `err_low` is the Cover &
+  - `nn_error`: the 1-NN error, the share of a side's rows whose nearest row (leave-one-out) is of the other side; rows
+    tied at the least distance share the vote, so the error does not depend on the order of the rows.
+    `bayes_error_low` is the Cover &
     Hart lower bound of the Bayes error it implies, a guide on a finite sample. It replaces kDN, ENN and N1, which
     said the same (Spearman 0.9-0.97 on cic) and depended on ties.
-  - one feature: the balanced accuracy of the best rule on a single column (OneR, Holte 1993): a threshold on a number,
+  - `single_column_acc`: the balanced accuracy of the best rule on a single column, `single_column` (OneR, Holte
+    1993; `n_single_columns` counts the columns that reach `thresholds.single_column_acc`): a threshold on a number,
     each value to its side on a categorical (its slots read back as one value). It is Ho & Basu's F3 (Lorena et al.'s
     1 - F3) made robust: F3 bounds the columns by min and max, so one row out of place halves it and a binary column
     split 99/1 against 1/99 gets 0. Its scale starts at 0.5, not 0.
-  - dependence: each side is split into halves; on the first, up to `quality.max_group` columns are removed one at a
-    time, each the one that raises the 1-NN error most (ties to the larger margin d_own / (d_own + d_other)); on the
-    second, the errors are measured, so choosing does not inflate them. Verdict, with tau = `thresholds.error`:
-    `conflict` (error >= tau and rows equal across the two classes), `overlap` (error >= tau and no single column
+  - `shortcut_columns`: each side is split into halves; on the first, up to `quality.max_group` columns are removed
+    one at a time, each the one that raises the 1-NN error most (ties to the larger margin d_own / (d_own + d_other));
+    on the second, the errors are measured (`nn_error_without`, `nn_error_rise`), so choosing does not inflate them.
+    Verdict, with tau = `thresholds.nn_error`: `label_conflict` (error >= tau and rows equal across the two classes),
+    `class_overlap` (error >= tau and no single column
     reaches 1 - tau: the 1-NN, swamped by the other columns, misses a column that alone separates), `shortcut`
     (removing the first columns raises the error by tau or more, up to tau at least), `robust` otherwise. L2, the
     error of a linear SVM, is gone: on its own training rows it is 0 whenever a side has fewer rows than dimensions,
@@ -95,7 +100,7 @@ Stages (each writes its files into the dataset's `output_dir` and its rows into 
   Per region: its copies (`n_duplicates` = `n_read - n_rows`), its rows in a label conflict (rows equal on every
   feature as read under another class), its rows with a null or invalid value by kind (empty, unparsable, NaN, inf),
   its rival (the pair where its own side errs most) and its pairs by verdict, then its problems: `missing` (any null or
-  invalid value), `duplicates` (`dup_share` >= `thresholds.dup_share`), `conflict`, `overlap`, `shortcut` (a pair of
+  invalid value), `duplicates` (`dup_share` >= `thresholds.dup_share`), `label_conflict`, `class_overlap`, `shortcut` (a pair of
   that verdict); none makes it solid. Per class: the roll-up, the share of its CSV rows in solid regions and in each
   problem, and its diversity: the mean cosine similarity of `quality.diversity_pairs` pairs of its rows on the points
   scaled into [0, 1] (pdd) and the share over 0.95 (tc), problems `low_diversity` and `collapse` from
@@ -126,17 +131,24 @@ overlap zone, each merge at the separation of the pair that made it), `region_ov
 different classes under `overlap_separation`), `region_stats` (regions); `quality_pairs`, `quality_regions`,
 `quality_classes`, `region_missing` (the null and invalid cells by region, column and kind),
 `label_conflict_groups` (every row in a label conflict, with its group), `quality_stats` (with the share of the CSV
-rows in solid regions and in each problem) (quality_report). There are no migrations: after a change of a table, delete the DB.
+rows in solid regions and in each problem) (quality_report). There are no migrations: a new column is added to its
+table, an old one stays, empty for the new runs; to drop the old ones, delete the DB.
 
 Dashboard: `make dashboard` (`PORT=` to change it) or `python -m uvicorn dashboard.app:app` serves a read-only page
 on 127.0.0.1, one tab per stage, for the datasets of `configs/datasets/`. Each tab shows the latest `ok` run of its
 stage on that dataset, and says which stage to run when there is none. The regions tab draws the tree of each class;
 a click on a node maps its rows (at most 2,000 per region, 20,000 in all) on their first two principal components,
 computed on the click. Below it, the overlap zones show where the classes overlap; a click on one of their nodes maps
-its rows by class and names its branch in each class tree. The quality tab shows the smells per class, the pairs of
-regions with their verdicts (filtered by verdict, or by a single column that separates them) and every region with
-its status. The URL hash keeps tab and dataset, and on the
-regions tab class, node and overlap node.
+its rows by class and names its branch in each class tree. The quality tab has a summary line, a "How to read" box
+with every definition and threshold (each column header also explains itself on hover) and two panels. Classes: one
+row per class with its shares of solid, copied, conflicting and null rows, nn_error, best single column, pdd, tc and
+problems. Regions: filtered by class and by problem, one column per check saying what was found (which null cells,
+the copies, how many rows identical to which classes, the worst neighbour with its verdict and the pairs by verdict).
+A click on a region opens its detail (`/quality/region`, `/quality/map`): its neighbours of other classes with every
+pair measure from its side, their nn_error with every column and without the shortcut columns, a map of its rows and
+its neighbours' by class, the heaviest groups of rows identical to rows of other classes with their values, and its
+null cells by column. The URL hash keeps tab and dataset, on the regions tab class, node and overlap node, on the
+quality tab panel and region.
 
 Layout:
 - `main.py`: the CLI, one stage per call inside a logged run

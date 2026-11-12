@@ -11,11 +11,15 @@ NaN).
 from __future__ import annotations
 
 __all__ = [
+    "CONFLICT_GROUPS",
     "MAP_MAX_POINTS",
     "MAP_PER_LEAF",
     "clean",
+    "overlap_map",
     "prepare",
     "quality",
+    "quality_map",
+    "quality_region",
     "region_map",
     "regions",
 ]
@@ -34,8 +38,10 @@ import polars as pl
 from sklearn.decomposition import PCA
 
 from src.config import DatasetConfig
+from src.data import feature_cols
 from stages.paths import (
     assignments_file,
+    data_file,
     need,
     prepared_file,
     read_classes,
@@ -44,6 +50,7 @@ from stages.paths import (
 
 MAP_PER_LEAF = 2000  # most rows of one region in a node's map
 MAP_MAX_POINTS = 20000  # most rows of a node's map
+CONFLICT_GROUPS = 10  # most label conflict groups in a region's detail
 
 
 def clean(cfg: DatasetConfig) -> dict[str, Any]:
@@ -172,6 +179,104 @@ def quality(cfg: DatasetConfig) -> dict[str, Any]:
         }
 
 
+def quality_region(cfg: DatasetConfig, region: int) -> dict[str, Any]:
+    """Return the detail of one region in the last quality_report run.
+
+    Args:
+        cfg: The dataset.
+        region: A region id of quality_regions.
+
+    Returns:
+        region (its quality_regions row); pairs (its quality_pairs rows,
+        reasons as a list); missing (its region_missing rows); n_groups
+        (the label conflict groups with a row in it) and conflicts: the
+        CONFLICT_GROUPS of them with the most CSV rows, heaviest first
+        (ties to the lower group), each {group, n_read, rows: [{class,
+        region, n_read}] heaviest first, values: {column: value}} with
+        values the features of the data file shared by its rows (null
+        for a null, NaN or infinite one).
+
+    Raises:
+        LookupError: When quality_report has not run or region is not
+            one of its regions.
+    """
+    with closing(_connect(cfg)) as conn:
+        run = _latest_run(conn, "quality_report", cfg)
+        rows = _where(conn, "quality_regions", run, "region = ?", region)
+        if not rows:
+            raise LookupError(f"no region {region} in quality_regions")
+        pairs = _where(
+            conn, "quality_pairs", run, "region_a = ? OR region_b = ?", region, region
+        )
+        missing = _where(conn, "region_missing", run, "region = ?", region)
+        groups = _where(
+            conn,
+            "label_conflict_groups",
+            run,
+            '"group" IN (SELECT "group" FROM label_conflict_groups '
+            "WHERE run_id = ? AND region = ?)",
+            run["id"],
+            region,
+        )
+    for pair in pairs:
+        pair["reasons"] = pair["reasons"].split(",")
+    by_group: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for row in groups:
+        by_group[row["group"]].append(row)
+    heaviest = sorted(
+        by_group.items(), key=lambda g: (-sum(r["n_read"] for r in g[1]), g[0])
+    )[:CONFLICT_GROUPS]
+    values = _feature_values(cfg, [rows[0]["row"] for _, rows in heaviest])
+    return {
+        "region": rows[0],
+        "pairs": pairs,
+        "missing": missing,
+        "n_groups": len(by_group),
+        "conflicts": [
+            {
+                "group": group,
+                "n_read": sum(r["n_read"] for r in members),
+                "rows": [
+                    {k: r[k] for k in ("class", "region", "n_read")}
+                    for r in sorted(members, key=lambda r: -r["n_read"])
+                ],
+                "values": values[members[0]["row"]],
+            }
+            for group, members in heaviest
+        ],
+    }
+
+
+def quality_map(cfg: DatasetConfig, region: int) -> dict[str, Any]:
+    """Return the rows of a region and of its measured rivals in their own plane.
+
+    As region_map, with the region and every region of its pairs in the
+    last quality_report run (quality_pairs).
+
+    Args:
+        cfg: The dataset.
+        region: A region id of quality_regions.
+
+    Returns:
+        region; regions (it, then its rivals by id); shares [s1, s2];
+        points [[pc1, pc2, region]].
+
+    Raises:
+        LookupError: When quality_report or regions has not run, or
+            region is not one of the regions.
+    """
+    with closing(_connect(cfg)) as conn:
+        run = _latest_run(conn, "quality_report", cfg)
+        if not _where(conn, "quality_regions", run, "region = ?", region):
+            raise LookupError(f"no region {region} in quality_regions")
+        pairs = _where(
+            conn, "quality_pairs", run, "region_a = ? OR region_b = ?", region, region
+        )
+    rivals = sorted({p["region_a"] for p in pairs} | {p["region_b"] for p in pairs})
+    regions = [region, *(r for r in rivals if r != region)]
+    return {"region": region, "regions": regions, **_map_regions(cfg, regions)}
+
+
 def region_map(cfg: DatasetConfig, node: int) -> dict[str, Any]:
     """Return the rows of one node of the region trees in their own plane.
 
@@ -222,9 +327,6 @@ def _map(cfg: DatasetConfig, table: str, node: int) -> dict[str, Any]:
     """Return region_map of the regions below node in table, a tree of the last regions run."""
     with closing(_connect(cfg)) as conn:
         run = _latest_run(conn, "regions", cfg)
-        (config,) = conn.execute(
-            "SELECT config FROM runs WHERE id = ?", (run["id"],)
-        ).fetchone()
         tree = _rows(conn, "regions", table, run)
     children = defaultdict(list)
     for row in tree:
@@ -238,6 +340,16 @@ def _map(cfg: DatasetConfig, table: str, node: int) -> dict[str, Any]:
         if row["region"] is not None:
             leaves.append(row["region"])
         stack += children[row["node"]]
+    return {"node": node, **_map_regions(cfg, leaves)}
+
+
+def _map_regions(cfg: DatasetConfig, leaves: list[int]) -> dict[str, Any]:
+    """Return shares and points of region_map for the rows of the regions leaves."""
+    with closing(_connect(cfg)) as conn:
+        run = _latest_run(conn, "regions", cfg)
+        (config,) = conn.execute(
+            "SELECT config FROM runs WHERE id = ?", (run["id"],)
+        ).fetchone()
     region = pl.read_parquet(need(assignments_file(cfg), "regions"))
     region = region.sort("row")["region"].to_numpy()
     rows = np.flatnonzero(np.isin(region, leaves))
@@ -259,12 +371,31 @@ def _map(cfg: DatasetConfig, table: str, node: int) -> dict[str, Any]:
         plane[:, : pca.n_components] = pca.fit_transform(points)
         shares[: pca.n_components] = [float(s) for s in pca.explained_variance_ratio_]
     return {
-        "node": node,
         "shares": shares,
         "points": [
             [round(float(a), 4), round(float(b), 4), int(r)]
             for (a, b), r in zip(plane, region[take])
         ],
+    }
+
+
+def _feature_values(cfg: DatasetConfig, rows: list[int]) -> dict[int, dict[str, Any]]:
+    """Return the features of some rows of the data file, num then cat, by row."""
+    path = need(data_file(cfg), "clean")
+    present = feature_cols(
+        pl.read_parquet_schema(path).names(), cfg.num_cols, cfg.cat_cols
+    )
+    columns = [*present.num, *present.cat]
+    found = (
+        pl.scan_parquet(path)
+        .with_row_index("__row__")
+        .filter(pl.col("__row__").is_in(rows))
+        .select("__row__", *columns)
+        .collect()
+    )
+    return {
+        int(r["__row__"]): {c: _json_value(r[c]) for c in columns}
+        for r in found.iter_rows(named=True)
     }
 
 
@@ -328,6 +459,29 @@ def _rows(
         if missing_ok and "no such table" in str(e):
             return []
         raise LookupError(f"run {stage} first") from e
+    return [{k: _json_value(r[k]) for k in r.keys() if k != "run_id"} for r in rows]
+
+
+def _where(
+    conn: sqlite3.Connection,
+    table: str,
+    run: Mapping[str, Any],
+    condition: str,
+    *params: Any,
+) -> list[dict[str, Any]]:
+    """Return the rows of a table logged by a run that meet condition, without run_id.
+
+    A missing table gives no rows: db.log_table skips an empty one.
+    """
+    try:
+        rows = conn.execute(
+            f'SELECT * FROM "{table}" WHERE run_id = ? AND ({condition})',
+            (run["id"], *params),
+        ).fetchall()
+    except sqlite3.OperationalError as e:
+        if "no such table" in str(e):
+            return []
+        raise
     return [{k: _json_value(r[k]) for k in r.keys() if k != "run_id"} for r in rows]
 
 

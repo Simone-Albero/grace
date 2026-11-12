@@ -82,6 +82,14 @@ def create_app(dataset_dir: Path = DATASET_DIR) -> FastAPI:
     def quality(dataset: str) -> Any:
         return _query(queries.quality, load_dataset(dataset))
 
+    @app.get("/api/{dataset}/quality/region")
+    def quality_region(dataset: str, region: int) -> Any:
+        return _query(queries.quality_region, load_dataset(dataset), region)
+
+    @app.get("/api/{dataset}/quality/map")
+    def quality_map(dataset: str, region: int) -> Any:
+        return _query(queries.quality_map, load_dataset(dataset), region)
+
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
     return app
 

@@ -411,7 +411,7 @@ def test_quality_classes_count_the_rows_of_every_class(reported):
     assert classes["dup_share"].to_list() == pytest.approx(
         (1 - kept["n_rows"] / kept["n_read"]).to_list()
     )
-    for column in ("pdd", "tc", "solid_share", "missing_share", "err"):
+    for column in ("pdd", "tc", "solid_share", "missing_share", "nn_error"):
         assert classes[column].is_between(0, 1).all()
     issues = {i for v in classes["issues"].drop_nulls() for i in v.split(",")}
     assert issues <= {"low_diversity", "collapse"}
@@ -433,7 +433,7 @@ def test_quality_regions_judge_every_region(reported):
         (1 - parquet["n_rows"] / parquet["n_read"]).to_list()
     )
     assert regions["rival"].is_not_null().all()
-    assert regions["err"].is_between(0, 1).all()
+    assert regions["nn_error"].is_between(0, 1).all()
     for r in regions.iter_rows(named=True):
         own = pairs.filter(
             (pl.col("region_a") == r["region"]) | (pl.col("region_b") == r["region"])
@@ -451,7 +451,7 @@ def test_quality_regions_judge_every_region(reported):
         )
         assert r["issues"] == (",".join(issues) or None)
         assert r["status"] == ("flagged" if issues else "solid")
-        assert (r["depends_on"] is not None) == (r["verdict"] == "shortcut")
+        assert (r["shortcut_columns"] is not None) == (r["verdict"] == "shortcut")
         assert r["missing_rows"] >= max(r[f"{kind}_rows"] for kind in KINDS)
 
 
@@ -486,7 +486,7 @@ def test_the_relabelled_row_is_a_label_conflict(reported):
     pairs = _table(reported, "quality_pairs")
     a, b = sorted(group["region"].to_list())
     pair = pairs.filter((pl.col("region_a") == a) & (pl.col("region_b") == b))
-    assert pair.height == 1 and "conflict" in pair["reasons"][0].split(",")
+    assert pair.height == 1 and "label_conflict" in pair["reasons"][0].split(",")
     assert pair["n_conflicts"][0] >= 2
 
 
@@ -503,17 +503,20 @@ def test_quality_pairs_follow_their_reasons(reported):
     for p in pairs.iter_rows(named=True):
         reasons = p["reasons"].split(",")
         assert ("near" in reasons) == (p["sep"] < quality.candidate_separation)
-        assert ("conflict" in reasons) == (p["n_conflicts"] > 0)
+        assert ("label_conflict" in reasons) == (p["n_conflicts"] > 0)
         assert p["verdict"] in VERDICTS
-        for key in ("err_a", "err_b", "err", "err_low", "err_without"):
-            assert 0 <= p[key] <= 1
-        assert p["err"] == pytest.approx((p["err_a"] + p["err_b"]) / 2)
-        assert p["delta"] == pytest.approx(p["err_without"] - p["err"])
-        assert 0.5 <= p["one_feature"] <= 1 and p["one_feature_col"] in columns
-        removed = p["removed"].split(",") if p["removed"] else []
+        for key in ("a", "b", "", "without_a", "without_b", "without"):
+            assert 0 <= p[f"nn_error_{key}".rstrip("_")] <= 1
+        assert 0 <= p["bayes_error_low"] <= p["nn_error"]
+        assert p["nn_error"] == pytest.approx((p["nn_error_a"] + p["nn_error_b"]) / 2)
+        assert p["nn_error_rise"] == pytest.approx(
+            p["nn_error_without"] - p["nn_error"]
+        )
+        assert 0.5 <= p["single_column_acc"] <= 1 and p["single_column"] in columns
+        removed = p["shortcut_columns"].split(",") if p["shortcut_columns"] else []
         assert set(removed) <= columns and len(removed) <= quality.max_group
         if p["verdict"] == "shortcut":
-            assert removed and p["delta"] >= quality.thresholds["error"]
+            assert removed and p["nn_error_rise"] >= quality.thresholds["nn_error"]
 
 
 def test_quality_report_refuses_regions_of_other_data(copy_of_done):

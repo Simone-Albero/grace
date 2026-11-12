@@ -3,6 +3,7 @@
 import math
 
 import polars as pl
+import pytest
 
 from src.data import (
     DUPLICATES,
@@ -11,9 +12,11 @@ from src.data import (
     Features,
     constant_columns,
     count_kinds,
+    csv_files,
     drop_duplicates,
     drop_rare_classes,
     feature_cols,
+    header_rows,
     read_numbers,
     unparsable_cells,
 )
@@ -104,3 +107,24 @@ def test_drop_duplicates_keeps_an_unparsable_cell_apart_from_an_empty_one():
     kept = drop_duplicates(read_numbers(text, ["a"]))
     assert kept[UNPARSABLE].to_list() == ["a", None]
     assert kept[DUPLICATES].to_list() == [1, 2]
+
+
+def test_csv_files_take_a_file_or_the_sorted_matches_of_a_glob(tmp_path):
+    for name in ("b.csv", "a.csv", "c.txt"):
+        (tmp_path / name).write_text("v\n1\n")
+    (tmp_path / "d.csv").mkdir()
+    assert csv_files(tmp_path / "b.csv") == [tmp_path / "b.csv"]
+    assert csv_files(tmp_path / "*.csv") == [tmp_path / "a.csv", tmp_path / "b.csv"]
+    with pytest.raises(FileNotFoundError, match="no CSV matches"):
+        csv_files(tmp_path / "*.parquet")
+
+
+def test_header_rows_flag_only_rows_that_are_the_header_on_every_column():
+    rows = pl.DataFrame(
+        {
+            "a": ["a", "1", "a", None, "a"],
+            "b": ["b", "b", "2", "b", None],
+        }
+    )
+    flags = rows.select(header_rows(["a", "b"]))[:, 0].to_list()
+    assert flags == [True, False, False, False, False]

@@ -134,8 +134,9 @@ def test_the_quality_thresholds_and_group_are_checked(tmp_path):
     thresholds = raw["quality"]["thresholds"]
     for bad in (
         {**thresholds, "kdn": 0.1},
-        {k: v for k, v in thresholds.items() if k != "error"},
-        {**thresholds, "error": 0.0},
+        {**{k: v for k, v in thresholds.items() if k != "nn_error"}, "error": 0.1},
+        {k: v for k, v in thresholds.items() if k != "nn_error"},
+        {**thresholds, "nn_error": 0.0},
         {**thresholds, "pdd": 1.5},
     ):
         path = tmp_path / "thresholds.yaml"

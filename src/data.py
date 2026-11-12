@@ -10,17 +10,24 @@ __all__ = [
     "Features",
     "constant_columns",
     "count_kinds",
+    "csv_files",
     "drop_duplicates",
     "drop_rare_classes",
     "feature_cols",
+    "header_rows",
     "read_numbers",
     "unparsable_cells",
 ]
 
+import glob
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
+from typing import TypeVar
 
 import polars as pl
+
+Frame = TypeVar("Frame", pl.DataFrame, pl.LazyFrame)
 
 LABEL = "label"  # class code column of the data file
 DUPLICATES = (
@@ -67,7 +74,50 @@ def feature_cols(
     )
 
 
-def read_numbers(rows: pl.DataFrame, num_cols: Sequence[str]) -> pl.DataFrame:
+def csv_files(path: Path) -> list[Path]:
+    """Return the CSVs a dataset is read from.
+
+    A dataset split over several files (one per capture day, say) is
+    configured as a glob pattern; its files are read in sorted order,
+    so the rows keep the same order, and positions, on every run.
+
+    Args:
+        path: A file, or a glob pattern ("*", "?", "[...]") of files.
+
+    Returns:
+        [path] when path is a file, else the files the pattern matches,
+        sorted.
+
+    Raises:
+        FileNotFoundError: When path is not a file and matches none.
+    """
+    if path.is_file():
+        return [path]
+    files = sorted(Path(match) for match in glob.glob(str(path)))
+    files = [file for file in files if file.is_file()]
+    if not files:
+        raise FileNotFoundError(f"no CSV matches {path}")
+    return files
+
+
+def header_rows(columns: Sequence[str]) -> pl.Expr:
+    """Flag the rows that repeat the header of the CSV.
+
+    Some CSVs written in chunks (CIC-IDS2018 among them) repeat the
+    header line inside the file; read as text, it is a row whose every
+    cell is its column's name. A row that is so on some columns only is
+    data.
+
+    Args:
+        columns: The columns read, at least one.
+
+    Returns:
+        A Boolean expression, True on a header row, never null.
+    """
+    return pl.all_horizontal(pl.col(c) == c for c in columns).fill_null(False)
+
+
+def read_numbers(rows: Frame, num_cols: Sequence[str]) -> Frame:
     """Turn the numeric columns from text into numbers, marking the bad text.
 
     A cell that is null stays null ("empty"); a cell whose text is not
@@ -76,7 +126,8 @@ def read_numbers(rows: pl.DataFrame, num_cols: Sequence[str]) -> pl.DataFrame:
     UNPARSABLE as any column). "nan" and "inf" texts are numbers.
 
     Args:
-        rows: The rows as read, every column text.
+        rows: The rows as read, every column text; lazy rows stay lazy,
+            so a large CSV is never held as text.
         num_cols: The numeric columns.
 
     Returns:

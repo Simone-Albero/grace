@@ -23,10 +23,10 @@ quality:                 # the quality report on regions, pairs of regions of di
   candidate_separation: 2.0    # pairs measured: separation under this, plus
                                #   the pairs sharing conflicting rows and each region's nearest rival
   diversity_pairs: 1000        # pairs of rows drawn per class for its mean cosine similarity (pdd) and collapse (tc)
-  max_group: 3                 # most columns removed from a pair to find the ones its separation rests on
+  max_group: 3                 # most columns removed from a pair to find the ones its separation depends on
   thresholds:
-    error: 0.1                 #   1-NN error from which a pair mixes; a shortcut raises it by this much when removed
-    one_feature: 0.95          #   balanced accuracy from which a single column separates a pair
+    nn_error: 0.1              #   1-NN error from which a pair mixes; removing its shortcut columns raises it this much
+    single_column_acc: 0.95    #   balanced accuracy from which a single column separates a pair
     dup_share: 0.9             #   share of a region's CSV rows that are copies from which it has "duplicates"
     pdd: 0.95                  #   mean cosine similarity of a class's rows from which its diversity is poor
     tc: 0.5                    #   share of a class's pairs of rows functionally identical (cosine > 0.95): collapse

@@ -81,7 +81,7 @@ class ClusteringConfig:
     overlap_separation: float
 
 
-THRESHOLDS = ("error", "one_feature", "dup_share", "pdd", "tc")
+THRESHOLDS = ("nn_error", "single_column_acc", "dup_share", "pdd", "tc")
 
 
 @dataclass(frozen=True)
@@ -97,11 +97,11 @@ class QualityConfig:
         diversity_pairs: The pairs of rows drawn per class for its
             diversity.
         max_group: The most columns removed from a pair to find the
-            ones its separation rests on.
-        thresholds: Per key of THRESHOLDS, in (0, 1]: error, the 1-NN
-            error from which a pair mixes (tau of quality.verdict);
-            one_feature, the balanced accuracy from which a single
-            column separates a pair; dup_share, the share of copies
+            ones its separation depends on (its shortcut columns).
+        thresholds: Per key of THRESHOLDS, in (0, 1]: nn_error, the
+            1-NN error from which a pair mixes (tau of
+            quality.verdict); single_column_acc, the balanced accuracy
+            from which a single column separates a pair; dup_share, the share of copies
             from which a region has the "duplicates" problem; pdd and
             tc, from which a class has poor diversity or collapsed
             traffic.

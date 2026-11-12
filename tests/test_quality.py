@@ -14,10 +14,10 @@ from src.quality import (
     invalid_values,
     label_conflicts,
     nearest_error,
-    one_feature,
     pair_conflicts,
     region_issues,
     region_samples,
+    single_column,
     verdict,
 )
 
@@ -89,7 +89,7 @@ def test_candidate_pairs_join_near_conflict_and_nearest():
     assert pairs == [
         Pair(0, 2, ("near", "nearest")),
         Pair(0, 3, ("nearest",)),
-        Pair(1, 2, ("conflict",)),
+        Pair(1, 2, ("label_conflict",)),
         Pair(1, 3, ("nearest",)),
     ]
 
@@ -192,41 +192,43 @@ def test_cover_hart_low():
     assert cover_hart_low(0.9) == pytest.approx(0.5)
 
 
-def test_one_feature_loses_only_the_outlier():
+def test_single_column_loses_only_the_outlier():
     Xa = np.c_[np.arange(10.0), np.zeros(10)]
     Xb = np.c_[np.r_[np.arange(20.0, 30.0), -5.0], np.zeros(11)]
-    result = one_feature(Xa, Xb, np.array([0, 1]), np.array([True, True]), 0.95)
+    result = single_column(Xa, Xb, np.array([0, 1]), np.array([True, True]), 0.95)
     assert result.column == 0
     assert result.side_a == 1.0 and result.side_b == pytest.approx(10 / 11)
     assert result.share == pytest.approx((1 + 10 / 11) / 2)  # 0.9545
-    assert result.n_separating == 1
-    stricter = one_feature(Xa, Xb, np.array([0, 1]), np.array([True, True]), 0.96)
-    assert stricter.n_separating == 0
+    assert result.n_single_columns == 1
+    stricter = single_column(Xa, Xb, np.array([0, 1]), np.array([True, True]), 0.96)
+    assert stricter.n_single_columns == 0
 
 
-def test_one_feature_on_a_binary_column():
+def test_single_column_on_a_binary_column():
     a = np.zeros((100, 1))
     a[0] = 1.0
     b = np.ones((100, 1))
     b[0] = 0.0
-    result = one_feature(a, b, np.array([0]), np.array([True]), 0.95)
-    assert result.side_a == 0.99 and result.side_b == 0.99 and result.n_separating == 1
+    result = single_column(a, b, np.array([0]), np.array([True]), 0.95)
+    assert (
+        result.side_a == 0.99 and result.side_b == 0.99 and result.n_single_columns == 1
+    )
 
 
-def test_one_feature_reads_the_slots_of_a_categorical_together():
+def test_single_column_reads_the_slots_of_a_categorical_together():
     # column 0: a number equal on both sides; column 1: three slots
     va, vb = np.array([0, 1] * 10), np.array([2] * 19 + [0])
     Xa = np.c_[np.zeros(20), np.eye(3)[va]]
     Xb = np.c_[np.zeros(20), np.eye(3)[vb]]
-    result = one_feature(Xa, Xb, np.array([0, 1, 1, 1]), np.array([True, False]), 0.9)
+    result = single_column(Xa, Xb, np.array([0, 1, 1, 1]), np.array([True, False]), 0.9)
     assert result.column == 1
     assert result.side_a == 1.0 and result.side_b == pytest.approx(19 / 20)
-    assert result.n_separating == 1
+    assert result.n_single_columns == 1
 
 
-def test_one_feature_without_any_varying_column():
+def test_single_column_without_any_varying_column():
     X = np.ones((5, 2))
-    result = one_feature(X, X, np.array([0, 1]), np.array([True, True]), 0.95)
+    result = single_column(X, X, np.array([0, 1]), np.array([True, True]), 0.95)
     assert result == type(result)(0.5, 0.5, -1, 0)
 
 
@@ -253,7 +255,7 @@ def _judge(case: str, n_conflicts: int = 0) -> tuple[tuple[int, ...], str, int]:
     a, b, column_of = _pair(case)
     numeric = np.r_[np.ones(column_of.max(), bool), case != "categorical"]
     dependence = feature_dependence(a, b, column_of, 3, seed=0)
-    share = one_feature(a, b, column_of, numeric, 0.95).share
+    share = single_column(a, b, column_of, numeric, 0.95).share
     return (dependence.group, *verdict(dependence.errors, n_conflicts, share, 0.1))
 
 
@@ -277,8 +279,8 @@ def test_a_separation_spread_over_many_columns_is_robust():
 
 
 def test_one_distribution_overlaps_or_conflicts():
-    assert _judge("same")[1:] == ("overlap", 0)
-    assert _judge("same", n_conflicts=3)[1:] == ("conflict", 0)
+    assert _judge("same")[1:] == ("class_overlap", 0)
+    assert _judge("same", n_conflicts=3)[1:] == ("label_conflict", 0)
 
 
 def test_feature_dependence_shapes_and_small_sides():
@@ -299,18 +301,18 @@ def test_verdict_by_hand():
             np.repeat(np.array(errors)[:, None], 2, 1), n_conflicts, share, 0.1
         )
 
-    assert judge([0.2, 0.3], n_conflicts=3) == ("conflict", 0)
-    assert judge([0.2, 0.3]) == ("overlap", 0)
+    assert judge([0.2, 0.3], n_conflicts=3) == ("label_conflict", 0)
+    assert judge([0.2, 0.3]) == ("class_overlap", 0)
     assert judge([0.2, 0.25, 0.35], share=0.95) == ("shortcut", 2)
     assert judge([0.05, 0.12, 0.2]) == ("shortcut", 2)
     assert judge([0.0, 0.08, 0.09]) == ("robust", 0)
     assert judge([0.09, 0.11, 0.12]) == ("robust", 0)
     sides = np.array([[0.0, 0.3], [0.5, 0.5]])
-    assert verdict(sides, 0, 0.5, 0.1) == ("overlap", 0)
+    assert verdict(sides, 0, 0.5, 0.1) == ("class_overlap", 0)
 
 
 def test_region_issues_in_order():
-    assert region_issues(0, 0.1, 0, ["robust", "conflict"], 0.9) == ()
-    every = region_issues(2, 0.95, 1, ["overlap", "shortcut", "robust"], 0.9)
+    assert region_issues(0, 0.1, 0, ["robust", "label_conflict"], 0.9) == ()
+    every = region_issues(2, 0.95, 1, ["class_overlap", "shortcut", "robust"], 0.9)
     assert every == ISSUES
     assert region_issues(0, 0.9, 0, [], 0.9) == ("duplicates",)

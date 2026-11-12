@@ -115,33 +115,92 @@
     <!-- quality -->
     <section id="tab-quality" class="panel" hidden>
       <p class="empty">Select a dataset.</p>
-      <div id="qr-tiles" class="tiles"></div>
-      <div class="card"><h2>Classes</h2>
-        <p class="note">The smells of Flood et al. (EuroS&amp;P 2024) per class. Copies: CSV rows that repeat another.
-          Conflicts: CSV rows equal on every feature to a row of another class. Null / invalid: CSV rows with an
-          empty, unreadable, NaN or infinite value. 1-NN error: of its regions against their closest rival, weighted by
-          rows. One feature: the best balanced accuracy of a rule on one column (OneR; Ho &amp; Basu's F3, made robust)
-          over its pairs that only one column separates. Diversity (pdd): mean cosine similarity of pairs of its rows;
-          collapse (tc): share of those pairs functionally identical; both are judged per class, since a region is
-          alike by construction. Solid: CSV rows in regions without a problem. Marked: from
-          <code>quality.thresholds</code>.</p>
+      <p id="qr-summary" class="summary"></p>
+      <details class="card howto">
+        <summary>How to read</summary>
+        <dl>
+          <dt>rows, CSV rows</dt>
+          <dd>Rows are the distinct rows stage clean kept; CSV rows count their copies too. Every measure is computed
+            on distinct rows; shares of the dataset are in CSV rows.</dd>
+          <dt>status</dt>
+          <dd>A region is <b>solid</b> when it has none of the problems below, <b>flagged</b> otherwise; its problems
+            are listed in the order missing, duplicates, label_conflict, class_overlap, shortcut.</dd>
+          <dt>missing</dt>
+          <dd>At least one cell of the region is empty, not a number where a number is due (unparsable), NaN or
+            infinite. A single one is enough.</dd>
+          <dt>duplicates</dt>
+          <dd>Copies: the share of the region's CSV rows that repeat another row exactly, label included. Flagged from
+            <span data-stat="thresholds.dup_share"></span>.</dd>
+          <dt>label_conflict</dt>
+          <dd>Rows identical on every feature, as read from the CSV, but labelled with different classes: no
+            classifier can tell them apart. Flagged with a single such row.</dd>
+          <dt>neighbours</dt>
+          <dd>The regions of other classes a region is measured against: those whose centroid is closer than
+            <span data-stat="candidate_separation"></span> sd (<i>near</i>), those sharing identical rows
+            (<i>label_conflict</i>), and the closest region of another class (<i>nearest</i>). Each pair is measured
+            on at most <span data-stat="max_rows_per_region"></span> random rows per region.</dd>
+          <dt>nn_error</dt>
+          <dd>The share of a region's rows whose nearest row (itself excluded) belongs to the other region: 0 when the
+            two are apart, about 0.5 when they are mixed. Measured on each side; the pair's is the mean of the two, so a
+            large region does not hide a small one. <i>bayes_error_low</i> is the least error any classifier could
+            reach, from nn_error (Cover &amp; Hart; an approximation on few rows).</dd>
+          <dt>shortcut_columns</dt>
+          <dd>Up to <span data-stat="max_group"></span> columns removed one at a time, each the one whose removal raises
+            nn_error the most (chosen on half of the rows, measured on the other half): the columns the separation
+            depends on. <i>nn_error without</i> is the error once they are removed.</dd>
+          <dt>single_column_acc</dt>
+          <dd>The balanced accuracy of the best rule on one column alone: a threshold on a number, a value-to-class map
+            on a categorical (OneR, Holte 1993; Ho &amp; Basu's F3, made robust to outliers). A column separates alone
+            from <span data-stat="thresholds.single_column_acc"></span>.</dd>
+          <dt>verdict of a pair</dt>
+          <dd>With &tau; = <span data-stat="thresholds.nn_error"></span>:
+            <b>label_conflict</b> when nn_error &ge; &tau; and the two share identical rows;
+            <b>class_overlap</b> when nn_error &ge; &tau; and no single column separates them;
+            <b>shortcut</b> when removing the shortcut columns raises nn_error by &tau; or more, up to &tau; at least:
+            the separation hangs on those columns;
+            <b>robust</b> otherwise: separated, also without them. A region takes the class_overlap and shortcut
+            problems from any of its pairs.</dd>
+          <dt>pdd, tc (classes only)</dt>
+          <dd>pdd: the mean cosine similarity of random pairs of rows of the class (low_diversity from
+            <span data-stat="thresholds.pdd"></span>); tc: the share of those pairs that are functionally identical,
+            cosine over 0.95 (collapse from <span data-stat="thresholds.tc"></span>). After Flood et al., EuroS&amp;P
+            2024. Judged on classes only: a region is alike by construction.</dd>
+        </dl>
+      </details>
+      <div class="filters view-switch" role="tablist">
+        <button class="chip" type="button" data-view="classes">classes</button>
+        <button class="chip" type="button" data-view="regions">regions</button>
+      </div>
+      <div id="qr-classes-view" class="card"><h2>Classes</h2>
         <div id="qr-classes" class="table-wrap"></div></div>
-      <div class="card"><h2>Pairs of regions</h2>
-        <p class="note">Each pair of regions of different classes that is near (separation under
-          <span id="qr-candidate"></span>), shares conflicting rows, or is a region's nearest rival, measured on at most
-          <span id="qr-rows"></span> rows per region, each side apart. 1-NN error: share of a side's rows whose
-          nearest row is of the other side. Then up to <span id="qr-group"></span> columns are removed, each the one
-          that raises the error most (chosen on half of the rows, measured on the other half). Verdict, with
-          &tau; = <span id="qr-error"></span>: conflict (error &ge; &tau; and rows equal across the classes), overlap
-          (error &ge; &tau; and no single column separates), shortcut (removing the columns raises the error by &tau;
-          or more), robust otherwise.</p>
-        <div id="qr-filters" class="filters"></div>
-        <div id="qr-pairs" class="table-wrap"></div></div>
-      <div class="card"><h2>Regions</h2>
-        <p class="note">Every region, with its problems: missing (a null or invalid value), duplicates (copies share
-          over its threshold), conflict (rows equal to a row of another class), overlap and shortcut (a pair of that
-          verdict). Solid: none of them. Closest rival: the pair where its own rows err the most.</p>
-        <div id="qr-regions" class="table-wrap"></div></div>
+      <div id="qr-regions-view" class="stack">
+        <div id="qr-detail" class="card" hidden>
+          <h2 id="qr-detail-title"></h2>
+          <p id="qr-detail-head" class="detail-head"></p>
+          <h3>Neighbours of other classes</h3>
+          <p class="note">Every region of another class this one was measured against, the one its own rows confuse
+            the most first. "here" is this region's side, "there" the neighbour's. Click one to open it.</p>
+          <div id="qr-neighbours" class="table-wrap"></div>
+          <h3>nn_error with every column and without the shortcut columns</h3>
+          <p class="note">Mean of the two sides. A shortcut is a short first bar and a long second one: the classes mix once those columns are gone.</p>
+          <div id="qr-bars"></div>
+          <h3 id="qr-map-title">Map</h3>
+          <p id="qr-map-note" class="note"></p>
+          <div id="qr-map"></div>
+          <h3>Rows identical to rows of other classes</h3>
+          <p id="qr-conflicts-note" class="note"></p>
+          <div id="qr-conflicts" class="table-wrap"></div>
+          <h3>Null and invalid values</h3>
+          <div id="qr-missing" class="table-wrap"></div>
+        </div>
+        <div class="card"><h2>Regions</h2>
+          <div class="filters">
+            <label class="inline">class <select id="qr-class"></select></label>
+            <div id="qr-filters" class="chips"></div>
+          </div>
+          <p class="note">Click a region for its neighbours, identical rows and null values.</p>
+          <div id="qr-regions" class="table-wrap"></div></div>
+      </div>
     </section>
 
   </main>

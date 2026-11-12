@@ -9,11 +9,12 @@ Benchmark NIDS Datasets" (EuroS&P 2024), measured on the regions of
 - how much two regions mix: the leave-one-out 1-NN error of each side
   (nearest_error), bounded below by Cover & Hart (cover_hart_low);
 - single-feature separation: the per-side accuracy of the best rule on
-  one column, a threshold or a value-to-side map (one_feature, OneR of
+  one column, a threshold or a value-to-side map (single_column, OneR of
   Holte 1993; it is Ho & Basu's F3 made robust, 1 - F3 of Lorena et
   al.);
 - on how few columns the separation rests (feature_dependence) and the
-  pair's verdict (verdict): conflict, overlap, shortcut or robust;
+  pair's verdict (verdict): label_conflict, class_overlap, shortcut or
+  robust;
 - poor data diversity and traffic collapse: how alike the rows of a
   class are (diversity).
 Which pairs are measured is candidate_pairs' choice; region_issues
@@ -27,10 +28,11 @@ from __future__ import annotations
 
 __all__ = [
     "ISSUES",
+    "REASONS",
     "VERDICTS",
     "Dependence",
-    "OneFeature",
     "Pair",
+    "SingleColumn",
     "candidate_pairs",
     "cover_hart_low",
     "diversity",
@@ -38,10 +40,10 @@ __all__ = [
     "invalid_values",
     "label_conflicts",
     "nearest_error",
-    "one_feature",
     "pair_conflicts",
     "region_issues",
     "region_samples",
+    "single_column",
     "verdict",
 ]
 
@@ -55,9 +57,9 @@ import polars as pl
 
 from src.graph import sample_rows
 
-REASONS = ("near", "conflict", "nearest")
-VERDICTS = ("conflict", "overlap", "shortcut", "robust")
-ISSUES = ("missing", "duplicates", "conflict", "overlap", "shortcut")
+REASONS = ("near", "label_conflict", "nearest")
+VERDICTS = ("label_conflict", "class_overlap", "shortcut", "robust")
+ISSUES = ("missing", "duplicates", "label_conflict", "class_overlap", "shortcut")
 
 
 @dataclass(frozen=True)
@@ -68,7 +70,8 @@ class Pair:
         a: The first region.
         b: The second region.
         reasons: Why the pair is measured, a subset of REASONS in that
-            order: "near" (separation under the threshold), "conflict" (they share rows equal on the features),
+            order: "near" (separation under the threshold),
+            "label_conflict" (they share rows equal on the features),
             "nearest" (one is the nearest rival of the other).
     """
 
@@ -158,8 +161,8 @@ def candidate_pairs(
 ) -> list[Pair]:
     """Choose the pairs of regions of different classes worth measuring.
 
-    A pair is "near" when its separation is under threshold, "conflict"
-    when it is among conflicts, "nearest" when one region is the nearest
+    A pair is "near" when its separation is under threshold,
+    "label_conflict" when it is among conflicts, "nearest" when one region is the nearest
     rival of the other (least separation; ties to the lower region id).
 
     Args:
@@ -180,7 +183,7 @@ def candidate_pairs(
         reasons[(int(a), int(b))].add("near")
     for a, b in conflicts:
         if rival[a, b]:
-            reasons[(min(a, b), max(a, b))].add("conflict")
+            reasons[(min(a, b), max(a, b))].add("label_conflict")
     for own in range(len(classes)):
         others = np.flatnonzero(rival[own])
         if len(others):
@@ -276,7 +279,7 @@ def diversity(
 
 
 @dataclass(frozen=True)
-class OneFeature:
+class SingleColumn:
     """The best rule on a single column between two regions.
 
     Attributes:
@@ -285,14 +288,14 @@ class OneFeature:
         side_b: The same for the second region.
         column: The index (into the column names) of the rule's
             column; -1 when no column has two values.
-        n_separating: The columns whose rule reaches the threshold, as
-            the mean of the two sides.
+        n_single_columns: The columns whose rule reaches the threshold,
+            as the mean of the two sides.
     """
 
     side_a: float
     side_b: float
     column: int
-    n_separating: int
+    n_single_columns: int
 
     @property
     def share(self) -> float:
@@ -396,13 +399,13 @@ def cover_hart_low(error: float) -> float:
     return (1 - math.sqrt(max(0.0, 1 - 2 * min(error, 0.5)))) / 2
 
 
-def one_feature(
+def single_column(
     Xa: np.ndarray,
     Xb: np.ndarray,
     column_of: np.ndarray,
     numeric: np.ndarray,
     threshold: float,
-) -> OneFeature:
+) -> SingleColumn:
     """Find the best rule on a single column between two regions (OneR).
 
     A numeric column (one point column) gets the threshold, in either
@@ -419,12 +422,12 @@ def one_feature(
             index into numeric, shape (d,).
         numeric: Whether each original column is numeric, shape (c,).
         threshold: The balanced accuracy from which a column counts in
-            n_separating.
+            n_single_columns.
 
     Returns:
-        The rule's accuracy on each side, its column, n_separating.
+        The rule's accuracy on each side, its column, n_single_columns.
     """
-    best, sides, n_separating = -1.0, (0.5, 0.5), 0
+    best, sides, n_single = -1.0, (0.5, 0.5), 0
     column = -1
     for c in range(len(numeric)):
         slots = column_of == c
@@ -435,10 +438,10 @@ def one_feature(
             continue
         rule = _stump(va, vb) if numeric[c] else _majority(va, vb)
         share = (rule[0] + rule[1]) / 2
-        n_separating += share >= threshold
+        n_single += share >= threshold
         if share > best:
             best, sides, column = share, rule, c
-    return OneFeature(float(sides[0]), float(sides[1]), column, int(n_separating))
+    return SingleColumn(float(sides[0]), float(sides[1]), column, int(n_single))
 
 
 def feature_dependence(
@@ -505,13 +508,13 @@ def feature_dependence(
 
 
 def verdict(
-    errors: np.ndarray, n_conflicts: int, one_feature: float, threshold: float
+    errors: np.ndarray, n_conflicts: int, single_column: float, threshold: float
 ) -> tuple[str, int]:
     """Judge a pair from its Dependence errors.
 
     With err the mean of the two sides (row 0) and tau = threshold:
-    "conflict" when err >= tau and the pair shares conflicting rows;
-    "overlap" when err >= tau and one_feature < 1 - tau (a single
+    "label_conflict" when err >= tau and the pair shares conflicting
+    rows; "class_overlap" when err >= tau and single_column < 1 - tau (a single
     column often separates what the 1-NN, swamped by the others,
     mixes); "shortcut" when, for the fewest first columns of the group,
     the error rises by at least tau and reaches tau; "robust" otherwise.
@@ -519,7 +522,7 @@ def verdict(
     Args:
         errors: Dependence.errors.
         n_conflicts: The conflicting rows the two regions share.
-        one_feature: OneFeature.share of the pair.
+        single_column: SingleColumn.share of the pair.
         threshold: tau.
 
     Returns:
@@ -529,9 +532,9 @@ def verdict(
     err = errors.mean(axis=1)
     if err[0] >= threshold:
         if n_conflicts > 0:
-            return "conflict", 0
-        if one_feature < 1 - threshold:
-            return "overlap", 0
+            return "label_conflict", 0
+        if single_column < 1 - threshold:
+            return "class_overlap", 0
     for k in range(1, len(err)):
         if err[k] - err[0] >= threshold and err[k] >= threshold:
             return "shortcut", k
@@ -548,8 +551,9 @@ def region_issues(
     """Return the problems of a region, in ISSUES order.
 
     "missing": a null or invalid value in any row; "duplicates":
-    dup_share >= dup_threshold; "conflict": a row equal to a row of
-    another class; "overlap" and "shortcut": a pair of that verdict.
+    dup_share >= dup_threshold; "label_conflict": a row equal to a row
+    of another class; "class_overlap" and "shortcut": a pair of that
+    verdict.
     None of them: the region is solid.
 
     Args:
@@ -566,8 +570,8 @@ def region_issues(
     found = {
         "missing": missing_rows > 0,
         "duplicates": dup_share >= dup_threshold,
-        "conflict": conflict_rows > 0,
-        "overlap": "overlap" in verdicts,
+        "label_conflict": conflict_rows > 0,
+        "class_overlap": "class_overlap" in verdicts,
         "shortcut": "shortcut" in verdicts,
     }
     return tuple(issue for issue in ISSUES if found[issue])

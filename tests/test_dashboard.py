@@ -6,7 +6,7 @@ import yaml
 from fastapi.testclient import TestClient
 
 from dashboard.app import create_app
-from dashboard.queries import MAP_MAX_POINTS, MAP_PER_LEAF
+from dashboard.queries import CONFLICT_GROUPS, MAP_MAX_POINTS, MAP_PER_LEAF
 
 
 @pytest.fixture(scope="module")
@@ -155,14 +155,77 @@ def test_quality(reported, client):
     data = _get(client, "/api/toy/quality")
     assert len(data["classes"]) == 9 and data["pairs"] and data["regions"]
     assert set(data["stats"]["thresholds"]) == {
-        "error",
-        "one_feature",
+        "nn_error",
+        "single_column_acc",
         "dup_share",
         "pdd",
         "tc",
     }
     assert data["missing"] and {"region", "column", "kind"} <= set(data["missing"][0])
     assert all(isinstance(p["reasons"], list) for p in data["pairs"])
+    assert {"nn_error", "shortcut_columns", "single_column"} <= set(data["pairs"][0])
+
+
+def _of(rows: list[dict], region: int) -> list[dict]:
+    """The pairs that have region on either side."""
+    return [p for p in rows if region in (p["region_a"], p["region_b"])]
+
+
+def test_quality_region_of_a_region_in_a_label_conflict(reported, client):
+    quality = _get(client, "/api/toy/quality")
+    region = next(r["region"] for r in quality["regions"] if r["conflict_rows"])
+    data = _get(client, f"/api/toy/quality/region?region={region}")
+    assert data["region"]["region"] == region
+    assert data["region"]["conflict_rows"] > 0
+    key = lambda p: (p["region_a"], p["region_b"])  # noqa: E731
+    assert sorted(map(key, data["pairs"])) == sorted(
+        map(key, _of(quality["pairs"], region))
+    )
+    assert all(isinstance(p["reasons"], list) for p in data["pairs"])
+    assert data["missing"] == [m for m in quality["missing"] if m["region"] == region]
+    conflicts = data["conflicts"]
+    assert 1 <= len(conflicts) <= min(data["n_groups"], CONFLICT_GROUPS)
+    weights = [g["n_read"] for g in conflicts]
+    assert weights == sorted(weights, reverse=True)
+    features = _get(client, "/api/toy/clean")["features"]
+    for group in conflicts:
+        assert len({r["class"] for r in group["rows"]}) >= 2
+        assert any(r["region"] == region for r in group["rows"])
+        assert group["n_read"] == pytest.approx(sum(r["n_read"] for r in group["rows"]))
+        assert list(group["values"]) == features["num"] + features["cat"]
+
+
+def test_quality_region_without_label_conflicts(reported, client):
+    quality = _get(client, "/api/toy/quality")
+    clean = [r for r in quality["regions"] if not r["conflict_rows"]]
+    data = _get(client, f"/api/toy/quality/region?region={clean[0]['region']}")
+    assert data["n_groups"] == 0 and data["conflicts"] == []
+
+
+def test_quality_region_of_an_unknown_region_is_404(reported, client):
+    assert client.get("/api/toy/quality/region?region=-1").status_code == 404
+    assert client.get("/api/toy/quality/map?region=100000").status_code == 404
+
+
+def test_quality_map_shows_a_region_and_its_rivals(reported, client):
+    quality = _get(client, "/api/toy/quality")
+    sizes = {r["region"]: r["n_rows"] for r in quality["regions"]}
+    region = quality["pairs"][0]["region_a"]
+    rivals = sorted(
+        {p["region_a"] for p in _of(quality["pairs"], region)}
+        | {p["region_b"] for p in _of(quality["pairs"], region)}
+    )
+    rivals.remove(region)
+    data = _get(client, f"/api/toy/quality/map?region={region}")
+    assert data["region"] == region and data["regions"] == [region, *rivals]
+    points = np.array(data["points"])
+    shown = points[:, 2].astype(int)
+    per_leaf = min(MAP_PER_LEAF, max(1, MAP_MAX_POINTS // len(data["regions"])))
+    for r in data["regions"]:
+        assert (shown == r).sum() == min(sizes[r], per_leaf)
+    assert set(shown) == set(data["regions"])
+    s1, s2 = data["shares"]
+    assert 0 <= s2 <= s1 <= 1
 
 
 def test_missing_runs_are_404(client):
@@ -170,4 +233,5 @@ def test_missing_runs_are_404(client):
     assert client.get("/api/empty/prepare").status_code == 404
     assert client.get("/api/empty/regions").status_code == 404
     assert client.get("/api/empty/quality").status_code == 404
+    assert client.get("/api/empty/quality/region?region=0").status_code == 404
     assert client.get("/api/nope/clean").status_code == 404

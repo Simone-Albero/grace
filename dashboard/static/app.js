@@ -3,13 +3,18 @@
 /**
  * UI state.
  * @type {{dataset: string|null, tab: "clean"|"prepare"|"regions"|"quality", cls: string|null, node: number|null,
- *   overlap: number|null, diagnosis: string|null}} node: the region tree node whose map is shown (null: the root of
- *   state.cls); overlap: the overlap zones node whose map is shown (null: the root of the first zone); diagnosis:
- *   the filter of the quality pairs, one of FILTERS (null: every pair)
+ *   overlap: number|null, view: "classes"|"regions", qclass: string|null, qfilter: string|null,
+ *   region: number|null}} node: the region tree node whose map is shown (null: the root of state.cls); overlap: the
+ *   overlap zones node whose map is shown (null: the root of the first zone); view: the quality panel shown; qclass,
+ *   qfilter: the filters of the quality regions (null: all), qfilter "solid", "flagged" or one of ISSUES; region: the
+ *   quality region whose detail is shown (null: none)
  */
-const state = { dataset: null, tab: "clean", cls: null, node: null, overlap: null, diagnosis: null };
+const state = {
+  dataset: null, tab: "clean", cls: null, node: null, overlap: null,
+  view: "regions", qclass: null, qfilter: null, region: null,
+};
 
-const last = { regions: null }; // last responses, for the controls that only redraw
+const last = { regions: null, quality: null }; // last responses, for the controls that only redraw
 let loadId = 0; // drops answers of superseded requests
 
 const $ = (id) => document.getElementById(id);
@@ -45,11 +50,14 @@ function table(headers, rows) {
 /**
  * A table sorted by clicking a header (numbers descending first, text ascending first).
  * @param {HTMLElement} el container, replaced
- * @param {{key: string, label: string, format?: (v: any) => any}[]} columns
+ * @param {{key: string, label: string, format?: (v: any, row: object) => any, help?: string, wrap?: boolean}[]} columns
+ *   help: the header's tooltip; wrap: the cells may wrap; text: left-aligned, as text
  * @param {object[]} rows one object per row, keyed by column key
- * @param {{onClick?: (row: object) => void, selected?: (row: object) => boolean}} [opts]
+ * @param {{onClick?: (row: object) => void, selected?: (row: object) => boolean, empty?: string}} [opts]
+ *   empty: the note shown instead of a table without rows
  */
 function sortable(el, columns, rows, opts = {}) {
+  if (!rows.length) { el.replaceChildren(h("p", { class: "note" }, opts.empty ?? "Nothing to show.")); return; }
   let by = null, dir = 1;
   const draw = () => {
     const sorted = by == null ? rows : [...rows].sort((a, b) => {
@@ -59,7 +67,7 @@ function sortable(el, columns, rows, opts = {}) {
       return (typeof x === "number" ? y - x : String(x).localeCompare(String(y))) * dir;
     });
     const head = columns.map((c) => {
-      const th = h("th", { class: "sortable" }, c.label);
+      const th = h("th", { class: `sortable${c.text || c.wrap ? " text" : ""}`, ...(c.help ? { title: c.help } : {}) }, c.label);
       if (c.key === by) {
         const descending = typeof rows[0]?.[by] === "number" ? dir > 0 : dir < 0;
         th.setAttribute("aria-sort", descending ? "descending" : "ascending");
@@ -68,7 +76,8 @@ function sortable(el, columns, rows, opts = {}) {
       return th;
     });
     const body = sorted.map((r) => {
-      const tr = h("tr", {}, columns.map((c) => h("td", {}, (c.format ?? String)(r[c.key], r))));
+      const kind = (c) => [c.wrap && "wrap", c.text && "text"].filter(Boolean).join(" ");
+      const tr = h("tr", {}, columns.map((c) => h("td", kind(c) ? { class: kind(c) } : {}, (c.format ?? String)(r[c.key], r))));
       if (opts.onClick) { tr.classList.add("clickable"); tr.onclick = () => opts.onClick(r); }
       if (opts.selected?.(r)) tr.classList.add("selected");
       return tr;
@@ -107,36 +116,72 @@ async function api(path) {
 async function init() {
   const opts = await api("/options");
   $("dataset").replaceChildren(...opts.datasets.map((v) => h("option", {}, v)));
+  readHash(opts.datasets);
+  // back, forward and a pasted link change only the hash: draw what it names
+  window.onhashchange = async () => {
+    if (location.hash === shownHash) return;
+    readHash(opts.datasets);
+    await showTab(state.tab);
+    if (state.tab === "quality" && state.view === "regions" && state.region != null) scrollUnderHeader($("qr-detail"));
+  };
+  $("dataset").onchange = (e) => {
+    state.dataset = e.target.value;
+    state.cls = state.node = state.overlap = state.qclass = state.qfilter = state.region = null;
+    load();
+  };
+  $("rg-class").onchange = (e) => selectClass(e.target.value);
+  $("qr-class").onchange = (e) => { state.qclass = e.target.value || null; drawRegionList(); };
+  for (const b of document.querySelectorAll(".view-switch button")) b.onclick = () => showView(b.dataset.view, true);
+  for (const b of document.querySelectorAll(".tabs button")) b.onclick = () => showTab(b.dataset.tab);
+  showTab(state.tab);
+}
+
+let shownHash = ""; // the hash last written by saveHash: a hashchange to it is our own
+
+/**
+ * Set state from the URL hash: tab, dataset, and the regions tab's class, node and overlap or the quality tab's view and region.
+ * @param {string[]} datasets the known datasets; an unknown one falls back to the first
+ */
+function readHash(datasets) {
   const [tab, dataset, cls, node, overlap] = location.hash.slice(1).split("/").map(decodeURIComponent);
   if ([...document.querySelectorAll(".tabs button")].some((b) => b.dataset.tab === tab)) state.tab = tab;
-  state.dataset = opts.datasets.includes(dataset) ? dataset : opts.datasets[0];
-  if (state.tab === "regions") {
+  const next = datasets.includes(dataset) ? dataset : datasets[0];
+  if (next !== state.dataset) state.qclass = state.qfilter = null;
+  state.dataset = next;
+  if (tab === "quality") {
+    state.view = cls === "classes" ? "classes" : "regions";
+    state.region = node ? Number(node) : null;
+  }
+  if (tab === "regions") {
     state.cls = cls || null;
     state.node = node ? Number(node) : null;
     state.overlap = overlap ? Number(overlap) : null;
   }
   $("dataset").value = state.dataset;
-  $("dataset").onchange = (e) => { state.dataset = e.target.value; state.cls = state.node = state.overlap = state.diagnosis = null; load(); };
-  $("rg-class").onchange = (e) => selectClass(e.target.value);
-  for (const b of document.querySelectorAll(".tabs button")) b.onclick = () => showTab(b.dataset.tab);
-  showTab(state.tab);
 }
 
-/** Show a tab, hide the others. */
+/** Show a tab, hide the others. @returns {Promise<void>} once it is drawn */
 function showTab(tab) {
   state.tab = tab;
   for (const b of document.querySelectorAll(".tabs button")) b.setAttribute("aria-selected", b.dataset.tab === tab);
   for (const p of document.querySelectorAll(".panel")) p.hidden = p.id !== `tab-${tab}`;
-  load();
+  return load();
 }
 
-/** Keep tab, dataset and, on the regions tab, class, node and overlap node in the URL hash. */
-function saveHash() {
+/**
+ * Keep tab, dataset and, on the regions tab, class, node and overlap node, on the quality tab view and region, in the URL hash.
+ * @param {boolean} [push] a step the back button returns from (opening a region, switching panel); else the entry is replaced
+ */
+function saveHash(push = false) {
   const parts = [state.tab, state.dataset];
+  if (state.tab === "quality") parts.push(state.view, ...(state.view === "regions" && state.region != null ? [state.region] : []));
   if (state.tab === "regions" && state.cls != null && state.node != null) {
     parts.push(state.cls, state.node, ...(state.overlap == null ? [] : [state.overlap]));
   } else if (state.tab === "regions" && state.cls != null) parts.push(state.cls);
-  history.replaceState(null, "", `#${parts.map((p) => encodeURIComponent(p)).join("/")}`);
+  shownHash = `#${parts.map((p) => encodeURIComponent(p)).join("/")}`;
+  if (shownHash === location.hash) return;
+  if (push) history.pushState(null, "", shownHash);
+  else history.replaceState(null, "", shownHash);
 }
 
 /** Fetch the data of state.tab and render it; on error show the message in the tab's empty state. */
@@ -289,7 +334,7 @@ function renderRegions(data) {
     { key: "n_read", label: "CSV rows", format: num },
     { key: "stability", label: "stability", format: stability },
   ], data.regions, {
-    onClick: (r) => { selectNode(leafOf.get(r.region)); $("rg-map-title").scrollIntoView({ behavior: "smooth", block: "start" }); },
+    onClick: (r) => { selectNode(leafOf.get(r.region)); scrollUnderHeader($("rg-map-title")); },
   });
   drawClass();
   drawOverlaps();
@@ -539,7 +584,7 @@ function drawOverlaps() {
     const chip = h("button", { class: "chip", type: "button", title: "show it in the tree of its class" },
       h("i", { style: `background:${colors.get(b.class)}` }),
       `${b.class}: ${where} · ${b.n_regions} of its ${b.n_below} ${b.n_below > 1 ? "regions" : "region"}`);
-    chip.onclick = () => { selectNode(b.node.node); $("rg-tree").scrollIntoView({ behavior: "smooth", block: "start" }); };
+    chip.onclick = () => { selectNode(b.node.node); scrollUnderHeader($("rg-tree")); };
     return chip;
   }));
   drawOverlapMap(sel, colors, regionClass);
@@ -555,7 +600,7 @@ function drawOverlaps() {
     { key: "spread_b", label: "sd b", format: (v) => dec(v, 3) },
     { key: "separation", label: "separation", format: (v) => dec(v, 2) },
   ], [...data.overlaps].sort((a, b) => a.separation - b.separation), {
-    onClick: (r) => { selectOverlap(meet.get(r)); $("rg-ov-tree").scrollIntoView({ behavior: "smooth", block: "start" }); },
+    onClick: (r) => { selectOverlap(meet.get(r)); scrollUnderHeader($("rg-ov-tree")); },
     selected: (r) => meet.get(r) === state.overlap,
   });
 }
@@ -826,106 +871,380 @@ function panZoom(svg, draw) {
   draw(t);
 }
 
-/** The filters of the quality pairs: the verdicts (quality.verdict), then the pairs a single column separates. */
-const FILTERS = ["conflict", "overlap", "shortcut", "robust", "one feature"];
+// the problems of a region and the verdicts of a pair, in the order of src.quality.ISSUES and VERDICTS
+const ISSUES = ["missing", "duplicates", "label_conflict", "class_overlap", "shortcut"];
+const VERDICTS = ["label_conflict", "class_overlap", "shortcut", "robust"];
+
+/** One sentence per column of the quality tables, shown on hover of the header. */
+const HELP = {
+  rows: "distinct rows (as kept by stage clean)",
+  read: "rows of the CSV, copies included",
+  status: "solid: none of the problems; otherwise the problems found (see How to read)",
+  missing: "rows with at least one empty, unparsable, NaN or infinite cell, and in which columns",
+  copies: "share of the CSV rows that repeat another row exactly",
+  conflicts: "rows identical on every feature to rows of another class, and of which classes",
+  neighbours: "the neighbour this region's rows confuse the most (its verdict and nn_error), then its pairs by verdict",
+  nn: "share of rows whose nearest row is in the other region (0 apart, about 0.5 mixed)",
+  bayes: "least error any classifier could reach, from nn_error (Cover & Hart, approximate)",
+  shortcut: "the columns whose removal makes the classes mix: the separation depends on them",
+  without: "nn_error once the shortcut columns are removed",
+  single: "balanced accuracy of the best rule on one column alone, and that column",
+  verdict: "label_conflict, class_overlap, shortcut or robust (see How to read)",
+  reasons: "near: centroids close; label_conflict: shares identical rows; nearest: the closest region of another class",
+  sep: "distance between the centroids, in standard deviations of their rows along the line between them",
+  pdd: "mean cosine similarity of random pairs of rows of the class",
+  tc: "share of random pairs of rows of the class that are functionally identical (cosine > 0.95)",
+  solid: "share of the class's CSV rows in solid regions",
+};
 
 /**
- * Tiles, the classes table, the pairs table with its verdict filter, the regions table with their status.
+ * Show a quality panel, classes or regions.
+ * @param {"classes"|"regions"} view
+ * @param {boolean} [push] a click: the back button returns to the panel before
+ */
+function showView(view, push = false) {
+  state.view = view;
+  for (const b of document.querySelectorAll(".view-switch button")) b.setAttribute("aria-pressed", String(b.dataset.view === view));
+  $("qr-classes-view").hidden = view !== "classes";
+  $("qr-regions-view").hidden = view !== "regions";
+  saveHash(push);
+  if (view === "regions" && last.quality) drawRegionList();
+}
+
+/**
+ * The summary line, the How to read values, then the panel of state.view.
  * @param {object} data response of /quality
  */
 function renderQuality(data) {
-  const s = data.stats, th = s.thresholds;
-  const oneFeature = (p) => p.one_feature >= th.one_feature && p.n_separating <= 1;
-  const matches = (p, f) => (f === "one feature" ? oneFeature(p) : p.verdict === f);
-  const total = (key) => data.regions.reduce((a, r) => a + r[key], 0);
-  const rows = total("n_rows"), read = total("n_read");
-  const conflictRead = total("conflict_read"), missingRead = total("missing_read");
-  fill("qr-tiles",
-    tile("solid regions", `${num(s.n_solid)} of ${num(s.n_regions)}`, `${pct(s.solid_share)} of the CSV rows`),
-    tile("copies removed", num(read - rows), `${pct((read - rows) / read)} of ${num(read)} CSV rows`),
-    tile("rows in a label conflict", num(conflictRead), `${pct(conflictRead / read, 2)} of the CSV rows`),
-    tile("rows with a null or invalid value", num(missingRead), `${pct(missingRead / read, 2)} of the CSV rows`),
-    tile("pairs measured", num(s.n_pairs), `${num(s.n_near)} near · ${num(s.n_conflict)} conflict · ${num(s.n_nearest)} nearest`),
-    tile("shortcut pairs", num(s.pairs_shortcut),
-      `${num(s.pairs_overlap)} overlap · ${num(s.pairs_conflict)} conflict · ${num(s.pairs_robust)} robust`));
-  $("qr-candidate").textContent = `${s.candidate_separation} sd`;
-  $("qr-rows").textContent = num(s.max_rows_per_region);
-  $("qr-error").textContent = th.error;
-  $("qr-group").textContent = s.max_group;
+  last.quality = data;
+  const s = data.stats;
+  fill("qr-summary",
+    h("b", {}, `${num(s.n_solid)} of ${num(s.n_regions)} regions solid`),
+    ` · ${pct(s.solid_share)} of the CSV rows · ${num(s.n_pairs)} pairs of regions of different classes measured`);
+  for (const el of document.querySelectorAll("#tab-quality [data-stat]")) {
+    const v = el.dataset.stat.split(".").reduce((o, k) => o?.[k], s);
+    el.textContent = v ?? "–";
+  }
+  drawClassTable();
+  if (!data.regions.some((r) => r.region === state.region)) state.region = null;
+  showView(state.view);
+}
 
+/** The classes table. */
+function drawClassTable() {
+  const data = last.quality, th = data.stats.thresholds;
+  const nRegions = new Map();
+  for (const r of data.regions) nRegions.set(r.class, (nRegions.get(r.class) ?? 0) + 1);
   sortable($("qr-classes"), [
-    { key: "class", label: "class" },
-    { key: "n_rows", label: "rows", format: num },
-    { key: "n_read", label: "CSV rows", format: num },
-    { key: "dup_share", label: "copies", format: (v) => share(v, false) },
-    { key: "conflict_share", label: "conflicts", format: (v) => share(v, v > 0, 2) },
-    { key: "missing_share", label: "null / invalid", format: (v) => share(v, v > 0, 2) },
-    { key: "err", label: "1-NN error", format: (v) => flagged(dec(v, 3), v >= th.error) },
-    { key: "one_feature", label: "one feature", format: (v, r) => (v == null ? "–" : flagged(`${pct(v)} ${r.one_feature_col}`, v >= th.one_feature)) },
-    { key: "pdd", label: "diversity (pdd)", format: (v) => flagged(dec(v, 3), v >= th.pdd) },
-    { key: "tc", label: "collapse (tc)", format: (v) => flagged(pct(v), v >= th.tc) },
-    { key: "issues", label: "class issues", format: chips },
-    { key: "solid_share", label: "solid", format: (v) => share(v, false) },
-    { key: "pairs_shortcut", label: "shortcut pairs", format: num },
-    { key: "pairs_overlap", label: "overlap pairs", format: num },
-    { key: "n_pairs", label: "pairs", format: num },
-  ], data.classes);
+    { key: "class", label: "class", wrap: true },
+    { key: "n_rows", label: "rows", format: num, help: HELP.rows },
+    { key: "n_read", label: "CSV rows", format: num, help: HELP.read },
+    { key: "n_regions", label: "regions", format: num },
+    { key: "solid_share", label: "solid", format: (v) => pct(v), help: HELP.solid },
+    { key: "dup_share", label: "copies", format: (v) => pct(v), help: HELP.copies },
+    { key: "conflict_share", label: "label conflicts", format: (v) => flagged(pct(v, 2), v > 0),
+      help: "share of the class's CSV rows identical to rows of another class" },
+    { key: "missing_share", label: "null / invalid", format: (v) => flagged(pct(v, 2), v > 0),
+      help: "share of the class's CSV rows with an empty, unparsable, NaN or infinite cell" },
+    { key: "nn_error", label: "nn_error", format: (v) => flagged(dec(v, 3), v >= th.nn_error),
+      help: "nn_error of its regions against the neighbour each confuses the most, weighted by rows" },
+    { key: "single_column_acc", label: "best single column",
+      format: (v, r) => (v == null ? "–" : flagged(h("span", {}, `${pct(v)} `, colName(r.single_column)), v >= th.single_column_acc)),
+      help: "the best single-column rule over its pairs that at most one column separates", wrap: true },
+    { key: "pdd", label: "pdd", format: (v) => flagged(dec(v, 3), v >= th.pdd), help: HELP.pdd },
+    { key: "tc", label: "tc", format: (v) => flagged(pct(v), v >= th.tc), help: HELP.tc },
+    { key: "issues", label: "class problems", format: chips, help: "low_diversity (pdd) and collapse (tc)", wrap: true },
+  ], data.classes.map((c) => ({ ...c, n_regions: nRegions.get(c.class) ?? 0 })));
+}
 
-  const draw = () => {
-    const shown = state.diagnosis ? data.pairs.filter((p) => matches(p, state.diagnosis)) : data.pairs;
-    fill("qr-filters", h("div", { class: "chips" }, [null, ...FILTERS].map((f) => {
-      const n = f == null ? data.pairs.length : data.pairs.filter((p) => matches(p, f)).length;
-      const chip = h("button", { class: "chip", type: "button", "aria-pressed": String(state.diagnosis === f) },
-        `${f ?? "all pairs"} (${num(n)})`);
-      chip.onclick = () => { state.diagnosis = f; draw(); };
-      return chip;
-    })));
-    sortable($("qr-pairs"), [
-      { key: "region_a", label: "region a" },
-      { key: "class_a", label: "class a" },
-      { key: "region_b", label: "region b" },
-      { key: "class_b", label: "class b" },
-      { key: "reasons", label: "measured as", format: (v) => v.join(", ") },
-      { key: "verdict", label: "verdict", format: verdictChip },
-      { key: "sep", label: "separation", format: short },
-      { key: "n_conflicts", label: "conflicts", format: num },
-      { key: "err_a", label: "1-NN error a", format: (v) => flagged(dec(v, 3), v >= th.error) },
-      { key: "err_b", label: "1-NN error b", format: (v) => flagged(dec(v, 3), v >= th.error) },
-      { key: "removed", label: "columns removed", format: (v) => v || "–" },
-      { key: "err_without", label: "error without them", format: (v) => dec(v, 3) },
-      { key: "delta", label: "rise", format: (v) => flagged(dec(v, 3), v >= th.error) },
-      { key: "one_feature", label: "one feature", format: (v, r) => flagged(`${pct(v)} ${r.one_feature_col ?? ""}`, oneFeature(r)) },
-      { key: "n_separating", label: "columns that separate", format: num },
-    ], shown);
+/** A column name that may break after its underscores. @param {string} name */
+function colName(name) {
+  return h("span", {}, name.split("_").flatMap((part, i, all) => (i < all.length - 1 ? [`${part}_`, h("wbr")] : [part])));
+}
+
+/** Column names joined by "," as breakable names, comma separated. @param {string} names */
+function colNames(names) {
+  return h("span", {}, names.split(",").flatMap((n, i) => (i ? [", ", colName(n)] : [colName(n)])));
+}
+
+/** Whether a quality region passes a filter of the regions panel. */
+function passes(r, f) {
+  if (f == null) return true;
+  if (f === "solid") return r.status === "solid";
+  if (f === "flagged") return r.status !== "solid";
+  return (r.issues ?? "").split(",").includes(f);
+}
+
+/** The filters, the regions table with one column per check, and the detail of state.region. */
+function drawRegionList() {
+  const data = last.quality, th = data.stats.thresholds;
+  const classOf = new Map(data.regions.map((r) => [r.region, r.class]));
+  const missingOf = new Map();
+  for (const m of data.missing) missingOf.set(m.region, [...(missingOf.get(m.region) ?? []), m]);
+  const conflictWith = new Map();
+  for (const p of data.pairs.filter((p) => p.n_conflicts > 0)) {
+    for (const [own, other] of [[p.region_a, p.class_b], [p.region_b, p.class_a]]) {
+      conflictWith.set(own, new Set([...(conflictWith.get(own) ?? []), other]));
+    }
+  }
+  const classes = data.classes.map((c) => c.class);
+  if (!classes.includes(state.qclass)) state.qclass = null;
+  $("qr-class").replaceChildren(h("option", { value: "" }, "all classes"), ...classes.map((c) => h("option", { value: c }, c)));
+  $("qr-class").value = state.qclass ?? "";
+  const ofClass = data.regions.filter((r) => state.qclass == null || r.class === state.qclass);
+  fill("qr-filters", [null, "solid", "flagged", ...ISSUES].map((f) => {
+    const chip = h("button", { class: "chip", type: "button", "aria-pressed": String(state.qfilter === f) },
+      `${f ?? "all"} (${num(ofClass.filter((r) => passes(r, f)).length)})`);
+    chip.onclick = () => { state.qfilter = f; drawRegionList(); };
+    return chip;
+  }));
+  const missingText = (v, r) => {
+    if (!v) return "";
+    const cells = (missingOf.get(r.region) ?? []).map((m) => `${m.column} ${m.kind}`);
+    const more = cells.length > 3 ? ` and ${cells.length - 3} more` : "";
+    return flagged(`${num(v)} ${v === 1 ? "row" : "rows"}: ${cells.slice(0, 3).join(", ")}${more}`, true);
   };
-  draw();
-
-  const missing = {};
-  for (const m of data.missing) (missing[m.region] ??= []).push(`${m.column} ${m.kind} ×${num(m.n_rows)}`);
+  const conflictText = (v, r) => (v
+    ? flagged(`${num(v)} ${v === 1 ? "row" : "rows"} · with ${[...(conflictWith.get(r.region) ?? [])].sort().join(", ")}`, true)
+    : "");
+  const neighbourText = (v, r) => {
+    if (r.rival == null) return h("span", { class: "muted" }, "no neighbour measured");
+    const judged = r.verdict ?? "not judged (too few rows)";
+    const on = r.verdict === "shortcut" && r.shortcut_columns ? ` on ${r.shortcut_columns}` : "";
+    const worst = `${judged}${on} with ${classOf.get(r.rival)} ${r.rival} · nn_error ${dec(v, 2)}`;
+    const counts = VERDICTS.filter((k) => r[`pairs_${k}`]).map((k) => `${r[`pairs_${k}`]} ${k}`).join(", ");
+    return h("span", {}, r.verdict && r.verdict !== "robust" ? flagged(worst, true) : worst,
+      h("span", { class: "muted" }, ` · pairs: ${counts || "none judged"}`));
+  };
   sortable($("qr-regions"), [
     { key: "region", label: "region" },
-    { key: "class", label: "class" },
-    { key: "status", label: "status", format: (v, r) => (v === "solid" ? "solid" : chips(r.issues)) },
-    { key: "n_rows", label: "rows", format: num },
-    { key: "n_read", label: "CSV rows", format: num },
-    { key: "n_duplicates", label: "copies", format: num },
-    { key: "dup_share", label: "copies share", format: (v) => share(v, v >= th.dup_share) },
-    { key: "conflict_rows", label: "rows in a conflict", format: num },
-    { key: "missing_rows", label: "rows null / invalid", format: (v, r) => (v ? h("span", { title: (missing[r.region] ?? []).join("\n") }, flagged(num(v), true)) : "0") },
-    { key: "rival", label: "closest rival", format: (v) => (v == null ? "–" : String(v)) },
-    { key: "err", label: "1-NN error", format: (v) => flagged(dec(v, 3), v >= th.error) },
-    { key: "one_feature", label: "one feature", format: (v, r) => (v == null ? "–" : `${pct(v)} ${r.one_feature_col ?? ""}`) },
-    { key: "verdict", label: "verdict", format: verdictChip },
-    { key: "depends_on", label: "rests on", format: (v) => v || "–" },
-    { key: "pairs_shortcut", label: "shortcut pairs", format: num },
-    { key: "pairs_overlap", label: "overlap pairs", format: num },
-    { key: "pairs_conflict", label: "conflict pairs", format: num },
-  ], data.regions);
+    { key: "class", label: "class", text: true },
+    { key: "n_rows", label: "rows", format: num, help: HELP.rows },
+    { key: "n_read", label: "CSV rows", format: num, help: HELP.read },
+    { key: "status", label: "status", format: (v, r) => (v === "solid" ? "solid" : chips(r.issues)), help: HELP.status, wrap: true },
+    { key: "missing_rows", label: "null / invalid", format: missingText, help: HELP.missing, wrap: true },
+    { key: "dup_share", label: "copies", format: (v) => flagged(pct(v), v >= th.dup_share), help: HELP.copies },
+    { key: "conflict_rows", label: "label conflicts", format: conflictText, help: HELP.conflicts, wrap: true },
+    { key: "nn_error", label: "neighbours", format: neighbourText, help: HELP.neighbours, wrap: true },
+  ], ofClass.filter((r) => passes(r, state.qfilter)), {
+    onClick: (r) => selectRegion(r.region),
+    selected: (r) => r.region === state.region,
+    empty: "No region matches these filters.",
+  });
+  drawDetail();
+}
+
+/** Open the detail of a region (null: close it). @param {number|null} region */
+function selectRegion(region) {
+  state.region = region;
+  saveHash(true);
+  drawRegionList();
+  if (region != null) scrollUnderHeader($("qr-detail"));
+}
+
+/** Scroll an element to the top of the window, below the sticky header. @param {HTMLElement} el */
+function scrollUnderHeader(el) {
+  const top = el.getBoundingClientRect().top + scrollY - document.querySelector(".top").offsetHeight - 12;
+  window.scrollTo({ top: Math.max(0, top), behavior: "smooth" });
+}
+
+let detailId = 0; // drops detail answers of superseded requests
+
+/** Fetch the detail of state.region and draw its neighbours, bars, map, identical rows and null values. */
+async function drawDetail() {
+  const id = ++detailId;
+  const card = $("qr-detail");
+  const row = last.quality.regions.find((r) => r.region === state.region);
+  card.hidden = row == null;
+  if (row == null) return;
+  const th = last.quality.stats.thresholds;
+  const close = h("button", { class: "chip close", type: "button", title: "close the detail" }, "close");
+  close.onclick = () => selectRegion(null);
+  fill("qr-detail-title", `Region ${row.region} · ${row.class}`, close);
+  fill("qr-detail-head",
+    `${num(row.n_rows)} rows · ${num(row.n_read)} CSV rows · ${pct(row.dup_share)} copies · `,
+    row.status === "solid" ? "solid" : h("span", {}, "flagged: ", chips(row.issues)));
+  for (const el of ["qr-neighbours", "qr-bars", "qr-conflicts", "qr-missing"]) fill(el, h("p", { class: "note" }, "loading…"));
+  const ds = encodeURIComponent(state.dataset);
+  let d;
+  try {
+    d = await api(`/${ds}/quality/region?region=${row.region}`);
+  } catch (e) {
+    if (id === detailId) fill("qr-neighbours", h("p", { class: "note" }, e.message));
+    return;
+  }
+  if (id !== detailId) return;
+  const sides = d.pairs.map((p) => {
+    const [s, o] = p.region_a === row.region ? ["a", "b"] : ["b", "a"];
+    return {
+      region: p[`region_${o}`], class: p[`class_${o}`], reasons: p.reasons, sep: p.sep,
+      n_conflicts: p.n_conflicts, n_conflicts_read: p.n_conflicts_read,
+      here: p[`nn_error_${s}`], there: p[`nn_error_${o}`], nn_error: p.nn_error, bayes: p.bayes_error_low,
+      shortcut_columns: p.shortcut_columns, without: p.nn_error_without, rise: p.nn_error_rise,
+      acc: p.single_column_acc, column: p.single_column, verdict: p.verdict,
+    };
+  }).sort((a, b) => (b.here ?? -1) - (a.here ?? -1) || a.region - b.region);
+  sortable($("qr-neighbours"), [
+    { key: "region", label: "region" },
+    { key: "class", label: "class", wrap: true },
+    { key: "verdict", label: "verdict", format: verdictChip, help: HELP.verdict, text: true },
+    { key: "nn_error", label: "nn_error", format: (v) => flagged(dec(v, 3), v >= th.nn_error),
+      help: "the pair's nn_error, the mean of its two sides: what the verdict compares with the threshold" },
+    { key: "here", label: "here / there",
+      format: (v, r) => (v == null ? "–" : `${dec(v, 3)} / ${dec(r.there, 3)}`),
+      help: "nn_error of this region's rows / of the neighbour's rows" },
+    { key: "bayes", label: "bayes_error_low", format: (v) => dec(v, 3), help: HELP.bayes },
+    { key: "n_conflicts", label: "identical rows",
+      format: (v, r) => (v ? h("span", { title: `${num(r.n_conflicts_read)} CSV rows` }, flagged(num(v), true)) : "0"),
+      help: "rows of the two regions identical on every feature (hover: CSV rows)" },
+    { key: "shortcut_columns", label: "shortcut_columns", help: HELP.shortcut, wrap: true,
+      format: (v, r) => (!v ? "–" : r.verdict === "shortcut" ? flagged(colNames(v), true)
+        : h("span", { class: "muted", title: "removed to test the pair: the separation does not hang on them" },
+          "removed: ", colNames(v))) },
+    { key: "without", label: "nn_error without", format: (v) => dec(v, 3), help: HELP.without },
+    { key: "acc", label: "single column", format: (v, r) => (r.column == null ? "–" : h("span", {}, `${pct(v)} `, colName(r.column))), help: HELP.single, wrap: true },
+    { key: "sep", label: "separation", format: short, help: HELP.sep },
+    { key: "reasons", label: "why measured", format: (v) => v.join(", "), help: HELP.reasons, wrap: true },
+  ], sides, { onClick: (r) => selectRegion(r.region), empty: "No region of another class was measured against this one." });
+  errorBars($("qr-bars"), sides, th.nn_error);
+  drawConflicts(d, row);
+  if (d.missing.length) {
+    sortable($("qr-missing"), [
+      { key: "column", label: "column" },
+      { key: "kind", label: "kind", help: "empty, unparsable (not a number), nan or inf", text: true },
+      { key: "n_rows", label: "rows", format: num, help: HELP.rows },
+      { key: "n_read", label: "CSV rows", format: num, help: HELP.read },
+    ], d.missing);
+  } else fill("qr-missing", h("p", { class: "note" }, "None: every cell of the region is a valid value."));
+  drawQualityMap(row, id);
+}
+
+/**
+ * Two horizontal bars per neighbour: the pair's nn_error with every column (series 1) and without its shortcut
+ * columns (series 2), on one axis from 0, the threshold dashed; a tooltip per bar.
+ * @param {HTMLElement} el container, replaced
+ * @param {object[]} sides the neighbours, in display order
+ * @param {number} tau thresholds.nn_error
+ */
+function errorBars(el, sides, tau) {
+  const judged = sides.filter((s) => s.nn_error != null);
+  if (!judged.length) { el.replaceChildren(h("p", { class: "note" }, "No pair judged: too few rows.")); return; }
+  const top = Math.min(1, niceMax(Math.max(tau * 2, ...judged.map((s) => Math.max(s.nn_error, s.without)))));
+  const bar = 9, gap = 2, rowH = 2 * bar + gap + 12;
+  const W = Math.max(560, el.clientWidth || 1100); // drawn at the width it is shown, so text keeps its size
+  const m = { l: 170, r: 24, t: 22, b: 26 }, H = m.t + m.b + rowH * judged.length;
+  const x = (v) => m.l + (Math.min(v, top) / top) * (W - m.l - m.r);
+  const kids = [];
+  for (let k = 0; k <= 4; k++) {
+    const v = (top * k) / 4;
+    kids.push(sv("line", { class: k ? "grid" : "axis", x1: x(v), x2: x(v), y1: m.t - 4, y2: H - m.b }),
+      sv("text", { x: x(v), y: H - 8, "text-anchor": "middle" }, short(v)));
+  }
+  kids.push(sv("line", { x1: x(tau), x2: x(tau), y1: m.t - 10, y2: H - m.b, style: "stroke:var(--text-2);stroke-dasharray:4 4" }),
+    sv("text", { x: x(tau) + 4, y: m.t - 10 }, `τ = ${tau}`));
+  judged.forEach((s, i) => {
+    const y0 = m.t + i * rowH;
+    kids.push(sv("text", { x: m.l - 8, y: y0 + bar + 4, "text-anchor": "end" }, `${s.class} ${s.region}`));
+    [[s.nn_error, "var(--accent)", "every column"],
+      [s.without, "var(--series-2)", s.shortcut_columns ? `without ${s.shortcut_columns.split(",").join(", ")}` : "without the columns removed"]]
+      .forEach(([v, color, what], j) => {
+        const y = y0 + j * (bar + gap);
+        const w = Math.max(0, x(v) - x(0));
+        const r = Math.min(4, w, bar / 2); // rounded data end, square at the baseline
+        const mark = sv("path", {
+          d: `M${x(0)},${y}h${w - r}a${r},${r} 0 0 1 ${r},${r}v${bar - 2 * r}a${r},${r} 0 0 1 ${-r},${r}h${-(w - r)}z`,
+          style: `fill:${color}`,
+        });
+        const hit = sv("rect", { x: x(0), y, width: W - m.l - m.r, height: bar, fill: "transparent" });
+        hit.onmousemove = (ev) => tip(ev, `${s.class} ${s.region} · nn_error ${what}: ${dec(v, 3)} · ${s.verdict}`);
+        hit.onmouseleave = () => tip(null);
+        kids.push(mark, hit);
+      });
+  });
+  el.replaceChildren(
+    h("div", { class: "legend" },
+      h("span", {}, h("i", { style: "background:var(--accent)" }), "every column"),
+      h("span", {}, h("i", { style: "background:var(--series-2)" }), "without the columns removed (shortcut_columns)")),
+    sv("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "nn_error per neighbour, with and without the shortcut columns" }, kids));
+}
+
+/** The label conflict groups of the region: one table row per group, its classes then its feature values. */
+function drawConflicts(d, row) {
+  if (!d.conflicts.length) {
+    $("qr-conflicts-note").textContent = "";
+    fill("qr-conflicts", h("p", { class: "note" }, "None: no row of this region is identical to a row of another class."));
+    return;
+  }
+  const some = d.conflicts.length < d.n_groups ? `The ${d.conflicts.length} with the most CSV rows; each` : "Each";
+  $("qr-conflicts-note").textContent = `${num(row.conflict_rows)} rows of this region (${num(row.conflict_read)} CSV rows) ` +
+    `fall in ${num(d.n_groups)} ${d.n_groups === 1 ? "group" : "groups"} of rows identical on every feature but labelled ` +
+    `with different classes. ${some} line is one group: which classes carry it, then the values all its rows share.`;
+  const columns = Object.keys(d.conflicts[0].values);
+  const value = (v) => (v == null ? h("span", { class: "muted" }, "null") : String(v));
+  fill("qr-conflicts", table(
+    ["class (region) × CSV rows", "CSV rows", ...columns],
+    d.conflicts.map((g) => [
+      h("span", { class: "cell-wrap" }, g.rows.map((r) => `${r.class} (${r.region}) ×${num(r.n_read)}`).join(" · ")),
+      num(g.n_read),
+      ...columns.map((c) => value(g.values[c])),
+    ])));
+}
+
+let qualityMapId = 0; // drops quality map answers of superseded requests
+
+/**
+ * Fetch and draw the map of a region and its neighbours, coloured by class.
+ * @param {object} row its quality_regions row
+ * @param {number} detail the detailId of the detail it belongs to
+ */
+async function drawQualityMap(row, detail) {
+  const id = ++qualityMapId;
+  $("qr-map-title").textContent = `Map of region ${row.region} and its neighbours`;
+  $("qr-map-note").textContent = "";
+  fill("qr-map", h("p", { class: "note" }, "loading…"));
+  let data;
+  try {
+    data = await api(`/${encodeURIComponent(state.dataset)}/quality/map?region=${row.region}`);
+  } catch (e) {
+    if (id === qualityMapId) fill("qr-map", h("p", { class: "note" }, e.message));
+    return;
+  }
+  if (id !== qualityMapId || detail !== detailId) return;
+  shuffle(data.points); // drawn interleaved: no region covers the others where they mix
+  const byRegion = new Map(last.quality.regions.map((r) => [r.region, r]));
+  const order = last.quality.classes.map((c) => c.class);
+  // in the dataset's class order, so a class keeps its colour from one region's map to the next
+  const shown = [...new Set(data.regions.map((r) => byRegion.get(r).class))];
+  shown.sort((a, b) => order.indexOf(a) - order.indexOf(b));
+  const colors = classColor(shown);
+  const labels = new Map(shown.map((c) => [c, `${c} · ${data.regions.filter((r) => byRegion.get(r).class === c)
+    .map((r) => (r === row.region ? `region ${r} (this one)` : `region ${r}`)).join(", ")}`]));
+  const n = data.regions.length - 1;
+  $("qr-map-note").textContent = `${num(data.points.length)} random rows of region ${row.region} and its ` +
+    `${n} ${n === 1 ? "neighbour" : "neighbours"} (at most 2,000 per region, 20,000 in all), on the first two principal ` +
+    "components of these rows, coloured by class. Hover a point for its region; drag to pan, pinch or ctrl + scroll " +
+    "to zoom, double click to reset.";
+  const svg = pointMap(data, (r) => colors.get(byRegion.get(r).class) ?? OTHER_CLASS, (r) => {
+    const x = byRegion.get(r);
+    return x ? `region ${r} · ${x.class} · ${num(x.n_rows)} rows · ${num(x.n_read)} CSV rows` : null;
+  }, `quality-clip-${id}`);
+  fill("qr-map", h("div", { class: "legend" }, classLegend(colors, labels)), h("div", { class: "table-wrap" }, svg));
+}
+
+/** Shuffle an array in place, the same way every time (a fixed seed), so a redraw looks the same. @param {any[]} a */
+function shuffle(a) {
+  let seed = 42;
+  const rand = () => ((seed = (seed * 1664525 + 1013904223) >>> 0) / 2 ** 32);
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
 }
 
 /** A verdict as a chip, flagged unless robust. @param {string|null} v */
 function verdictChip(v) {
-  if (v == null) return "–";
+  if (v == null) return "not judged";
   return v === "robust" ? "robust" : diagnosisChip(v);
 }
 
