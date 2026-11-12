@@ -182,3 +182,5 @@ td.wrap .chips { flex-wrap: wrap; }
 #qr-conflicts th:first-child, #qr-conflicts td:first-child { position: sticky; left: 0; z-index: 1; background: var(--surface); box-shadow: 1px 0 0 var(--axis); }
 #qr-neighbours td.wrap { min-width: 96px; }
 #qr-neighbours th { white-space: normal; vertical-align: bottom; }
+/* maps: curves or curves and points */
+.map-switch { margin-bottom: 8px; }

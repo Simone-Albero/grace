@@ -259,7 +259,7 @@ def quality_map(cfg: DatasetConfig, region: int) -> dict[str, Any]:
 
     Returns:
         region; regions (it, then its rivals by id); shares [s1, s2];
-        points [[pc1, pc2, region]].
+        points [[pc1, pc2, region]]; sampled [[region, rows, taken]].
 
     Raises:
         LookupError: When quality_report or regions has not run, or
@@ -295,7 +295,9 @@ def region_map(cfg: DatasetConfig, node: int) -> dict[str, Any]:
     Returns:
         node; shares [s1, s2] (the variance of each component, 0 when
         it does not exist); points [[pc1, pc2, region]], pc rounded to 4
-        decimals.
+        decimals; sampled [[region, rows, taken]], by region: its rows
+        and how many of them are in points, so that a point stands for
+        rows / taken rows of its region.
 
     Raises:
         LookupError: When regions has not run or node is not a node of
@@ -314,7 +316,8 @@ def overlap_map(cfg: DatasetConfig, node: int) -> dict[str, Any]:
         node: A node id of overlap_zones.
 
     Returns:
-        node; shares [s1, s2]; points [[pc1, pc2, region]].
+        node; shares [s1, s2]; points [[pc1, pc2, region]]; sampled
+        [[region, rows, taken]].
 
     Raises:
         LookupError: When regions has not run or node is not a node of
@@ -344,7 +347,7 @@ def _map(cfg: DatasetConfig, table: str, node: int) -> dict[str, Any]:
 
 
 def _map_regions(cfg: DatasetConfig, leaves: list[int]) -> dict[str, Any]:
-    """Return shares and points of region_map for the rows of the regions leaves."""
+    """Return shares, points and sampled of region_map for the rows of the regions leaves."""
     with closing(_connect(cfg)) as conn:
         run = _latest_run(conn, "regions", cfg)
         (config,) = conn.execute(
@@ -357,9 +360,10 @@ def _map_regions(cfg: DatasetConfig, leaves: list[int]) -> dict[str, Any]:
     bounds = np.flatnonzero(np.diff(region[rows])) + 1
     per_leaf = min(MAP_PER_LEAF, max(1, MAP_MAX_POINTS // len(leaves)))
     rng = np.random.default_rng(cfg.seed)
+    groups = [group for group in np.split(rows, bounds) if len(group)]
     take = np.sort(
         np.concatenate(
-            [rng.permutation(group)[:per_leaf] for group in np.split(rows, bounds)]
+            [rng.permutation(group)[:per_leaf] for group in groups] or [rows]
         )
     )
     distance = json.loads(config)["method"]["distance"]
@@ -376,6 +380,7 @@ def _map_regions(cfg: DatasetConfig, leaves: list[int]) -> dict[str, Any]:
             [round(float(a), 4), round(float(b), 4), int(r)]
             for (a, b), r in zip(plane, region[take])
         ],
+        "sampled": [[int(region[g[0]]), len(g), min(len(g), per_leaf)] for g in groups],
     }
 
 

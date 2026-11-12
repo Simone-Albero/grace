@@ -505,22 +505,27 @@ async function drawMap(nodes, colors) {
   const byId = new Map(nodes.map((n) => [n.node, n]));
   const regionNode = new Map(nodes.filter((n) => n.region != null).map((n) => [n.region, n]));
   const leaves = nodes.filter((n) => colors.byRegion.has(n.region)).length;
-  $("rg-map-note").textContent = `${num(data.points.length)} random rows of ${what} (at most 2,000 per region, ` +
-    `20,000 in all), on the first two principal components of these rows, in the space of the regions. ` +
+  $("rg-map-note").textContent = `The rows of ${what} on the first two principal components of ` +
+    `${num(data.points.length)} of them taken at random (at most 2,000 per region, 20,000 in all), in the space of the ` +
+    "regions. " +
     (colors.groups.length < leaves
       ? `Its ${num(leaves)} regions are coloured by the ${colors.groups.length} subtrees ringed in the tree; click one to go deeper. `
       : "Each region has its colour. ") +
-    "Hover a point for its region; drag to pan, pinch or ctrl + scroll to zoom, double click to reset.";
+    MAP_HOWTO;
   const legend = h("div", { class: "legend" }, colors.groups.map((g) => {
     const n = byId.get(g.node);
     const name = n.region != null ? `region ${n.region}` : `node ${n.node}`;
     return h("span", {}, h("i", { style: `background:${g.color}` }), `${name} · ${num(n.n_rows)} rows`);
   }));
-  const svg = pointMap(data, (r) => colors.byRegion.get(r)?.color ?? "var(--muted)", (r) => {
+  const names = new Map(colors.groups.map((g) => {
+    const n = byId.get(g.node);
+    return [g.color, n.region != null ? `region ${n.region}` : `node ${n.node}`];
+  }));
+  const map = pointMap(data, (r) => colors.byRegion.get(r)?.color ?? "var(--muted)", (r) => {
     const n = regionNode.get(r);
     return n ? nodeTip(n) : null;
-  }, `map-clip-${id}`);
-  el.replaceChildren(legend, h("div", { class: "table-wrap" }, svg));
+  }, (color) => names.get(color) ?? "other regions", `map-clip-${id}`);
+  el.replaceChildren(legend, map);
 }
 
 const OTHER_CLASS = "var(--muted)"; // the colour of the classes past the palette
@@ -550,6 +555,22 @@ function classLegend(colors, shown) {
     ...(rest.length ? [swatch(OTHER_CLASS, `other classes: ${rest.join(", ")}`)] : []),
   ];
 }
+
+/**
+ * The name of the classes drawn in each colour, for the tooltip of a map's curves.
+ * @param {Map<string, string>} colors from classColor
+ * @returns {(color: string) => string}
+ */
+function colorClass(colors) {
+  const names = new Map([...colors].map(([c, col]) => [col, c]));
+  return (color) => (color === OTHER_CLASS ? "other classes" : names.get(color) ?? "other classes");
+}
+
+// how to read a map of pointMap, the end of every map's note
+const MAP_HOWTO = "Each colour's curves enclose 25, 50, 75 and 95% of its rows (a sampled row counts for the rows of " +
+  "its region it stands for); the strips show its rows along each axis, scaled to its own peak. Hover the plot for " +
+  "the curves you are inside, or a point for its region; drag to pan, pinch or ctrl + scroll to zoom, double click " +
+  "to reset.";
 
 /** Show a node of the overlap zones: its zone, map, branches and pairs. @param {number} node */
 function selectOverlap(node) {
@@ -772,61 +793,268 @@ async function drawOverlapMap(sel, colors, regionClass) {
   for (const r of regionsBelow(last.regions.zones, sel.node)) {
     rows.set(regionClass.get(r), (rows.get(regionClass.get(r)) ?? 0) + regionRow.get(r).n_rows);
   }
-  $("rg-ov-note").textContent = `${num(data.points.length)} random rows of ${what} (at most 2,000 per region, ` +
-    "20,000 in all), on the first two principal components of these rows, in the space of the regions, coloured by " +
-    "class. Hover a point for its region; drag to pan, pinch or ctrl + scroll to zoom, double click to reset.";
+  $("rg-ov-note").textContent = `The rows of ${what} by class, on the first two principal components of ` +
+    `${num(data.points.length)} of them taken at random (at most 2,000 per region, 20,000 in all), in the space of ` +
+    `the regions. ${MAP_HOWTO}`;
   const legend = h("div", { class: "legend" },
     classLegend(colors, new Map([...rows].map(([c, n]) => [c, `${c} · ${num(n)} rows`]))));
-  const svg = pointMap(data, (r) => colors.get(regionClass.get(r)) ?? OTHER_CLASS, (r) => {
+  const map = pointMap(data, (r) => colors.get(regionClass.get(r)) ?? OTHER_CLASS, (r) => {
     const row = regionRow.get(r);
     return row ? `region ${r} · ${row.class} · ${num(row.n_rows)} rows · ${num(row.n_read)} CSV rows` : null;
-  }, `overlap-clip-${id}`);
-  el.replaceChildren(legend, h("div", { class: "table-wrap" }, svg));
+  }, colorClass(colors), `overlap-clip-${id}`);
+  el.replaceChildren(legend, map);
 }
 
 let overlapMapId = 0; // drops overlap map answers of superseded requests
 
+const LEVELS = [0.25, 0.5, 0.75, 0.95]; // the share of a group's rows inside each of its curves, innermost first
+const LEVEL_OPACITY = [1, 0.75, 0.55, 0.35];
+const CELL = 4; // side of a density cell, in viewBox units
+let showPoints = false; // the maps draw their rows as points too (the switch above every map)
+
 /**
  * Sampled rows in their PCA plane, one scale for both axes framed on the 1st to 99th percentiles, navigable with
- * panZoom (the plot of drawMap).
- * @param {{shares: number[], points: number[][]}} data response of a map endpoint
- * @param {(region: number) => string} colorOf fill of a region's points
+ * panZoom (the plot of drawMap). Each group of regions (the regions drawn in one colour) is shown by its density: four
+ * curves enclosing 25, 50, 75 and 95% of its rows, and a curve along each axis in the strips above and on the right,
+ * scaled to its own peak. A point stands for rows / taken rows of its region (data.sampled), so the regions sampled
+ * down weigh as much as they hold. A switch adds the points, whose tooltip names their region.
+ * @param {{shares: number[], points: number[][], sampled: number[][]}} data response of a map endpoint
+ * @param {(region: number) => string} colorOf colour of a region's group
  * @param {(region: number) => string|null} tipOf tooltip of a region's points
- * @param {string} clip a unique id for the clip path
- * @returns {SVGSVGElement}
+ * @param {(color: string) => string} nameOf name of the group drawn in a colour, for the tooltip of the curves
+ * @param {string} clip a unique id for the clip paths
+ * @returns {HTMLElement} the switch and the plot
  */
-function pointMap(data, colorOf, tipOf, clip) {
+function pointMap(data, colorOf, tipOf, nameOf, clip) {
   const pts = data.points.map(([a, b, region]) => ({ a, b, region }));
+  const weight = new Map(data.sampled.map(([region, rows, taken]) => [region, rows / taken]));
   const frame = (vals) => {
     const lo = percentile(vals, 1), hi = percentile(vals, 99), pad = 0.2 * (hi - lo || 1);
     return [lo - pad, hi + pad];
   };
   const [xa, xb] = frame(pts.map((p) => p.a)), [ya, yb] = frame(pts.map((p) => p.b));
-  const W = 1100, H = 520, m = { l: 48, r: 12, t: 12, b: 36 };
-  const k = Math.min((W - m.l - m.r) / (xb - xa), (H - m.t - m.b) / (yb - ya)); // one scale for both axes
-  const cx = (W - m.l - m.r - k * (xb - xa)) / 2 + m.l, cy = (H - m.t - m.b - k * (yb - ya)) / 2 + m.t;
-  const X = (v) => cx + (v - xa) * k, Y = (v) => cy + (yb - v) * k;
+  const W = 1100, H = 600, S = 64, G = 8; // S: depth of a strip, G: its gap to the plot
+  const m = { l: 48, r: 12 + S + G, t: 12 + S + G, b: 36 };
+  const pw = W - m.l - m.r, ph = H - m.t - m.b;
+  const k = Math.min(pw / (xb - xa), ph / (yb - ya)); // one scale for both axes
+  const cx = (pw - k * (xb - xa)) / 2 + m.l, cy = (ph - k * (yb - ya)) / 2 + m.t;
+  const bx = pts.map((p) => cx + (p.a - xa) * k), by = pts.map((p) => cy + (yb - p.b) * k);
+
+  // the density grid spans the plot and half of it again on every side, where a pan can bring the eye
+  const grid = { x0: m.l - pw / 2, y0: m.t - ph / 2, nx: Math.ceil((2 * pw) / CELL), ny: Math.ceil((2 * ph) / CELL) };
+  const members = new Map();
+  pts.forEach((p, i) => {
+    const color = colorOf(p.region);
+    if (!members.has(color)) members.set(color, []);
+    members.get(color).push(i);
+  });
+  const groups = [...members].map(([color, idx]) =>
+    ({ color, ...density(idx.map((i) => bx[i]), idx.map((i) => by[i]),
+      idx.map((i) => weight.get(pts[i].region) ?? 1), grid) }));
+  groups.sort((g1, g2) => g2.total - g1.total); // the small groups drawn last, on top
+
+  const stroke = (color, i) => `fill:none;stroke:${color};stroke-width:1.5;opacity:${LEVEL_OPACITY[i]}`;
+  const curves = sv("g", {}, groups.flatMap((g) => g.levels.map((t, i) => t == null ? null
+    : sv("path", { d: isolines(g.cells, grid, t), style: stroke(g.color, i), "vector-effect": "non-scaling-stroke" }))
+    .filter(Boolean)));
+  const line = (pairs) => "M" + pairs.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join("L");
+  const col = (i) => grid.x0 + (i + 0.5) * CELL, row = (j) => grid.y0 + (j + 0.5) * CELL;
+  const top = sv("g", {}, groups.map((g) => sv("path", {
+    d: line(g.alongX.map((v, i) => [col(i), 12 + S - v * (S - 4)])),
+    style: `fill:none;stroke:${g.color};stroke-width:1.5`, "vector-effect": "non-scaling-stroke",
+  })));
+  const right = sv("g", {}, groups.map((g) => sv("path", {
+    d: line(g.alongY.map((v, j) => [W - 12 - S + v * (S - 4), row(j)])),
+    style: `fill:none;stroke:${g.color};stroke-width:1.5`, "vector-effect": "non-scaling-stroke",
+  })));
   const dots = pts.map((p) => sv("circle", {
     r: 2.5, "data-region": p.region, style: `fill:${colorOf(p.region)};opacity:0.8`,
   }));
+  const dotLayer = sv("g", {}, dots);
+  dotLayer.hidden = !showPoints;
+
+  const rect = (id, x, y, width, height) => sv("clipPath", { id }, sv("rect", { x, y, width, height }));
   const svg = sv("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", class: "zoomable", style: "min-width:640px" },
-    sv("defs", {}, sv("clipPath", { id: clip }, sv("rect", { x: m.l, y: m.t, width: W - m.l - m.r, height: H - m.t - m.b }))),
-    sv("rect", { x: m.l, y: m.t, width: W - m.l - m.r, height: H - m.t - m.b, fill: "none", style: "stroke:var(--grid)" }),
-    sv("g", { "clip-path": `url(#${clip})` }, dots),
-    sv("text", { x: (W + m.l) / 2, y: H - 10, "text-anchor": "middle" }, `PC 1 · ${pct(data.shares[0], 0)} of the variance`),
-    sv("text", { transform: `translate(16, ${(H - m.b + m.t) / 2}) rotate(-90)`, "text-anchor": "middle" },
+    sv("defs", {},
+      rect(clip, m.l, m.t, pw, ph), rect(`${clip}-x`, m.l, 12, pw, S), rect(`${clip}-y`, W - 12 - S, m.t, S, ph)),
+    sv("rect", { x: m.l, y: m.t, width: pw, height: ph, fill: "none", style: "stroke:var(--grid)" }),
+    sv("line", { class: "axis", x1: m.l, x2: m.l + pw, y1: 12 + S, y2: 12 + S }),
+    sv("line", { class: "axis", x1: W - 12 - S, x2: W - 12 - S, y1: m.t, y2: m.t + ph }),
+    sv("g", { "clip-path": `url(#${clip})` }, curves, dotLayer),
+    sv("g", { "clip-path": `url(#${clip}-x)` }, top),
+    sv("g", { "clip-path": `url(#${clip}-y)` }, right),
+    sv("text", { x: m.l + pw / 2, y: H - 10, "text-anchor": "middle" }, `PC 1 · ${pct(data.shares[0], 0)} of the variance`),
+    sv("text", { transform: `translate(16, ${m.t + ph / 2}) rotate(-90)`, "text-anchor": "middle" },
       `PC 2 · ${pct(data.shares[1], 0)} of the variance`));
+
+  let now = { k: 1, x: 0, y: 0 };
+  const draw = (t) => {
+    now = t;
+    curves.setAttribute("transform", `matrix(${t.k} 0 0 ${t.k} ${t.x} ${t.y})`);
+    top.setAttribute("transform", `matrix(${t.k} 0 0 1 ${t.x} 0)`);
+    right.setAttribute("transform", `matrix(1 0 0 ${t.k} 0 ${t.y})`);
+    if (dotLayer.hidden) return;
+    dots.forEach((d, i) => {
+      d.setAttribute("cx", (t.k * bx[i] + t.x).toFixed(1));
+      d.setAttribute("cy", (t.k * by[i] + t.y).toFixed(1));
+    });
+  };
   svg.onmousemove = (ev) => {
     const region = ev.target.getAttribute?.("data-region");
-    tip(ev, region == null ? null : tipOf(Number(region)));
+    if (region != null) return tip(ev, tipOf(Number(region)));
+    const p = new DOMPoint(ev.clientX, ev.clientY).matrixTransform(svg.getScreenCTM().inverse());
+    if (p.x < m.l || p.x > m.l + pw || p.y < m.t || p.y > m.t + ph) return tip(null);
+    const i = Math.floor(((p.x - now.x) / now.k - grid.x0) / CELL), j = Math.floor(((p.y - now.y) / now.k - grid.y0) / CELL);
+    if (i < 0 || j < 0 || i >= grid.nx || j >= grid.ny) return tip(null);
+    const inside = groups.map((g) => [g, g.levels.findIndex((t) => t != null && g.cells[j * grid.nx + i] >= t)])
+      .filter(([, level]) => level >= 0).sort((a, b) => a[1] - b[1]);
+    tip(ev, inside.length ? inside.map(([g, level]) => `${nameOf(g.color)}: inside its ${pct(LEVELS[level], 0)} curve`)
+      .join(" · ") : null);
   };
   svg.onmouseleave = () => tip(null);
-  const bx = pts.map((p) => X(p.a)), by = pts.map((p) => Y(p.b));
-  panZoom(svg, (t) => dots.forEach((d, i) => {
-    d.setAttribute("cx", (t.k * bx[i] + t.x).toFixed(1));
-    d.setAttribute("cy", (t.k * by[i] + t.y).toFixed(1));
-  }));
-  return svg;
+  panZoom(svg, draw);
+
+  const choice = (label, on) => {
+    const b = h("button", { class: "chip", type: "button", "aria-pressed": String(showPoints === on) }, label);
+    b.onclick = () => {
+      showPoints = on;
+      dotLayer.hidden = !on;
+      for (const x of b.parentElement.children) x.setAttribute("aria-pressed", String(x === b));
+      draw(now);
+    };
+    return b;
+  };
+  return h("div", {},
+    h("div", { class: "chips map-switch" }, choice("curves", false), choice("curves and points", true)),
+    h("div", { class: "table-wrap" }, svg));
+}
+
+const REACH = [0, 1, 2, 3, 4, 6, 8, 11, 16, 22, 32, 45, 64]; // half sides, in cells, of the squares tried by density
+
+/**
+ * Weighted density of some points on a grid of CELL-sided cells: their weights binned in the cells, then smoothed by
+ * a Gaussian (three box blurs) as wide as the median reach of a point, the half side of the smallest square around it
+ * holding n_eff^(-1/3) / π of the weight. For a Gaussian cloud that is Scott's bandwidth (sd · n_eff^(-1/6)); measured
+ * around each point, it keeps the detail of thin or far apart clusters that the spread of the whole group would blur.
+ * @param {number[]} xs
+ * @param {number[]} ys
+ * @param {number[]} ws weight of each point
+ * @param {{x0: number, y0: number, nx: number, ny: number}} grid
+ * @returns {{cells: Float32Array, levels: (number|null)[], alongX: number[], alongY: number[], total: number}}
+ *   cells: mass per cell, row by row; levels: the density above which lie LEVELS of the total weight (null when the
+ *   grid holds less); alongX, alongY: the density along each axis, scaled to its peak; total: the summed weight
+ */
+function density(xs, ys, ws, grid) {
+  const { x0, y0, nx, ny } = grid;
+  const total = ws.reduce((s, w) => s + w, 0);
+  const nEff = total ** 2 / ws.reduce((s, w) => s + w * w, 0);
+  const cells = new Float32Array(nx * ny), alongX = new Float32Array(nx), alongY = new Float32Array(ny);
+  const at = xs.map((x, n) => {
+    const i = Math.floor((x - x0) / CELL), j = Math.floor((ys[n] - y0) / CELL);
+    if (i >= 0 && i < nx) alongX[i] += ws[n];
+    if (j >= 0 && j < ny) alongY[j] += ws[n];
+    if (i < 0 || i >= nx || j < 0 || j >= ny) return -1;
+    cells[j * nx + i] += ws[n];
+    return j * nx + i;
+  });
+  const buf = new Float32Array(Math.max(nx, ny));
+  const sigma = Math.max(1, medianReach(cells, at, ws, (nEff ** (-1 / 3) / Math.PI) * total, grid, buf) + 0.5);
+  const r = Math.max(1, Math.round((Math.sqrt(4 * sigma * sigma + 1) - 1) / 2)); // three such boxes make that Gaussian
+  for (let pass = 0; pass < 3; pass++) {
+    for (let j = 0; j < ny; j++) blur(cells, j * nx, 1, nx, r, buf);
+    for (let i = 0; i < nx; i++) blur(cells, i, nx, ny, r, buf);
+    blur(alongX, 0, 1, nx, r, buf);
+    blur(alongY, 0, 1, ny, r, buf);
+  }
+  const sorted = Float32Array.from(cells).sort().reverse();
+  const levels = LEVELS.map(() => null);
+  let sum = 0, next = 0;
+  for (let c = 0; c < sorted.length && next < LEVELS.length && sorted[c] > 0; c++) {
+    sum += sorted[c];
+    while (next < LEVELS.length && sum >= LEVELS[next] * total) levels[next++] = sorted[c];
+  }
+  const scaled = (a) => { const peak = Math.max(...a) || 1; return Array.from(a, (v) => v / peak); };
+  return { cells, levels, alongX: scaled(alongX), alongY: scaled(alongY), total };
+}
+
+/**
+ * The weighted median, over the points on the grid, of the smallest of REACH whose square around the point's cell
+ * holds at least need of the weight binned in cells (the last of REACH when none does).
+ * @param {Float32Array} cells weight per cell
+ * @param {number[]} at cell of each point, -1 off the grid
+ * @param {number[]} ws weight of each point
+ * @param {number} need
+ * @param {{nx: number, ny: number}} grid
+ * @param {Float32Array} buf scratch of at least max(nx, ny)
+ * @returns {number} in cells
+ */
+function medianReach(cells, at, ws, need, grid, buf) {
+  const { nx, ny } = grid;
+  const reach = at.map(() => REACH[REACH.length - 1]), open = new Set(at.flatMap((c, n) => (c < 0 ? [] : [n])));
+  const box = new Float32Array(cells.length);
+  for (const r of REACH) {
+    box.set(cells);
+    if (r) {
+      for (let j = 0; j < ny; j++) blur(box, j * nx, 1, nx, r, buf);
+      for (let i = 0; i < nx; i++) blur(box, i, nx, ny, r, buf);
+    }
+    const scale = (2 * r + 1) ** 2; // blur leaves the mean of the square, not its sum
+    for (const n of open) if (box[at[n]] * scale >= need) { reach[n] = r; open.delete(n); }
+    if (!open.size) break;
+  }
+  const on = at.flatMap((c, n) => (c < 0 ? [] : [n])).sort((a, b) => reach[a] - reach[b]);
+  const half = on.reduce((s, n) => s + ws[n], 0) / 2;
+  let sum = 0;
+  for (const n of on) if ((sum += ws[n]) >= half) return reach[n];
+  return 0;
+}
+
+/** One box blur of radius r, zero beyond the ends, of the n values a[off], a[off + stride], …, in place. */
+function blur(a, off, stride, n, r, buf) {
+  let s = 0;
+  for (let i = 0; i < Math.min(r, n); i++) s += a[off + i * stride];
+  for (let i = 0; i < n; i++) {
+    if (i + r < n) s += a[off + (i + r) * stride];
+    if (i - r - 1 >= 0) s -= a[off + (i - r - 1) * stride];
+    buf[i] = s / (2 * r + 1);
+  }
+  for (let i = 0; i < n; i++) a[off + i * stride] = buf[i];
+}
+
+/**
+ * The curve where a grid of cells crosses t (marching squares between the cells' centres), as SVG path data of
+ * unjoined segments.
+ * @param {Float32Array} cells
+ * @param {{x0: number, y0: number, nx: number, ny: number}} grid
+ * @param {number} t
+ * @returns {string}
+ */
+function isolines(cells, grid, t) {
+  const { x0, y0, nx, ny } = grid;
+  const out = [];
+  const seg = (p, q) => out.push(`M${p[0].toFixed(1)},${p[1].toFixed(1)}L${q[0].toFixed(1)},${q[1].toFixed(1)}`);
+  for (let j = 0; j < ny - 1; j++) {
+    for (let i = 0; i < nx - 1; i++) {
+      const a = cells[j * nx + i], b = cells[j * nx + i + 1];
+      const c = cells[(j + 1) * nx + i + 1], d = cells[(j + 1) * nx + i];
+      const code = (a >= t ? 8 : 0) | (b >= t ? 4 : 0) | (c >= t ? 2 : 0) | (d >= t ? 1 : 0);
+      if (code === 0 || code === 15) continue;
+      const x = x0 + (i + 0.5) * CELL, y = y0 + (j + 0.5) * CELL;
+      const T = [x + (CELL * (t - a)) / (b - a), y], R = [x + CELL, y + (CELL * (t - b)) / (c - b)];
+      const B = [x + (CELL * (t - d)) / (c - d), y + CELL], L = [x, y + (CELL * (t - a)) / (d - a)];
+      switch (code) {
+        case 1: case 14: seg(L, B); break;
+        case 2: case 13: seg(B, R); break;
+        case 3: case 12: seg(L, R); break;
+        case 4: case 11: seg(T, R); break;
+        case 6: case 9: seg(T, B); break;
+        case 7: case 8: seg(L, T); break;
+        case 5: seg(L, T); seg(B, R); break;
+        case 10: seg(T, R); seg(L, B); break;
+      }
+    }
+  }
+  return out.join("");
 }
 
 /** p-th percentile (0-100) of values, linear between ranks. */
@@ -1220,15 +1448,14 @@ async function drawQualityMap(row, detail) {
   const labels = new Map(shown.map((c) => [c, `${c} · ${data.regions.filter((r) => byRegion.get(r).class === c)
     .map((r) => (r === row.region ? `region ${r} (this one)` : `region ${r}`)).join(", ")}`]));
   const n = data.regions.length - 1;
-  $("qr-map-note").textContent = `${num(data.points.length)} random rows of region ${row.region} and its ` +
-    `${n} ${n === 1 ? "neighbour" : "neighbours"} (at most 2,000 per region, 20,000 in all), on the first two principal ` +
-    "components of these rows, coloured by class. Hover a point for its region; drag to pan, pinch or ctrl + scroll " +
-    "to zoom, double click to reset.";
-  const svg = pointMap(data, (r) => colors.get(byRegion.get(r).class) ?? OTHER_CLASS, (r) => {
+  $("qr-map-note").textContent = `The rows of region ${row.region} and of its ${n} ` +
+    `${n === 1 ? "neighbour" : "neighbours"} by class, on the first two principal components of ` +
+    `${num(data.points.length)} of them taken at random (at most 2,000 per region, 20,000 in all). ${MAP_HOWTO}`;
+  const map = pointMap(data, (r) => colors.get(byRegion.get(r).class) ?? OTHER_CLASS, (r) => {
     const x = byRegion.get(r);
     return x ? `region ${r} · ${x.class} · ${num(x.n_rows)} rows · ${num(x.n_read)} CSV rows` : null;
-  }, `quality-clip-${id}`);
-  fill("qr-map", h("div", { class: "legend" }, classLegend(colors, labels)), h("div", { class: "table-wrap" }, svg));
+  }, colorClass(colors), `quality-clip-${id}`);
+  fill("qr-map", h("div", { class: "legend" }, classLegend(colors, labels)), map);
 }
 
 /** Shuffle an array in place, the same way every time (a fixed seed), so a redraw looks the same. @param {any[]} a */

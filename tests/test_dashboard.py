@@ -39,6 +39,21 @@ def test_index_and_options(client):
     assert options == {"datasets": ["empty", "toy"]}
 
 
+def test_page_files_are_revalidated(client):
+    # An embedded browser (VS Code's) keeps a stale style.css otherwise.
+    for path in ["/", "/static/style.css", "/static/app.js"]:
+        assert client.get(path).headers["cache-control"] == "no-cache"
+
+
+def test_page_asks_for_its_files_by_version(client):
+    # A file that changes changes its address, so no cache can serve
+    # the old one.
+    page = client.get("/").text
+    for name in ["style.css", "app.js"]:
+        assert f'"/static/{name}?v=' in page
+        assert f'"/static/{name}"' not in page
+
+
 def test_clean(client):
     data = _get(client, "/api/toy/clean")
     assert set(data) >= {"run", "summary", "classes", "dropped_classes", "features"}
@@ -106,6 +121,10 @@ def test_region_map_of_a_root_and_of_a_leaf(client):
     assert len(points) == sum(min(n["n_rows"], per_leaf) for n in leaves)
     for n in leaves:
         assert (regions == n["region"]).sum() == min(n["n_rows"], per_leaf)
+    # the weight of a point (rows / taken) needs both counts of its region
+    assert sorted(data["sampled"]) == sorted(
+        [n["region"], n["n_rows"], min(n["n_rows"], per_leaf)] for n in leaves
+    )
     s1, s2 = data["shares"]
     assert 0 <= s2 <= s1 <= 1 and s1 + s2 <= 1 + 1e-9
     assert np.isfinite(points[:, :2]).all()
@@ -224,6 +243,9 @@ def test_quality_map_shows_a_region_and_its_rivals(reported, client):
     for r in data["regions"]:
         assert (shown == r).sum() == min(sizes[r], per_leaf)
     assert set(shown) == set(data["regions"])
+    assert sorted(data["sampled"]) == sorted(
+        [r, sizes[r], min(sizes[r], per_leaf)] for r in data["regions"]
+    )
     s1, s2 = data["shares"]
     assert 0 <= s2 <= s1 <= 1
 

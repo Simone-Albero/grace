@@ -139,7 +139,11 @@ on 127.0.0.1, one tab per stage, for the datasets of `configs/datasets/`. Each t
 stage on that dataset, and says which stage to run when there is none. The regions tab draws the tree of each class;
 a click on a node maps its rows (at most 2,000 per region, 20,000 in all) on their first two principal components,
 computed on the click. Below it, the overlap zones show where the classes overlap; a click on one of their nodes maps
-its rows by class and names its branch in each class tree. The quality tab has a summary line, a "How to read" box
+its rows by class and names its branch in each class tree. A map draws each colour (a class, or a subtree) as the
+density of its rows, each sampled row counting for the rows of its region it stands for: curves enclosing 25, 50, 75
+and 95% of them, smoothed by a Gaussian as wide as the median square around a row holding n^(-1/3)/π of its colour's
+rows (Scott's bandwidth for a Gaussian cloud, but local), and their density along each axis in strips above and on the
+right; a switch adds the rows as points. The quality tab has a summary line, a "How to read" box
 with every definition and threshold (each column header also explains itself on hover) and two panels. Classes: one
 row per class with its shares of solid, copied, conflicting and null rows, nn_error, best single column, pdd, tc and
 problems. Regions: filtered by class and by problem, one column per check saying what was found (which null cells,

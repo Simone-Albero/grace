@@ -8,8 +8,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from dashboard import queries
@@ -40,6 +40,15 @@ def create_app(dataset_dir: Path = DATASET_DIR) -> FastAPI:
     """
     app = FastAPI(title="grace dashboard")
 
+    @app.middleware("http")
+    async def revalidate(request: Request, call_next: Callable) -> Response:
+        # Without it a browser may reuse the page's files for hours on
+        # its own guess, never asking whether they changed.
+        response = await call_next(request)
+        if not request.url.path.startswith("/api/"):
+            response.headers["Cache-Control"] = "no-cache"
+        return response
+
     def offered_datasets() -> list[str]:
         return sorted(path.stem for path in dataset_dir.glob("*.yaml"))
 
@@ -51,8 +60,12 @@ def create_app(dataset_dir: Path = DATASET_DIR) -> FastAPI:
         return load_config(str(dataset_dir / f"{dataset}.yaml"))
 
     @app.get("/")
-    def index() -> FileResponse:
-        return FileResponse(STATIC / "index.html")
+    def index() -> HTMLResponse:
+        page = (STATIC / "index.html").read_text()
+        for name in ["style.css", "app.js"]:
+            version = (STATIC / name).stat().st_mtime_ns
+            page = page.replace(f'"/static/{name}"', f'"/static/{name}?v={version}"')
+        return HTMLResponse(page)
 
     @app.get("/api/options")
     def options() -> dict[str, list[str]]:
