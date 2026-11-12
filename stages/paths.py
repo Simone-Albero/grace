@@ -8,6 +8,8 @@ from __future__ import annotations
 
 __all__ = [
     "assignments_file",
+    "cell_tree_file",
+    "cells_file",
     "classes_file",
     "data_file",
     "need",
@@ -18,7 +20,6 @@ __all__ = [
     "read_points",
     "read_unparsable",
     "read_weights",
-    "regions_file",
     "unparsable_file",
 ]
 
@@ -102,8 +103,8 @@ def prepared_file(cfg: DatasetConfig) -> Path:
     return cfg.output_dir / "prepared.parquet"
 
 
-def regions_file(cfg: DatasetConfig) -> Path:
-    """Return the file of one row per region (stage regions).
+def cells_file(cfg: DatasetConfig) -> Path:
+    """Return the file of one row per cell (stage cells).
 
     Args:
         cfg: The dataset config.
@@ -111,11 +112,23 @@ def regions_file(cfg: DatasetConfig) -> Path:
     Returns:
         The parquet path.
     """
-    return cfg.output_dir / "regions.parquet"
+    return cfg.output_dir / "cells.parquet"
+
+
+def cell_tree_file(cfg: DatasetConfig) -> Path:
+    """Return the file of the cut of every class down to its cells (stage cells).
+
+    Args:
+        cfg: The dataset config.
+
+    Returns:
+        The parquet path.
+    """
+    return cfg.output_dir / "cell_tree.parquet"
 
 
 def assignments_file(cfg: DatasetConfig) -> Path:
-    """Return the file of the region of every row (stage regions).
+    """Return the file of the cell of every row (stage cells).
 
     Args:
         cfg: The dataset config.

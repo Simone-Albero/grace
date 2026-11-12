@@ -22,7 +22,7 @@ import yaml
 from main import main
 
 ROOT = Path(__file__).resolve().parents[1]
-STAGE_ORDER = ("clean", "prepare", "regions")
+STAGE_ORDER = ("clean", "prepare", "cells")
 N_DUPLICATES = 52  # copies synthetic_csv appends
 UNPARSABLE_ROW = 100  # the first row of class_1 from here gets num_1 = "n/a"
 
@@ -79,12 +79,9 @@ def write_dataset_yaml(folder: Path, csv: Path, name: str = "toy") -> Path:
 def write_method_yaml(folder: Path) -> Path:
     """Write a method yaml of the defaults, scaled down for speed."""
     method = yaml.safe_load((ROOT / "configs/method/default.yaml").read_text())
-    method["clustering"]["max_regions"] = 120
-    # The closest synthetic regions of different classes lie about 1.2 sd
-    # apart: under 2 a few zones form.
-    method["clustering"]["overlap_separation"] = 2.0
-    method["quality"]["max_rows_per_region"] = 100
-    method["quality"]["diversity_pairs"] = 200
+    method["cells"]["max_rows"] = 300  # cells enough per class for the merge
+    method["quality"]["max_rows_per_cell"] = 100
+    method["quality"]["rival_rows"] = 50
     path = folder / "method.yaml"
     path.write_text(yaml.safe_dump(method, sort_keys=False))
     return path

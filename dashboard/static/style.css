@@ -100,7 +100,6 @@ svg { display: block; max-width: 100%; height: auto; }
 svg text { fill: var(--muted); font: 11px var(--font); }
 svg .grid { stroke: var(--grid); stroke-width: 1; }
 svg .axis { stroke: var(--axis); stroke-width: 1; }
-svg .diagonal { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 4 4; }
 .legend { display: flex; gap: 16px; margin-bottom: 8px; color: var(--text-2); font-size: 12px; }
 .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
 
@@ -135,13 +134,19 @@ svg .dot { cursor: default; }
 svg .dot.clickable { cursor: pointer; }
 svg .dot.selected { stroke: var(--text); stroke-width: 2; }
 
-/* region trees and maps */
+/* cell trees and maps */
 .tree .edge { stroke: var(--axis); stroke-width: 1.5; }
 .tree .node { cursor: pointer; }
+.tree .subtree { stroke: var(--surface); stroke-width: 1; }
+.tree .count { font-size: 10px; }
+.crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 8px; font-size: 12px;
+  color: var(--text-2); }
+.crumbs[hidden] { display: none; }
+.crumbs .sep { color: var(--muted); }
+.crumbs .here { color: var(--text); }
 button.chip { background: none; font: inherit; font-size: 12px; cursor: pointer; }
 button.chip:hover { color: var(--text); border-color: var(--muted); }
 .chip i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 6px; }
-#rg-ov-branches { margin-bottom: 12px; }
 .zoomable { cursor: grab; touch-action: none; user-select: none; }
 .zoomable.dragging { cursor: grabbing; }
 

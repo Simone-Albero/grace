@@ -8,11 +8,12 @@ import polars as pl
 import pytest
 from conftest import N_DUPLICATES, STAGE_ORDER, Workspace, make_workspace
 
+from src.cells import CellTree, merge_cells
 from src.config import load_config
 from src.data import DUPLICATES, KINDS, LABEL
 from src.prepare import MISSING, OTHER
-from src.quality import ISSUES, VERDICTS, region_issues
-from stages.paths import read_points, read_weights
+from src.quality import DEFECTS, defects_of, rival_defects
+from stages.paths import read_points
 
 
 def _rows(workspace: Workspace, sql: str) -> list[tuple]:
@@ -156,74 +157,81 @@ def test_the_points_leave_missing_out(done):
     assert labels.tolist() == prepared[LABEL].to_list()
 
 
+def _cells(workspace: Workspace) -> pl.DataFrame:
+    return _read(workspace, "cells.parquet").sort("cell")
+
+
+def _classes(workspace: Workspace) -> list[str]:
+    return json.loads((workspace.output_dir / "classes.json").read_text())
+
+
 def test_assignments_cover_every_row_and_keep_its_class(done):
     assignments = _read(done, "assignments.parquet").sort("row")
-    regions = _read(done, "regions.parquet")
+    cells = _cells(done)
     data = _read(done, "data.parquet")
+    assert assignments.columns == ["row", "cell"]
     assert assignments["row"].to_list() == list(range(data.height))
-    region_class = dict(zip(regions["region"].to_list(), regions["class"].to_list()))
+    assert cells["cell"].to_list() == list(range(cells.height))
+    cell_class = dict(zip(cells["cell"].to_list(), cells["class"].to_list()))
     labels = data[LABEL].to_list()
-    assert [region_class[r] for r in assignments["region"].to_list()] == labels
-    assert regions["n_rows"].sum() == data.height
+    assert [cell_class[c] for c in assignments["cell"].to_list()] == labels
+    assert cells["n_rows"].sum() == data.height
 
 
-def test_regions_count_the_rows_of_the_csv(done):
-    regions = _read(done, "regions.parquet")
+def test_cells_count_the_rows_of_the_csv_and_keep_their_size(done):
+    limits = load_config(str(done.dataset), method=str(done.method)).method.cells
+    cells = _cells(done)
     data = _read(done, "data.parquet")
     read = dict(_rows(done, "SELECT label, n_read FROM class_counts"))
-    classes = json.loads((done.output_dir / "classes.json").read_text())
-    per_class = regions.group_by("class").agg(pl.col("n_read").sum())
+    classes = _classes(done)
+    per_class = cells.group_by("class").agg(pl.col("n_read").sum())
     for code, n_read in per_class.iter_rows():
         assert n_read == read[classes[code]]
-    assert regions["n_read"].sum() == data[DUPLICATES].sum()
-    stability = [row[0] for row in _rows(done, "SELECT stability FROM regions")]
-    assert len(stability) == regions.height
-    assert all(0 <= value <= 1 for value in stability)
-    logged = _rows(
-        done,
-        "SELECT class, n_rows, n_read, n_regions, n_pieces, n_voted, "
-        "split_separation, stability FROM class_clusterings",
+    assert cells["n_read"].sum() == data[DUPLICATES].sum()
+    assert cells["n_rows"].min() >= limits.min_rows
+    # at most max_rows, and the rows of the small branches left beside it
+    assert cells["n_rows"].max() <= 1.25 * limits.max_rows
+    logged = _rows(done, "SELECT cell, class, n_rows, n_read FROM cells ORDER BY cell")
+    assert [r[0] for r in logged] == cells["cell"].to_list()
+    assert [classes.index(r[1]) for r in logged] == cells["class"].to_list()
+    assert [r[2] for r in logged] == cells["n_rows"].to_list()
+    by_class = _rows(done, "SELECT class, n_rows, n_read, n_cells FROM class_cells")
+    assert sorted(r[0] for r in by_class) == sorted(classes)
+    assert sum(r[3] for r in by_class) == cells.height
+    assert all(r[3] >= 1 for r in by_class)
+    ((n_cells, max_rows, min_rows),) = _rows(
+        done, "SELECT n_cells, max_rows, min_rows FROM cell_stats"
     )
-    method = load_config(str(done.dataset), method=str(done.method)).method
-    assert {row[0] for row in logged} == set(classes)
-    assert sum(row[3] for row in logged) == regions.height
-    assert all(row[4] >= row[3] and row[5] >= 0 for row in logged)
-    assert all(row[6] >= method.clustering.split_separation for row in logged)
-    assert all(0 <= row[7] <= 1 for row in logged)
-    curve = _rows(
-        done,
-        "SELECT class, threshold, n_regions FROM granularity_candidates "
-        "ORDER BY class, threshold",
-    )
-    assert {row[0] for row in curve} == set(classes)
-    for name in classes:
-        counts = [row[2] for row in curve if row[0] == name]
-        assert counts == sorted(counts, reverse=True)
+    assert n_cells == cells.height
+    assert (max_rows, min_rows) == (limits.max_rows, limits.min_rows)
 
 
-def test_region_tree_counts_the_rows_below_each_node(done):
-    regions = _read(done, "regions.parquet")
-    classes = json.loads((done.output_dir / "classes.json").read_text())
-    data = _read(done, "data.parquet")
-    nodes = pl.DataFrame(
-        _rows(
-            done,
-            "SELECT node, class, parent, depth, region, n_rows, n_read "
-            "FROM region_tree ORDER BY node",
-        ),
-        schema=["node", "class", "parent", "depth", "region", "n_rows", "n_read"],
+def _tree(workspace: Workspace) -> pl.DataFrame:
+    columns = ["node", "class", "parent", "depth", "cell", "n_rows", "n_read"]
+    return pl.DataFrame(
+        _rows(workspace, f"SELECT {', '.join(columns)} FROM cell_tree ORDER BY node"),
+        schema=columns,
         orient="row",
     )
+
+
+def test_cell_tree_counts_the_rows_below_each_node(done):
+    cells = _cells(done)
+    classes = _classes(done)
+    data = _read(done, "data.parquet")
+    nodes = _tree(done)
     roots = nodes.filter(pl.col("parent") == -1)
     assert sorted(roots["class"].to_list()) == sorted(classes)
     assert (roots["depth"] == 0).all()
     class_rows = data.group_by(LABEL).len()
     expected = {classes[code]: n for code, n in class_rows.iter_rows()}
     assert dict(zip(roots["class"], roots["n_rows"])) == expected
-    leaves = nodes.filter(pl.col("region").is_not_null()).sort("region")
-    assert leaves["region"].to_list() == regions["region"].to_list()
-    assert leaves["n_rows"].to_list() == regions["n_rows"].to_list()
-    np.testing.assert_allclose(leaves["n_read"], regions["n_read"])
+    leaves = nodes.filter(pl.col("cell").is_not_null()).sort("cell")
+    assert leaves["cell"].to_list() == cells["cell"].to_list()
+    assert leaves["n_rows"].to_list() == cells["n_rows"].to_list()
+    np.testing.assert_allclose(leaves["n_read"], cells["n_read"])
+    # the cells come in pre-order: by node, as by cell
+    assert leaves.sort("node")["cell"].to_list() == leaves["cell"].to_list()
     by_node = {row["node"]: row for row in nodes.iter_rows(named=True)}
     children = (
         nodes.filter(pl.col("parent") >= 0)
@@ -232,130 +240,19 @@ def test_region_tree_counts_the_rows_below_each_node(done):
     )
     for parent, n_rows, n_read, n_children in children.iter_rows():
         node = by_node[parent]
-        assert node["region"] is None and n_children == 2
+        assert node["cell"] is None and n_children == 2
         assert node["n_rows"] == n_rows and node["n_read"] == pytest.approx(n_read)
     for row in nodes.filter(pl.col("parent") >= 0).iter_rows(named=True):
         parent = by_node[row["parent"]]
         assert parent["class"] == row["class"] and parent["node"] < row["node"]
         assert row["depth"] == parent["depth"] + 1
-
-
-def _zones(done) -> pl.DataFrame:
-    columns = [
-        "node",
-        "zone",
-        "parent",
-        "depth",
-        "separation",
-        "region_a",
-        "region_b",
-        "region",
-        "class",
-        "n_classes",
-        "n_regions",
-        "n_rows",
-        "n_read",
-    ]
-    return pl.DataFrame(
-        _rows(done, f"SELECT {', '.join(columns)} FROM overlap_zones ORDER BY node"),
-        schema=columns,
-        orient="row",
-    )
-
-
-def test_overlap_zones_count_the_regions_below_each_node(done):
-    regions = _read(done, "regions.parquet")
-    classes = json.loads((done.output_dir / "classes.json").read_text())
-    ((threshold, n_zones),) = _rows(
-        done, "SELECT overlap_separation, n_zones FROM region_stats"
-    )
-    nodes = _zones(done)
-    assert nodes.height > 0, "the synthetic classes overlap somewhere"
-    assert nodes["node"].to_list() == list(range(nodes.height))
-    roots = nodes.filter(pl.col("parent") == -1)
-    assert roots["zone"].to_list() == list(range(n_zones))
-    assert (roots["depth"] == 0).all()
-    leaves = nodes.filter(pl.col("region").is_not_null())
-    by_region = {row["region"]: row for row in regions.iter_rows(named=True)}
-    for leaf in leaves.iter_rows(named=True):
-        region = by_region[leaf["region"]]
-        assert leaf["class"] == classes[region["class"]]
-        assert leaf["n_rows"] == region["n_rows"]
-        assert leaf["n_read"] == pytest.approx(region["n_read"])
-        assert leaf["n_regions"] == leaf["n_classes"] == 1
-        assert leaf["separation"] is None and leaf["region_a"] is None
-    assert leaves["region"].n_unique() == leaves.height
-    by_node = {row["node"]: row for row in nodes.iter_rows(named=True)}
-    below: dict[int, list[dict]] = {}
-    for row in nodes.filter(pl.col("parent") >= 0).iter_rows(named=True):
-        parent = by_node[row["parent"]]
-        assert parent["node"] < row["node"] and parent["zone"] == row["zone"]
-        assert row["depth"] == parent["depth"] + 1
-        below.setdefault(row["parent"], []).append(row)
-    for node, kids in below.items():
-        row = by_node[node]
-        assert len(kids) == 2 and row["region"] is None and row["class"] is None
-        assert 0 <= row["separation"] < threshold
-        assert all(
-            k["separation"] is None or k["separation"] <= row["separation"]
-            for k in kids
-        )
-        assert row["n_rows"] == sum(k["n_rows"] for k in kids)
-        assert row["n_regions"] == sum(k["n_regions"] for k in kids)
-        assert row["n_read"] == pytest.approx(sum(k["n_read"] for k in kids))
-        assert row["n_classes"] >= 2
-        a, b = by_region[row["region_a"]], by_region[row["region_b"]]
-        assert a["class"] != b["class"]
-
-
-def test_region_overlaps_are_the_pairs_under_the_threshold(done):
-    cfg = load_config(str(done.dataset), method=str(done.method))
-    regions = _read(done, "regions.parquet").sort("region")
-    centers = np.array(regions["centroid"].to_list())
-    region = _read(done, "assignments.parquet").sort("row")["region"].to_numpy()
-    points, _ = read_points(cfg)
-    weights = read_weights(cfg)
-    classes = json.loads((done.output_dir / "classes.json").read_text())
-    ((threshold,),) = _rows(done, "SELECT overlap_separation FROM region_stats")
-    columns = [
-        "zone",
-        "region_a",
-        "class_a",
-        "region_b",
-        "class_b",
-        "distance",
-        "spread_a",
-        "spread_b",
-        "separation",
-    ]
-    pairs = [
-        dict(zip(columns, r))
-        for r in _rows(done, f"SELECT {', '.join(columns)} FROM region_overlaps")
-    ]
-    assert pairs
-    nodes = _zones(done).filter(pl.col("region").is_not_null())
-    zone_of = dict(zip(nodes["region"].to_list(), nodes["zone"].to_list()))
-    assert {p["region_a"] for p in pairs} | {p["region_b"] for p in pairs} == set(
-        zone_of
-    )
-    for p in pairs:
-        a, b = p["region_a"], p["region_b"]
-        assert a < b and p["class_a"] != p["class_b"]
-        assert p["class_a"] == classes[regions["class"][a]]
-        assert p["class_b"] == classes[regions["class"][b]]
-        assert zone_of[a] == zone_of[b] == p["zone"]
-        line = centers[b] - centers[a]
-        assert p["distance"] == pytest.approx(np.linalg.norm(line))
-        line /= np.linalg.norm(line)
-        for side, own in (("a", a), ("b", b)):
-            rows = region == own
-            along = (points[rows] - centers[own]) @ line
-            spread = np.sqrt(np.average(along**2, weights=weights[rows]))
-            assert p[f"spread_{side}"] == pytest.approx(spread, rel=1e-6)
-        assert p["separation"] == pytest.approx(
-            p["distance"] / np.hypot(p["spread_a"], p["spread_b"])
-        )
-        assert p["separation"] < threshold
+    # the file the report merges on is the same tree
+    tree = _read(done, "cell_tree.parquet").sort("node")
+    assert tree.columns == ["node", "class", "parent", "cell"]
+    assert tree["node"].to_list() == nodes["node"].to_list()
+    assert tree["parent"].to_list() == nodes["parent"].to_list()
+    assert tree["cell"].to_list() == nodes["cell"].to_list()
+    assert [classes[c] for c in tree["class"]] == nodes["class"].to_list()
 
 
 def test_a_stage_without_its_input_fails_and_is_logged(tmp_path, synthetic_csv):
@@ -364,11 +261,11 @@ def test_a_stage_without_its_input_fails_and_is_logged(tmp_path, synthetic_csv):
         workspace.run("prepare")
     workspace.run("clean")
     with pytest.raises(FileNotFoundError, match="run prepare first"):
-        workspace.run("regions")
+        workspace.run("cells")
     assert _rows(workspace, "SELECT stage, status FROM runs") == [
         ("prepare", "failed"),
         ("clean", "ok"),
-        ("regions", "failed"),
+        ("cells", "failed"),
     ]
 
 
@@ -408,51 +305,183 @@ def test_quality_classes_count_the_rows_of_every_class(reported):
     assert classes["class"].to_list() == kept["class"].to_list()
     assert classes["n_rows"].to_list() == kept["n_rows"].to_list()
     assert classes["n_read"].to_list() == pytest.approx(kept["n_read"].to_list())
-    assert classes["dup_share"].to_list() == pytest.approx(
-        (1 - kept["n_rows"] / kept["n_read"]).to_list()
+    assert classes["n_cells"].sum() == _table(reported, "quality_cells").height
+    assert classes["n_regions"].sum() == _table(reported, "quality_regions").height
+    assert "dup_share" not in classes.columns
+
+
+def test_quality_classes_share_the_csv_rows_with_each_defect(reported):
+    classes = _table(reported, "quality_classes").sort("class")
+    cells = _table(reported, "quality_cells").with_columns(
+        rival=pl.col("defects").fill_null("").str.contains("class_overlap|shortcut")
     )
-    for column in ("pdd", "tc", "solid_share", "missing_share", "nn_error"):
-        assert classes[column].is_between(0, 1).all()
-    issues = {i for v in classes["issues"].drop_nulls() for i in v.split(",")}
-    assert issues <= {"low_diversity", "collapse"}
-    for issue in ISSUES:
-        assert classes[f"share_{issue}"].is_between(0, 1).all()
+    has = lambda d: pl.col("defects").fill_null("").str.contains(d)  # noqa: E731
+    by_hand = (
+        cells.group_by("class")
+        .agg(
+            n_read=pl.col("n_read").sum(),
+            invalid_values=pl.col("missing_read").sum(),
+            duplicates=pl.col("n_duplicates").sum(),
+            label_conflict=pl.col("conflict_read").sum(),
+            class_overlap=pl.col("n_read").filter(has("class_overlap")).sum(),
+            shortcut=pl.col("n_read").filter(has("shortcut")).sum(),
+            # a row with no defect: a first copy, with no null value and in no
+            # conflict, in a cell without class_overlap or shortcut
+            lo=pl.when(pl.col("rival"))
+            .then(0)
+            .otherwise(
+                pl.col("n_rows") - pl.col("missing_rows") - pl.col("conflict_rows")
+            )
+            .sum(),
+            hi=pl.when(pl.col("rival"))
+            .then(0)
+            .otherwise(
+                pl.col("n_rows") - pl.max_horizontal("missing_rows", "conflict_rows")
+            )
+            .sum(),
+        )
+        .sort("class")
+    )
+    for defect in DEFECTS:
+        assert classes[f"share_{defect}"].to_list() == pytest.approx(
+            (by_hand[defect] / by_hand["n_read"]).to_list()
+        )
+    clean = (classes["share_no_defect"] * classes["n_read"]).to_numpy()
+    assert (by_hand["lo"].to_numpy() - 1e-6 <= clean).all()
+    assert (clean <= by_hand["hi"].to_numpy() + 1e-6).all()
+    assert (classes["share_duplicates"] > 0).any()
+    assert (classes["share_label_conflict"] > 0).any()
+    assert (classes["share_invalid_values"] > 0).any()
 
 
-def test_quality_regions_judge_every_region(reported):
-    cfg = load_config(str(reported.dataset), method=str(reported.method))
-    regions = _table(reported, "quality_regions").sort("region")
+def test_quality_stats_share_the_csv_rows_of_every_class(reported):
+    stats = _table(reported, "quality_stats").row(0, named=True)
+    classes = _table(reported, "quality_classes")
+    weight = classes["n_read"] / classes["n_read"].sum()
+    for name in (*DEFECTS, "no_defect"):
+        assert stats[f"share_{name}"] == pytest.approx(
+            (classes[f"share_{name}"] * weight).sum()
+        )
+
+
+def _codes(names: str | None, classes: list[str]) -> tuple[int, ...]:
+    """The codes of the class names joined by ","."""
+    return tuple(classes.index(n) for n in names.split(",")) if names else ()
+
+
+def test_quality_cells_judge_every_cell(reported):
+    tau = load_config(
+        str(reported.dataset), method=str(reported.method)
+    ).method.quality.tau
+    classes = _classes(reported)
+    cells = _table(reported, "quality_cells").sort("cell")
     pairs = _table(reported, "quality_pairs")
-    parquet = _read(reported, "regions.parquet").sort("region")
-    assert regions["region"].to_list() == parquet["region"].to_list()
-    assert regions["n_rows"].to_list() == parquet["n_rows"].to_list()
-    assert regions["n_duplicates"].to_list() == pytest.approx(
+    parquet = _cells(reported)
+    assert cells["cell"].to_list() == parquet["cell"].to_list()
+    assert cells["n_rows"].to_list() == parquet["n_rows"].to_list()
+    assert cells["n_duplicates"].to_list() == pytest.approx(
         (parquet["n_read"] - parquet["n_rows"]).to_list()
     )
-    assert regions["dup_share"].to_list() == pytest.approx(
+    assert cells["dup_share"].to_list() == pytest.approx(
         (1 - parquet["n_rows"] / parquet["n_read"]).to_list()
     )
-    assert regions["rival"].is_not_null().all()
-    assert regions["nn_error"].is_between(0, 1).all()
-    for r in regions.iter_rows(named=True):
+    for r in cells.iter_rows(named=True):
         own = pairs.filter(
-            (pl.col("region_a") == r["region"]) | (pl.col("region_b") == r["region"])
+            (pl.col("cell_a") == r["cell"]) | (pl.col("cell_b") == r["cell"])
         )
-        verdicts = own["verdict"].drop_nulls().to_list()
-        assert [r[f"pairs_{v}"] for v in VERDICTS] == [
-            verdicts.count(v) for v in VERDICTS
-        ]
-        issues = region_issues(
+        assert r["n_rivals"] == own.height > 0
+        rivals = []
+        for p in own.iter_rows(named=True):
+            side, other = ("a", "b") if p["cell_a"] == r["cell"] else ("b", "a")
+            assert p[f"region_{side}"] == r["region"]
+            if p[f"confusion_{side}"] is None:
+                continue
+            steps = [
+                p[f"confusion_{side}"],
+                *json.loads(p[f"confusion_without_{side}"]),
+            ]
+            rivals.append((classes.index(p[f"class_{other}"]), np.array(steps)))
+            if p[f"cell_{other}"] == r["rival"]:
+                assert r["confusion"] == pytest.approx(p[f"confusion_{side}"])
+                assert r["rival_class"] == p[f"class_{other}"]
+        assert r["confusion"] == pytest.approx(max(e[0] for _, e in rivals))
+        overlap, shortcut = rival_defects(rivals, tau)
+        assert _codes(r["overlap_with"], classes) == overlap
+        assert _codes(r["shortcut_with"], classes) == shortcut
+        defects = defects_of(
             r["missing_rows"],
-            r["dup_share"],
+            r["n_rows"],
+            r["n_read"],
             r["conflict_rows"],
-            verdicts,
-            cfg.method.quality.thresholds["dup_share"],
+            overlap,
+            shortcut,
         )
-        assert r["issues"] == (",".join(issues) or None)
-        assert r["status"] == ("flagged" if issues else "solid")
-        assert (r["shortcut_columns"] is not None) == (r["verdict"] == "shortcut")
+        assert r["defects"] == (",".join(defects) or None)
+        if r["shortcut_rival"] is not None:
+            assert r["shortcut_columns"]
+            assert (r["confusion_without"] >= tau) == ("shortcut" in defects)
         assert r["missing_rows"] >= max(r[f"{kind}_rows"] for kind in KINDS)
+
+
+def test_quality_regions_are_the_largest_branches_of_cells_that_agree(reported):
+    classes = _classes(reported)
+    cells = _table(reported, "quality_cells").sort("cell")
+    regions = _table(reported, "quality_regions").sort("region")
+    tree = _read(reported, "cell_tree.parquet").sort("node")
+    profile = [
+        (r["overlap_with"], r["shortcut_with"]) for r in cells.iter_rows(named=True)
+    ]
+    expected, offset = [], 0
+    for code in range(len(classes)):
+        part = tree.filter(pl.col("class") == code)
+        if not part.height:
+            continue
+        first = part["node"][0]
+        own = part["cell"].drop_nulls().to_numpy()
+        base = int(own.min())
+        cut = CellTree(
+            parent=np.where(part["parent"] >= 0, part["parent"] - first, -1),
+            cell=np.where(part["cell"].is_null(), -1, part["cell"].fill_null(0) - base),
+        )
+        merged = merge_cells(cut, profile[base : base + len(own)])
+        expected += (merged + offset).tolist()
+        offset += int(merged.max()) + 1
+    assert cells["region"].to_list() == expected
+    assert regions["region"].to_list() == list(range(offset))
+    summed = (
+        cells.group_by("region")
+        .agg(
+            pl.len().alias("n_cells"),
+            *(
+                pl.col(c).sum()
+                for c in ("n_rows", "n_read", "conflict_rows", "missing_rows")
+            ),
+            pl.col("overlap_with").unique(),
+            pl.col("shortcut_with").unique(),
+            pl.col("confusion").max(),
+        )
+        .sort("region")
+    )
+    assert regions["n_cells"].to_list() == summed["n_cells"].to_list()
+    for column in ("n_rows", "conflict_rows", "missing_rows"):
+        assert regions[column].to_list() == summed[column].to_list()
+    assert regions["n_read"].to_list() == pytest.approx(summed["n_read"].to_list())
+    assert regions["confusion"].to_list() == pytest.approx(
+        summed["confusion"].to_list()
+    )
+    for r, s in zip(regions.iter_rows(named=True), summed.iter_rows(named=True)):
+        # the cells of a region share their classes of class_overlap and shortcut
+        assert s["overlap_with"] == [r["overlap_with"]]
+        assert s["shortcut_with"] == [r["shortcut_with"]]
+        defects = defects_of(
+            r["missing_rows"],
+            r["n_rows"],
+            r["n_read"],
+            r["conflict_rows"],
+            _codes(r["overlap_with"], classes),
+            _codes(r["shortcut_with"], classes),
+        )
+        assert r["defects"] == (",".join(defects) or None)
 
 
 def _bad_cells(series: pl.Series) -> int:
@@ -462,18 +491,23 @@ def _bad_cells(series: pl.Series) -> int:
     return n
 
 
-def test_region_missing_counts_every_null_or_invalid_cell(reported):
+def test_cell_missing_counts_every_null_or_invalid_cell(reported):
     data = _read(reported, "data.parquet").drop(DUPLICATES, LABEL)
-    missing = _table(reported, "region_missing")
-    regions = _table(reported, "quality_regions")
+    missing = _table(reported, "cell_missing")
+    cells = _table(reported, "quality_cells")
     bad = sum(_bad_cells(data[c]) for c in data.columns)
     assert missing["n_rows"].sum() == bad > 0
     assert {"empty", "unparsable", "inf"} <= set(missing["kind"]) <= set(KINDS)
     (unparsable,) = missing.filter(pl.col("kind") == "unparsable").rows(named=True)
     assert unparsable["column"] == "num_1" and unparsable["n_rows"] == 1
-    assert 0 < regions["missing_rows"].sum() <= bad
-    flagged = regions.filter(pl.col("missing_rows") > 0)
-    assert flagged["issues"].str.contains("missing").all()
+    region_of = dict(zip(cells["cell"].to_list(), cells["region"].to_list()))
+    assert all(
+        region_of[c] == r for c, r in missing.select("cell", "region").iter_rows()
+    )
+    assert 0 < cells["missing_rows"].sum() <= bad
+    for table in (cells, _table(reported, "quality_regions")):
+        flagged = table.filter(pl.col("missing_rows") > 0)
+        assert flagged["defects"].str.contains("invalid_values").all()
 
 
 def test_the_relabelled_row_is_a_label_conflict(reported):
@@ -483,46 +517,61 @@ def test_the_relabelled_row_is_a_label_conflict(reported):
     assert len(of_last) == 1
     group = groups.filter(pl.col("group") == of_last[0])
     assert group.height == 2 and group["class"].n_unique() == 2
-    pairs = _table(reported, "quality_pairs")
-    a, b = sorted(group["region"].to_list())
-    pair = pairs.filter((pl.col("region_a") == a) & (pl.col("region_b") == b))
-    assert pair.height == 1 and "label_conflict" in pair["reasons"][0].split(",")
-    assert pair["n_conflicts"][0] >= 2
+    for table, key in (
+        (_table(reported, "quality_cells"), "cell"),
+        (_table(reported, "quality_regions"), "region"),
+    ):
+        for unit, own in group.select(key, "class").iter_rows():
+            (row,) = table.filter(pl.col(key) == unit).rows(named=True)
+            assert row["conflict_rows"] >= 1 and "label_conflict" in row["defects"]
+            other = set(group["class"]) - {own}
+            assert other <= set(row["conflict_with"].split(","))
 
 
-def test_quality_pairs_follow_their_reasons(reported):
+def test_the_copies_are_duplicates(reported):
+    for table in (
+        _table(reported, "quality_cells"),
+        _table(reported, "quality_regions"),
+    ):
+        copied = table.filter(pl.col("n_read") > pl.col("n_rows"))
+        assert copied.height > 0
+        assert copied["defects"].str.contains("duplicates").all()
+        alone = table.filter(pl.col("n_read") == pl.col("n_rows"))
+        assert not alone["defects"].fill_null("").str.contains("duplicates").any()
+
+
+def test_quality_pairs_are_the_rivals_of_every_cell(reported):
     cfg = load_config(str(reported.dataset), method=str(reported.method))
     quality = cfg.method.quality
     pairs = _table(reported, "quality_pairs")
-    regions = _read(reported, "regions.parquet")
+    cells = _cells(reported)
     assert pairs.height and (pairs["class_a"] != pairs["class_b"]).all()
-    assert (pairs["region_a"] < pairs["region_b"]).all()
-    measured = set(pairs["region_a"]) | set(pairs["region_b"])
-    assert measured == set(regions["region"])
+    assert (pairs["cell_a"] < pairs["cell_b"]).all()
+    assert pairs.select("cell_a", "cell_b").is_unique().all()
+    measured = set(pairs["cell_a"]) | set(pairs["cell_b"])
+    assert measured == set(cells["cell"])
     columns = set(cfg.num_cols + cfg.cat_cols)
     for p in pairs.iter_rows(named=True):
-        reasons = p["reasons"].split(",")
-        assert ("near" in reasons) == (p["sep"] < quality.candidate_separation)
-        assert ("label_conflict" in reasons) == (p["n_conflicts"] > 0)
-        assert p["verdict"] in VERDICTS
-        for key in ("a", "b", "", "without_a", "without_b", "without"):
+        for key in ("a", "b", ""):
             assert 0 <= p[f"nn_error_{key}".rstrip("_")] <= 1
         assert 0 <= p["bayes_error_low"] <= p["nn_error"]
         assert p["nn_error"] == pytest.approx((p["nn_error_a"] + p["nn_error_b"]) / 2)
-        assert p["nn_error_rise"] == pytest.approx(
-            p["nn_error_without"] - p["nn_error"]
-        )
         assert 0.5 <= p["single_column_acc"] <= 1 and p["single_column"] in columns
-        removed = p["shortcut_columns"].split(",") if p["shortcut_columns"] else []
-        assert set(removed) <= columns and len(removed) <= quality.max_group
-        if p["verdict"] == "shortcut":
-            assert removed and p["nn_error_rise"] >= quality.thresholds["nn_error"]
+        removed = p["key_columns"].split(",")
+        assert set(removed) <= columns and len(removed) == quality.max_group
+        one = (1 - p["single_column_acc_a"], 1 - p["single_column_acc_b"])
+        nearest = (p["nn_error_a"], p["nn_error_b"])
+        assert (p["confusion_a"], p["confusion_b"]) in (one, nearest)
+        for side in ("a", "b"):
+            without = json.loads(p[f"confusion_without_{side}"])
+            assert len(without) == len(removed)
+            assert all(0 <= e <= 1 for e in without)
 
 
-def test_quality_report_refuses_regions_of_other_data(copy_of_done):
+def test_quality_report_refuses_cells_of_other_data(copy_of_done):
     prepared_file = copy_of_done.output_dir / "prepared.parquet"
     prepared = pl.read_parquet(prepared_file)
     shuffled = np.random.default_rng(0).permutation(prepared[LABEL].to_numpy())
     prepared.with_columns(pl.Series(LABEL, shuffled)).write_parquet(prepared_file)
-    with pytest.raises(ValueError, match="run regions again"):
+    with pytest.raises(ValueError, match="run cells again"):
         copy_of_done.run("quality_report")

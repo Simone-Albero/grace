@@ -79,17 +79,13 @@ def create_app(dataset_dir: Path = DATASET_DIR) -> FastAPI:
     def prepare(dataset: str) -> Any:
         return _query(queries.prepare, load_dataset(dataset))
 
-    @app.get("/api/{dataset}/regions")
-    def regions(dataset: str) -> Any:
-        return _query(queries.regions, load_dataset(dataset))
+    @app.get("/api/{dataset}/cells")
+    def cells(dataset: str) -> Any:
+        return _query(queries.cells, load_dataset(dataset))
 
-    @app.get("/api/{dataset}/regions/map")
-    def region_map(dataset: str, node: int) -> Any:
-        return _query(queries.region_map, load_dataset(dataset), node)
-
-    @app.get("/api/{dataset}/regions/overlap_map")
-    def overlap_map(dataset: str, node: int) -> Any:
-        return _query(queries.overlap_map, load_dataset(dataset), node)
+    @app.get("/api/{dataset}/cells/map")
+    def cell_map(dataset: str, node: int) -> Any:
+        return _query(queries.cell_map, load_dataset(dataset), node)
 
     @app.get("/api/{dataset}/quality")
     def quality(dataset: str) -> Any:

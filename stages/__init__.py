@@ -8,13 +8,13 @@ import sqlite3
 from collections.abc import Callable
 
 from src.config import DatasetConfig
-from stages import clean, prepare, quality_report, regions
+from stages import cells, clean, prepare, quality_report
 
 StageFn = Callable[[DatasetConfig, sqlite3.Connection, int], None]
 
 STAGES: dict[str, StageFn] = {
     "clean": clean.run,
     "prepare": prepare.run,
-    "regions": regions.run,
+    "cells": cells.run,
     "quality_report": quality_report.run,
 }

@@ -6,7 +6,8 @@ import yaml
 from fastapi.testclient import TestClient
 
 from dashboard.app import create_app
-from dashboard.queries import CONFLICT_GROUPS, MAP_MAX_POINTS, MAP_PER_LEAF
+from dashboard.queries import CONFLICT_GROUPS, MAP_MAX_POINTS, MAP_PER_CELL
+from src.quality import DEFECTS
 
 
 @pytest.fixture(scope="module")
@@ -78,116 +79,84 @@ def test_prepare(client):
     assert len({c["source"] for c in cat}) == summary["n_cat"]
 
 
-def test_regions(client):
-    data = _get(client, "/api/toy/regions")
-    assert set(data) >= {"run", "stats", "classes", "candidates", "regions", "tree"}
-    assert data["stats"]["n_regions"] == len(data["regions"])
-    assert "algorithm" not in data["stats"]
-    assert all("params" not in c for c in data["classes"] + data["candidates"])
-    leaves = [n for n in data["tree"] if n["region"] is not None]
-    assert len(leaves) == len(data["regions"])
-    assert all("stability" in r for r in data["regions"])
-    assert all({"threshold", "n_regions"} <= set(c) for c in data["candidates"])
+def test_cells(client):
+    data = _get(client, "/api/toy/cells")
+    assert set(data) == {"run", "stats", "classes", "cells", "tree"}
+    assert data["stats"]["n_cells"] == len(data["cells"])
+    assert {"max_rows", "min_rows", "distance"} <= set(data["stats"])
+    assert sum(c["n_cells"] for c in data["classes"]) == len(data["cells"])
+    leaves = [n for n in data["tree"] if n["cell"] is not None]
+    assert sorted(n["cell"] for n in leaves) == [c["cell"] for c in data["cells"]]
 
 
 def _below(tree: list[dict], node: int) -> set[int]:
-    """The regions under a node."""
+    """The cells under a node."""
     kids = {}
     for n in tree:
         kids.setdefault(n["parent"], []).append(n)
     by_node = {n["node"]: n for n in tree}
-    stack, regions = [by_node[node]], set()
+    stack, cells = [by_node[node]], set()
     while stack:
         n = stack.pop()
-        if n["region"] is not None:
-            regions.add(n["region"])
+        if n["cell"] is not None:
+            cells.add(n["cell"])
         stack += kids.get(n["node"], [])
-    return regions
+    return cells
 
 
-def test_region_map_of_a_root_and_of_a_leaf(client):
-    tree = _get(client, "/api/toy/regions")["tree"]
+def test_cell_map_of_a_root_and_of_a_leaf(client):
+    data = _get(client, "/api/toy/cells")
+    tree, sizes = data["tree"], {c["cell"]: c["n_rows"] for c in data["cells"]}
     root = max(
         (n for n in tree if n["parent"] == -1),
         key=lambda n: len(_below(tree, n["node"])),
     )
-    data = _get(client, f"/api/toy/regions/map?node={root['node']}")
+    below = _below(tree, root["node"])
+    data = _get(client, f"/api/toy/cells/map?node={root['node']}")
     assert data["node"] == root["node"]
     points = np.array(data["points"])
-    regions = points[:, 2].astype(int)
-    assert set(regions) <= _below(tree, root["node"])
-    leaves = [n for n in tree if n["region"] in _below(tree, root["node"])]
-    per_leaf = min(MAP_PER_LEAF, max(1, MAP_MAX_POINTS // len(leaves)))
-    assert len(points) == sum(min(n["n_rows"], per_leaf) for n in leaves)
-    for n in leaves:
-        assert (regions == n["region"]).sum() == min(n["n_rows"], per_leaf)
-    # the weight of a point (rows / taken) needs both counts of its region
+    shown = points[:, 2].astype(int)
+    assert set(shown) == below
+    per_cell = min(MAP_PER_CELL, max(1, MAP_MAX_POINTS // len(below)))
+    for c in below:
+        assert (shown == c).sum() == min(sizes[c], per_cell)
+    # the weight of a point (rows / taken) needs both counts of its cell
     assert sorted(data["sampled"]) == sorted(
-        [n["region"], n["n_rows"], min(n["n_rows"], per_leaf)] for n in leaves
+        [c, sizes[c], min(sizes[c], per_cell)] for c in below
     )
     s1, s2 = data["shares"]
     assert 0 <= s2 <= s1 <= 1 and s1 + s2 <= 1 + 1e-9
     assert np.isfinite(points[:, :2]).all()
-    leaf = next(n for n in tree if n["region"] is not None)
-    data = _get(client, f"/api/toy/regions/map?node={leaf['node']}")
-    assert {p[2] for p in data["points"]} == {leaf["region"]}
-    assert len(data["points"]) == min(leaf["n_rows"], MAP_PER_LEAF)
+    leaf = next(n for n in tree if n["cell"] is not None)
+    data = _get(client, f"/api/toy/cells/map?node={leaf['node']}")
+    assert {p[2] for p in data["points"]} == {leaf["cell"]}
 
 
-def test_region_map_of_an_unknown_node_is_404(client):
-    assert client.get("/api/toy/regions/map?node=-5").status_code == 404
+def test_cell_map_of_an_unknown_node_is_404(client):
+    assert client.get("/api/toy/cells/map?node=-5").status_code == 404
 
 
-def test_regions_carry_the_overlap_zones(client):
-    data = _get(client, "/api/toy/regions")
-    assert data["stats"]["overlap_separation"] > 0
-    assert data["zones"] and data["overlaps"]
-    roots = [n for n in data["zones"] if n["parent"] == -1]
-    assert len(roots) == data["stats"]["n_zones"]
-    assert {"zone", "region_a", "region_b", "spread_a", "separation"} <= set(
-        data["overlaps"][0]
-    )
-
-
-def test_overlap_map_of_a_zone_and_of_a_leaf(client):
-    nodes = _get(client, "/api/toy/regions")["zones"]
-    root = next(n for n in nodes if n["parent"] == -1)
-    data = _get(client, f"/api/toy/regions/overlap_map?node={root['node']}")
-    assert data["node"] == root["node"]
-    regions = {p[2] for p in data["points"]}
-    leaves = [n for n in nodes if n["region"] is not None and n["zone"] == root["zone"]]
-    assert regions == {n["region"] for n in leaves}
-    per_leaf = min(MAP_PER_LEAF, max(1, MAP_MAX_POINTS // len(leaves)))
-    assert len(data["points"]) == sum(min(n["n_rows"], per_leaf) for n in leaves)
-    s1, s2 = data["shares"]
-    assert 0 <= s2 <= s1 <= 1
-    leaf = leaves[0]
-    data = _get(client, f"/api/toy/regions/overlap_map?node={leaf['node']}")
-    assert {p[2] for p in data["points"]} == {leaf["region"]}
-
-
-def test_overlap_map_of_an_unknown_node_is_404(client):
-    assert client.get("/api/toy/regions/overlap_map?node=-5").status_code == 404
+def test_the_region_routes_of_the_cells_stage_are_gone(client):
+    assert client.get("/api/toy/regions").status_code == 404
+    assert client.get("/api/toy/regions/map?node=0").status_code == 404
+    assert client.get("/api/toy/regions/overlap_map?node=0").status_code == 404
 
 
 def test_quality(reported, client):
     data = _get(client, "/api/toy/quality")
-    assert len(data["classes"]) == 9 and data["pairs"] and data["regions"]
-    assert set(data["stats"]["thresholds"]) == {
-        "nn_error",
-        "single_column_acc",
-        "dup_share",
-        "pdd",
-        "tc",
-    }
+    assert set(data) == {"run", "stats", "classes", "regions", "missing"}
+    assert len(data["classes"]) == 9 and data["regions"]
+    shares = {f"share_{d}" for d in DEFECTS} | {"share_no_defect"}
+    for row in [data["stats"], *data["classes"]]:
+        assert shares <= set(row) and all(0 <= row[k] <= 1 for k in shares)
+    assert data["stats"]["tau"] == 0.1 and "thresholds" not in data["stats"]
+    assert data["stats"]["n_regions"] == len(data["regions"])
     assert data["missing"] and {"region", "column", "kind"} <= set(data["missing"][0])
-    assert all(isinstance(p["reasons"], list) for p in data["pairs"])
-    assert {"nn_error", "shortcut_columns", "single_column"} <= set(data["pairs"][0])
-
-
-def _of(rows: list[dict], region: int) -> list[dict]:
-    """The pairs that have region on either side."""
-    return [p for p in rows if region in (p["region_a"], p["region_b"])]
+    for region in data["regions"]:
+        assert set(region["defects"]) <= set(DEFECTS)
+        for key in ("overlap_with", "shortcut_with", "conflict_with"):
+            assert isinstance(region[key], list)
+    assert any(r["defects"] for r in data["regions"])
 
 
 def test_quality_region_of_a_region_in_a_label_conflict(reported, client):
@@ -196,12 +165,20 @@ def test_quality_region_of_a_region_in_a_label_conflict(reported, client):
     data = _get(client, f"/api/toy/quality/region?region={region}")
     assert data["region"]["region"] == region
     assert data["region"]["conflict_rows"] > 0
-    key = lambda p: (p["region_a"], p["region_b"])  # noqa: E731
-    assert sorted(map(key, data["pairs"])) == sorted(
-        map(key, _of(quality["pairs"], region))
+    assert "label_conflict" in data["region"]["defects"]
+    cells = {c["cell"] for c in data["cells"]}
+    assert len(cells) == data["region"]["n_cells"]
+    assert all(c["region"] == region for c in data["cells"])
+    assert sum(c["n_rows"] for c in data["cells"]) == data["region"]["n_rows"]
+    assert data["pairs"] and all(
+        {p["cell_a"], p["cell_b"]} & cells for p in data["pairs"]
     )
-    assert all(isinstance(p["reasons"], list) for p in data["pairs"])
-    assert data["missing"] == [m for m in quality["missing"] if m["region"] == region]
+    assert all(isinstance(p["confusion_without_a"], list) for p in data["pairs"])
+    assert data["missing"] == [
+        {k: m[k] for k in m if k != "region"}
+        for m in quality["missing"]
+        if m["region"] == region
+    ]
     conflicts = data["conflicts"]
     assert 1 <= len(conflicts) <= min(data["n_groups"], CONFLICT_GROUPS)
     weights = [g["n_read"] for g in conflicts]
@@ -210,6 +187,7 @@ def test_quality_region_of_a_region_in_a_label_conflict(reported, client):
     for group in conflicts:
         assert len({r["class"] for r in group["rows"]}) >= 2
         assert any(r["region"] == region for r in group["rows"])
+        assert any(r["cell"] in cells for r in group["rows"])
         assert group["n_read"] == pytest.approx(sum(r["n_read"] for r in group["rows"]))
         assert list(group["values"]) == features["num"] + features["cat"]
 
@@ -228,23 +206,21 @@ def test_quality_region_of_an_unknown_region_is_404(reported, client):
 
 def test_quality_map_shows_a_region_and_its_rivals(reported, client):
     quality = _get(client, "/api/toy/quality")
-    sizes = {r["region"]: r["n_rows"] for r in quality["regions"]}
-    region = quality["pairs"][0]["region_a"]
-    rivals = sorted(
-        {p["region_a"] for p in _of(quality["pairs"], region)}
-        | {p["region_b"] for p in _of(quality["pairs"], region)}
-    )
-    rivals.remove(region)
+    region = quality["regions"][0]["region"]
+    detail = _get(client, f"/api/toy/quality/region?region={region}")
+    own = sorted(c["cell"] for c in detail["cells"])
+    paired = {p["cell_a"] for p in detail["pairs"]} | {
+        p["cell_b"] for p in detail["pairs"]
+    }
+    rivals = sorted(paired - set(own))
+    sizes = {c["cell"]: c["n_rows"] for c in _get(client, "/api/toy/cells")["cells"]}
     data = _get(client, f"/api/toy/quality/map?region={region}")
-    assert data["region"] == region and data["regions"] == [region, *rivals]
-    points = np.array(data["points"])
-    shown = points[:, 2].astype(int)
-    per_leaf = min(MAP_PER_LEAF, max(1, MAP_MAX_POINTS // len(data["regions"])))
-    for r in data["regions"]:
-        assert (shown == r).sum() == min(sizes[r], per_leaf)
-    assert set(shown) == set(data["regions"])
+    assert data["region"] == region and data["cells"] == [*own, *rivals]
+    shown = np.array(data["points"])[:, 2].astype(int)
+    assert set(shown) == set(data["cells"])
+    per_cell = min(MAP_PER_CELL, max(1, MAP_MAX_POINTS // len(data["cells"])))
     assert sorted(data["sampled"]) == sorted(
-        [r, sizes[r], min(sizes[r], per_leaf)] for r in data["regions"]
+        [c, sizes[c], min(sizes[c], per_cell)] for c in data["cells"]
     )
     s1, s2 = data["shares"]
     assert 0 <= s2 <= s1 <= 1
@@ -253,7 +229,7 @@ def test_quality_map_shows_a_region_and_its_rivals(reported, client):
 def test_missing_runs_are_404(client):
     assert client.get("/api/empty/clean").status_code == 404
     assert client.get("/api/empty/prepare").status_code == 404
-    assert client.get("/api/empty/regions").status_code == 404
+    assert client.get("/api/empty/cells").status_code == 404
     assert client.get("/api/empty/quality").status_code == 404
     assert client.get("/api/empty/quality/region?region=0").status_code == 404
     assert client.get("/api/nope/clean").status_code == 404

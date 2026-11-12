@@ -18,7 +18,7 @@
     <nav class="tabs" role="tablist">
       <button role="tab" data-tab="clean" aria-selected="true">clean</button>
       <button role="tab" data-tab="prepare" aria-selected="false">prepare</button>
-      <button role="tab" data-tab="regions" aria-selected="false">regions</button>
+      <button role="tab" data-tab="cells" aria-selected="false">cells</button>
       <button role="tab" data-tab="quality" aria-selected="false">quality</button>
     </nav>
   </header>
@@ -59,55 +59,31 @@
         <div id="pp-cat" class="table-wrap"></div></div>
     </section>
 
-    <!-- regions -->
-    <section id="tab-regions" class="panel" hidden>
+    <!-- cells -->
+    <section id="tab-cells" class="panel" hidden>
       <p class="empty">Select a dataset.</p>
       <div id="rg-tiles" class="tiles"></div>
       <div class="card"><h2>Tree of a class</h2>
-        <p class="note">Each class is split on its own, by geometry alone. A Ward tree of half of its distinct rows
-          (each weighted by its copies in the CSV) proposes the splits; the other half judges them, so a split is never
-          judged on the rows that made it. The separation of the two sides of a split is the distance between their
-          centroids in standard deviations of the other half's rows along the line between them, on the numbers only
-          and each distinct row counted once, less two standard errors (Ashman's D over √2: a measure of how far
-          apart, not a test). The tree is cut from the leaves up wherever a split reaches split_separation, then the
-          pieces not that far apart are sewn back, the closest pair first. A branch under min_cluster_floor rows of
-          the judging half is pruned; its rows, and the rows outside the two halves, take the region of their
-          nearest labelled rows by vote. The tree drawn here is a Ward tree of the regions' centroids: it shows how the
-          regions group, its leaves are the regions; each node counts their distinct rows (hover for the rows of the
-          CSV). Click a node to map its rows.</p>
+        <p class="note">Each class is cut on its own, by geometry alone, into cells of about the same size: the units
+          every defect is measured on. A Ward tree is built on a sample of the class's distinct rows (each weighted by
+          its copies in the CSV), and every row joins its nearest sampled row; from the root, a node of more than
+          max_rows rows is split into its two children, until every node left is a cell. A branch under min_rows rows
+          is no cell of its own: its rows join the nearest cell. The cells have the same size limit in every class, so
+          that two cells compared are sampled alike, and a defect touching a share of a cell is not diluted in a larger
+          group. The tree drawn is this cut: its leaves are the cells, each node counts the distinct rows of the cells
+          below it (hover for the rows of the CSV). A drawing holds at most <span id="rg-tree-nodes"></span> nodes:
+          from its top, the node with the most rows is opened first, as the cut splits; a node left closed hangs a
+          triangle over the number of its cells, and a click on it draws it on its own, a level down. The path above
+          the tree leads back up. Click a node to map its rows.</p>
         <div class="filters"><label class="inline">class <select id="rg-class"></select></label></div>
+        <nav id="rg-path" class="crumbs" aria-label="levels of the tree" hidden></nav>
         <div id="rg-tree"></div>
         <h3 id="rg-map-title">Map</h3>
         <p class="note" id="rg-map-note"></p>
         <div id="rg-map"></div></div>
-      <div class="card"><h2>Overlaps between classes</h2>
-        <p class="note">Judged on the regions alone. The separation of two regions is the distance between their
-          centroids in standard deviations of their rows along the line between them (√ of Fisher's ratio on that
-          line): two regions of different classes overlap when it is under overlap_separation. Single linkage on these
-          pairs, the closest first, groups the regions into zones; a region close to no other class is in none, and
-          classes that never come that close never meet. Each zone is drawn as its tree: leaves in the colour of their
-          class, each merge at the separation of the pair that made it. Click a node to map its rows and find its
-          branch in each class tree.</p>
-        <div id="rg-ov-tree"></div>
-        <h3 id="rg-ov-title">Map</h3>
-        <p class="note" id="rg-ov-note"></p>
-        <div id="rg-ov-branches" class="chips"></div>
-        <div id="rg-ov-map"></div>
-        <h3>Pairs of regions that overlap</h3>
-        <p class="note">Every pair of regions of different classes under overlap_separation, not only those that made a
-          merge; sd a and sd b are the standard deviations of each region's rows along the line between the centroids.
-          Click a row to select the lowest node above both regions.</p>
-        <div id="rg-overlaps" class="table-wrap"></div></div>
-      <div class="card"><h2>Granularity per class</h2>
-        <p class="note">Pieces cut are the regions before sewing; sewn at is the separation the regions keep,
-          split_separation unless the class had to be capped at max_regions (then marked). Stability: the regions are
-          made again on other halves and each is matched to its most similar new region (Jaccard, Hennig 2007),
-          stable from 0.75, doubtful from 0.6, unreliable under it; a class's is the mean of its regions', by rows.
-          Stable is not proof: an unstable region is suspect, a stable one is not sure. The curve is how many regions
-          the same tree gives at other thresholds.</p>
-        <div id="rg-classes" class="table-wrap"></div>
-        <div id="rg-curve"></div></div>
-      <div class="card"><h2>Regions</h2>
+      <div class="card"><h2>Cells per class</h2>
+        <div id="rg-classes" class="table-wrap"></div></div>
+      <div class="card"><h2>Cells</h2>
         <div id="rg-sizes"></div>
         <div id="rg-table" class="table-wrap"></div></div>
     </section>
@@ -122,49 +98,44 @@
           <dt>rows, CSV rows</dt>
           <dd>Rows are the distinct rows stage clean kept; CSV rows count their copies too. Every measure is computed
             on distinct rows; shares of the dataset are in CSV rows.</dd>
-          <dt>status</dt>
-          <dd>A region is <b>solid</b> when it has none of the problems below, <b>flagged</b> otherwise; its problems
-            are listed in the order missing, duplicates, label_conflict, class_overlap, shortcut.</dd>
-          <dt>missing</dt>
-          <dd>At least one cell of the region is empty, not a number where a number is due (unparsable), NaN or
-            infinite. A single one is enough.</dd>
+          <dt>cells and regions</dt>
+          <dd>Every defect is measured on the cells, compact groups of at most the same number of rows in every class
+            (see the cells tab). For reading, neighbouring cells of a class are merged into a region up their tree,
+            while they have the same defects between cells (class_overlap and shortcut) against the same classes;
+            the defects of single rows (invalid_values, duplicates, label_conflict) are counted over the region. A
+            region so hides nothing its cells show.</dd>
+          <dt>defects</dt>
+          <dd>A cell or a region has a defect when its definition below holds; there is one threshold, &tau; =
+            <span data-stat="tau"></span>, the share of a cell's rows that may be confused with another class's.
+            Defects are listed in the order invalid_values, duplicates, label_conflict, class_overlap, shortcut.</dd>
+          <dt>invalid_values</dt>
+          <dd>At least one row holds a cell that is empty, not a number where a number is due (unparsable), NaN or
+            infinite.</dd>
           <dt>duplicates</dt>
-          <dd>Copies: the share of the region's CSV rows that repeat another row exactly, label included. Flagged from
-            <span data-stat="thresholds.dup_share"></span>.</dd>
+          <dd>At least one row comes more than once in the CSV, label included: copies can fall on both sides of a
+            train/test split (Flood et al., EuroS&amp;P 2024).</dd>
           <dt>label_conflict</dt>
-          <dd>Rows identical on every feature, as read from the CSV, but labelled with different classes: no
-            classifier can tell them apart. Flagged with a single such row.</dd>
-          <dt>neighbours</dt>
-          <dd>The regions of other classes a region is measured against: those whose centroid is closer than
-            <span data-stat="candidate_separation"></span> sd (<i>near</i>), those sharing identical rows
-            (<i>label_conflict</i>), and the closest region of another class (<i>nearest</i>). Each pair is measured
-            on at most <span data-stat="max_rows_per_region"></span> random rows per region.</dd>
-          <dt>nn_error</dt>
-          <dd>The share of a region's rows whose nearest row (itself excluded) belongs to the other region: 0 when the
-            two are apart, about 0.5 when they are mixed. Measured on each side; the pair's is the mean of the two, so a
-            large region does not hide a small one. <i>bayes_error_low</i> is the least error any classifier could
-            reach, from nn_error (Cover &amp; Hart; an approximation on few rows).</dd>
-          <dt>shortcut_columns</dt>
-          <dd>Up to <span data-stat="max_group"></span> columns removed one at a time, each the one whose removal raises
-            nn_error the most (chosen on half of the rows, measured on the other half): the columns the separation
-            depends on. <i>nn_error without</i> is the error once they are removed.</dd>
-          <dt>single_column_acc</dt>
-          <dd>The balanced accuracy of the best rule on one column alone: a threshold on a number, a value-to-class map
-            on a categorical (OneR, Holte 1993; Ho &amp; Basu's F3, made robust to outliers). A column separates alone
-            from <span data-stat="thresholds.single_column_acc"></span>.</dd>
-          <dt>verdict of a pair</dt>
-          <dd>With &tau; = <span data-stat="thresholds.nn_error"></span>:
-            <b>label_conflict</b> when nn_error &ge; &tau; and the two share identical rows;
-            <b>class_overlap</b> when nn_error &ge; &tau; and no single column separates them;
-            <b>shortcut</b> when removing the shortcut columns raises nn_error by &tau; or more, up to &tau; at least:
-            the separation hangs on those columns;
-            <b>robust</b> otherwise: separated, also without them. A region takes the class_overlap and shortcut
-            problems from any of its pairs.</dd>
-          <dt>pdd, tc (classes only)</dt>
-          <dd>pdd: the mean cosine similarity of random pairs of rows of the class (low_diversity from
-            <span data-stat="thresholds.pdd"></span>); tc: the share of those pairs that are functionally identical,
-            cosine over 0.95 (collapse from <span data-stat="thresholds.tc"></span>). After Flood et al., EuroS&amp;P
-            2024. Judged on classes only: a region is alike by construction.</dd>
+          <dd>At least one row is identical on every feature, as read from the CSV, to a row of another class: no
+            classifier can tell them apart.</dd>
+          <dt>rivals</dt>
+          <dd>The cells of other classes a cell is measured against: for each of
+            <span data-stat="rival_rows"></span> random rows of it, the nearest row of another class; the cells those
+            rows lie in are its rivals. Each pair is measured on at most <span data-stat="max_rows_per_cell"></span>
+            random rows per cell.</dd>
+          <dt>confusion</dt>
+          <dd>The share of a cell's rows that the better of two simple classifiers gets wrong against a rival: the
+            1-NN on every column (<i>nn_error</i>: the row's nearest other row is the rival's) and the best rule on a
+            single column (a threshold on a number, a value-to-class map on a categorical; OneR, Holte 1993). Any
+            classifier errs at least as much as the best one can; the 1-NN alone overstates the error when columns
+            that do not separate swamp the distance. <i>bayes_error_low</i> is the least error any classifier could
+            reach, from the pair's nn_error (Cover &amp; Hart; an approximation on few rows).</dd>
+          <dt>class_overlap</dt>
+          <dd>Against at least one rival, the confusion of the cell's rows is &tau; or more.</dd>
+          <dt>shortcut</dt>
+          <dd>Against at least one rival the confusion is under &tau;, but removing at most
+            <span data-stat="max_group"></span> columns (the <i>key columns</i>, each the one whose removal raises the
+            1-NN error the most, chosen on half of the rows and measured on the other half) brings it to &tau;: the
+            separation rests on those few columns.</dd>
         </dl>
       </details>
       <div class="filters view-switch" role="tablist">
@@ -172,17 +143,22 @@
         <button class="chip" type="button" data-view="regions">regions</button>
       </div>
       <div id="qr-classes-view" class="card"><h2>Classes</h2>
+        <p class="note">Per defect, the share of the class's CSV rows that have it: invalid_values, duplicates and
+          label_conflict are facts of the row itself (of the copies of a row, all but the first are duplicates),
+          class_overlap and shortcut of its cell. no defect: the rows with none of the five.</p>
         <div id="qr-classes" class="table-wrap"></div></div>
       <div id="qr-regions-view" class="stack">
         <div id="qr-detail" class="card" hidden>
           <h2 id="qr-detail-title"></h2>
           <p id="qr-detail-head" class="detail-head"></p>
-          <h3>Neighbours of other classes</h3>
-          <p class="note">Every region of another class this one was measured against, the one its own rows confuse
-            the most first. "here" is this region's side, "there" the neighbour's. Click one to open it.</p>
+          <h3>Cells</h3>
+          <div id="qr-cells" class="table-wrap"></div>
+          <h3>Rivals of other classes</h3>
+          <p class="note">Every pair of one of its cells and a cell of another class, the most confused first. "here"
+            is this region's cell, "there" the rival. Click one to open the rival's region.</p>
           <div id="qr-neighbours" class="table-wrap"></div>
-          <h3>nn_error with every column and without the shortcut columns</h3>
-          <p class="note">Mean of the two sides. A shortcut is a short first bar and a long second one: the classes mix once those columns are gone.</p>
+          <h3>Confusion with every column and without the key columns</h3>
+          <p id="qr-bars-note" class="note"></p>
           <div id="qr-bars"></div>
           <h3 id="qr-map-title">Map</h3>
           <p id="qr-map-note" class="note"></p>
@@ -198,7 +174,7 @@
             <label class="inline">class <select id="qr-class"></select></label>
             <div id="qr-filters" class="chips"></div>
           </div>
-          <p class="note">Click a region for its neighbours, identical rows and null values.</p>
+          <p class="note">Click a region for its cells, their rivals, identical rows and null values.</p>
           <div id="qr-regions" class="table-wrap"></div></div>
       </div>
     </section>

@@ -13,15 +13,14 @@ from __future__ import annotations
 __all__ = [
     "CONFLICT_GROUPS",
     "MAP_MAX_POINTS",
-    "MAP_PER_LEAF",
+    "MAP_PER_CELL",
+    "cell_map",
+    "cells",
     "clean",
-    "overlap_map",
     "prepare",
     "quality",
     "quality_map",
     "quality_region",
-    "region_map",
-    "regions",
 ]
 
 import dataclasses
@@ -48,8 +47,8 @@ from stages.paths import (
     read_points,
 )
 
-MAP_PER_LEAF = 2000  # most rows of one region in a node's map
-MAP_MAX_POINTS = 20000  # most rows of a node's map
+MAP_PER_CELL = 2000  # most rows of one cell in a map
+MAP_MAX_POINTS = 20000  # most rows of a map
 CONFLICT_GROUPS = 10  # most label conflict groups in a region's detail
 
 
@@ -111,40 +110,72 @@ def prepare(cfg: DatasetConfig) -> dict[str, Any]:
         }
 
 
-def regions(cfg: DatasetConfig) -> dict[str, Any]:
-    """Return the last regions run.
+def cells(cfg: DatasetConfig) -> dict[str, Any]:
+    """Return the last cells run.
 
     Args:
         cfg: The dataset.
 
     Returns:
-        run; stats {n_regions, distance, split_separation,
-        overlap_separation, n_zones}; classes [{class, n_rows, n_read,
-        n_regions, n_pieces, n_voted, split_separation, stability}];
-        candidates [{class, threshold, n_regions}] (the curve); regions
-        [{region, class, n_rows, n_read, stability}] (stability null
-        when it was not measured); tree [{node, class, parent,
-        depth, region, n_rows, n_read}] in pre-order per class; zones
-        [{node, zone, parent, depth, separation, region_a, region_b,
-        region, class, n_classes, n_regions, n_rows, n_read}] zone by
-        zone in pre-order; overlaps [{zone, region_a, class_a, region_b,
-        class_b, distance, spread_a, spread_b, separation}]; both empty
-        when no regions overlap or the run is older than the zones.
+        run; stats (the cell_stats row: n_cells, distance, max_rows,
+        min_rows, max_fit_samples); classes [{class, n_rows, n_read,
+        n_cells}]; cells [{cell, class, n_rows, n_read}]; tree [{node,
+        class, parent, depth, cell, n_rows, n_read}] in pre-order per
+        class.
     """
     with closing(_connect(cfg)) as conn:
-        run = _latest_run(conn, "regions", cfg)
-        classes = _rows(conn, "regions", "class_clusterings", run)
-        candidates = _rows(conn, "regions", "granularity_candidates", run)
+        run = _latest_run(conn, "cells", cfg)
         return {
             "run": _public(run),
-            "stats": _rows(conn, "regions", "region_stats", run)[0],
-            "classes": classes,
-            "candidates": candidates,
-            "regions": _rows(conn, "regions", "regions", run),
-            "tree": _rows(conn, "regions", "region_tree", run),
-            "zones": _rows(conn, "regions", "overlap_zones", run, missing_ok=True),
-            "overlaps": _rows(conn, "regions", "region_overlaps", run, missing_ok=True),
+            "stats": _rows(conn, "cells", "cell_stats", run)[0],
+            "classes": _rows(conn, "cells", "class_cells", run),
+            "cells": _rows(conn, "cells", "cells", run),
+            "tree": _rows(conn, "cells", "cell_tree", run),
         }
+
+
+def cell_map(cfg: DatasetConfig, node: int) -> dict[str, Any]:
+    """Return the rows of one node of the cell trees in their own plane.
+
+    The rows of the cells below node (assignments.parquet of the last
+    cells run) are sampled at random (seed cfg.seed): at most per_cell
+    = min(MAP_PER_CELL, max(1, MAP_MAX_POINTS // cells)) of each cell.
+    A PCA fitted on the sample, in the space the cells were cut in
+    (graph.space_points of the prepared file with the distance of that
+    run's method, not of cfg's), gives their first two components. The
+    prepared points are cached per file and mtime.
+
+    Args:
+        cfg: The dataset.
+        node: A node id of cell_tree.
+
+    Returns:
+        node; shares [s1, s2] (the variance of each component, 0 when
+        it does not exist); points [[pc1, pc2, cell]], pc rounded to 4
+        decimals; sampled [[cell, rows, taken]], by cell: its rows and
+        how many of them are in points, so that a point stands for
+        rows / taken rows of its cell.
+
+    Raises:
+        LookupError: When cells has not run or node is not a node of
+            its tree.
+    """
+    with closing(_connect(cfg)) as conn:
+        run = _latest_run(conn, "cells", cfg)
+        tree = _rows(conn, "cells", "cell_tree", run)
+    children = defaultdict(list)
+    for row in tree:
+        children[row["parent"]].append(row)
+    by_node = {row["node"]: row for row in tree}
+    if node not in by_node:
+        raise LookupError(f"no node {node} in cell_tree")
+    below, stack = [], [by_node[node]]
+    while stack:
+        row = stack.pop()
+        if row["cell"] is not None:
+            below.append(row["cell"])
+        stack += children[row["node"]]
+    return {"node": node, **_map_cells(cfg, sorted(below))}
 
 
 def quality(cfg: DatasetConfig) -> dict[str, Any]:
@@ -154,28 +185,23 @@ def quality(cfg: DatasetConfig) -> dict[str, Any]:
         cfg: The dataset.
 
     Returns:
-        run; stats (the quality_stats row, thresholds parsed from
-        JSON); classes, regions, pairs and missing: the rows of
-        quality_classes, quality_regions, quality_pairs and
-        region_missing (none when no cell is null or invalid), pairs with
-        reasons as a list.
+        run; stats (the quality_stats row); classes (quality_classes);
+        regions (quality_regions, defects and the class lists as
+        lists); missing (cell_missing summed by region, column and
+        kind: [{region, column, kind, n_rows, n_read}], none when no
+        cell is null or invalid).
     """
     with closing(_connect(cfg)) as conn:
         run = _latest_run(conn, "quality_report", cfg)
-        stats = _rows(conn, "quality_report", "quality_stats", run)[0]
-        stats["thresholds"] = json.loads(stats["thresholds"])
-        pairs = _rows(conn, "quality_report", "quality_pairs", run)
-        for pair in pairs:
-            pair["reasons"] = pair["reasons"].split(",")
         return {
             "run": _public(run),
-            "stats": stats,
+            "stats": _rows(conn, "quality_report", "quality_stats", run)[0],
             "classes": _rows(conn, "quality_report", "quality_classes", run),
-            "regions": _rows(conn, "quality_report", "quality_regions", run),
-            "pairs": pairs,
-            "missing": _rows(
-                conn, "quality_report", "region_missing", run, missing_ok=True
-            ),
+            "regions": [
+                _listed(r)
+                for r in _rows(conn, "quality_report", "quality_regions", run)
+            ],
+            "missing": _summed_missing(conn, run, ("region",)),
         }
 
 
@@ -187,14 +213,16 @@ def quality_region(cfg: DatasetConfig, region: int) -> dict[str, Any]:
         region: A region id of quality_regions.
 
     Returns:
-        region (its quality_regions row); pairs (its quality_pairs rows,
-        reasons as a list); missing (its region_missing rows); n_groups
-        (the label conflict groups with a row in it) and conflicts: the
-        CONFLICT_GROUPS of them with the most CSV rows, heaviest first
-        (ties to the lower group), each {group, n_read, rows: [{class,
-        region, n_read}] heaviest first, values: {column: value}} with
-        values the features of the data file shared by its rows (null
-        for a null, NaN or infinite one).
+        region (its quality_regions row, as quality's); cells (its
+        quality_cells rows, the lists as lists); pairs (the quality_pairs
+        rows with one of its cells, confusion_without_a and _b as
+        lists); missing (its cell_missing rows summed by column and
+        kind); n_groups (the label conflict groups with a row in it) and
+        conflicts: the CONFLICT_GROUPS of them with the most CSV rows,
+        heaviest first (ties to the lower group), each {group, n_read,
+        rows: [{class, cell, region, n_read}] heaviest first, values:
+        {column: value}} with values the features of the data file
+        shared by its rows (null for a null, NaN or infinite one).
 
     Raises:
         LookupError: When quality_report has not run or region is not
@@ -205,10 +233,11 @@ def quality_region(cfg: DatasetConfig, region: int) -> dict[str, Any]:
         rows = _where(conn, "quality_regions", run, "region = ?", region)
         if not rows:
             raise LookupError(f"no region {region} in quality_regions")
+        cells = _where(conn, "quality_cells", run, "region = ?", region)
         pairs = _where(
             conn, "quality_pairs", run, "region_a = ? OR region_b = ?", region, region
         )
-        missing = _where(conn, "region_missing", run, "region = ?", region)
+        missing = _summed_missing(conn, run, (), "region = ?", region)
         groups = _where(
             conn,
             "label_conflict_groups",
@@ -218,18 +247,17 @@ def quality_region(cfg: DatasetConfig, region: int) -> dict[str, Any]:
             run["id"],
             region,
         )
-    for pair in pairs:
-        pair["reasons"] = pair["reasons"].split(",")
     by_group: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for row in groups:
         by_group[row["group"]].append(row)
     heaviest = sorted(
         by_group.items(), key=lambda g: (-sum(r["n_read"] for r in g[1]), g[0])
     )[:CONFLICT_GROUPS]
-    values = _feature_values(cfg, [rows[0]["row"] for _, rows in heaviest])
+    values = _feature_values(cfg, [members[0]["row"] for _, members in heaviest])
     return {
-        "region": rows[0],
-        "pairs": pairs,
+        "region": _listed(rows[0]),
+        "cells": [_listed(c) for c in sorted(cells, key=lambda c: c["cell"])],
+        "pairs": [_pair_row(p) for p in pairs],
         "missing": missing,
         "n_groups": len(by_group),
         "conflicts": [
@@ -237,7 +265,7 @@ def quality_region(cfg: DatasetConfig, region: int) -> dict[str, Any]:
                 "group": group,
                 "n_read": sum(r["n_read"] for r in members),
                 "rows": [
-                    {k: r[k] for k in ("class", "region", "n_read")}
+                    {k: r[k] for k in ("class", "cell", "region", "n_read")}
                     for r in sorted(members, key=lambda r: -r["n_read"])
                 ],
                 "values": values[members[0]["row"]],
@@ -248,122 +276,96 @@ def quality_region(cfg: DatasetConfig, region: int) -> dict[str, Any]:
 
 
 def quality_map(cfg: DatasetConfig, region: int) -> dict[str, Any]:
-    """Return the rows of a region and of its measured rivals in their own plane.
+    """Return the rows of a region and of its rivals in their own plane.
 
-    As region_map, with the region and every region of its pairs in the
-    last quality_report run (quality_pairs).
+    As cell_map, with the cells of the region and every rival cell of
+    their pairs in the last quality_report run (quality_pairs).
 
     Args:
         cfg: The dataset.
         region: A region id of quality_regions.
 
     Returns:
-        region; regions (it, then its rivals by id); shares [s1, s2];
-        points [[pc1, pc2, region]]; sampled [[region, rows, taken]].
+        region; cells (its cells, then the rival cells, each by id);
+        shares [s1, s2]; points [[pc1, pc2, cell]]; sampled [[cell,
+        rows, taken]].
 
     Raises:
-        LookupError: When quality_report or regions has not run, or
-            region is not one of the regions.
+        LookupError: When quality_report or cells has not run, or
+            region is not one of its regions.
     """
     with closing(_connect(cfg)) as conn:
         run = _latest_run(conn, "quality_report", cfg)
-        if not _where(conn, "quality_regions", run, "region = ?", region):
+        own = _where(conn, "quality_cells", run, "region = ?", region)
+        if not own:
             raise LookupError(f"no region {region} in quality_regions")
         pairs = _where(
             conn, "quality_pairs", run, "region_a = ? OR region_b = ?", region, region
         )
-    rivals = sorted({p["region_a"] for p in pairs} | {p["region_b"] for p in pairs})
-    regions = [region, *(r for r in rivals if r != region)]
-    return {"region": region, "regions": regions, **_map_regions(cfg, regions)}
+    mine = sorted(c["cell"] for c in own)
+    paired = {p["cell_a"] for p in pairs} | {p["cell_b"] for p in pairs}
+    shown = [*mine, *sorted(paired - set(mine))]
+    return {"region": region, "cells": shown, **_map_cells(cfg, shown)}
 
 
-def region_map(cfg: DatasetConfig, node: int) -> dict[str, Any]:
-    """Return the rows of one node of the region trees in their own plane.
-
-    The rows of the regions below node (assignments.parquet of the last
-    regions run's tree) are sampled at random (seed cfg.seed): at most
-    per_leaf = min(MAP_PER_LEAF, max(1, MAP_MAX_POINTS // regions))
-    of each region. A PCA fitted on the sample, in the space the regions
-    were built in (graph.space_points of the prepared file with the
-    distance of that run's method, not of cfg's), gives their first two
-    components. The prepared points are cached per file and mtime.
-
-    Args:
-        cfg: The dataset.
-        node: A node id of region_tree.
-
-    Returns:
-        node; shares [s1, s2] (the variance of each component, 0 when
-        it does not exist); points [[pc1, pc2, region]], pc rounded to 4
-        decimals; sampled [[region, rows, taken]], by region: its rows
-        and how many of them are in points, so that a point stands for
-        rows / taken rows of its region.
-
-    Raises:
-        LookupError: When regions has not run or node is not a node of
-            its tree.
-    """
-    return _map(cfg, "region_tree", node)
+def _listed(row: dict[str, Any]) -> dict[str, Any]:
+    """Return a quality_regions or quality_cells row with its comma lists as lists."""
+    out = dict(row)
+    for key in ("defects", "overlap_with", "shortcut_with", "conflict_with"):
+        out[key] = row[key].split(",") if row[key] else []
+    return out
 
 
-def overlap_map(cfg: DatasetConfig, node: int) -> dict[str, Any]:
-    """Return the rows of one node of the overlap zones in their own plane.
-
-    As region_map, with the regions below node in overlap_zones.
-
-    Args:
-        cfg: The dataset.
-        node: A node id of overlap_zones.
-
-    Returns:
-        node; shares [s1, s2]; points [[pc1, pc2, region]]; sampled
-        [[region, rows, taken]].
-
-    Raises:
-        LookupError: When regions has not run or node is not a node of
-            its overlap zones.
-    """
-    return _map(cfg, "overlap_zones", node)
+def _pair_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Return a quality_pairs row with its confusion without columns as lists."""
+    out = dict(row)
+    for side in ("a", "b"):
+        key = f"confusion_without_{side}"
+        out[key] = json.loads(row[key]) if row[key] else []
+    return out
 
 
-def _map(cfg: DatasetConfig, table: str, node: int) -> dict[str, Any]:
-    """Return region_map of the regions below node in table, a tree of the last regions run."""
+def _summed_missing(
+    conn: sqlite3.Connection,
+    run: Mapping[str, Any],
+    by: tuple[str, ...],
+    condition: str = "1",
+    *params: Any,
+) -> list[dict[str, Any]]:
+    """Return the cell_missing rows that meet condition, summed by `by`, column and kind."""
+    keys = ", ".join([*by, '"column"', "kind"])
+    try:
+        rows = conn.execute(
+            f"SELECT {keys}, sum(n_rows) AS n_rows, sum(n_read) AS n_read "
+            f"FROM cell_missing WHERE run_id = ? AND ({condition}) "
+            f"GROUP BY {keys} ORDER BY {keys}",
+            (run["id"], *params),
+        ).fetchall()
+    except sqlite3.OperationalError as e:
+        if "no such table" in str(e):
+            return []
+        raise
+    return [{k: _json_value(r[k]) for k in r.keys()} for r in rows]
+
+
+def _map_cells(cfg: DatasetConfig, shown: list[int]) -> dict[str, Any]:
+    """Return shares, points and sampled of cell_map for the rows of the cells shown."""
     with closing(_connect(cfg)) as conn:
-        run = _latest_run(conn, "regions", cfg)
-        tree = _rows(conn, "regions", table, run)
-    children = defaultdict(list)
-    for row in tree:
-        children[row["parent"]].append(row)
-    by_node = {row["node"]: row for row in tree}
-    if node not in by_node:
-        raise LookupError(f"no node {node} in {table}")
-    leaves, stack = [], [by_node[node]]
-    while stack:
-        row = stack.pop()
-        if row["region"] is not None:
-            leaves.append(row["region"])
-        stack += children[row["node"]]
-    return {"node": node, **_map_regions(cfg, leaves)}
-
-
-def _map_regions(cfg: DatasetConfig, leaves: list[int]) -> dict[str, Any]:
-    """Return shares, points and sampled of region_map for the rows of the regions leaves."""
-    with closing(_connect(cfg)) as conn:
-        run = _latest_run(conn, "regions", cfg)
+        run = _latest_run(conn, "cells", cfg)
         (config,) = conn.execute(
             "SELECT config FROM runs WHERE id = ?", (run["id"],)
         ).fetchone()
-    region = pl.read_parquet(need(assignments_file(cfg), "regions"))
-    region = region.sort("row")["region"].to_numpy()
-    rows = np.flatnonzero(np.isin(region, leaves))
-    rows = rows[np.argsort(region[rows], kind="stable")]
-    bounds = np.flatnonzero(np.diff(region[rows])) + 1
-    per_leaf = min(MAP_PER_LEAF, max(1, MAP_MAX_POINTS // len(leaves)))
+    cell = pl.read_parquet(need(assignments_file(cfg), "cells"))
+    cell = cell.sort("row")["cell"].to_numpy()
+    rows = np.flatnonzero(np.isin(cell, shown))
+    rows = rows[np.argsort(cell[rows], kind="stable")]
+    bounds = np.flatnonzero(np.diff(cell[rows])) + 1
+    per_cell = min(MAP_PER_CELL, max(1, MAP_MAX_POINTS // len(shown)))
     rng = np.random.default_rng(cfg.seed)
     groups = [group for group in np.split(rows, bounds) if len(group)]
     take = np.sort(
         np.concatenate(
-            [rng.permutation(group)[:per_leaf] for group in groups] or [rows]
+            [rng.permutation(group)[:per_cell] for group in groups] or [rows]
         )
     )
     distance = json.loads(config)["method"]["distance"]
@@ -377,10 +379,10 @@ def _map_regions(cfg: DatasetConfig, leaves: list[int]) -> dict[str, Any]:
     return {
         "shares": shares,
         "points": [
-            [round(float(a), 4), round(float(b), 4), int(r)]
-            for (a, b), r in zip(plane, region[take])
+            [round(float(a), 4), round(float(b), 4), int(c)]
+            for (a, b), c in zip(plane, cell[take])
         ],
-        "sampled": [[int(region[g[0]]), len(g), min(len(g), per_leaf)] for g in groups],
+        "sampled": [[int(cell[g[0]]), len(g), min(len(g), per_cell)] for g in groups],
     }
 
 

@@ -6,27 +6,17 @@ prepare:                 # the features every distance is measured on (src.prepa
   cat_cost: 1.0          # weight of each categorical column against a numeric one, on average over pairs of rows;
                          #   the mismatch cost of a column grows as its values concentrate (2 · cat_cost / (1 - Σ p²))
 
-clustering:              # regions: a weighted Ward tree per class (weight: n_duplicates) on half A of its rows, its
-                         #   splits judged on half B, cut where the two sides are separated, then the pieces sewn back
-  max_fit_samples: 20000 # most distinct rows of each half (the tree takes quadratic time); the other rows are voted
-  max_regions: 2500      # regions over all classes, shared equally between them; past it the pieces keep being sewn
-  split_separation: 4.0  # separation two regions of a class must keep: centroids apart by this many sd of half B's
-                         #   rows along the line between them, on the numbers only, less 2 standard errors
-  min_cluster_floor: 20  # fewest rows of half B on each side of a split judged: a smaller branch is pruned, its rows voted
-  vote_k: 10             # labelled neighbours whose majority gives a region to a pruned or unsampled row
-  stability_repeats: 1   # times the regions are made again on other halves to measure each region's stability (0: none)
-  overlap_separation: 1.0  # two regions of different classes overlap when their centroids lie closer than this many
-                           #   standard deviations of their rows along the line between them
+cells:                   # every class cut into compact cells of about the same size, the units every defect is measured on
+  max_fit_samples: 20000 # most distinct rows of a class its Ward tree is built on (weight: n_duplicates; quadratic time);
+                         #   every other row joins its nearest sampled row
+  max_rows: 1000         # most distinct rows of a cell, the same for every class: a defect touching tau of a cell's rows is
+                         #   seen, and two cells compared are sampled alike
+  min_rows: 20           # fewest distinct rows of a cell: a smaller branch of the tree joins the cells around it
 
-quality:                 # the quality report on regions, pairs of regions of different classes and classes
-  max_rows_per_region: 500     # distinct rows of a region its pairs are measured on: a uniform sample above this
-  candidate_separation: 2.0    # pairs measured: separation under this, plus
-                               #   the pairs sharing conflicting rows and each region's nearest rival
-  diversity_pairs: 1000        # pairs of rows drawn per class for its mean cosine similarity (pdd) and collapse (tc)
-  max_group: 3                 # most columns removed from a pair to find the ones its separation depends on
-  thresholds:
-    nn_error: 0.1              #   1-NN error from which a pair mixes; removing its shortcut columns raises it this much
-    single_column_acc: 0.95    #   balanced accuracy from which a single column separates a pair
-    dup_share: 0.9             #   share of a region's CSV rows that are copies from which it has "duplicates"
-    pdd: 0.95                  #   mean cosine similarity of a class's rows from which its diversity is poor
-    tc: 0.5                    #   share of a class's pairs of rows functionally identical (cosine > 0.95): collapse
+quality:                 # the defects of every cell against its rivals, then of the regions the cells are merged into
+  tau: 0.1               # the one threshold: the share of a cell's rows that may be confused with a rival's; at or over it
+                         #   the cell overlaps, and a shortcut is a removal of columns that brings it there
+  max_rows_per_cell: 500 # distinct rows of a cell its pairs are measured on: a uniform sample above this
+  rival_rows: 100        # distinct rows of a cell its rivals are searched from (a budget: the search compares every row
+                         #   with every other)
+  max_group: 3           # most columns removed from a pair to find a shortcut

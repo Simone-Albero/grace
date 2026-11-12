@@ -1,50 +1,58 @@
-"""Data-quality measures on regions, on pairs of regions of different classes and on classes.
+"""Data-quality defects of the cells, after Flood, Engelen, Aspinall & Desmet.
 
-After Flood, Engelen, Aspinall & Desmet, "Bad Design Smells in
-Benchmark NIDS Datasets" (EuroS&P 2024), measured on the regions of
-`src.clustering`:
-- null and invalid values, cell by cell (invalid_values);
-- label conflicts: rows equal on every feature under different
-  classes (label_conflicts, pair_conflicts);
-- how much two regions mix: the leave-one-out 1-NN error of each side
-  (nearest_error), bounded below by Cover & Hart (cover_hart_low);
-- single-feature separation: the per-side accuracy of the best rule on
-  one column, a threshold or a value-to-side map (single_column, OneR of
-  Holte 1993; it is Ho & Basu's F3 made robust, 1 - F3 of Lorena et
-  al.);
-- on how few columns the separation rests (feature_dependence) and the
-  pair's verdict (verdict): label_conflict, class_overlap, shortcut or
-  robust;
-- poor data diversity and traffic collapse: how alike the rows of a
-  class are (diversity).
-Which pairs are measured is candidate_pairs' choice; region_issues
-turns a region's counts into its problems. Every measure but the
-counts of copies is computed on distinct rows, unweighted. Every pair
-measure is per side (a, b), its summary the mean of the two: a large
-region does not hide a small one.
+"Bad Design Smells in Benchmark NIDS Datasets" (EuroS&P 2024), judged
+on the cells of `src.cells`. A cell, or a region of cells, has a defect
+when (DEFECTS, defects_of):
+- invalid_values: a row holds a null or invalid cell (invalid_values);
+- duplicates: a row comes more than once in the CSV, so copies can
+  fall on both sides of a train/test split;
+- label_conflict: a row equals, on every feature, a row of another
+  class: no classifier can tell them apart (label_conflicts);
+- class_overlap: against a rival cell, the share of its rows confused
+  with the rival's reaches tau;
+- shortcut: against a rival that share is under tau, but removing at
+  most max_group columns, chosen on half of the rows and measured on
+  the other half (feature_dependence), brings it to tau: the separation
+  rests on those few columns.
+The first three are facts of single rows (ROW_DEFECTS): counted in any
+group of rows, they are never diluted. The last two are measured between
+two cells (RIVAL_DEFECTS, rival_defects), so the cells are small enough
+that a defect touching tau of a cell's rows is seen. The rows confused
+are those that the better of two simple classifiers gets wrong
+(pair_confusion): the leave-one-out 1-NN on every column (nearest_error;
+by Cover & Hart its error lies between the least error any classifier
+can reach and twice it, cover_hart_low) and the best rule on a single
+column (single_column, OneR of Holte 1993). Any classifier errs at least
+as much as the best one can, so when the better of the two confuses tau
+of a cell's rows, the cell overlaps its rival; the 1-NN alone would
+overstate it when columns that do not separate swamp the distance. tau
+is the one threshold: the share of a cell's rows that may be confused.
+The rivals of a cell are the cells of the nearest rows of other classes
+to its rows (rival_pairs): no threshold picks them. Every measure but
+the copies is computed on distinct rows, unweighted, and per side of a
+pair.
 """
 
 from __future__ import annotations
 
 __all__ = [
-    "ISSUES",
-    "REASONS",
-    "VERDICTS",
+    "DEFECTS",
+    "RIVAL_DEFECTS",
+    "ROW_DEFECTS",
     "Dependence",
-    "Pair",
     "SingleColumn",
-    "candidate_pairs",
+    "cell_samples",
     "cover_hart_low",
-    "diversity",
+    "defects_of",
     "feature_dependence",
     "invalid_values",
     "label_conflicts",
     "nearest_error",
+    "pair_confusion",
     "pair_conflicts",
-    "region_issues",
-    "region_samples",
+    "rival_defects",
+    "rival_pairs",
     "single_column",
-    "verdict",
 ]
 
 import math
@@ -57,27 +65,9 @@ import polars as pl
 
 from src.graph import sample_rows
 
-REASONS = ("near", "label_conflict", "nearest")
-VERDICTS = ("label_conflict", "class_overlap", "shortcut", "robust")
-ISSUES = ("missing", "duplicates", "label_conflict", "class_overlap", "shortcut")
-
-
-@dataclass(frozen=True)
-class Pair:
-    """Two regions of different classes worth measuring, a < b.
-
-    Attributes:
-        a: The first region.
-        b: The second region.
-        reasons: Why the pair is measured, a subset of REASONS in that
-            order: "near" (separation under the threshold),
-            "label_conflict" (they share rows equal on the features),
-            "nearest" (one is the nearest rival of the other).
-    """
-
-    a: int
-    b: int
-    reasons: tuple[str, ...]
+ROW_DEFECTS = ("invalid_values", "duplicates", "label_conflict")
+RIVAL_DEFECTS = ("class_overlap", "shortcut")
+DEFECTS = ROW_DEFECTS + RIVAL_DEFECTS
 
 
 def label_conflicts(features: pl.DataFrame, labels: np.ndarray) -> np.ndarray:
@@ -116,186 +106,77 @@ def label_conflicts(features: pl.DataFrame, labels: np.ndarray) -> np.ndarray:
 
 
 def pair_conflicts(
-    groups: np.ndarray, labels: np.ndarray, region: np.ndarray, weights: np.ndarray
+    groups: np.ndarray, labels: np.ndarray, cell: np.ndarray, weights: np.ndarray
 ) -> dict[tuple[int, int], tuple[int, float]]:
-    """Count the conflicting rows that every pair of regions shares.
+    """Count the conflicting rows that every pair of cells shares.
 
-    A group joins the regions of its rows; two regions of different
-    classes in a group share its rows that lie in either, counted once
-    per group. Two regions of one class share no conflict.
+    A group joins the cells of its rows; two cells of different classes
+    in a group share its rows that lie in either, counted once per
+    group. Two cells of one class share no conflict.
 
     Args:
         groups: The group of every row (label_conflicts), -1 for none.
         labels: The class code of every row.
-        region: The region of every row.
+        cell: The cell of every row.
         weights: The copies of every row in the CSV.
 
     Returns:
         By pair (a, b) with a < b: the conflicting rows of the two
-        regions, summed over their groups, and their summed weights.
+        cells, summed over their groups, and their summed weights.
     """
     rows = np.flatnonzero(groups >= 0)
     rows = rows[np.argsort(groups[rows], kind="stable")]
     bounds = np.flatnonzero(np.diff(groups[rows])) + 1
     counts: dict[tuple[int, int], tuple[int, float]] = {}
     for members in np.split(rows, bounds) if len(rows) else []:
-        by_region: dict[int, list[int]] = defaultdict(list)
+        by_cell: dict[int, list[int]] = defaultdict(list)
         for row in members.tolist():
-            by_region[int(region[row])].append(row)
-        regions = sorted(by_region)
-        for i, a in enumerate(regions):
-            for b in regions[i + 1 :]:
-                if labels[by_region[a][0]] == labels[by_region[b][0]]:
+            by_cell[int(cell[row])].append(row)
+        cells = sorted(by_cell)
+        for i, a in enumerate(cells):
+            for b in cells[i + 1 :]:
+                if labels[by_cell[a][0]] == labels[by_cell[b][0]]:
                     continue
-                shared = by_region[a] + by_region[b]
+                shared = by_cell[a] + by_cell[b]
                 n, read = counts.get((a, b), (0, 0.0))
                 counts[(a, b)] = (n + len(shared), read + float(weights[shared].sum()))
     return counts
 
 
-def candidate_pairs(
-    separation: np.ndarray,
-    conflicts: Iterable[tuple[int, int]],
-    classes: np.ndarray,
-    threshold: float,
-) -> list[Pair]:
-    """Choose the pairs of regions of different classes worth measuring.
-
-    A pair is "near" when its separation is under threshold,
-    "label_conflict" when it is among conflicts, "nearest" when one region is the nearest
-    rival of the other (least separation; ties to the lower region id).
+def cell_samples(cell: np.ndarray, cap: int, seed: int) -> dict[int, np.ndarray]:
+    """Draw the rows each cell is measured on.
 
     Args:
-        separation: The (m, m) separations of the regions
-            (clustering.separation).
-        conflicts: The pairs (a, b) that share conflicting rows.
-        classes: The class of every region, shape (m,).
-        threshold: The separation under which a pair is near.
+        cell: The cell of every row.
+        cap: The most rows per cell.
+        seed: The seed of graph.sample_rows, the same for every cell.
 
     Returns:
-        The pairs sorted by (a, b), each with its reasons.
+        By cell, its row positions (at most cap, ascending).
     """
-    separation = np.asarray(separation)
-    classes = np.asarray(classes)
-    rival = classes[:, None] != classes[None, :]
-    reasons: dict[tuple[int, int], set[str]] = defaultdict(set)
-    for a, b in np.argwhere(np.triu(rival & (separation < threshold), 1)):
-        reasons[(int(a), int(b))].add("near")
-    for a, b in conflicts:
-        if rival[a, b]:
-            reasons[(min(a, b), max(a, b))].add("label_conflict")
-    for own in range(len(classes)):
-        others = np.flatnonzero(rival[own])
-        if len(others):
-            other = int(others[np.argmin(separation[own, others])])
-            reasons[(min(own, other), max(own, other))].add("nearest")
-    return [
-        Pair(a, b, tuple(r for r in REASONS if r in found))
-        for (a, b), found in sorted(reasons.items())
-    ]
-
-
-def region_samples(region: np.ndarray, cap: int, seed: int) -> dict[int, np.ndarray]:
-    """Draw the rows each region is measured on.
-
-    Args:
-        region: The region of every row.
-        cap: The most rows per region.
-        seed: The seed of graph.sample_rows, the same for every region.
-
-    Returns:
-        By region, its row positions (at most cap, ascending).
-    """
-    order = np.argsort(region, kind="stable")
-    ids, starts = np.unique(region[order], return_index=True)
+    order = np.argsort(cell, kind="stable")
+    ids, starts = np.unique(cell[order], return_index=True)
     samples = {}
     for own, rows in zip(ids.tolist(), np.split(order, starts[1:])):
         samples[own] = rows[sample_rows(len(rows), cap, seed)]
     return samples
 
 
-def _scaled(X: np.ndarray, lo: np.ndarray, span: np.ndarray) -> np.ndarray:
-    """Return rows of X scaled into [0, 1] by column; a constant column is 0."""
-    return np.divide(X - lo, span, out=np.zeros(X.shape), where=span > 0)
-
-
-def diversity(
-    X: np.ndarray,
-    region: np.ndarray,
-    n_pairs: int,
-    seed: int,
-    collapse: float = 0.95,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return how alike the rows of every region are (PDD and TC of Flood).
-
-    The cosine similarity is that of the points scaled into [0, 1] by
-    column over every row of X (a constant column is 0), so that it
-    lies in [0, 1] as in Flood et al.; only the rows drawn are scaled.
-    n_pairs pairs of distinct rows of the region are drawn at random
-    (with replacement; every pair when the region has no more); two
-    rows of norm 0 have similarity 1, one of norm 0 and one not 0.
-
-    Args:
-        X: The points, shape (n, d).
-        region: The region of every row, ids 0..m-1.
-        n_pairs: The pairs drawn per region.
-        seed: The seed of the draws.
-        collapse: The cosine similarity over which two rows are
-            functionally identical.
-
-    Returns:
-        Per region, shape (m,): the mean cosine similarity of its pairs
-        (pdd) and the share of pairs over collapse (tc); 1 and 1 for a
-        region of a single row.
-    """
-    lo, span = X.min(axis=0), X.max(axis=0) - X.min(axis=0)
-    rng = np.random.default_rng(seed)
-    m = int(region.max()) + 1
-    pdd, tc = np.ones(m), np.ones(m)
-    order = np.argsort(region, kind="stable")
-    ids, starts = np.unique(region[order], return_index=True)
-    for own, rows in zip(ids.tolist(), np.split(order, starts[1:])):
-        n = len(rows)
-        if n < 2:
-            continue
-        if n * (n - 1) // 2 <= n_pairs:
-            first, second = np.triu_indices(n, 1)
-        else:
-            first = rng.integers(n, size=n_pairs)
-            second = rng.integers(n - 1, size=n_pairs)
-            second += second >= first
-        drawn, back = np.unique(np.r_[first, second], return_inverse=True)
-        points = _scaled(X[rows[drawn]], lo, span)
-        a, b = points[back[: len(first)]], points[back[len(first) :]]
-        norm_a, norm_b = np.linalg.norm(a, axis=1), np.linalg.norm(b, axis=1)
-        both = norm_a * norm_b
-        cosine = np.where(
-            both > 0,
-            np.einsum("ij,ij->i", a, b) / np.where(both > 0, both, 1.0),
-            (norm_a == 0) & (norm_b == 0),
-        )
-        pdd[own], tc[own] = cosine.mean(), (cosine > collapse).mean()
-    return pdd, tc
-
-
 @dataclass(frozen=True)
 class SingleColumn:
-    """The best rule on a single column between two regions.
+    """The best rule on a single column between two cells.
 
     Attributes:
-        side_a: The share of the first region's rows the rule puts on
+        side_a: The share of the first cell's rows the rule puts on
             their side.
-        side_b: The same for the second region.
+        side_b: The same for the second cell.
         column: The index (into the column names) of the rule's
             column; -1 when no column has two values.
-        n_single_columns: The columns whose rule reaches the threshold,
-            as the mean of the two sides.
     """
 
     side_a: float
     side_b: float
     column: int
-    n_single_columns: int
 
     @property
     def share(self) -> float:
@@ -372,11 +253,11 @@ def nearest_error(sq_dist: np.ndarray, side: np.ndarray) -> tuple[float, float]:
     Args:
         sq_dist: The squared distances between the rows, shape (n, n),
             n >= 2.
-        side: True for a row of the second region, shape (n,); each
+        side: True for a row of the second cell, shape (n,); each
             side holds at least one row.
 
     Returns:
-        The error of the first region's rows and of the second's, each
+        The error of the first cell's rows and of the second's, each
         in [0, 1].
     """
     rival = _rival_share(sq_dist, side)
@@ -404,9 +285,9 @@ def single_column(
     Xb: np.ndarray,
     column_of: np.ndarray,
     numeric: np.ndarray,
-    threshold: float,
+    skip: Iterable[int] = (),
 ) -> SingleColumn:
-    """Find the best rule on a single column between two regions (OneR).
+    """Find the best rule on a single column between two cells (OneR).
 
     A numeric column (one point column) gets the threshold, in either
     direction, of highest balanced accuracy; ties of value stay on one
@@ -416,32 +297,31 @@ def single_column(
     wins (ties to the lower index).
 
     Args:
-        Xa: The rows of the first region, shape (n_a, d), n_a >= 1.
-        Xb: The rows of the second region, shape (n_b, d), n_b >= 1.
+        Xa: The rows of the first cell, shape (n_a, d), n_a >= 1.
+        Xb: The rows of the second cell, shape (n_b, d), n_b >= 1.
         column_of: The original column of each point column, as an
             index into numeric, shape (d,).
         numeric: Whether each original column is numeric, shape (c,).
-        threshold: The balanced accuracy from which a column counts in
-            n_single_columns.
+        skip: The original columns left out.
 
     Returns:
-        The rule's accuracy on each side, its column, n_single_columns.
+        The rule's accuracy on each side and its column; (0.5, 0.5, -1)
+        when no column is left with two values.
     """
-    best, sides, n_single = -1.0, (0.5, 0.5), 0
-    column = -1
+    best, sides, column = -1.0, (0.5, 0.5), -1
+    skip = set(skip)
     for c in range(len(numeric)):
         slots = column_of == c
-        if not slots.any():
+        if c in skip or not slots.any():
             continue
         va, vb = _values(Xa[:, slots], numeric[c]), _values(Xb[:, slots], numeric[c])
         if len(np.unique(np.r_[va, vb])) < 2:
             continue
         rule = _stump(va, vb) if numeric[c] else _majority(va, vb)
         share = (rule[0] + rule[1]) / 2
-        n_single += share >= threshold
         if share > best:
             best, sides, column = share, rule, c
-    return SingleColumn(float(sides[0]), float(sides[1]), column, int(n_single))
+    return SingleColumn(float(sides[0]), float(sides[1]), column)
 
 
 def feature_dependence(
@@ -463,8 +343,8 @@ def feature_dependence(
     is the sum of the columns' parts, so a removal subtracts one part.
 
     Args:
-        Xa: The rows of the first region, shape (n_a, d).
-        Xb: The rows of the second region, shape (n_b, d).
+        Xa: The rows of the first cell, shape (n_a, d).
+        Xb: The rows of the second cell, shape (n_b, d).
         column_of: The original column of each point column, shape (d,).
         max_group: The most columns removed.
         seed: The seed of the halves (np.random.default_rng's).
@@ -507,77 +387,146 @@ def feature_dependence(
     return Dependence(tuple(int(columns[i]) for i in group), np.array(errors))
 
 
-def verdict(
-    errors: np.ndarray, n_conflicts: int, single_column: float, threshold: float
-) -> tuple[str, int]:
-    """Judge a pair from its Dependence errors.
+def pair_confusion(
+    Xa: np.ndarray,
+    Xb: np.ndarray,
+    column_of: np.ndarray,
+    numeric: np.ndarray,
+    dependence: Dependence,
+) -> np.ndarray:
+    """Return the share of each side's rows the better of two classifiers confuses.
 
-    With err the mean of the two sides (row 0) and tau = threshold:
-    "label_conflict" when err >= tau and the pair shares conflicting
-    rows; "class_overlap" when err >= tau and single_column < 1 - tau (a single
-    column often separates what the 1-NN, swamped by the others,
-    mixes); "shortcut" when, for the fewest first columns of the group,
-    the error rises by at least tau and reaches tau; "robust" otherwise.
+    The classifiers are the 1-NN on every column (dependence.errors)
+    and the best rule on a single column (single_column); the better is
+    the one of the lower mean error over the two sides. Each holds the
+    error of the best classifier above it: the 1-NN alone overstates it
+    when columns that do not separate swamp the distance, and a single
+    column misses a separation that needs several. After removing the
+    first i columns of dependence.group, the single column is sought
+    among the others.
 
     Args:
-        errors: Dependence.errors.
-        n_conflicts: The conflicting rows the two regions share.
-        single_column: SingleColumn.share of the pair.
-        threshold: tau.
+        Xa: The rows of the first cell, shape (n_a, d).
+        Xb: The rows of the second cell, shape (n_b, d).
+        column_of: The original column of each point column.
+        numeric: Whether each original column is numeric.
+        dependence: feature_dependence of the two cells.
 
     Returns:
-        One of VERDICTS and how many columns of the group the verdict
-        rests on (0 but for "shortcut").
+        Shape (len(dependence.group) + 1, 2): the confusion of each side
+        with every column (row 0) and after removing the first i
+        columns of the group (row i).
     """
-    err = errors.mean(axis=1)
-    if err[0] >= threshold:
-        if n_conflicts > 0:
-            return "label_conflict", 0
-        if single_column < 1 - threshold:
-            return "class_overlap", 0
-    for k in range(1, len(err)):
-        if err[k] - err[0] >= threshold and err[k] >= threshold:
-            return "shortcut", k
-    return "robust", 0
+    confusion = np.empty_like(dependence.errors)
+    for i, nearest in enumerate(dependence.errors):
+        rule = single_column(Xa, Xb, column_of, numeric, dependence.group[:i])
+        one = np.array([1 - rule.side_a, 1 - rule.side_b])
+        confusion[i] = nearest if nearest.mean() <= one.mean() else one
+    return confusion
 
 
-def region_issues(
+def rival_pairs(
+    points: np.ndarray, cell: np.ndarray, cell_class: np.ndarray
+) -> list[tuple[int, int]]:
+    """Return the pairs of a cell and the cells of its rows' nearest rivals.
+
+    For every row, its nearest row of another class (euclidean, ties
+    to the first); each cell is paired with the cells those rows lie in.
+
+    Args:
+        points: The rows, shape (n, d) (the sampled rows of every cell).
+        cell: The cell of every row, shape (n,).
+        cell_class: The class of every cell.
+
+    Returns:
+        The pairs (a, b), a < b, sorted.
+    """
+    points = np.asarray(points, dtype=np.float64)
+    cell = np.asarray(cell, dtype=np.int64)
+    classes = np.asarray(cell_class)[cell]
+    if len(np.unique(classes)) < 2:
+        return []
+    norms = np.einsum("ij,ij->i", points, points)
+    found: set[tuple[int, int]] = set()
+    for start in range(0, len(points), _RIVAL_ROWS):
+        part = slice(start, start + _RIVAL_ROWS)
+        sq = norms[part, None] + norms[None, :] - 2.0 * points[part] @ points.T
+        sq[classes[part, None] == classes[None, :]] = np.inf
+        rival = cell[np.argmin(sq, axis=1)]
+        for a, b in zip(cell[part].tolist(), rival.tolist()):
+            found.add((min(a, b), max(a, b)))
+    return sorted(found)
+
+
+def rival_defects(
+    rivals: Iterable[tuple[int, np.ndarray]], tau: float
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Return the classes a cell has class_overlap and shortcut against.
+
+    Against a rival, class_overlap when the confusion of the cell's rows
+    with every column reaches tau; shortcut when it is under tau but
+    reaches it once the first 1, 2, ... key columns are removed.
+
+    Args:
+        rivals: Per rival cell, its class and the confusion of this
+            cell's rows (its side of pair_confusion): with every column,
+            then after removing the first 1, 2, ... columns of
+            feature_dependence, shape (k + 1,).
+        tau: The share of its rows that may be confused.
+
+    Returns:
+        The classes of class_overlap and the classes of shortcut, each
+        sorted with no repeat.
+    """
+    overlap: set[int] = set()
+    shortcut: set[int] = set()
+    for rival_class, confusion in rivals:
+        steps = np.asarray(confusion, dtype=np.float64)
+        if steps[0] >= tau:
+            overlap.add(int(rival_class))
+        elif (steps[1:] >= tau).any():
+            shortcut.add(int(rival_class))
+    return tuple(sorted(overlap)), tuple(sorted(shortcut))
+
+
+def defects_of(
     missing_rows: int,
-    dup_share: float,
+    n_rows: int,
+    n_read: float,
     conflict_rows: int,
-    verdicts: Iterable[str],
-    dup_threshold: float,
+    overlap: Iterable[int],
+    shortcut: Iterable[int],
 ) -> tuple[str, ...]:
-    """Return the problems of a region, in ISSUES order.
+    """Return the defects of a cell or of a region of cells, in DEFECTS order.
 
-    "missing": a null or invalid value in any row; "duplicates":
-    dup_share >= dup_threshold; "label_conflict": a row equal to a row
-    of another class; "class_overlap" and "shortcut": a pair of that
-    verdict.
-    None of them: the region is solid.
+    invalid_values when a row has a null or invalid cell, duplicates
+    when it has copies (n_read > n_rows), label_conflict when a row
+    equals a row of another class; class_overlap and shortcut when
+    there is a class against which it has them (rival_defects).
 
     Args:
-        missing_rows: The rows with a null or invalid value.
-        dup_share: 1 - n_rows / n_read.
-        conflict_rows: The rows in a label conflict.
-        verdicts: The verdicts of the region's pairs.
-        dup_threshold: quality.thresholds.dup_share.
+        missing_rows: Its rows with a null or invalid cell.
+        n_rows: Its distinct rows.
+        n_read: Its rows in the CSV.
+        conflict_rows: Its rows equal to a row of another class.
+        overlap: The classes it has class_overlap against.
+        shortcut: The classes it has shortcut against.
 
     Returns:
-        The problems, empty when the region is solid.
+        The defects; empty when it has none.
     """
-    verdicts = set(verdicts)
     found = {
-        "missing": missing_rows > 0,
-        "duplicates": dup_share >= dup_threshold,
+        "invalid_values": missing_rows > 0,
+        "duplicates": n_read > n_rows,
         "label_conflict": conflict_rows > 0,
-        "class_overlap": "class_overlap" in verdicts,
-        "shortcut": "shortcut" in verdicts,
+        "class_overlap": bool(tuple(overlap)),
+        "shortcut": bool(tuple(shortcut)),
     }
-    return tuple(issue for issue in ISSUES if found[issue])
+    return tuple(defect for defect in DEFECTS if found[defect])
 
 
 _TIE = 1e-9  # relative tolerance under which two distances tie
+_RIVAL_ROWS = 256  # rows whose nearest rival is searched at once
 
 
 def _rival_share(sq_dist: np.ndarray, side: np.ndarray) -> np.ndarray:

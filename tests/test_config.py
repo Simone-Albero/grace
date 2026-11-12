@@ -24,12 +24,28 @@ def _method(tmp_path, **changes) -> str:
     return str(path)
 
 
-@pytest.mark.parametrize("key", ["name", "params"])
-def test_the_dropped_clustering_keys_are_unknown(tmp_path, key):
-    with pytest.raises(ValueError, match=f"clustering.{key}"):
-        load_config(
-            "synthetic_test", method=_method(tmp_path, **{f"clustering__{key}": 1})
-        )
+def test_the_clustering_section_is_gone(tmp_path):
+    method = yaml.safe_load((ROOT / "configs/method/default.yaml").read_text())
+    method["clustering"] = {"split_separation": 4.0}
+    path = tmp_path / "method.yaml"
+    path.write_text(yaml.safe_dump(method))
+    with pytest.raises(ValueError, match="unknown keys"):
+        load_config("synthetic_test", method=str(path))
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "min_cluster_floor",
+        "vote_k",
+        "separation_grid",
+        "min_stability",
+        "stability_repeats",
+    ],
+)
+def test_the_dropped_cell_keys_are_unknown(tmp_path, key):
+    with pytest.raises(ValueError, match=f"cells.{key}"):
+        load_config("synthetic_test", method=_method(tmp_path, **{f"cells__{key}": 1}))
 
 
 def test_the_kdn_reference_is_gone(tmp_path):
@@ -41,31 +57,20 @@ def test_the_kdn_reference_is_gone(tmp_path):
         load_config("synthetic_test", method=str(path))
 
 
-def test_degenerate_counts_fail(tmp_path):
-    with pytest.raises(ValueError, match="min_cluster_floor"):
+@pytest.mark.parametrize(
+    "key", ["cells__max_fit_samples", "cells__min_rows", "quality__rival_rows"]
+)
+def test_degenerate_counts_fail(tmp_path, key):
+    with pytest.raises(ValueError, match=key.replace("__", ".")):
+        load_config("synthetic_test", method=_method(tmp_path, **{key: 0}))
+
+
+def test_a_cell_holds_two_of_the_smallest_branches(tmp_path):
+    # A node over max_rows always has a child of min_rows or more.
+    with pytest.raises(ValueError, match="cells.max_rows"):
         load_config(
             "synthetic_test",
-            method=_method(tmp_path, clustering__min_cluster_floor=0),
-        )
-    with pytest.raises(ValueError, match="vote_k"):
-        load_config("synthetic_test", method=_method(tmp_path, clustering__vote_k=0))
-    with pytest.raises(ValueError, match="min_cluster_floor"):
-        load_config(
-            "synthetic_test",
-            method=_method(tmp_path, clustering__min_cluster_floor=1),
-        )
-    with pytest.raises(ValueError, match="split_separation"):
-        load_config(
-            "synthetic_test", method=_method(tmp_path, clustering__split_separation=0)
-        )
-    with pytest.raises(ValueError, match="stability_repeats"):
-        load_config(
-            "synthetic_test", method=_method(tmp_path, clustering__stability_repeats=-1)
-        )
-    with pytest.raises(ValueError, match="overlap_separation"):
-        load_config(
-            "synthetic_test",
-            method=_method(tmp_path, clustering__overlap_separation=0.0),
+            method=_method(tmp_path, cells__max_rows=39, cells__min_rows=20),
         )
 
 
@@ -111,15 +116,23 @@ def test_the_duplicates_column_cannot_be_configured(tmp_path):
         load_config(str(path))
 
 
-def test_quality_values_out_of_range_fail(tmp_path):
-    with pytest.raises(ValueError, match="candidate_separation"):
-        load_config(
-            "synthetic_test",
-            method=_method(tmp_path, quality__candidate_separation=0),
-        )
+@pytest.mark.parametrize("value", [0.0, 0.6])
+def test_tau_is_a_share_of_rows_under_one_half(tmp_path, value):
+    with pytest.raises(ValueError, match="quality.tau"):
+        load_config("synthetic_test", method=_method(tmp_path, quality__tau=value))
 
 
-@pytest.mark.parametrize("key", ["k", "highlight"])
+@pytest.mark.parametrize(
+    "key",
+    [
+        "k",
+        "highlight",
+        "thresholds",
+        "candidate_separation",
+        "diversity_pairs",
+        "max_rows_per_region",
+    ],
+)
 def test_the_dropped_quality_keys_are_unknown(tmp_path, key):
     with pytest.raises(ValueError, match=f"quality.{key}"):
         load_config(
@@ -127,24 +140,15 @@ def test_the_dropped_quality_keys_are_unknown(tmp_path, key):
         )
 
 
-def test_the_quality_thresholds_and_group_are_checked(tmp_path):
+def test_the_quality_group_is_checked(tmp_path):
     with pytest.raises(ValueError, match="quality.max_group"):
         load_config("synthetic_test", method=_method(tmp_path, quality__max_group=0))
-    raw = yaml.safe_load((ROOT / "configs/method/default.yaml").read_text())
-    thresholds = raw["quality"]["thresholds"]
-    for bad in (
-        {**thresholds, "kdn": 0.1},
-        {**{k: v for k, v in thresholds.items() if k != "nn_error"}, "error": 0.1},
-        {k: v for k, v in thresholds.items() if k != "nn_error"},
-        {**thresholds, "nn_error": 0.0},
-        {**thresholds, "pdd": 1.5},
-    ):
-        path = tmp_path / "thresholds.yaml"
-        path.write_text(
-            yaml.safe_dump({**raw, "quality": {**raw["quality"], "thresholds": bad}})
-        )
-        with pytest.raises(ValueError, match="quality.thresholds"):
-            load_config("synthetic_test", method=str(path))
+
+
+def test_the_default_method_loads():
+    method = load_config("synthetic_test").method
+    assert (method.cells.max_rows, method.cells.min_rows) == (1000, 20)
+    assert method.quality.tau == 0.1 and method.quality.rival_rows == 100
 
 
 def test_shortcut_cols_are_unknown(tmp_path):

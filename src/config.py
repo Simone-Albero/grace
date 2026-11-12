@@ -9,7 +9,6 @@ from __future__ import annotations
 
 __all__ = [
     "DATASET_DIR",
-    "THRESHOLDS",
     "DatasetConfig",
     "dataset_names",
     "load_config",
@@ -46,72 +45,46 @@ class PrepareConfig:
 
 
 @dataclass(frozen=True)
-class ClusteringConfig:
-    """The per-class weighted Ward regions (`src.clustering`).
+class CellsConfig:
+    """The cells every defect is measured on (`src.cells`).
 
     Attributes:
-        max_fit_samples: The most distinct rows of each half of a
-            class: the tree is built on half A, its splits judged on
-            half B; the other rows are labelled by vote.
-        max_regions: The regions over all classes, shared equally
-            between them.
-        split_separation: The separation (S_low, `clustering.
-            pair_separation`) two regions of a class must keep: a
-            split is cut, and two pieces stay apart, at it or over.
-        min_cluster_floor: The fewest rows of half B of each side of a
-            split judged; a smaller branch is pruned and its rows
-            labelled by vote.
-        vote_k: The labelled neighbours that vote the region of an
-            unlabelled row.
-        stability_repeats: The times the regions of a class are made
-            again on other halves to measure the stability of each
-            region; 0 measures none.
-        overlap_separation: Two regions of different classes overlap
-            when their centroids lie closer than this many standard
-            deviations of their rows along the line between them
-            (`clustering.separation`).
+        max_fit_samples: The most distinct rows of a class its Ward tree
+            is built on; every other row joins its nearest sampled row.
+        max_rows: The most distinct rows of a cell, the same for every
+            class: the resolution of the report (a defect touching tau
+            of a cell's rows is seen), and what makes two cells compared
+            sampled alike.
+        min_rows: The fewest distinct rows of a cell: a smaller branch
+            of the tree joins the cells around it.
     """
 
     max_fit_samples: int
-    max_regions: int
-    split_separation: float
-    min_cluster_floor: int
-    vote_k: int
-    stability_repeats: int
-    overlap_separation: float
-
-
-THRESHOLDS = ("nn_error", "single_column_acc", "dup_share", "pdd", "tc")
+    max_rows: int
+    min_rows: int
 
 
 @dataclass(frozen=True)
 class QualityConfig:
-    """The quality report on pairs of regions (`src.quality`).
+    """The defects of the cells and of their regions (`src.quality`).
 
     Attributes:
-        max_rows_per_region: The distinct rows of a region its pairs
-            are measured on, a uniform sample above this.
-        candidate_separation: Two regions of different classes are
-            measured when their separation (`clustering.separation`)
-            is under this.
-        diversity_pairs: The pairs of rows drawn per class for its
-            diversity.
-        max_group: The most columns removed from a pair to find the
-            ones its separation depends on (its shortcut columns).
-        thresholds: Per key of THRESHOLDS, in (0, 1]: nn_error, the
-            1-NN error from which a pair mixes (tau of
-            quality.verdict); single_column_acc, the balanced accuracy
-            from which a single column separates a pair; dup_share, the share of copies
-            from which a region has the "duplicates" problem; pdd and
-            tc, from which a class has poor diversity or collapsed
-            traffic.
+        tau: The share of a cell's rows that may be confused with a
+            rival's, in (0, 0.5]: the one threshold of class_overlap and
+            shortcut.
+        max_rows_per_cell: The distinct rows of a cell its pairs are
+            measured on, a uniform sample above this.
+        rival_rows: The distinct rows of a cell its rivals are searched
+            from, a uniform sample above this: a budget, as the search
+            compares every row with every other.
+        max_group: The most columns removed from a pair to find a
+            shortcut.
     """
 
-    max_rows_per_region: int
-    candidate_separation: float
-    diversity_pairs: int
+    tau: float
+    max_rows_per_cell: int
+    rival_rows: int
     max_group: int
-    thresholds: dict[str, float]
 
 
 @dataclass(frozen=True)
@@ -122,13 +95,13 @@ class MethodConfig:
         distance: One of DISTANCES: how the numeric columns are
             compared (graph.space_points).
         prepare: The prepared features.
-        clustering: The per-class clustering.
+        cells: The cells of every class.
         quality: The quality report.
     """
 
     distance: str
     prepare: PrepareConfig
-    clustering: ClusteringConfig
+    cells: CellsConfig
     quality: QualityConfig
 
 
@@ -206,43 +179,24 @@ def _validate_method(method: MethodConfig) -> None:
         method.distance in DISTANCES,
         f"distance must be one of {DISTANCES}, got {method.distance!r}",
     )
-    clustering = method.clustering
+    cells, quality = method.cells, method.quality
     positive = {
-        "clustering.max_fit_samples": clustering.max_fit_samples,
-        "clustering.max_regions": clustering.max_regions,
-        "clustering.min_cluster_floor": clustering.min_cluster_floor,
-        "clustering.vote_k": clustering.vote_k,
-        "quality.max_rows_per_region": method.quality.max_rows_per_region,
-        "quality.diversity_pairs": method.quality.diversity_pairs,
-        "quality.max_group": method.quality.max_group,
+        "cells.max_fit_samples": cells.max_fit_samples,
+        "cells.min_rows": cells.min_rows,
+        "quality.max_rows_per_cell": quality.max_rows_per_cell,
+        "quality.rival_rows": quality.rival_rows,
+        "quality.max_group": quality.max_group,
     }
     for key, value in positive.items():
         _check(value >= 1, f"{key} must be >= 1, got {value}")
-    split = clustering.split_separation
-    _check(split > 0, f"clustering.split_separation must be > 0, got {split}")
-    repeats = clustering.stability_repeats
-    _check(repeats >= 0, f"clustering.stability_repeats must be >= 0, got {repeats}")
+    # A node over max_rows always has a child of min_rows or more.
     _check(
-        clustering.min_cluster_floor >= 2,
-        f"clustering.min_cluster_floor must be >= 2, got {clustering.min_cluster_floor}",
+        cells.max_rows >= 2 * cells.min_rows,
+        f"cells.max_rows must be >= 2 * cells.min_rows, got {cells.max_rows}",
     )
-    separation = clustering.overlap_separation
     _check(
-        separation > 0,
-        f"clustering.overlap_separation must be > 0, got {separation}",
+        0 < quality.tau <= 0.5, f"quality.tau must be in (0, 0.5], got {quality.tau}"
     )
-    candidate = method.quality.candidate_separation
-    _check(
-        candidate > 0,
-        f"quality.candidate_separation must be > 0, got {candidate}",
-    )
-    thresholds = method.quality.thresholds
-    _check(
-        set(thresholds) == set(THRESHOLDS),
-        f"quality.thresholds must hold {THRESHOLDS}, got {sorted(thresholds)}",
-    )
-    for key, value in thresholds.items():
-        _check(0 < value <= 1, f"quality.thresholds.{key} must be in (0, 1]")
     cat_cost = method.prepare.cat_cost
     _check(cat_cost > 0, f"prepare.cat_cost must be > 0, got {cat_cost}")
 
@@ -265,7 +219,7 @@ def load_method_config(name_or_path: str = "default") -> MethodConfig:
     _check_keys(raw, MethodConfig, path)
     sections = {
         "prepare": PrepareConfig,
-        "clustering": ClusteringConfig,
+        "cells": CellsConfig,
         "quality": QualityConfig,
     }
     for key, section in sections.items():
