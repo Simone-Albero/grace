@@ -1,6 +1,5 @@
 """Every stage end to end on the small synthetic dataset."""
 
-import dataclasses
 import json
 import sqlite3
 
@@ -10,9 +9,10 @@ import pytest
 from conftest import N_DUPLICATES, STAGE_ORDER, Workspace, make_workspace
 
 from src.config import load_config
-from src.data import DUPLICATES, LABEL
+from src.data import DUPLICATES, KINDS, LABEL
 from src.prepare import MISSING, OTHER
-from stages.paths import prepared_columns, read_points, read_weights
+from src.quality import ISSUES, VERDICTS, region_issues
+from stages.paths import read_points, read_weights
 
 
 def _rows(workspace: Workspace, sql: str) -> list[tuple]:
@@ -42,6 +42,8 @@ def test_clean_drops_the_rare_class_and_the_constant_column_only(done):
     )[0]
     assert n_duplicate == N_DUPLICATES
     assert data.height == n_kept == n_raw - n_duplicate - n_rare
+    (n_unparsable,) = _rows(done, "SELECT n_unparsable FROM clean_summary")[0]
+    assert n_unparsable == 1
     counts = dict(_rows(done, "SELECT label, n_rows FROM class_counts"))
     per_code = dict(data[LABEL].value_counts().iter_rows())
     assert counts == {name: per_code[code] for code, name in enumerate(classes)}
@@ -61,9 +63,27 @@ def test_clean_keeps_one_copy_of_each_row_and_counts_them(done):
     assert data[DUPLICATES].dtype == pl.Int64
     assert set(data[DUPLICATES].unique().to_list()) == {1, 2, 3}
     features = data.drop(DUPLICATES, LABEL)
-    assert not data.drop(DUPLICATES).is_duplicated().any()
-    # Row 51 under another class: same features, two rows.
-    assert features.is_duplicated().sum() == 2
+    # Only the "n/a" row and its empty twin look alike in the file: what
+    # tells them apart is unparsable.parquet.
+    assert data.drop(DUPLICATES).is_duplicated().sum() == 2
+    # Row 51 under another class, and the row whose num_1 read "n/a" with
+    # its twin of num_1 empty: the same features in the file, two rows each.
+    assert features.is_duplicated().sum() == 4
+
+
+def test_clean_names_the_cell_that_was_not_a_number(done):
+    data = _read(done, "data.parquet")
+    cells = _read(done, "unparsable.parquet")
+    assert cells.rows() == [(cells["row"][0], "num_1")]
+    row = cells["row"][0]
+    assert data["num_1"][row] is None
+    twin = data.drop(DUPLICATES, LABEL).with_row_index("i")
+    same = twin.filter(
+        pl.all_horizontal(
+            pl.col(c).eq_missing(twin[c][row]) for c in twin.columns if c != "i"
+        )
+    )
+    assert same.height == 2
     logged = _rows(done, f"SELECT kind FROM features WHERE column = '{DUPLICATES}'")
     assert logged == []
 
@@ -362,27 +382,6 @@ def test_clean_refuses_rows_without_a_label(tmp_path, synthetic_csv):
         workspace.run("clean")
 
 
-def test_the_points_without_shortcuts_lose_their_columns(done):
-    cfg = load_config(str(done.dataset), method=str(done.method))
-    full = prepared_columns(cfg)
-    points, _ = read_points(cfg)
-    assert len(full) == points.shape[1]
-    assert full.count("num_1") == 1 and full.count("cat_1") == 3
-    kept = prepared_columns(cfg, drop=cfg.shortcut_cols)
-    assert kept == [c for c in full if c not in {"num_1", "cat_1"}]
-    without, labels = read_points(cfg, drop=cfg.shortcut_cols)
-    keep = [i for i, c in enumerate(full) if c not in {"num_1", "cat_1"}]
-    np.testing.assert_array_equal(without, points[:, keep])
-    assert labels.tolist() == _read(done, "data.parquet")[LABEL].to_list()
-    cosine = dataclasses.replace(
-        cfg, method=dataclasses.replace(cfg.method, distance="cosine")
-    )
-    unit, _ = read_points(cosine, drop=cfg.shortcut_cols)
-    n_num = sum(c.startswith("num_") for c in kept)
-    norms = np.linalg.norm(unit[:, :n_num], axis=1)
-    np.testing.assert_allclose(norms[norms > 0], 1.0)
-
-
 def _table(workspace: Workspace, table: str) -> pl.DataFrame:
     with sqlite3.connect(workspace.db_path) as conn:
         cursor = conn.execute(
@@ -412,31 +411,78 @@ def test_quality_classes_count_the_rows_of_every_class(reported):
     assert classes["dup_share"].to_list() == pytest.approx(
         (1 - kept["n_rows"] / kept["n_read"]).to_list()
     )
+    for column in ("pdd", "tc", "solid_share", "missing_share", "err"):
+        assert classes[column].is_between(0, 1).all()
+    issues = {i for v in classes["issues"].drop_nulls() for i in v.split(",")}
+    assert issues <= {"low_diversity", "collapse"}
+    for issue in ISSUES:
+        assert classes[f"share_{issue}"].is_between(0, 1).all()
 
 
-def test_quality_regions_count_their_copies(reported):
+def test_quality_regions_judge_every_region(reported):
+    cfg = load_config(str(reported.dataset), method=str(reported.method))
     regions = _table(reported, "quality_regions").sort("region")
+    pairs = _table(reported, "quality_pairs")
     parquet = _read(reported, "regions.parquet").sort("region")
     assert regions["region"].to_list() == parquet["region"].to_list()
     assert regions["n_rows"].to_list() == parquet["n_rows"].to_list()
+    assert regions["n_duplicates"].to_list() == pytest.approx(
+        (parquet["n_read"] - parquet["n_rows"]).to_list()
+    )
     assert regions["dup_share"].to_list() == pytest.approx(
         (1 - parquet["n_rows"] / parquet["n_read"]).to_list()
     )
-    for column in ("pdd", "tc"):
-        assert regions[column].is_between(0, 1).all()
     assert regions["rival"].is_not_null().all()
+    assert regions["err"].is_between(0, 1).all()
+    for r in regions.iter_rows(named=True):
+        own = pairs.filter(
+            (pl.col("region_a") == r["region"]) | (pl.col("region_b") == r["region"])
+        )
+        verdicts = own["verdict"].drop_nulls().to_list()
+        assert [r[f"pairs_{v}"] for v in VERDICTS] == [
+            verdicts.count(v) for v in VERDICTS
+        ]
+        issues = region_issues(
+            r["missing_rows"],
+            r["dup_share"],
+            r["conflict_rows"],
+            verdicts,
+            cfg.method.quality.thresholds["dup_share"],
+        )
+        assert r["issues"] == (",".join(issues) or None)
+        assert r["status"] == ("flagged" if issues else "solid")
+        assert (r["depends_on"] is not None) == (r["verdict"] == "shortcut")
+        assert r["missing_rows"] >= max(r[f"{kind}_rows"] for kind in KINDS)
+
+
+def _bad_cells(series: pl.Series) -> int:
+    n = series.is_null().sum()
+    if series.dtype.is_float():
+        n += (series.is_nan() | series.is_infinite()).sum()
+    return n
+
+
+def test_region_missing_counts_every_null_or_invalid_cell(reported):
+    data = _read(reported, "data.parquet").drop(DUPLICATES, LABEL)
+    missing = _table(reported, "region_missing")
+    regions = _table(reported, "quality_regions")
+    bad = sum(_bad_cells(data[c]) for c in data.columns)
+    assert missing["n_rows"].sum() == bad > 0
+    assert {"empty", "unparsable", "inf"} <= set(missing["kind"]) <= set(KINDS)
+    (unparsable,) = missing.filter(pl.col("kind") == "unparsable").rows(named=True)
+    assert unparsable["column"] == "num_1" and unparsable["n_rows"] == 1
+    assert 0 < regions["missing_rows"].sum() <= bad
+    flagged = regions.filter(pl.col("missing_rows") > 0)
+    assert flagged["issues"].str.contains("missing").all()
 
 
 def test_the_relabelled_row_is_a_label_conflict(reported):
     groups = _table(reported, "label_conflict_groups")
     n_rows = _read(reported, "data.parquet").height
-    every = groups.filter(pl.col("scope") == "all")
-    of_last = every.filter(pl.col("row") == n_rows - 1)["group"].to_list()
+    of_last = groups.filter(pl.col("row") == n_rows - 1)["group"].to_list()
     assert len(of_last) == 1
-    group = every.filter(pl.col("group") == of_last[0])
+    group = groups.filter(pl.col("group") == of_last[0])
     assert group.height == 2 and group["class"].n_unique() == 2
-    without = groups.filter(pl.col("scope") == "ns")
-    assert set(every["row"]) <= set(without["row"])
     pairs = _table(reported, "quality_pairs")
     a, b = sorted(group["region"].to_list())
     pair = pairs.filter((pl.col("region_a") == a) & (pl.col("region_b") == b))
@@ -453,22 +499,21 @@ def test_quality_pairs_follow_their_reasons(reported):
     assert (pairs["region_a"] < pairs["region_b"]).all()
     measured = set(pairs["region_a"]) | set(pairs["region_b"])
     assert measured == set(regions["region"])
+    columns = set(cfg.num_cols + cfg.cat_cols)
     for p in pairs.iter_rows(named=True):
         reasons = p["reasons"].split(",")
-        near = p["sep"] < quality.candidate_separation
-        near |= p["sep_ns"] < quality.candidate_separation
-        assert ("near" in reasons) == near
-        assert ("conflict" in reasons) == (p["n_conflicts"] + p["n_conflicts_ns"] > 0)
-        for suffix in ("", "_ns"):
-            for key in ("f3", "kdn", "enn", "n1"):
-                assert 0 <= p[key + suffix] <= 1
-            assert p["f3_feature" + suffix] in cfg.num_cols + cfg.cat_cols + (None,)
-        assert p["f3_feature_ns"] not in cfg.shortcut_cols
-        highlight = quality.highlight["kdn"]
-        shortcut = (p["kdn_ns"] >= highlight > p["kdn"]) or (
-            p["n_conflicts_ns"] > p["n_conflicts"]
-        )
-        assert bool(p["shortcut"]) == shortcut
+        assert ("near" in reasons) == (p["sep"] < quality.candidate_separation)
+        assert ("conflict" in reasons) == (p["n_conflicts"] > 0)
+        assert p["verdict"] in VERDICTS
+        for key in ("err_a", "err_b", "err", "err_low", "err_without"):
+            assert 0 <= p[key] <= 1
+        assert p["err"] == pytest.approx((p["err_a"] + p["err_b"]) / 2)
+        assert p["delta"] == pytest.approx(p["err_without"] - p["err"])
+        assert 0.5 <= p["one_feature"] <= 1 and p["one_feature_col"] in columns
+        removed = p["removed"].split(",") if p["removed"] else []
+        assert set(removed) <= columns and len(removed) <= quality.max_group
+        if p["verdict"] == "shortcut":
+            assert removed and p["delta"] >= quality.thresholds["error"]
 
 
 def test_quality_report_refuses_regions_of_other_data(copy_of_done):

@@ -5,7 +5,7 @@
  * @type {{dataset: string|null, tab: "clean"|"prepare"|"regions"|"quality", cls: string|null, node: number|null,
  *   overlap: number|null, diagnosis: string|null}} node: the region tree node whose map is shown (null: the root of
  *   state.cls); overlap: the overlap zones node whose map is shown (null: the root of the first zone); diagnosis:
- *   the diagnosis the quality pairs are filtered on (null: every pair)
+ *   the filter of the quality pairs, one of FILTERS (null: every pair)
  */
 const state = { dataset: null, tab: "clean", cls: null, node: null, overlap: null, diagnosis: null };
 
@@ -826,112 +826,112 @@ function panZoom(svg, draw) {
   draw(t);
 }
 
-/** The diagnoses of a pair, in the order of the filter chips. */
-const DIAGNOSES = ["label conflict", "overlap", "one feature", "nonlinear", "shortcut"];
+/** The filters of the quality pairs: the verdicts (quality.verdict), then the pairs a single column separates. */
+const FILTERS = ["conflict", "overlap", "shortcut", "robust", "one feature"];
 
 /**
- * Tiles, the classes table (Flood et al.'s smells per class), the pairs table with its diagnosis filter, the regions.
+ * Tiles, the classes table, the pairs table with its verdict filter, the regions table with their status.
  * @param {object} data response of /quality
  */
 function renderQuality(data) {
-  const s = data.stats, hl = s.highlight;
-  const shortcuts = s.shortcut_cols.length > 0;
-  for (const p of data.pairs) p.diagnoses = diagnoses(p, hl);
-  const rows = data.regions.reduce((a, r) => a + r.n_rows, 0);
-  const read = data.regions.reduce((a, r) => a + r.n_read, 0);
-  const conflictRead = data.regions.reduce((a, r) => a + r.conflict_read, 0);
-  const count = (d) => data.pairs.filter((p) => p.diagnoses.includes(d)).length;
+  const s = data.stats, th = s.thresholds;
+  const oneFeature = (p) => p.one_feature >= th.one_feature && p.n_separating <= 1;
+  const matches = (p, f) => (f === "one feature" ? oneFeature(p) : p.verdict === f);
+  const total = (key) => data.regions.reduce((a, r) => a + r[key], 0);
+  const rows = total("n_rows"), read = total("n_read");
+  const conflictRead = total("conflict_read"), missingRead = total("missing_read");
   fill("qr-tiles",
+    tile("solid regions", `${num(s.n_solid)} of ${num(s.n_regions)}`, `${pct(s.solid_share)} of the CSV rows`),
     tile("copies removed", num(read - rows), `${pct((read - rows) / read)} of ${num(read)} CSV rows`),
     tile("rows in a label conflict", num(conflictRead), `${pct(conflictRead / read, 2)} of the CSV rows`),
+    tile("rows with a null or invalid value", num(missingRead), `${pct(missingRead / read, 2)} of the CSV rows`),
     tile("pairs measured", num(s.n_pairs), `${num(s.n_near)} near · ${num(s.n_conflict)} conflict · ${num(s.n_nearest)} nearest`),
-    tile("pairs that overlap", num(count("overlap")), `ENN ≥ ${hl.enn} or kDN ≥ ${hl.kdn}`),
-    tile("shortcut pairs", shortcuts ? num(count("shortcut")) : "–",
-      shortcuts ? `without ${s.shortcut_cols.join(", ")}` : "no shortcut_cols in the dataset yaml"));
-  $("qr-shortcuts").textContent = shortcuts ? s.shortcut_cols.join(", ") : "the shortcut_cols (none configured)";
+    tile("shortcut pairs", num(s.pairs_shortcut),
+      `${num(s.pairs_overlap)} overlap · ${num(s.pairs_conflict)} conflict · ${num(s.pairs_robust)} robust`));
   $("qr-candidate").textContent = `${s.candidate_separation} sd`;
   $("qr-rows").textContent = num(s.max_rows_per_region);
+  $("qr-error").textContent = th.error;
+  $("qr-group").textContent = s.max_group;
 
   sortable($("qr-classes"), [
     { key: "class", label: "class" },
     { key: "n_rows", label: "rows", format: num },
     { key: "n_read", label: "CSV rows", format: num },
-    { key: "dup_share", label: "copies", format: (v) => share(v, v >= hl.dup_share) },
-    { key: "conflict_share", label: "conflicts", format: (v) => share(v, v > hl.conflict, 2) },
-    { key: "enn", label: "overlap (ENN)", format: (v) => share(v, v >= hl.enn) },
-    { key: "f3", label: "one feature (F3)", format: (v, r) => flagged(v == null ? "–" : `${pct(v)} ${r.f3_feature ?? ""}`, v >= hl.f3) },
-    { key: "shortcut_share", label: "shortcut", format: (v) => (shortcuts ? share(v, v > 0) : "–") },
-    { key: "pdd", label: "diversity (pdd)", format: (v) => flagged(dec(v, 3), v >= hl.pdd) },
-    { key: "tc", label: "collapse (tc)", format: (v) => flagged(pct(v), v >= hl.tc) },
+    { key: "dup_share", label: "copies", format: (v) => share(v, false) },
+    { key: "conflict_share", label: "conflicts", format: (v) => share(v, v > 0, 2) },
+    { key: "missing_share", label: "null / invalid", format: (v) => share(v, v > 0, 2) },
+    { key: "err", label: "1-NN error", format: (v) => flagged(dec(v, 3), v >= th.error) },
+    { key: "one_feature", label: "one feature", format: (v, r) => (v == null ? "–" : flagged(`${pct(v)} ${r.one_feature_col}`, v >= th.one_feature)) },
+    { key: "pdd", label: "diversity (pdd)", format: (v) => flagged(dec(v, 3), v >= th.pdd) },
+    { key: "tc", label: "collapse (tc)", format: (v) => flagged(pct(v), v >= th.tc) },
+    { key: "issues", label: "class issues", format: chips },
+    { key: "solid_share", label: "solid", format: (v) => share(v, false) },
+    { key: "pairs_shortcut", label: "shortcut pairs", format: num },
+    { key: "pairs_overlap", label: "overlap pairs", format: num },
     { key: "n_pairs", label: "pairs", format: num },
   ], data.classes);
 
   const draw = () => {
-    const shown = state.diagnosis ? data.pairs.filter((p) => p.diagnoses.includes(state.diagnosis)) : data.pairs;
-    fill("qr-filters", h("div", { class: "chips" }, [null, ...DIAGNOSES].map((d) => {
-      if (d === "shortcut" && !shortcuts) return null;
-      const chip = h("button", { class: "chip", type: "button", "aria-pressed": String(state.diagnosis === d) },
-        d == null ? `all pairs (${num(data.pairs.length)})` : `${d} (${num(count(d))})`);
-      chip.onclick = () => { state.diagnosis = d; draw(); };
+    const shown = state.diagnosis ? data.pairs.filter((p) => matches(p, state.diagnosis)) : data.pairs;
+    fill("qr-filters", h("div", { class: "chips" }, [null, ...FILTERS].map((f) => {
+      const n = f == null ? data.pairs.length : data.pairs.filter((p) => matches(p, f)).length;
+      const chip = h("button", { class: "chip", type: "button", "aria-pressed": String(state.diagnosis === f) },
+        `${f ?? "all pairs"} (${num(n)})`);
+      chip.onclick = () => { state.diagnosis = f; draw(); };
       return chip;
     })));
-    const columns = [
+    sortable($("qr-pairs"), [
       { key: "region_a", label: "region a" },
       { key: "class_a", label: "class a" },
       { key: "region_b", label: "region b" },
       { key: "class_b", label: "class b" },
       { key: "reasons", label: "measured as", format: (v) => v.join(", ") },
-      { key: "diagnoses", label: "diagnoses", format: (v) => h("span", { class: "chips" }, v.map(diagnosisChip)) },
+      { key: "verdict", label: "verdict", format: verdictChip },
       { key: "sep", label: "separation", format: short },
       { key: "n_conflicts", label: "conflicts", format: num },
-      { key: "kdn", label: "kDN", format: (v) => flagged(dec(v, 3), v >= hl.kdn) },
-      { key: "enn", label: "ENN", format: (v) => flagged(dec(v, 3), v >= hl.enn) },
-      { key: "n1", label: "N1", format: (v) => dec(v, 3) },
-      { key: "f3", label: "F3", format: (v, r) => flagged(`${dec(v, 3)} ${r.f3_feature ?? ""}`, v >= hl.f3) },
-      { key: "n_separating", label: "separating features", format: num },
-      { key: "l2", label: "L2", format: (v) => flagged(dec(v, 3), v >= hl.l2) },
-    ];
-    if (shortcuts) columns.push(
-      { key: "sep_ns", label: "separation · no shortcuts", format: short },
-      { key: "n_conflicts_ns", label: "conflicts · no shortcuts", format: num },
-      { key: "kdn_ns", label: "kDN · no shortcuts", format: (v) => flagged(dec(v, 3), v >= hl.kdn) },
-      { key: "enn_ns", label: "ENN · no shortcuts", format: (v) => flagged(dec(v, 3), v >= hl.enn) },
-      { key: "f3_ns", label: "F3 · no shortcuts", format: (v, r) => flagged(`${dec(v, 3)} ${r.f3_feature_ns ?? ""}`, v >= hl.f3) },
-      { key: "l2_ns", label: "L2 · no shortcuts", format: (v) => flagged(dec(v, 3), v >= hl.l2) });
-    sortable($("qr-pairs"), columns, shown);
+      { key: "err_a", label: "1-NN error a", format: (v) => flagged(dec(v, 3), v >= th.error) },
+      { key: "err_b", label: "1-NN error b", format: (v) => flagged(dec(v, 3), v >= th.error) },
+      { key: "removed", label: "columns removed", format: (v) => v || "–" },
+      { key: "err_without", label: "error without them", format: (v) => dec(v, 3) },
+      { key: "delta", label: "rise", format: (v) => flagged(dec(v, 3), v >= th.error) },
+      { key: "one_feature", label: "one feature", format: (v, r) => flagged(`${pct(v)} ${r.one_feature_col ?? ""}`, oneFeature(r)) },
+      { key: "n_separating", label: "columns that separate", format: num },
+    ], shown);
   };
   draw();
 
+  const missing = {};
+  for (const m of data.missing) (missing[m.region] ??= []).push(`${m.column} ${m.kind} ×${num(m.n_rows)}`);
   sortable($("qr-regions"), [
     { key: "region", label: "region" },
     { key: "class", label: "class" },
+    { key: "status", label: "status", format: (v, r) => (v === "solid" ? "solid" : chips(r.issues)) },
     { key: "n_rows", label: "rows", format: num },
     { key: "n_read", label: "CSV rows", format: num },
-    { key: "dup_share", label: "copies", format: (v) => share(v, v >= hl.dup_share) },
+    { key: "n_duplicates", label: "copies", format: num },
+    { key: "dup_share", label: "copies share", format: (v) => share(v, v >= th.dup_share) },
     { key: "conflict_rows", label: "rows in a conflict", format: num },
-    { key: "pdd", label: "diversity (pdd)", format: (v) => flagged(dec(v, 3), v >= hl.pdd) },
-    { key: "tc", label: "collapse (tc)", format: (v) => flagged(pct(v), v >= hl.tc) },
+    { key: "missing_rows", label: "rows null / invalid", format: (v, r) => (v ? h("span", { title: (missing[r.region] ?? []).join("\n") }, flagged(num(v), true)) : "0") },
     { key: "rival", label: "closest rival", format: (v) => (v == null ? "–" : String(v)) },
-    { key: "enn", label: "ENN with it", format: (v) => flagged(dec(v, 3), v >= hl.enn) },
-    { key: "shortcut", label: "shortcut", format: (v) => (shortcuts ? (v ? diagnosisChip("shortcut") : "no") : "–") },
+    { key: "err", label: "1-NN error", format: (v) => flagged(dec(v, 3), v >= th.error) },
+    { key: "one_feature", label: "one feature", format: (v, r) => (v == null ? "–" : `${pct(v)} ${r.one_feature_col ?? ""}`) },
+    { key: "verdict", label: "verdict", format: verdictChip },
+    { key: "depends_on", label: "rests on", format: (v) => v || "–" },
+    { key: "pairs_shortcut", label: "shortcut pairs", format: num },
+    { key: "pairs_overlap", label: "overlap pairs", format: num },
+    { key: "pairs_conflict", label: "conflict pairs", format: num },
   ], data.regions);
 }
 
-/**
- * Diagnoses of a pair under the highlight thresholds, in DIAGNOSES order. One feature: some feature tells at least
- * hl.f3 of the rows apart and at most one does so for every row (many would only say the regions are far apart).
- * Nonlinear: the linear boundary errs while the neighbours do not mix.
- * @param {object} p a pair of /quality @param {Object<string, number>} hl stats.highlight @returns {string[]}
- */
-function diagnoses(p, hl) {
-  const overlap = p.enn >= hl.enn || p.kdn >= hl.kdn;
-  return [
-    p.n_conflicts > hl.conflict && "label conflict",
-    overlap && "overlap",
-    p.f3 >= hl.f3 && p.n_separating <= 1 && "one feature",
-    p.l2 != null && p.l2 >= hl.l2 && p.kdn < hl.kdn && "nonlinear",
-    p.shortcut && "shortcut",
-  ].filter(Boolean);
+/** A verdict as a chip, flagged unless robust. @param {string|null} v */
+function verdictChip(v) {
+  if (v == null) return "–";
+  return v === "robust" ? "robust" : diagnosisChip(v);
+}
+
+/** Problems joined by "," as chips. @param {string|null} v */
+function chips(v) {
+  return v ? h("span", { class: "chips" }, v.split(",").map(diagnosisChip)) : "–";
 }
 
 /** A diagnosis as a chip: the warning sign and its name. @param {string} d */
@@ -939,9 +939,9 @@ function diagnosisChip(d) {
   return h("span", { class: "chip flag" }, h("b", { class: "sign", "aria-hidden": "true" }, "▲"), d);
 }
 
-/** A value, with the warning sign when it reaches its threshold. @param {string} text @param {boolean} over */
+/** A value, with the warning sign when it reaches its threshold (quality.thresholds). @param {string} text @param {boolean} over */
 function flagged(text, over) {
-  return over ? h("span", { class: "flag", title: "over the highlight threshold" },
+  return over ? h("span", { class: "flag", title: "over its threshold" },
     h("b", { class: "sign", "aria-label": "over the threshold" }, "▲"), text) : text;
 }
 

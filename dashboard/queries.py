@@ -147,16 +147,16 @@ def quality(cfg: DatasetConfig) -> dict[str, Any]:
         cfg: The dataset.
 
     Returns:
-        run; stats (the quality_stats row, shortcut_cols and highlight
-        parsed from JSON); classes, regions and pairs: the rows of
-        quality_classes, quality_regions and quality_pairs, pairs with
+        run; stats (the quality_stats row, thresholds parsed from
+        JSON); classes, regions, pairs and missing: the rows of
+        quality_classes, quality_regions, quality_pairs and
+        region_missing (none when no cell is null or invalid), pairs with
         reasons as a list.
     """
     with closing(_connect(cfg)) as conn:
         run = _latest_run(conn, "quality_report", cfg)
         stats = _rows(conn, "quality_report", "quality_stats", run)[0]
-        stats["shortcut_cols"] = json.loads(stats["shortcut_cols"])
-        stats["highlight"] = json.loads(stats["highlight"])
+        stats["thresholds"] = json.loads(stats["thresholds"])
         pairs = _rows(conn, "quality_report", "quality_pairs", run)
         for pair in pairs:
             pair["reasons"] = pair["reasons"].split(",")
@@ -166,6 +166,9 @@ def quality(cfg: DatasetConfig) -> dict[str, Any]:
             "classes": _rows(conn, "quality_report", "quality_classes", run),
             "regions": _rows(conn, "quality_report", "quality_regions", run),
             "pairs": pairs,
+            "missing": _rows(
+                conn, "quality_report", "region_missing", run, missing_ok=True
+            ),
         }
 
 

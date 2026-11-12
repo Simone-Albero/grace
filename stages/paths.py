@@ -16,8 +16,10 @@ __all__ = [
     "read_classes",
     "read_data",
     "read_points",
+    "read_unparsable",
     "read_weights",
     "regions_file",
+    "unparsable_file",
 ]
 
 import json
@@ -62,6 +64,18 @@ def data_file(cfg: DatasetConfig) -> Path:
         The parquet path.
     """
     return cfg.output_dir / "data.parquet"
+
+
+def unparsable_file(cfg: DatasetConfig) -> Path:
+    """Return the file of the numeric cells that were not numbers (stage clean).
+
+    Args:
+        cfg: The dataset config.
+
+    Returns:
+        The parquet path.
+    """
+    return cfg.output_dir / "unparsable.parquet"
 
 
 def classes_file(cfg: DatasetConfig) -> Path:
@@ -127,32 +141,27 @@ def read_data(cfg: DatasetConfig) -> pl.DataFrame:
     return pl.read_parquet(need(data_file(cfg), "clean"))
 
 
-def read_points(
-    cfg: DatasetConfig, drop: Sequence[str] = ()
-) -> tuple[np.ndarray, np.ndarray]:
+def read_points(cfg: DatasetConfig) -> tuple[np.ndarray, np.ndarray]:
     """Return the prepared rows as points of the space, and their classes.
 
     The numeric columns of the prepared file (data.feature_cols) and its
     one-hot slots (every other column but MISSING and LABEL) go through
     graph.space_points with method.distance. MISSING is a diagnostic:
-    no distance sees it. A column of drop leaves before: a numeric one
-    with its column, a categorical one with all its slots; under
-    "cosine" the remaining numbers are then the ones put at unit length.
+    no distance sees it.
 
     Args:
         cfg: The dataset config.
-        drop: Configured columns (numeric or categorical) left out.
 
     Returns:
         The Float64 points, shape (n, d_num + d_cat), and the class
         codes, shape (n,). Row i is row i of the data file. Column j is
-        a column of prepared_columns(cfg, drop)[j].
+        a column of prepared_columns(cfg)[j].
 
     Raises:
         FileNotFoundError: When stage prepare has not run.
     """
     prepared = pl.read_parquet(need(prepared_file(cfg), "prepare"))
-    numeric, slots, _ = _space_columns(cfg, prepared.columns, drop)
+    numeric, slots, _ = _space_columns(cfg, prepared.columns)
     points = space_points(
         prepared.select(numeric).to_numpy(),
         prepared.select(slots).to_numpy(),
@@ -161,12 +170,11 @@ def read_points(
     return points, prepared[LABEL].to_numpy()
 
 
-def prepared_columns(cfg: DatasetConfig, drop: Sequence[str] = ()) -> list[str]:
+def prepared_columns(cfg: DatasetConfig) -> list[str]:
     """Return the configured column behind every column of read_points.
 
     Args:
         cfg: The dataset config.
-        drop: The columns read_points leaves out.
 
     Returns:
         One name per column of the points: a numeric column's own, the
@@ -176,12 +184,12 @@ def prepared_columns(cfg: DatasetConfig, drop: Sequence[str] = ()) -> list[str]:
         FileNotFoundError: When stage prepare has not run.
     """
     names = pl.read_parquet_schema(need(prepared_file(cfg), "prepare")).names()
-    numeric, _, owners = _space_columns(cfg, names, drop)
+    numeric, _, owners = _space_columns(cfg, names)
     return [*numeric, *owners]
 
 
 def _space_columns(
-    cfg: DatasetConfig, columns: Sequence[str], drop: Sequence[str]
+    cfg: DatasetConfig, columns: Sequence[str]
 ) -> tuple[list[str], list[str], list[str]]:
     """Return the numeric columns, the slots and the column of each slot.
 
@@ -190,16 +198,31 @@ def _space_columns(
     """
     present = feature_cols(columns, cfg.num_cols, cfg.cat_cols).num
     by_length = sorted(cfg.cat_cols, key=len, reverse=True)
-    numeric = [c for c in present if c not in drop]
+    numeric = list(present)
     slots, owners = [], []
     for name in columns:
         if name in present or name in (MISSING, LABEL):
             continue
         owner = next(c for c in by_length if name.startswith(f"{c}="))
-        if owner not in drop:
-            slots.append(name)
-            owners.append(owner)
+        slots.append(name)
+        owners.append(owner)
     return numeric, slots, owners
+
+
+def read_unparsable(cfg: DatasetConfig) -> pl.DataFrame:
+    """Return the numeric cells whose text was not a number.
+
+    Args:
+        cfg: The dataset config.
+
+    Returns:
+        Columns row (the row of the data file) and column, as stage
+        clean wrote them (data.unparsable_cells).
+
+    Raises:
+        FileNotFoundError: When stage clean has not run.
+    """
+    return pl.read_parquet(need(unparsable_file(cfg), "clean"))
 
 
 def read_weights(cfg: DatasetConfig) -> np.ndarray:

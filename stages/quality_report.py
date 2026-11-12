@@ -1,4 +1,4 @@
-"""Stage quality_report: the data-quality report of the regions and their pairs."""
+"""Stage quality_report: the data-quality report of the regions, their pairs and the classes."""
 
 from __future__ import annotations
 
@@ -7,25 +7,30 @@ __all__ = ["run"]
 import json
 import math
 import sqlite3
-from dataclasses import dataclass
+from collections import Counter
 
 import numpy as np
 import polars as pl
 
 from src import db
 from src.clustering import centroids, line_spread, separation
-from src.config import DatasetConfig
-from src.data import DUPLICATES, LABEL
+from src.config import DatasetConfig, QualityConfig
+from src.data import DUPLICATES, KINDS, LABEL
 from src.quality import (
+    ISSUES,
+    VERDICTS,
     Pair,
     candidate_pairs,
+    cover_hart_low,
     diversity,
-    feature_separation,
+    feature_dependence,
+    invalid_values,
     label_conflicts,
-    linear_error,
-    neighbour_overlap,
+    one_feature,
     pair_conflicts,
+    region_issues,
     region_samples,
+    verdict,
 )
 from stages.paths import (
     assignments_file,
@@ -34,74 +39,69 @@ from stages.paths import (
     read_classes,
     read_data,
     read_points,
+    read_unparsable,
     read_weights,
     regions_file,
 )
 
-MEASURES = ("f3", "f3_feature", "n_separating", "kdn", "enn", "n1", "l2")
-SPACES = ("", "_ns")  # the suffix of the full space and of the one without shortcuts
-SCOPES = {"": "all", "_ns": "ns"}
-
-
-@dataclass(frozen=True)
-class _Space:
-    """What the pairs need of one space: no point but the sampled ones.
-
-    Attributes:
-        separation: clustering.separation of every pair of regions.
-        rows: By region, its sampled rows' points.
-        column_of: The column (into names) of each column of the points.
-        names: The configured columns behind the points.
-    """
-
-    separation: np.ndarray
-    rows: dict[int, np.ndarray]
-    column_of: np.ndarray
-    names: list[str]
+SOLID = "solid"  # the status of a region without problems; "flagged" otherwise
+CLASS_ISSUES = ("low_diversity", "collapse")
 
 
 def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
-    """Report the quality of the regions and of their pairs.
+    """Report the quality of the regions, of their pairs and of the classes.
 
-    Reads the data file (the features as read, DUPLICATES), the points
-    (paths.read_points, as stage regions; again without shortcut_cols
-    when any, the space "ns"), regions.parquet and assignments.parquet,
-    which must be of the same rows ("run regions again" otherwise).
-    Order: quality.region_samples (max_rows_per_region, seed) ->
-    quality.diversity of every region on the points (diversity_pairs,
-    seed) -> per space: the weighted centroids of the regions ->
-    clustering.line_spread -> clustering.separation. Then
-    quality.label_conflicts on every feature (and on every feature but
-    shortcut_cols) -> quality.pair_conflicts -> quality.candidate_pairs
-    under quality.candidate_separation -> per pair and space, on the
-    sampled rows: quality.feature_separation, quality.neighbour_overlap
-    (k) and quality.linear_error (null when a side has fewer than 2
-    sampled rows).
-
-    A pair is a shortcut when its kdn without shortcut_cols reaches
-    highlight.kdn while its kdn does not, or when it shares more
-    conflicting rows without them. The ns columns and shortcut are null
-    without shortcut_cols.
+    Reads the data file (the features as read, DUPLICATES), the cells
+    stage clean could not read as numbers (paths.read_unparsable), the
+    points (paths.read_points, as stage regions), regions.parquet and
+    assignments.parquet, which must be of the same rows ("run regions
+    again" otherwise). With q = method.quality, tau =
+    q.thresholds["error"]. Order: quality.diversity of every class on
+    the points (q.diversity_pairs, seed) -> quality.region_samples
+    (q.max_rows_per_region, seed) -> the weighted centroids of the
+    regions -> clustering.line_spread -> clustering.separation ->
+    quality.invalid_values -> quality.label_conflicts on every feature
+    -> quality.pair_conflicts -> quality.candidate_pairs under
+    q.candidate_separation -> per pair, on the sampled rows:
+    quality.one_feature (q.thresholds["one_feature"]),
+    quality.feature_dependence (q.max_group, seed (seed, a, b)) and
+    quality.verdict (tau; null when a side has fewer than 4 sampled
+    rows) -> per region: its rival, its pairs' verdicts,
+    quality.region_issues (q.thresholds["dup_share"]) -> per class:
+    the roll-up, and low_diversity (pdd >= q.thresholds["pdd"]) and
+    collapse (tc >= q.thresholds["tc"]).
 
     Logs: quality_pairs (region_a, class_a, region_b, class_b, reasons
-    joined by ",", sep, sep_ns, n_conflicts, n_conflicts_read,
-    n_conflicts_ns, n_conflicts_ns_read, shortcut, then f3, f3_feature,
-    n_separating, kdn, enn, n1, l2 and the same with _ns),
-    quality_regions (region, class, n_rows, n_read, dup_share = 1 -
-    n_rows / n_read, conflict_rows, conflict_read, pdd, tc, rival: the
-    pair's other region of highest enn, and that pair's enn, kdn, f3,
-    l2, shortcut: whether any of its pairs is one), quality_classes
-    (class, n_rows, n_read, dup_share, conflict_share: conflicting CSV
-    rows over n_read, enn: of its regions' rival pairs, weighted by
-    n_rows, f3 and f3_feature: the most over its pairs that at most one
-    feature separates for every row (null without), shortcut_share:
-    rows of regions with a shortcut pair over n_rows, pdd weighted by
-    n_rows, tc: the most over its regions, n_pairs),
-    label_conflict_groups (scope "all" | "ns", group, row, class,
-    region, n_read), quality_stats (one row: shortcut_cols and highlight
-    as JSON, candidate_separation, k, max_rows_per_region,
-    diversity_pairs, n_pairs, n_near, n_conflict, n_nearest, n_groups,
-    n_groups_ns). n_rows counts distinct rows, n_read rows of the CSV.
+    joined by ",", sep, n_conflicts, n_conflicts_read; err_a, err_b,
+    err (their mean), err_low (quality.cover_hart_low of err); removed
+    (the columns removed, joined by ",": the group's first columns the
+    shortcut rests on, the whole group otherwise), without_a, without_b,
+    err_without (the errors without them), delta = err_without - err,
+    verdict; one_feature_a, one_feature_b, one_feature (their mean),
+    one_feature_col, n_separating), quality_regions (region, class,
+    n_rows, n_read, n_duplicates = n_read - n_rows, dup_share = 1 -
+    n_rows / n_read, conflict_rows, conflict_read, missing_rows and
+    missing_read (rows with a null or invalid value), then per kind of
+    data.KINDS <kind>_rows; rival: the region of the pair where this
+    region's side errs the most (ties to the lower id), with err,
+    err_low, one_feature, one_feature_col of its own side and the
+    pair's verdict, depends_on (removed when the verdict is
+    "shortcut"); pairs_<verdict>: its pairs by verdict; issues joined
+    by ",", status "solid" or "flagged"), quality_classes (class,
+    n_rows, n_read, n_duplicates, dup_share, conflict_share and
+    missing_share over n_read, err: its regions' weighted by n_rows,
+    one_feature and one_feature_col: the most over its pairs that at
+    most one column separates (null without), pdd, tc, issues of
+    low_diversity and collapse, solid_share and share_<issue> of its
+    CSV rows, pairs_<verdict>, n_pairs), region_missing (region,
+    column, kind, n_rows, n_read: the null and invalid cells; no row
+    without one), label_conflict_groups (group, row, class, region,
+    n_read), quality_stats (one row: thresholds as JSON,
+    candidate_separation, max_rows_per_region, diversity_pairs,
+    max_group, n_pairs, n_near, n_conflict, n_nearest, n_groups,
+    n_regions, n_solid, solid_share and share_<issue> of the CSV rows,
+    pairs_<verdict>). n_rows counts distinct rows, n_read rows of the
+    CSV.
     """
     quality = cfg.method.quality
     classes = read_classes(cfg)
@@ -113,66 +113,86 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     points, labels = read_points(cfg)
     if len(region) != len(labels) or not np.array_equal(region_class[region], labels):
         raise ValueError("the regions were built on other data: run regions again")
+    names = prepared_columns(cfg)
+    columns = list(dict.fromkeys(names))
+    column_of = np.array([columns.index(name) for name in names], dtype=np.int64)
+    numeric = np.isin(columns, cfg.num_cols)
+    print(f"[quality_report] diversity of {len(classes)} classes", flush=True)
+    pdd, tc = diversity(points, labels, quality.diversity_pairs, cfg.seed)
     samples = region_samples(region, quality.max_rows_per_region, cfg.seed)
-    print(f"[quality_report] diversity of {len(region_class)} regions", flush=True)
-    pdd, tc = diversity(points, region, quality.diversity_pairs, cfg.seed)
+    rows_of = {own: points[rows] for own, rows in samples.items()}
+    _, centers = centroids(points, region, weights)
+    apart = separation(centers, line_spread(points, region, weights, centers))
+    del points
 
     data = read_data(cfg)
     features = data.drop(DUPLICATES, LABEL)
-    shortcuts = [c for c in cfg.shortcut_cols if c in features.columns]
-    spaces = {"": _space(points, region, weights, samples, prepared_columns(cfg))}
-    del points
-    groups = {"": label_conflicts(features, labels)}
-    if cfg.shortcut_cols:
-        drop = cfg.shortcut_cols
-        points, _ = read_points(cfg, drop=drop)
-        names = prepared_columns(cfg, drop=drop)
-        spaces["_ns"] = _space(points, region, weights, samples, names)
-        del points
-        groups["_ns"] = label_conflicts(features.drop(shortcuts), labels)
-    conflicts = {
-        s: pair_conflicts(g, labels, region, weights) for s, g in groups.items()
-    }
+    invalid = invalid_values(features, read_unparsable(cfg))
+    groups = label_conflicts(features, labels)
+    conflicts = pair_conflicts(groups, labels, region, weights)
     pairs = candidate_pairs(
-        [space.separation for space in spaces.values()],
-        set().union(*conflicts.values()),
-        region_class,
-        quality.candidate_separation,
+        apart, set(conflicts), region_class, quality.candidate_separation
     )
     print(f"[quality_report] measuring {len(pairs)} pairs of regions", flush=True)
     pair_rows = []
     for i, pair in enumerate(pairs):
-        pair_rows.append(_pair_row(pair, spaces, conflicts, region_class, classes, cfg))
+        n, read = conflicts.get((pair.a, pair.b), (0, 0.0))
+        pair_rows.append(
+            {
+                "region_a": pair.a,
+                "class_a": classes[region_class[pair.a]],
+                "region_b": pair.b,
+                "class_b": classes[region_class[pair.b]],
+                "reasons": ",".join(pair.reasons),
+                "sep": float(apart[pair.a, pair.b]),
+                "n_conflicts": n,
+                "n_conflicts_read": read,
+                **_pair_measures(
+                    pair, rows_of, column_of, numeric, columns, n, quality, cfg.seed
+                ),
+            }
+        )
         if (i + 1) % 100 == 0:
             print(f"[quality_report] {i + 1}/{len(pairs)} pairs", flush=True)
 
-    sizes = regions["n_rows"].to_numpy()
-    reads = regions["n_read"].to_numpy()
+    missing_cells = _missing_rows(invalid, region, weights)
     region_rows = _region_rows(
-        pair_rows, groups[""], region, region_class, classes, sizes, reads, weights
+        pair_rows,
+        groups,
+        invalid,
+        region,
+        region_class,
+        classes,
+        regions["n_rows"].to_numpy(),
+        regions["n_read"].to_numpy(),
+        weights,
+        quality.thresholds["dup_share"],
     )
-    for row, own_pdd, own_tc in zip(region_rows, pdd, tc):
-        row["pdd"], row["tc"] = float(own_pdd), float(own_tc)
+    class_rows = _class_rows(region_rows, pair_rows, classes, pdd, tc, quality)
+    n_read = sum(r["n_read"] for r in region_rows)
+    n_solid = sum(r["status"] == SOLID for r in region_rows)
+    print(
+        f"[quality_report] {len(pairs)} pairs, {int(groups.max()) + 1} label "
+        f"conflicts, {n_solid}/{len(region_rows)} regions solid",
+        flush=True,
+    )
     db.log_table(conn, run_id, "quality_pairs", pair_rows)
     db.log_table(conn, run_id, "quality_regions", region_rows)
-    db.log_table(
-        conn, run_id, "quality_classes", _class_rows(region_rows, pair_rows, classes)
-    )
+    db.log_table(conn, run_id, "quality_classes", class_rows)
+    db.log_table(conn, run_id, "region_missing", missing_cells)
     db.log_table(
         conn,
         run_id,
         "label_conflict_groups",
         [
             {
-                "scope": SCOPES[suffix],
-                "group": int(g[row]),
+                "group": int(groups[row]),
                 "row": int(row),
                 "class": classes[labels[row]],
                 "region": int(region[row]),
                 "n_read": float(weights[row]),
             }
-            for suffix, g in groups.items()
-            for row in np.flatnonzero(g >= 0)
+            for row in np.flatnonzero(groups >= 0)
         ],
     )
     db.log_table(
@@ -181,159 +201,171 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
         "quality_stats",
         [
             {
-                "shortcut_cols": json.dumps(list(cfg.shortcut_cols)),
-                "highlight": json.dumps(quality.highlight),
+                "thresholds": json.dumps(quality.thresholds),
                 "candidate_separation": quality.candidate_separation,
-                "k": quality.k,
                 "max_rows_per_region": quality.max_rows_per_region,
                 "diversity_pairs": quality.diversity_pairs,
+                "max_group": quality.max_group,
                 "n_pairs": len(pairs),
                 **{
                     f"n_{reason}": sum(reason in p.reasons for p in pairs)
                     for reason in ("near", "conflict", "nearest")
                 },
-                **{
-                    f"n_groups{suffix}": (
-                        int(groups[suffix].max()) + 1 if suffix in groups else None
-                    )
-                    for suffix in SPACES
-                },
+                "n_groups": int(groups.max()) + 1,
+                "n_regions": len(region_rows),
+                "n_solid": n_solid,
+                **_coverage(region_rows, n_read),
+                **_verdict_counts(pair_rows),
             }
         ],
     )
-    print(
-        f"[quality_report] {len(pairs)} pairs, "
-        f"{int(groups[''].max()) + 1} label conflicts",
-        flush=True,
-    )
-
-
-def _space(
-    points: np.ndarray,
-    region: np.ndarray,
-    weights: np.ndarray,
-    samples: dict[int, np.ndarray],
-    names: list[str],
-) -> _Space:
-    """Return the separation of the regions and their sampled rows."""
-    _, centers = centroids(points, region, weights)
-    apart = separation(centers, line_spread(points, region, weights, centers))
-    unique = list(dict.fromkeys(names))
-    return _Space(
-        separation=apart,
-        rows={own: points[rows] for own, rows in samples.items()},
-        column_of=np.array([unique.index(name) for name in names], dtype=np.int64),
-        names=unique,
-    )
-
-
-def _pair_row(
-    pair: Pair,
-    spaces: dict[str, _Space],
-    conflicts: dict[str, dict[tuple[int, int], tuple[int, float]]],
-    region_class: np.ndarray,
-    classes: list[str],
-    cfg: DatasetConfig,
-) -> dict[str, object]:
-    """Return the quality_pairs row of one pair."""
-    a, b = pair.a, pair.b
-    row: dict[str, object] = {
-        "region_a": a,
-        "class_a": classes[region_class[a]],
-        "region_b": b,
-        "class_b": classes[region_class[b]],
-        "reasons": ",".join(pair.reasons),
-    }
-    for suffix in SPACES:
-        space = spaces.get(suffix)
-        row[f"sep{suffix}"] = None if space is None else float(space.separation[a, b])
-    for suffix in SPACES:
-        n, read = (None, None)
-        if suffix in conflicts:
-            n, read = conflicts[suffix].get((a, b), (0, 0.0))
-        row[f"n_conflicts{suffix}"], row[f"n_conflicts{suffix}_read"] = n, read
-    row["shortcut"] = None
-    for suffix in SPACES:
-        space = spaces.get(suffix)
-        values = (
-            dict.fromkeys(MEASURES)
-            if space is None
-            else _pair_measures(
-                space.rows[a],
-                space.rows[b],
-                space.column_of,
-                space.names,
-                cfg.method.quality.k,
-            )
-        )
-        row.update({f"{key}{suffix}": value for key, value in values.items()})
-    if "_ns" in spaces:
-        highlight = cfg.method.quality.highlight["kdn"]
-        row["shortcut"] = bool(
-            (row["kdn_ns"] >= highlight > row["kdn"])
-            or row["n_conflicts_ns"] > row["n_conflicts"]
-        )
-    return row
 
 
 def _pair_measures(
-    Xa: np.ndarray, Xb: np.ndarray, column_of: np.ndarray, names: list[str], k: int
-) -> dict[str, float | int | str | None]:
-    """Return MEASURES of one pair in one space."""
-    separated = feature_separation(Xa, Xb, column_of)
-    overlap = neighbour_overlap(Xa, Xb, k)
+    pair: Pair,
+    rows_of: dict[int, np.ndarray],
+    column_of: np.ndarray,
+    numeric: np.ndarray,
+    columns: list[str],
+    n_conflicts: int,
+    quality: QualityConfig,
+    seed: int,
+) -> dict[str, object]:
+    """Return the measures of one pair on its regions' sampled rows."""
+    Xa, Xb = rows_of[pair.a], rows_of[pair.b]
+    tau = quality.thresholds["error"]
+    one = one_feature(Xa, Xb, column_of, numeric, quality.thresholds["one_feature"])
+    dependence = feature_dependence(
+        Xa, Xb, column_of, quality.max_group, (seed, pair.a, pair.b)
+    )
+    row: dict[str, object] = dict.fromkeys(
+        ("err_a", "err_b", "err", "err_low", "removed", "without_a", "without_b")
+        + ("err_without", "delta", "verdict")
+    )
+    if dependence is not None:
+        errors = dependence.errors
+        judged, k = verdict(errors, n_conflicts, one.share, tau)
+        last = k if judged == "shortcut" else len(dependence.group)
+        err, without = float(errors[0].mean()), float(errors[last].mean())
+        row.update(
+            err_a=float(errors[0, 0]),
+            err_b=float(errors[0, 1]),
+            err=err,
+            err_low=cover_hart_low(err),
+            removed=",".join(columns[c] for c in dependence.group[:last]),
+            without_a=float(errors[last, 0]),
+            without_b=float(errors[last, 1]),
+            err_without=without,
+            delta=without - err,
+            verdict=judged,
+        )
     return {
-        "f3": separated.share,
-        "f3_feature": names[separated.column] if separated.column >= 0 else None,
-        "n_separating": separated.n_separating,
-        "kdn": overlap.kdn,
-        "enn": overlap.enn,
-        "n1": overlap.n1,
-        "l2": linear_error(Xa, Xb) if min(len(Xa), len(Xb)) >= 2 else None,
+        **row,
+        "one_feature_a": one.side_a,
+        "one_feature_b": one.side_b,
+        "one_feature": one.share,
+        "one_feature_col": columns[one.column] if one.column >= 0 else None,
+        "n_separating": one.n_separating,
     }
+
+
+def _missing_rows(
+    invalid: pl.DataFrame, region: np.ndarray, weights: np.ndarray
+) -> list[dict[str, object]]:
+    """Return the region_missing rows: the null and invalid cells per region, column and kind."""
+    cells = invalid.with_columns(
+        region=pl.Series(region)[invalid["row"]],
+        weight=pl.Series(weights)[invalid["row"]],
+    )
+    return (
+        cells.group_by("region", "column", "kind")
+        .agg(n_rows=pl.len(), n_read=pl.col("weight").sum())
+        .sort("region", "column", "kind")
+        .to_dicts()
+    )
 
 
 def _region_rows(
     pair_rows: list[dict[str, object]],
     groups: np.ndarray,
+    invalid: pl.DataFrame,
     region: np.ndarray,
     region_class: np.ndarray,
     classes: list[str],
     sizes: np.ndarray,
     reads: np.ndarray,
     weights: np.ndarray,
+    dup_threshold: float,
 ) -> list[dict[str, object]]:
-    """Return the quality_regions rows but pdd and tc, by region id."""
+    """Return the quality_regions rows, by region id."""
     m = len(region_class)
     conflicting = groups >= 0
     conflict_rows = np.bincount(region[conflicting], minlength=m)
     conflict_read = np.bincount(
         region[conflicting], weights=weights[conflicting], minlength=m
     )
-    worst: dict[int, dict[str, object]] = {}
-    shortcut = np.zeros(m, dtype=bool)
+    hit = np.unique(invalid["row"].to_numpy())
+    missing_rows = np.bincount(region[hit], minlength=m)
+    missing_read = np.bincount(region[hit], weights=weights[hit], minlength=m)
+    by_kind = {}
+    for kind in KINDS:
+        rows = np.unique(invalid.filter(pl.col("kind") == kind)["row"].to_numpy())
+        by_kind[kind] = np.bincount(region[rows], minlength=m)
+    sides: dict[int, list[dict[str, object]]] = {r: [] for r in range(m)}
     for p in pair_rows:
-        for own, other in (("region_a", "region_b"), ("region_b", "region_a")):
-            r = p[own]
-            if r not in worst or p["enn"] > worst[r]["enn"]:
-                worst[r] = {**p, "rival": p[other]}
-            shortcut[r] |= bool(p["shortcut"])
+        for own, other, s in (
+            ("region_a", "region_b", "a"),
+            ("region_b", "region_a", "b"),
+        ):
+            sides[p[own]].append(
+                {
+                    **p,
+                    "rival": p[other],
+                    "own_err": p[f"err_{s}"],
+                    "own_one": p[f"one_feature_{s}"],
+                }
+            )
     rows = []
     for r in range(m):
-        rival = worst.get(r, {})
+        mine = sides[r]
+        judged = [s for s in mine if s["own_err"] is not None]
+        rival = max(judged, key=lambda s: (s["own_err"], -s["rival"]), default=None)
+        verdicts = [s["verdict"] for s in mine if s["verdict"] is not None]
+        dup_share = float(1 - sizes[r] / reads[r])
+        issues = region_issues(
+            int(missing_rows[r]),
+            dup_share,
+            int(conflict_rows[r]),
+            verdicts,
+            dup_threshold,
+        )
         rows.append(
             {
                 "region": r,
                 "class": classes[region_class[r]],
                 "n_rows": int(sizes[r]),
                 "n_read": float(reads[r]),
-                "dup_share": float(1 - sizes[r] / reads[r]),
+                "n_duplicates": float(reads[r] - sizes[r]),
+                "dup_share": dup_share,
                 "conflict_rows": int(conflict_rows[r]),
                 "conflict_read": float(conflict_read[r]),
-                "pdd": None,
-                "tc": None,
-                **{key: rival.get(key) for key in ("rival", "enn", "kdn", "f3", "l2")},
-                "shortcut": bool(shortcut[r]),
+                "missing_rows": int(missing_rows[r]),
+                "missing_read": float(missing_read[r]),
+                **{f"{kind}_rows": int(by_kind[kind][r]) for kind in KINDS},
+                "rival": None if rival is None else rival["rival"],
+                "err": None if rival is None else rival["own_err"],
+                "err_low": None if rival is None else cover_hart_low(rival["own_err"]),
+                "one_feature": None if rival is None else rival["own_one"],
+                "one_feature_col": None if rival is None else rival["one_feature_col"],
+                "verdict": None if rival is None else rival["verdict"],
+                "depends_on": (
+                    rival["removed"]
+                    if rival is not None and rival["verdict"] == "shortcut"
+                    else None
+                ),
+                **{f"pairs_{v}": Counter(verdicts)[v] for v in VERDICTS},
+                "issues": ",".join(issues) or None,
+                "status": "flagged" if issues else SOLID,
             }
         )
     return rows
@@ -343,10 +375,13 @@ def _class_rows(
     region_rows: list[dict[str, object]],
     pair_rows: list[dict[str, object]],
     classes: list[str],
+    pdd: np.ndarray,
+    tc: np.ndarray,
+    quality: QualityConfig,
 ) -> list[dict[str, object]]:
     """Return the quality_classes rows, the roll-up of the regions."""
     rows = []
-    for name in classes:
+    for code, name in enumerate(classes):
         own = [r for r in region_rows if r["class"] == name]
         if not own:
             continue
@@ -354,34 +389,65 @@ def _class_rows(
         n_read = sum(r["n_read"] for r in own)
         pairs = [p for p in pair_rows if name in (p["class_a"], p["class_b"])]
         single = [p for p in pairs if p["n_separating"] <= 1]
-        best = max(single, key=lambda p: p["f3"], default=None)
+        best = max(single, key=lambda p: p["one_feature"], default=None)
+        known = [r for r in own if r["err"] is not None]
+        issues = [
+            issue
+            for issue, value, key in zip(
+                CLASS_ISSUES, (pdd[code], tc[code]), ("pdd", "tc")
+            )
+            if value >= quality.thresholds[key]
+        ]
         rows.append(
             {
                 "class": name,
                 "n_rows": n_rows,
                 "n_read": n_read,
+                "n_duplicates": n_read - n_rows,
                 "dup_share": 1 - n_rows / n_read,
                 "conflict_share": sum(r["conflict_read"] for r in own) / n_read,
-                "enn": _weighted(own, "enn"),
-                "f3": None if best is None else best["f3"],
-                "f3_feature": None if best is None else best["f3_feature"],
-                "shortcut_share": sum(r["n_rows"] for r in own if r["shortcut"])
-                / n_rows,
-                "pdd": _weighted(own, "pdd"),
-                "tc": max(r["tc"] for r in own),
+                "missing_share": sum(r["missing_read"] for r in own) / n_read,
+                "err": _number(
+                    sum(r["err"] * r["n_rows"] for r in known)
+                    / sum(r["n_rows"] for r in known)
+                    if known
+                    else None
+                ),
+                "one_feature": None if best is None else best["one_feature"],
+                "one_feature_col": None if best is None else best["one_feature_col"],
+                "pdd": float(pdd[code]),
+                "tc": float(tc[code]),
+                "issues": ",".join(issues) or None,
+                **_coverage(own, n_read),
+                **_verdict_counts(pairs),
                 "n_pairs": len(pairs),
             }
         )
     return rows
 
 
-def _weighted(rows: list[dict[str, object]], key: str) -> float | None:
-    """Return the mean of key over rows, weighted by n_rows; None if none."""
-    known = [r for r in rows if r[key] is not None]
-    if not known:
-        return None
-    total = sum(r["n_rows"] for r in known)
-    return _number(sum(r[key] * r["n_rows"] for r in known) / total)
+def _coverage(region_rows: list[dict[str, object]], n_read: float) -> dict[str, float]:
+    """Return solid_share and share_<issue>: the CSV rows of those regions over n_read."""
+    out = {
+        "solid_share": sum(r["n_read"] for r in region_rows if r["status"] == SOLID)
+        / n_read
+    }
+    for issue in ISSUES:
+        out[f"share_{issue}"] = (
+            sum(
+                r["n_read"]
+                for r in region_rows
+                if issue in (r["issues"] or "").split(",")
+            )
+            / n_read
+        )
+    return out
+
+
+def _verdict_counts(pair_rows: list[dict[str, object]]) -> dict[str, int]:
+    """Return pairs_<verdict>: the pairs of each verdict."""
+    counts = Counter(p["verdict"] for p in pair_rows)
+    return {f"pairs_{v}": counts[v] for v in VERDICTS}
 
 
 def _number(value: float | None) -> float | None:

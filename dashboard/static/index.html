@@ -117,23 +117,30 @@
       <p class="empty">Select a dataset.</p>
       <div id="qr-tiles" class="tiles"></div>
       <div class="card"><h2>Classes</h2>
-        <p class="note">The smells of Flood et al. (EuroS&amp;P 2024) per class, measured on its regions. Copies: CSV
-          rows that repeat another. Conflicts: CSV rows equal on every feature to a row of another class. Overlap (ENN):
-          rows whose nearest neighbours are mostly of the closest rival region, weighted by rows. One feature: the most
-          of a pair's rows a single feature tells apart. Shortcut: rows of regions that overlap a rival only once
-          <span id="qr-shortcuts"></span> are removed. Diversity: mean cosine similarity of pairs of rows of a region
-          (pdd) and share of pairs that are functionally identical (tc). Marked: from the thresholds of
-          <code>quality.highlight</code>.</p>
+        <p class="note">The smells of Flood et al. (EuroS&amp;P 2024) per class. Copies: CSV rows that repeat another.
+          Conflicts: CSV rows equal on every feature to a row of another class. Null / invalid: CSV rows with an
+          empty, unreadable, NaN or infinite value. 1-NN error: of its regions against their closest rival, weighted by
+          rows. One feature: the best balanced accuracy of a rule on one column (OneR; Ho &amp; Basu's F3, made robust)
+          over its pairs that only one column separates. Diversity (pdd): mean cosine similarity of pairs of its rows;
+          collapse (tc): share of those pairs functionally identical; both are judged per class, since a region is
+          alike by construction. Solid: CSV rows in regions without a problem. Marked: from
+          <code>quality.thresholds</code>.</p>
         <div id="qr-classes" class="table-wrap"></div></div>
       <div class="card"><h2>Pairs of regions</h2>
         <p class="note">Each pair of regions of different classes that is near (separation under
           <span id="qr-candidate"></span>), shares conflicting rows, or is a region's nearest rival, measured on at most
-          <span id="qr-rows"></span> rows per region: kDN and ENN (neighbours of the other region), N1 (rows on the
-          spanning tree's border), F3 (rows one feature tells apart, and which), L2 (error of a linear boundary: high
-          with a low overlap, the boundary is curved). "without shortcuts": the same without the shortcut columns.</p>
+          <span id="qr-rows"></span> rows per region, each side apart. 1-NN error: share of a side's rows whose
+          nearest row is of the other side. Then up to <span id="qr-group"></span> columns are removed, each the one
+          that raises the error most (chosen on half of the rows, measured on the other half). Verdict, with
+          &tau; = <span id="qr-error"></span>: conflict (error &ge; &tau; and rows equal across the classes), overlap
+          (error &ge; &tau; and no single column separates), shortcut (removing the columns raises the error by &tau;
+          or more), robust otherwise.</p>
         <div id="qr-filters" class="filters"></div>
         <div id="qr-pairs" class="table-wrap"></div></div>
       <div class="card"><h2>Regions</h2>
+        <p class="note">Every region, with its problems: missing (a null or invalid value), duplicates (copies share
+          over its threshold), conflict (rows equal to a row of another class), overlap and shortcut (a pair of that
+          verdict). Solid: none of them. Closest rival: the pair where its own rows err the most.</p>
         <div id="qr-regions" class="table-wrap"></div></div>
     </section>
 

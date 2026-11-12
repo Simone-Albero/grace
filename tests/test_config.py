@@ -112,31 +112,43 @@ def test_the_duplicates_column_cannot_be_configured(tmp_path):
 
 
 def test_quality_values_out_of_range_fail(tmp_path):
-    with pytest.raises(ValueError, match="quality.k"):
-        load_config("synthetic_test", method=_method(tmp_path, quality__k=0))
     with pytest.raises(ValueError, match="candidate_separation"):
         load_config(
             "synthetic_test",
             method=_method(tmp_path, quality__candidate_separation=0),
         )
-    raw = yaml.safe_load((ROOT / "configs/method/default.yaml").read_text())
-    for highlight in ({**raw["quality"]["highlight"], "nope": 0.1}, {"kdn": 0.1}):
-        path = tmp_path / "highlight.yaml"
-        path.write_text(
-            yaml.safe_dump(
-                {**raw, "quality": {**raw["quality"], "highlight": highlight}}
-            )
+
+
+@pytest.mark.parametrize("key", ["k", "highlight"])
+def test_the_dropped_quality_keys_are_unknown(tmp_path, key):
+    with pytest.raises(ValueError, match=f"quality.{key}"):
+        load_config(
+            "synthetic_test", method=_method(tmp_path, **{f"quality__{key}": 1})
         )
-        with pytest.raises(ValueError, match="quality.highlight"):
+
+
+def test_the_quality_thresholds_and_group_are_checked(tmp_path):
+    with pytest.raises(ValueError, match="quality.max_group"):
+        load_config("synthetic_test", method=_method(tmp_path, quality__max_group=0))
+    raw = yaml.safe_load((ROOT / "configs/method/default.yaml").read_text())
+    thresholds = raw["quality"]["thresholds"]
+    for bad in (
+        {**thresholds, "kdn": 0.1},
+        {k: v for k, v in thresholds.items() if k != "error"},
+        {**thresholds, "error": 0.0},
+        {**thresholds, "pdd": 1.5},
+    ):
+        path = tmp_path / "thresholds.yaml"
+        path.write_text(
+            yaml.safe_dump({**raw, "quality": {**raw["quality"], "thresholds": bad}})
+        )
+        with pytest.raises(ValueError, match="quality.thresholds"):
             load_config("synthetic_test", method=str(path))
 
 
-def test_shortcut_cols_must_be_configured_columns(tmp_path):
+def test_shortcut_cols_are_unknown(tmp_path):
     raw = yaml.safe_load((DATASET_DIR / "synthetic_test.yaml").read_text())
     path = tmp_path / "shortcuts.yaml"
-    path.write_text(yaml.safe_dump({**raw, "shortcut_cols": ["num_1", "ttl"]}))
-    with pytest.raises(ValueError, match="ttl"):
+    path.write_text(yaml.safe_dump({**raw, "shortcut_cols": ["num_1"]}))
+    with pytest.raises(ValueError, match="unknown keys"):
         load_config(str(path))
-    path.write_text(yaml.safe_dump({**raw, "shortcut_cols": ["num_1", "cat_1"]}))
-    assert load_config(str(path)).shortcut_cols == ("num_1", "cat_1")
-    assert load_config("synthetic_test").shortcut_cols == ()

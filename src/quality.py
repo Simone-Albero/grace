@@ -1,56 +1,63 @@
-"""Data-quality measures on regions and on pairs of regions of different classes.
+"""Data-quality measures on regions, on pairs of regions of different classes and on classes.
 
 After Flood, Engelen, Aspinall & Desmet, "Bad Design Smells in
 Benchmark NIDS Datasets" (EuroS&P 2024), measured on the regions of
-`src.clustering` rather than on whole classes:
+`src.clustering`:
+- null and invalid values, cell by cell (invalid_values);
 - label conflicts: rows equal on every feature under different
   classes (label_conflicts, pair_conflicts);
-- overlap: how much two regions of different classes mix, from the
-  neighbours inside the pair (neighbour_overlap: kDN, ENN, N1);
-- single-feature separation: the share of the pair's rows one feature
-  alone tells apart (feature_separation, F3 read the other way round);
-- complicated separation: the error of a linear boundary between the
-  two regions (linear_error, L2);
+- how much two regions mix: the leave-one-out 1-NN error of each side
+  (nearest_error), bounded below by Cover & Hart (cover_hart_low);
+- single-feature separation: the per-side accuracy of the best rule on
+  one column, a threshold or a value-to-side map (one_feature, OneR of
+  Holte 1993; it is Ho & Basu's F3 made robust, 1 - F3 of Lorena et
+  al.);
+- on how few columns the separation rests (feature_dependence) and the
+  pair's verdict (verdict): conflict, overlap, shortcut or robust;
 - poor data diversity and traffic collapse: how alike the rows of a
-  region are (diversity).
-Which pairs are measured is candidate_pairs' choice. Every measure is
-a share in [0, 1] and is computed on distinct rows, unweighted: the
-copies of a row are their own diagnosis (n_read - n_rows).
+  class are (diversity).
+Which pairs are measured is candidate_pairs' choice; region_issues
+turns a region's counts into its problems. Every measure but the
+counts of copies is computed on distinct rows, unweighted. Every pair
+measure is per side (a, b), its summary the mean of the two: a large
+region does not hide a small one.
 """
 
 from __future__ import annotations
 
 __all__ = [
-    "FeatureSeparation",
-    "NeighbourOverlap",
+    "ISSUES",
+    "VERDICTS",
+    "Dependence",
+    "OneFeature",
     "Pair",
     "candidate_pairs",
+    "cover_hart_low",
     "diversity",
-    "feature_separation",
+    "feature_dependence",
+    "invalid_values",
     "label_conflicts",
-    "linear_error",
-    "neighbour_overlap",
+    "nearest_error",
+    "one_feature",
     "pair_conflicts",
+    "region_issues",
     "region_samples",
+    "verdict",
 ]
 
-import warnings
+import math
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
 
 import numpy as np
 import polars as pl
-from scipy.sparse.csgraph import minimum_spanning_tree
-from scipy.spatial.distance import cdist
-from sklearn.exceptions import ConvergenceWarning
-from sklearn.metrics import balanced_accuracy_score
-from sklearn.svm import LinearSVC
 
 from src.graph import sample_rows
 
 REASONS = ("near", "conflict", "nearest")
-_TINY = 1e-300  # the spanning tree's weight of two copies, which lie 0 apart
+VERDICTS = ("conflict", "overlap", "shortcut", "robust")
+ISSUES = ("missing", "duplicates", "conflict", "overlap", "shortcut")
 
 
 @dataclass(frozen=True)
@@ -61,52 +68,13 @@ class Pair:
         a: The first region.
         b: The second region.
         reasons: Why the pair is measured, a subset of REASONS in that
-            order: "near" (separation under the threshold in some
-            space), "conflict" (they share rows equal on the features),
+            order: "near" (separation under the threshold), "conflict" (they share rows equal on the features),
             "nearest" (one is the nearest rival of the other).
     """
 
     a: int
     b: int
     reasons: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class FeatureSeparation:
-    """How well single columns tell two regions apart.
-
-    Attributes:
-        share: The most, over the columns, of the share of the pair's
-            rows outside the interval where the two regions' ranges
-            overlap; 1 when one column separates them.
-        column: The index (into the column names) of the column that
-            reaches share; -1 when no column has any row outside.
-        n_separating: The columns whose share is 1.
-    """
-
-    share: float
-    column: int
-    n_separating: int
-
-
-@dataclass(frozen=True)
-class NeighbourOverlap:
-    """How much two regions mix among their nearest neighbours.
-
-    Attributes:
-        kdn: The mean, over the two regions, of the mean share of
-            neighbours of the other region (kDN, k neighbours inside
-            the pair).
-        enn: The share of the pair's rows whose neighbours are at
-            least half of the other region (edited nearest neighbour,
-            ties count against the row).
-        n1: The share of the pair's rows on an edge of the minimum
-            spanning tree of the pair that joins the two regions.
-    """
-
-    kdn: float
-    enn: float
-    n1: float
 
 
 def label_conflicts(features: pl.DataFrame, labels: np.ndarray) -> np.ndarray:
@@ -183,21 +151,20 @@ def pair_conflicts(
 
 
 def candidate_pairs(
-    separations: Iterable[np.ndarray],
+    separation: np.ndarray,
     conflicts: Iterable[tuple[int, int]],
     classes: np.ndarray,
     threshold: float,
 ) -> list[Pair]:
     """Choose the pairs of regions of different classes worth measuring.
 
-    A pair is "near" when its separation is under threshold in any of
-    separations, "conflict" when it is among conflicts, "nearest" when
-    one region is the nearest rival of the other (least separation in
-    the first of separations; ties to the lower region id).
+    A pair is "near" when its separation is under threshold, "conflict"
+    when it is among conflicts, "nearest" when one region is the nearest
+    rival of the other (least separation; ties to the lower region id).
 
     Args:
-        separations: The (m, m) separations (clustering.separation) of
-            the regions in each space, the full space first.
+        separation: The (m, m) separations of the regions
+            (clustering.separation).
         conflicts: The pairs (a, b) that share conflicting rows.
         classes: The class of every region, shape (m,).
         threshold: The separation under which a pair is near.
@@ -205,21 +172,19 @@ def candidate_pairs(
     Returns:
         The pairs sorted by (a, b), each with its reasons.
     """
-    separations = [np.asarray(s) for s in separations]
+    separation = np.asarray(separation)
     classes = np.asarray(classes)
     rival = classes[:, None] != classes[None, :]
     reasons: dict[tuple[int, int], set[str]] = defaultdict(set)
-    for apart in separations:
-        for a, b in np.argwhere(np.triu(rival & (apart < threshold), 1)):
-            reasons[(int(a), int(b))].add("near")
+    for a, b in np.argwhere(np.triu(rival & (separation < threshold), 1)):
+        reasons[(int(a), int(b))].add("near")
     for a, b in conflicts:
         if rival[a, b]:
             reasons[(min(a, b), max(a, b))].add("conflict")
-    first = separations[0]
     for own in range(len(classes)):
         others = np.flatnonzero(rival[own])
         if len(others):
-            other = int(others[np.argmin(first[own, others])])
+            other = int(others[np.argmin(separation[own, others])])
             reasons[(min(own, other), max(own, other))].add("nearest")
     return [
         Pair(a, b, tuple(r for r in REASONS if r in found))
@@ -244,101 +209,6 @@ def region_samples(region: np.ndarray, cap: int, seed: int) -> dict[int, np.ndar
     for own, rows in zip(ids.tolist(), np.split(order, starts[1:])):
         samples[own] = rows[sample_rows(len(rows), cap, seed)]
     return samples
-
-
-def feature_separation(
-    Xa: np.ndarray, Xb: np.ndarray, column_of: np.ndarray
-) -> FeatureSeparation:
-    """Return the share of the rows of a pair one column tells apart.
-
-    Per column of the points, the rows outside [max(min_a, min_b),
-    min(max_a, max_b)] are told apart by that column alone (F3 of
-    Lorena et al., read as separation instead of overlap). The points
-    of one original column (the one-hot slots of a categorical) count
-    as one: a row is told apart by the column when any of them tells
-    it apart.
-
-    Args:
-        Xa: The rows of the first region, shape (n_a, d).
-        Xb: The rows of the second region, shape (n_b, d).
-        column_of: The original column of each of the d points'
-            columns, as an index, shape (d,).
-
-    Returns:
-        The best column's share, the column, and how many columns
-        separate every row.
-    """
-    X = np.vstack([Xa, Xb])
-    lo = np.maximum(Xa.min(axis=0), Xb.min(axis=0))
-    hi = np.minimum(Xa.max(axis=0), Xb.max(axis=0))
-    outside = (X < lo) | (X > hi)
-    columns, owner = np.unique(column_of, return_inverse=True)
-    told = np.zeros((len(X), len(columns)), dtype=bool)
-    for j, column in enumerate(owner):
-        told[:, column] |= outside[:, j]
-    shares = told.mean(axis=0)
-    best = int(np.argmax(shares))
-    if shares[best] == 0:
-        return FeatureSeparation(0.0, -1, 0)
-    return FeatureSeparation(
-        float(shares[best]), int(columns[best]), int((shares == 1).sum())
-    )
-
-
-def neighbour_overlap(Xa: np.ndarray, Xb: np.ndarray, k: int) -> NeighbourOverlap:
-    """Measure how much two regions mix, from neighbours inside the pair.
-
-    The neighbours of a row are its k nearest other rows of the two
-    regions (fewer when the pair has fewer rows).
-
-    Args:
-        Xa: The rows of the first region, shape (n_a, d), n_a >= 1.
-        Xb: The rows of the second region, shape (n_b, d), n_b >= 1.
-        k: The neighbours of each row.
-
-    Returns:
-        kDN, ENN and N1 of the pair.
-    """
-    X = np.vstack([Xa, Xb])
-    side = np.r_[np.zeros(len(Xa), dtype=bool), np.ones(len(Xb), dtype=bool)]
-    distances = cdist(X, X)
-    np.fill_diagonal(distances, np.inf)
-    k = min(k, len(X) - 1)
-    neighbours = np.argsort(distances, axis=1, kind="stable")[:, :k]
-    rival_share = (side[neighbours] != side[:, None]).mean(axis=1)
-    kdn = (rival_share[~side].mean() + rival_share[side].mean()) / 2
-    enn = (rival_share >= 0.5).mean()
-    # A zero weight is no edge to the spanning tree: copies keep a tiny one.
-    np.fill_diagonal(distances, 0.0)
-    weights = np.where(distances == 0, _TINY, distances)
-    np.fill_diagonal(weights, 0.0)
-    tree = minimum_spanning_tree(weights).tocoo()
-    border = side[tree.row] != side[tree.col]
-    on_border = np.unique(np.r_[tree.row[border], tree.col[border]])
-    return NeighbourOverlap(float(kdn), float(enn), len(on_border) / len(X))
-
-
-def linear_error(Xa: np.ndarray, Xb: np.ndarray) -> float:
-    """Return the balanced training error of a linear SVM between two regions.
-
-    LinearSVC(class_weight="balanced") fit on the two regions (L2 of
-    Lorena et al.). High with a low neighbour overlap, the boundary is
-    there but is not a hyperplane.
-
-    Args:
-        Xa: The rows of the first region, shape (n_a, d), n_a >= 2.
-        Xb: The rows of the second region, shape (n_b, d), n_b >= 2.
-
-    Returns:
-        1 - balanced accuracy on the rows, in [0, 1].
-    """
-    X = np.vstack([Xa, Xb])
-    y = np.r_[np.ones(len(Xa)), np.zeros(len(Xb))]
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ConvergenceWarning)
-        svm = LinearSVC(class_weight="balanced", max_iter=10_000, random_state=0)
-        svm.fit(X, y)
-    return float(1.0 - balanced_accuracy_score(y, svm.predict(X)))
 
 
 def _scaled(X: np.ndarray, lo: np.ndarray, span: np.ndarray) -> np.ndarray:
@@ -403,3 +273,369 @@ def diversity(
         )
         pdd[own], tc[own] = cosine.mean(), (cosine > collapse).mean()
     return pdd, tc
+
+
+@dataclass(frozen=True)
+class OneFeature:
+    """The best rule on a single column between two regions.
+
+    Attributes:
+        side_a: The share of the first region's rows the rule puts on
+            their side.
+        side_b: The same for the second region.
+        column: The index (into the column names) of the rule's
+            column; -1 when no column has two values.
+        n_separating: The columns whose rule reaches the threshold, as
+            the mean of the two sides.
+    """
+
+    side_a: float
+    side_b: float
+    column: int
+    n_separating: int
+
+    @property
+    def share(self) -> float:
+        """The balanced accuracy of the rule: the mean of the two sides."""
+        return (self.side_a + self.side_b) / 2
+
+
+@dataclass(frozen=True)
+class Dependence:
+    """How a pair's 1-NN error grows as columns are removed.
+
+    Attributes:
+        group: The columns removed, in the order chosen (indices into
+            the column names), at most max_group.
+        errors: Shape (len(group) + 1, 2): the 1-NN error of each side
+            (nearest_error) on the measured half, with every column
+            (row 0) and after removing the first i columns of group
+            (row i).
+    """
+
+    group: tuple[int, ...]
+    errors: np.ndarray
+
+
+def invalid_values(features: pl.DataFrame, unparsable: pl.DataFrame) -> pl.DataFrame:
+    """List every null or invalid cell, with its kind.
+
+    Kinds (data.KINDS): "unparsable" for a cell of unparsable (a
+    numeric cell whose text was not a number, null in features),
+    "empty" for any other null, "nan" and "inf" (either sign) for a
+    float that is not finite.
+
+    Args:
+        features: The columns of the data file but DUPLICATES and
+            LABEL, one row per row.
+        unparsable: The cells whose text was not a number (paths.
+            read_unparsable): columns row and column.
+
+    Returns:
+        Columns row (Int64), column (String), kind (String), one row
+        per null or invalid cell, sorted by row then column order.
+    """
+    order = {column: i for i, column in enumerate(features.columns)}
+    bad = {(row, column) for row, column in unparsable.iter_rows()}
+    cells = []
+    for column in features.columns:
+        values = features[column]
+        empty = values.is_null().to_numpy()
+        for row in np.flatnonzero(empty).tolist():
+            kind = "unparsable" if (row, column) in bad else "empty"
+            cells.append((row, column, kind))
+        if values.dtype.is_float():
+            x = values.to_numpy()
+            for row in np.flatnonzero(np.isnan(x) & ~empty).tolist():
+                cells.append((row, column, "nan"))
+            for row in np.flatnonzero(np.isinf(x)).tolist():
+                cells.append((row, column, "inf"))
+    cells.sort(key=lambda cell: (cell[0], order[cell[1]]))
+    return pl.DataFrame(
+        cells,
+        schema={"row": pl.Int64, "column": pl.String, "kind": pl.String},
+        orient="row",
+    )
+
+
+def nearest_error(sq_dist: np.ndarray, side: np.ndarray) -> tuple[float, float]:
+    """Return the leave-one-out 1-NN error of each side of a pair.
+
+    A row votes for the side of its nearest other row; rows tied at the
+    least distance (relative tolerance 1e-9) share its vote, so the
+    error does not depend on the order of the rows. The error of a side
+    is the mean share of its rows' votes that go to the other side.
+
+    Args:
+        sq_dist: The squared distances between the rows, shape (n, n),
+            n >= 2.
+        side: True for a row of the second region, shape (n,); each
+            side holds at least one row.
+
+    Returns:
+        The error of the first region's rows and of the second's, each
+        in [0, 1].
+    """
+    rival = _rival_share(sq_dist, side)
+    return float(rival[~side].mean()), float(rival[side].mean())
+
+
+def cover_hart_low(error: float) -> float:
+    """Return Cover & Hart's lower bound of the Bayes error under a 1-NN error.
+
+    With two classes, R* >= (1 - sqrt(1 - 2 R)) / 2 for the asymptotic
+    1-NN error R (R clipped to 0.5). On a finite sample it is a guide,
+    not a guarantee.
+
+    Args:
+        error: A 1-NN error in [0, 1].
+
+    Returns:
+        The bound, in [0, 0.5].
+    """
+    return (1 - math.sqrt(max(0.0, 1 - 2 * min(error, 0.5)))) / 2
+
+
+def one_feature(
+    Xa: np.ndarray,
+    Xb: np.ndarray,
+    column_of: np.ndarray,
+    numeric: np.ndarray,
+    threshold: float,
+) -> OneFeature:
+    """Find the best rule on a single column between two regions (OneR).
+
+    A numeric column (one point column) gets the threshold, in either
+    direction, of highest balanced accuracy; ties of value stay on one
+    side. A categorical column (its one-hot slots, read back as the
+    active slot or none) sends each value to the side where it is the
+    larger share of the rows. The column of highest balanced accuracy
+    wins (ties to the lower index).
+
+    Args:
+        Xa: The rows of the first region, shape (n_a, d), n_a >= 1.
+        Xb: The rows of the second region, shape (n_b, d), n_b >= 1.
+        column_of: The original column of each point column, as an
+            index into numeric, shape (d,).
+        numeric: Whether each original column is numeric, shape (c,).
+        threshold: The balanced accuracy from which a column counts in
+            n_separating.
+
+    Returns:
+        The rule's accuracy on each side, its column, n_separating.
+    """
+    best, sides, n_separating = -1.0, (0.5, 0.5), 0
+    column = -1
+    for c in range(len(numeric)):
+        slots = column_of == c
+        if not slots.any():
+            continue
+        va, vb = _values(Xa[:, slots], numeric[c]), _values(Xb[:, slots], numeric[c])
+        if len(np.unique(np.r_[va, vb])) < 2:
+            continue
+        rule = _stump(va, vb) if numeric[c] else _majority(va, vb)
+        share = (rule[0] + rule[1]) / 2
+        n_separating += share >= threshold
+        if share > best:
+            best, sides, column = share, rule, c
+    return OneFeature(float(sides[0]), float(sides[1]), column, int(n_separating))
+
+
+def feature_dependence(
+    Xa: np.ndarray,
+    Xb: np.ndarray,
+    column_of: np.ndarray,
+    max_group: int,
+    seed: int | tuple[int, ...],
+) -> Dependence | None:
+    """Find the columns whose removal raises a pair's 1-NN error the most.
+
+    Each side is split at random into halves: the columns are chosen
+    on the first, the errors measured on the second, so the search does
+    not inflate them. Greedy: max_group times, the column (all the
+    slots of an original column together) whose removal gives the
+    highest mean of the two sides' errors on the choosing half, ties
+    broken by the highest mean margin d_own / (d_own + d_other)
+    (nearest row of the same side, of the other). The squared distance
+    is the sum of the columns' parts, so a removal subtracts one part.
+
+    Args:
+        Xa: The rows of the first region, shape (n_a, d).
+        Xb: The rows of the second region, shape (n_b, d).
+        column_of: The original column of each point column, shape (d,).
+        max_group: The most columns removed.
+        seed: The seed of the halves (np.random.default_rng's).
+
+    Returns:
+        The group and the errors on the measured half; None when a
+        side has fewer than 4 rows.
+    """
+    n_a, n_b = len(Xa), len(Xb)
+    if min(n_a, n_b) < 4:
+        return None
+    rng = np.random.default_rng(seed)
+    measure = np.zeros(n_a + n_b, dtype=bool)
+    for start, n in ((0, n_a), (n_a, n_b)):
+        measure[start + rng.permutation(n)[: n // 2]] = True
+    X = np.vstack([Xa, Xb])
+    side = np.r_[np.zeros(n_a, dtype=bool), np.ones(n_b, dtype=bool)]
+    columns = np.unique(column_of)
+    choose_parts = _column_parts(X[~measure], column_of, columns)
+    measure_parts = _column_parts(X[measure], column_of, columns)
+    choose_side, measure_side = side[~measure], side[measure]
+    choose_total, measure_total = choose_parts.sum(0), measure_parts.sum(0)
+    group: list[int] = []
+    errors = [nearest_error(measure_total, measure_side)]
+    for _ in range(min(max_group, len(columns))):
+        best, best_score = -1, (-1.0, -1.0)
+        for i in range(len(columns)):
+            if i in group:
+                continue
+            sq = choose_total - choose_parts[i]
+            rival = _rival_share(sq, choose_side)
+            error = (rival[~choose_side].mean() + rival[choose_side].mean()) / 2
+            score = (error, _margin(sq, choose_side))
+            if score > best_score:
+                best, best_score = i, score
+        group.append(best)
+        choose_total = choose_total - choose_parts[best]
+        measure_total = measure_total - measure_parts[best]
+        errors.append(nearest_error(measure_total, measure_side))
+    return Dependence(tuple(int(columns[i]) for i in group), np.array(errors))
+
+
+def verdict(
+    errors: np.ndarray, n_conflicts: int, one_feature: float, threshold: float
+) -> tuple[str, int]:
+    """Judge a pair from its Dependence errors.
+
+    With err the mean of the two sides (row 0) and tau = threshold:
+    "conflict" when err >= tau and the pair shares conflicting rows;
+    "overlap" when err >= tau and one_feature < 1 - tau (a single
+    column often separates what the 1-NN, swamped by the others,
+    mixes); "shortcut" when, for the fewest first columns of the group,
+    the error rises by at least tau and reaches tau; "robust" otherwise.
+
+    Args:
+        errors: Dependence.errors.
+        n_conflicts: The conflicting rows the two regions share.
+        one_feature: OneFeature.share of the pair.
+        threshold: tau.
+
+    Returns:
+        One of VERDICTS and how many columns of the group the verdict
+        rests on (0 but for "shortcut").
+    """
+    err = errors.mean(axis=1)
+    if err[0] >= threshold:
+        if n_conflicts > 0:
+            return "conflict", 0
+        if one_feature < 1 - threshold:
+            return "overlap", 0
+    for k in range(1, len(err)):
+        if err[k] - err[0] >= threshold and err[k] >= threshold:
+            return "shortcut", k
+    return "robust", 0
+
+
+def region_issues(
+    missing_rows: int,
+    dup_share: float,
+    conflict_rows: int,
+    verdicts: Iterable[str],
+    dup_threshold: float,
+) -> tuple[str, ...]:
+    """Return the problems of a region, in ISSUES order.
+
+    "missing": a null or invalid value in any row; "duplicates":
+    dup_share >= dup_threshold; "conflict": a row equal to a row of
+    another class; "overlap" and "shortcut": a pair of that verdict.
+    None of them: the region is solid.
+
+    Args:
+        missing_rows: The rows with a null or invalid value.
+        dup_share: 1 - n_rows / n_read.
+        conflict_rows: The rows in a label conflict.
+        verdicts: The verdicts of the region's pairs.
+        dup_threshold: quality.thresholds.dup_share.
+
+    Returns:
+        The problems, empty when the region is solid.
+    """
+    verdicts = set(verdicts)
+    found = {
+        "missing": missing_rows > 0,
+        "duplicates": dup_share >= dup_threshold,
+        "conflict": conflict_rows > 0,
+        "overlap": "overlap" in verdicts,
+        "shortcut": "shortcut" in verdicts,
+    }
+    return tuple(issue for issue in ISSUES if found[issue])
+
+
+_TIE = 1e-9  # relative tolerance under which two distances tie
+
+
+def _rival_share(sq_dist: np.ndarray, side: np.ndarray) -> np.ndarray:
+    """Return, per row, the share of its nearest other rows (ties together) of the other side."""
+    sq = sq_dist.copy()
+    np.fill_diagonal(sq, np.inf)
+    least = sq.min(axis=1, keepdims=True)
+    near = sq <= least + _TIE * np.maximum(least, 1.0)
+    other = side[None, :] != side[:, None]
+    return (near & other).sum(axis=1) / near.sum(axis=1)
+
+
+def _margin(sq_dist: np.ndarray, side: np.ndarray) -> float:
+    """Return the mean over the two sides of d_own / (d_own + d_other), 0.5 at d = 0.
+
+    The squared distances may come from subtracted parts, a hair under 0.
+    """
+    sq = np.maximum(sq_dist, 0.0)
+    np.fill_diagonal(sq, np.inf)
+    same = side[None, :] == side[:, None]
+    own = np.sqrt(np.where(same, sq, np.inf).min(axis=1))
+    other = np.sqrt(np.where(~same, sq, np.inf).min(axis=1))
+    both = own + other
+    ratio = np.full(len(own), 0.5)
+    np.divide(own, both, out=ratio, where=np.isfinite(both) & (both > 0))
+    return float((ratio[~side].mean() + ratio[side].mean()) / 2)
+
+
+def _column_parts(
+    X: np.ndarray, column_of: np.ndarray, columns: np.ndarray
+) -> np.ndarray:
+    """Return the squared distances each original column adds, shape (c, n, n)."""
+    parts = np.empty((len(columns), len(X), len(X)))
+    for i, c in enumerate(columns):
+        Z = X[:, column_of == c]
+        sq = (Z * Z).sum(axis=1)
+        parts[i] = np.maximum(sq[:, None] + sq[None, :] - 2 * Z @ Z.T, 0.0)
+    return parts
+
+
+def _values(Z: np.ndarray, numeric: bool) -> np.ndarray:
+    """Return a column's values: the number, or the active slot (-1 for none)."""
+    if numeric:
+        return Z[:, 0]
+    return np.where(Z.max(axis=1) > 0, Z.argmax(axis=1), -1).astype(float)
+
+
+def _stump(va: np.ndarray, vb: np.ndarray) -> tuple[float, float]:
+    """Return the per-side accuracy of the best threshold on a number, either way."""
+    cuts = np.unique(np.r_[va, vb])
+    below_a = np.searchsorted(np.sort(va), cuts, side="right") / len(va)
+    below_b = np.searchsorted(np.sort(vb), cuts, side="right") / len(vb)
+    rules = np.r_[[below_a, 1 - below_b], [1 - below_a, below_b]].reshape(2, 2, -1)
+    balanced = rules.mean(axis=1)  # (direction, cut)
+    way, cut = np.unravel_index(np.argmax(balanced), balanced.shape)
+    return float(rules[way, 0, cut]), float(rules[way, 1, cut])
+
+
+def _majority(va: np.ndarray, vb: np.ndarray) -> tuple[float, float]:
+    """Return the per-side accuracy of sending each value where it is the larger share."""
+    values = np.unique(np.r_[va, vb])
+    share_a = np.array([(va == v).mean() for v in values])
+    share_b = np.array([(vb == v).mean() for v in values])
+    to_a = share_a >= share_b
+    return float(share_a[to_a].sum()), float(share_b[~to_a].sum())

@@ -1,6 +1,13 @@
 """Shared fixtures: a small synthetic dataset through every stage."""
 
-__all__ = ["N_DUPLICATES", "ROOT", "STAGE_ORDER", "Workspace", "make_workspace"]
+__all__ = [
+    "N_DUPLICATES",
+    "ROOT",
+    "STAGE_ORDER",
+    "UNPARSABLE_ROW",
+    "Workspace",
+    "make_workspace",
+]
 
 import shutil
 import subprocess
@@ -17,6 +24,7 @@ from main import main
 ROOT = Path(__file__).resolve().parents[1]
 STAGE_ORDER = ("clean", "prepare", "regions")
 N_DUPLICATES = 52  # copies synthetic_csv appends
+UNPARSABLE_ROW = 100  # the first row of class_1 from here gets num_1 = "n/a"
 
 
 @dataclass(frozen=True)
@@ -60,7 +68,6 @@ def write_dataset_yaml(folder: Path, csv: Path, name: str = "toy") -> Path:
         num_cols=[*base["num_cols"], "flat"],
         min_class_count=600,
         top_n=3,  # cat_1 has 3 values, all slotted; cat_2 has 4, one "other"
-        shortcut_cols=["num_1", "cat_1"],
         output_dir=str(folder / "out"),
         db_path=str(folder / "grace.db"),
     )
@@ -89,8 +96,10 @@ def synthetic_csv(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
     A constant column, flat, is added for stage clean to drop, and
     N_DUPLICATES copies at the end: rows 0-49 once more, row 50 twice
-    more. Row 51 comes back under another class, which is not a copy
-    but a label conflict, the last row of the data.
+    more. The first row of class_1 from UNPARSABLE_ROW on reads "n/a" in
+    num_1, and comes back once more with num_1 empty: no copy, two rows.
+    Row 51 comes back under another class, which is not a copy but a
+    label conflict, the last row of the data.
     """
     csv = tmp_path_factory.mktemp("data") / "synthetic.csv"
     subprocess.run(
@@ -107,7 +116,17 @@ def synthetic_csv(tmp_path_factory: pytest.TempPathFactory) -> Path:
     )
     relabelled = rows.slice(51, 1).with_columns(other_class.alias("label"))
     copies = [rows.head(50), rows.slice(50, 1), rows.slice(50, 1)]
-    pl.concat([rows, *copies, relabelled]).write_csv(csv)
+    bad = rows.with_row_index("i").filter(
+        (pl.col("i") >= UNPARSABLE_ROW) & (pl.col("label") == "class_1")
+    )["i"][0]
+    rows = rows.with_columns(
+        pl.when(pl.int_range(pl.len()) == bad)
+        .then(pl.lit("n/a"))
+        .otherwise(pl.col("num_1"))
+        .alias("num_1")
+    )
+    empty = rows.slice(bad, 1).with_columns(pl.lit(None, pl.String).alias("num_1"))
+    pl.concat([rows, *copies, empty, relabelled]).write_csv(csv)
     return csv
 
 

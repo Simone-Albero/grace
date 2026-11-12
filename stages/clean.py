@@ -13,13 +13,18 @@ from src import db
 from src.config import DatasetConfig
 from src.data import (
     DUPLICATES,
+    KINDS,
     LABEL,
+    UNPARSABLE,
     constant_columns,
+    count_kinds,
     drop_duplicates,
     drop_rare_classes,
     feature_cols,
+    read_numbers,
+    unparsable_cells,
 )
-from stages.paths import classes_file, data_file
+from stages.paths import classes_file, data_file, unparsable_file
 
 
 def _read(cfg: DatasetConfig) -> pl.DataFrame:
@@ -28,32 +33,36 @@ def _read(cfg: DatasetConfig) -> pl.DataFrame:
     missing = sorted(set(columns) - set(scan.collect_schema().names()))
     if missing:
         raise ValueError(f"columns missing from {cfg.path}: {missing}")
-    numeric = pl.col(cfg.num_cols).cast(pl.Float64, strict=False)
-    return scan.select(columns).with_columns(numeric).collect()
+    return read_numbers(scan.select(columns).collect(), cfg.num_cols)
 
 
 def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     """Read the CSV, drop duplicates, rare classes and constant columns.
 
-    Order: read num_cols (Float64; a value that is not a number becomes
-    null) and cat_cols and label_col (text) of cfg.path ->
+    Order: read num_cols, cat_cols and label_col of cfg.path as text ->
+    data.read_numbers (num_cols as Float64; a text that is not a number
+    becomes null, marked in UNPARSABLE) -> data.count_kinds ->
     data.drop_duplicates (one copy of each row equal on every column,
-    the label included, with DUPLICATES = its copies, 1 when unique) ->
+    the label and UNPARSABLE included, with DUPLICATES = its copies, 1
+    when unique) ->
     data.drop_rare_classes(min_class_count), on the distinct rows ->
     data.constant_columns of num_cols and cat_cols, dropped -> classes
-    sorted, label_col replaced by its code in LABEL. No row is dropped
-    for a missing or non-finite value, and nothing is scaled or encoded:
-    stage prepare does it.
+    sorted, label_col replaced by its code in LABEL ->
+    data.unparsable_cells of the kept rows and columns. No row is
+    dropped for a missing or non-finite value, and nothing is scaled or
+    encoded: stage prepare does it.
 
     Writes to output_dir: data.parquet (the kept num_cols as read, then
     DUPLICATES, the weight of the row and no feature, then the kept
     cat_cols as read, then LABEL as class code; row order = the CSV's
     order of first copies among the kept rows, so a row's position is
     its id everywhere downstream),
-    classes.json (the names, indexed by code).
+    classes.json (the names, indexed by code), unparsable.parquet (row of
+    data.parquet, column: the cells whose text was not a number).
     Logs: clean_summary (one row: n_raw, n_duplicate (copies dropped),
     n_rare, n_kept, n_classes, n_constant; n_kept = n_raw -
-    n_duplicate - n_rare), dropped_classes (label, n_rows: distinct),
+    n_duplicate - n_rare; then n_empty, n_unparsable, n_nan, n_inf:
+    the cells of the CSV rows read, by kind), dropped_classes (label, n_rows: distinct),
     dropped_columns (column), class_counts (label, n_read, n_rows:
     rows read and kept), features (column, kind "num" | "cat": the kept
     ones).
@@ -67,6 +76,7 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     n_unlabelled = raw[cfg.label_col].null_count()
     if n_unlabelled:
         raise ValueError(f"{n_unlabelled} rows of {cfg.path} have no {cfg.label_col}")
+    kinds = count_kinds(raw, cfg.num_cols, cfg.cat_cols)
     distinct = drop_duplicates(raw)
     kept, rare_classes = drop_rare_classes(distinct, cfg.label_col, cfg.min_class_count)
     if kept.is_empty():
@@ -92,6 +102,9 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
 
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     data.write_parquet(data_file(cfg))
+    unparsable_cells(kept[UNPARSABLE], [*features.num, *features.cat]).write_parquet(
+        unparsable_file(cfg)
+    )
     classes_file(cfg).write_text(json.dumps(classes))
     print(f"[clean] saved {data.height} rows", flush=True)
 
@@ -109,6 +122,7 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
                 "n_kept": kept.height,
                 "n_classes": len(classes),
                 "n_constant": len(constant_cols),
+                **{f"n_{kind}": kinds[kind] for kind in KINDS},
             }
         ],
     )

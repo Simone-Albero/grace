@@ -9,7 +9,7 @@ from __future__ import annotations
 
 __all__ = [
     "DATASET_DIR",
-    "HIGHLIGHTS",
+    "THRESHOLDS",
     "DatasetConfig",
     "dataset_names",
     "load_config",
@@ -81,7 +81,7 @@ class ClusteringConfig:
     overlap_separation: float
 
 
-HIGHLIGHTS = ("conflict", "kdn", "enn", "f3", "l2", "pdd", "tc", "dup_share")
+THRESHOLDS = ("error", "one_feature", "dup_share", "pdd", "tc")
 
 
 @dataclass(frozen=True)
@@ -91,23 +91,27 @@ class QualityConfig:
     Attributes:
         max_rows_per_region: The distinct rows of a region its pairs
             are measured on, a uniform sample above this.
-        k: The neighbours inside a pair behind kDN and ENN.
         candidate_separation: Two regions of different classes are
             measured when their separation (`clustering.separation`)
-            is under this, in the full space or without the shortcut
-            columns.
-        diversity_pairs: The pairs of rows drawn per region for its
+            is under this.
+        diversity_pairs: The pairs of rows drawn per class for its
             diversity.
-        highlight: Per key of HIGHLIGHTS, the value from which the
-            dashboard marks a measure; the values are kept as they
-            are.
+        max_group: The most columns removed from a pair to find the
+            ones its separation rests on.
+        thresholds: Per key of THRESHOLDS, in (0, 1]: error, the 1-NN
+            error from which a pair mixes (tau of quality.verdict);
+            one_feature, the balanced accuracy from which a single
+            column separates a pair; dup_share, the share of copies
+            from which a region has the "duplicates" problem; pdd and
+            tc, from which a class has poor diversity or collapsed
+            traffic.
     """
 
     max_rows_per_region: int
-    k: int
     candidate_separation: float
     diversity_pairs: int
-    highlight: dict[str, float]
+    max_group: int
+    thresholds: dict[str, float]
 
 
 @dataclass(frozen=True)
@@ -141,8 +145,6 @@ class DatasetConfig:
         min_class_count: Classes with fewer rows are dropped.
         top_n: The most frequent values of a categorical column with
             their own one-hot slot; the others share one.
-        shortcut_cols: The columns suspected of shortcuts: the quality
-            report measures the pairs of regions again without them.
         seed: The seed of every stage.
         output_dir: The folder of every file of every stage.
         db_path: The SQLite file.
@@ -156,7 +158,6 @@ class DatasetConfig:
     cat_cols: tuple[str, ...]
     min_class_count: int
     top_n: int
-    shortcut_cols: tuple[str, ...]
     seed: int
     output_dir: Path
     db_path: Path
@@ -212,8 +213,8 @@ def _validate_method(method: MethodConfig) -> None:
         "clustering.min_cluster_floor": clustering.min_cluster_floor,
         "clustering.vote_k": clustering.vote_k,
         "quality.max_rows_per_region": method.quality.max_rows_per_region,
-        "quality.k": method.quality.k,
         "quality.diversity_pairs": method.quality.diversity_pairs,
+        "quality.max_group": method.quality.max_group,
     }
     for key, value in positive.items():
         _check(value >= 1, f"{key} must be >= 1, got {value}")
@@ -235,13 +236,13 @@ def _validate_method(method: MethodConfig) -> None:
         candidate > 0,
         f"quality.candidate_separation must be > 0, got {candidate}",
     )
-    highlight = method.quality.highlight
+    thresholds = method.quality.thresholds
     _check(
-        set(highlight) == set(HIGHLIGHTS),
-        f"quality.highlight must hold {HIGHLIGHTS}, got {sorted(highlight)}",
+        set(thresholds) == set(THRESHOLDS),
+        f"quality.thresholds must hold {THRESHOLDS}, got {sorted(thresholds)}",
     )
-    for key, value in highlight.items():
-        _check(0 <= value <= 1, f"quality.highlight.{key} must be in [0, 1]")
+    for key, value in thresholds.items():
+        _check(0 < value <= 1, f"quality.thresholds.{key} must be in (0, 1]")
     cat_cost = method.prepare.cat_cost
     _check(cat_cost > 0, f"prepare.cat_cost must be > 0, got {cat_cost}")
 
@@ -302,9 +303,6 @@ def load_config(dataset: str, method: str = "default") -> DatasetConfig:
             f"{added} is the column stage {stage} adds, not a configured one",
         )
     _check(raw["top_n"] >= 1, f"top_n must be >= 1, got {raw['top_n']}")
-    shortcut_cols = tuple(raw.get("shortcut_cols") or ())
-    unknown = sorted(set(shortcut_cols) - set(columns[:-1]))
-    _check(not unknown, f"shortcut_cols must be configured columns, got {unknown}")
     return DatasetConfig(
         name=raw["name"],
         path=Path(raw["path"]),
@@ -313,7 +311,6 @@ def load_config(dataset: str, method: str = "default") -> DatasetConfig:
         cat_cols=tuple(raw["cat_cols"] or ()),
         min_class_count=raw["min_class_count"],
         top_n=raw["top_n"],
-        shortcut_cols=shortcut_cols,
         seed=raw["seed"],
         output_dir=Path(raw["output_dir"]),
         db_path=Path(raw["db_path"]),
