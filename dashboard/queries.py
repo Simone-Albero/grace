@@ -12,6 +12,7 @@ from __future__ import annotations
 
 __all__ = [
     "CONFLICT_GROUPS",
+    "HYPERPARAMETERS",
     "MAP_MAX_POINTS",
     "MAP_PER_CELL",
     "cell_map",
@@ -20,16 +21,19 @@ __all__ = [
     "prepare",
     "quality",
     "quality_map",
+    "quality_profile",
     "quality_region",
 ]
 
 import dataclasses
+import datetime as dt
 import json
 import math
 import sqlite3
 from collections import defaultdict
 from collections.abc import Mapping
 from contextlib import closing
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -38,18 +42,28 @@ from sklearn.decomposition import PCA
 
 from src.config import DatasetConfig
 from src.data import feature_cols
+from src.provenance import KEYS, TIME, concentration, time_window
 from stages.paths import (
     assignments_file,
     data_file,
     need,
     prepared_file,
+    provenance_file,
     read_classes,
     read_points,
+    read_weights,
 )
 
 MAP_PER_CELL = 2000  # most rows of one cell in a map
 MAP_MAX_POINTS = 20000  # most rows of a map
 CONFLICT_GROUPS = 10  # most label conflict groups in a region's detail
+# the settings each stage's tab shows, by stage, as its run's config set them
+HYPERPARAMETERS = {
+    "clean": ("min_class_count",),
+    "prepare": ("top_n", "cat_cost"),
+    "cells": ("distance", "max_rows", "min_rows", "max_fit_samples", "seed"),
+    "quality_report": ("tau", "rival_rows", "max_rows_per_cell", "max_group"),
+}
 
 
 def clean(cfg: DatasetConfig) -> dict[str, Any]:
@@ -59,8 +73,8 @@ def clean(cfg: DatasetConfig) -> dict[str, Any]:
         cfg: The dataset.
 
     Returns:
-        run; summary {n_raw, n_duplicate, n_rare, n_kept, n_classes,
-        n_constant}; classes [{label, n_read, n_rows}] sorted by label;
+        run; params (_params); summary {n_raw, n_duplicate, n_rare,
+        n_kept, n_classes, n_constant}; classes [{label, n_read, n_rows}] sorted by label;
         dropped_classes [{label, n_rows}]; dropped_columns [column];
         features {num: [...], cat: [...]}; provenance [{key, column,
         n_read, n_empty, n_unparsable, n_values}] (the provenance_columns
@@ -72,6 +86,7 @@ def clean(cfg: DatasetConfig) -> dict[str, Any]:
         features = _rows(conn, "clean", "features", run)
         return {
             "run": _public(run),
+            "params": _params(conn, run, "clean"),
             "summary": summary,
             "classes": sorted(
                 _rows(conn, "clean", "class_counts", run),
@@ -101,8 +116,8 @@ def prepare(cfg: DatasetConfig) -> dict[str, Any]:
         cfg: The dataset.
 
     Returns:
-        run; summary {n_rows, n_num, n_cat, n_columns, n_missing,
-        n_missing_rows}; columns
+        run; params (_params); summary {n_rows, n_num, n_cat, n_columns,
+        n_missing, n_missing_rows}; columns
         [{column, source, kind, mean, std, value, n_rows, weight}] in column
         order.
     """
@@ -110,6 +125,7 @@ def prepare(cfg: DatasetConfig) -> dict[str, Any]:
         run = _latest_run(conn, "prepare", cfg)
         return {
             "run": _public(run),
+            "params": _params(conn, run, "prepare"),
             "summary": _rows(conn, "prepare", "prepare_summary", run)[0],
             "columns": _rows(conn, "prepare", "prepared_columns", run),
         }
@@ -122,19 +138,26 @@ def cells(cfg: DatasetConfig) -> dict[str, Any]:
         cfg: The dataset.
 
     Returns:
-        run; stats (the cell_stats row: n_cells, distance, max_rows,
-        min_rows, max_fit_samples); classes [{class, n_rows, n_read,
-        n_cells}]; cells [{cell, class, n_rows, n_read}]; tree [{node,
-        class, parent, depth, cell, n_rows, n_read}] in pre-order per
-        class.
+        run; params (_params); stats (the cell_stats row: n_cells,
+        distance, max_rows, min_rows, max_fit_samples); classes [{class, n_rows, n_read,
+        n_cells}]; cells [{cell, class, n_rows, n_read, region,
+        defects}], region and defects (a list) those of quality_cells in
+        the last quality_report run after this cells run, null without
+        one; tree [{node, class, parent, depth, cell, n_rows, n_read}] in
+        pre-order per class.
     """
     with closing(_connect(cfg)) as conn:
         run = _latest_run(conn, "cells", cfg)
+        judged = _cell_defects(conn, cfg, run)
         return {
             "run": _public(run),
+            "params": _params(conn, run, "cells"),
             "stats": _rows(conn, "cells", "cell_stats", run)[0],
             "classes": _rows(conn, "cells", "class_cells", run),
-            "cells": _rows(conn, "cells", "cells", run),
+            "cells": [
+                {**c, **judged.get(c["cell"], {"region": None, "defects": None})}
+                for c in _rows(conn, "cells", "cells", run)
+            ],
             "tree": _rows(conn, "cells", "cell_tree", run),
         }
 
@@ -190,7 +213,7 @@ def quality(cfg: DatasetConfig) -> dict[str, Any]:
         cfg: The dataset.
 
     Returns:
-        run; stats (the quality_stats row; regions_ and
+        run; params (_params); stats (the quality_stats row; regions_ and
         share_atypical_source null when the dataset names no source
         address, and so the classes'); classes (quality_classes);
         regions (quality_regions, defects and the class lists as
@@ -202,6 +225,7 @@ def quality(cfg: DatasetConfig) -> dict[str, Any]:
         run = _latest_run(conn, "quality_report", cfg)
         return {
             "run": _public(run),
+            "params": _params(conn, run, "quality_report"),
             "stats": _rows(conn, "quality_report", "quality_stats", run)[0],
             "classes": _rows(conn, "quality_report", "quality_classes", run),
             "regions": [
@@ -230,7 +254,8 @@ def quality_region(cfg: DatasetConfig, region: int) -> dict[str, Any]:
         heaviest first (ties to the lower group), each {group, n_read,
         rows: [{class, cell, region, n_read}] heaviest first, values:
         {column: value}} with values the features of the data file
-        shared by its rows (null for a null, NaN or infinite one).
+        shared by its rows (null for a null, NaN or infinite one);
+        provenance and time (_provenance_of its rows).
 
     Raises:
         LookupError: When quality_report has not run or region is not
@@ -262,7 +287,11 @@ def quality_region(cfg: DatasetConfig, region: int) -> dict[str, Any]:
         by_group.items(), key=lambda g: (-sum(r["n_read"] for r in g[1]), g[0])
     )[:CONFLICT_GROUPS]
     values = _feature_values(cfg, [members[0]["row"] for _, members in heaviest])
+    with closing(_connect(cfg)) as conn:
+        own = _region_rows(cfg, conn, run, [region])[region]
+        tau = _params(conn, run, "quality_report")["tau"]
     return {
+        **_provenance_of(cfg, own, tau),
         "region": _listed(rows[0]),
         "cells": [_listed(c) for c in sorted(cells, key=lambda c: c["cell"])],
         "pairs": [_pair_row(p) for p in pairs],
@@ -316,12 +345,229 @@ def quality_map(cfg: DatasetConfig, region: int) -> dict[str, Any]:
     return {"region": region, "cells": shown, **_map_cells(cfg, shown)}
 
 
+def quality_profile(cfg: DatasetConfig, region: int) -> dict[str, Any]:
+    """Return the mean features of a region and of the regions of its rivals.
+
+    Over the rows of each region (quality_cells of the last
+    quality_report run, assignments.parquet), each weighted by its
+    copies in the CSV: the mean of every numeric column of the prepared
+    file (logged and standardized: a difference of means is in standard
+    deviations of the dataset, alike for every column), and the most
+    frequent value of every categorical column of the data file (ties
+    to the first in text order; null for a null).
+
+    Args:
+        cfg: The dataset.
+        region: A region id of quality_regions.
+
+    Returns:
+        region; rivals (the other regions of its quality_pairs, in
+        order); columns (the numeric columns, in data file order);
+        means {region: [mean per column]} and top {region: {categorical
+        column: value}}, for the region and every rival, keyed by the
+        region as text.
+
+    Raises:
+        LookupError: When quality_report has not run, or region is not
+            one of its regions.
+    """
+    with closing(_connect(cfg)) as conn:
+        run = _latest_run(conn, "quality_report", cfg)
+        if not _where(conn, "quality_regions", run, "region = ?", region):
+            raise LookupError(f"no region {region} in quality_regions")
+        pairs = _where(
+            conn, "quality_pairs", run, "region_a = ? OR region_b = ?", region, region
+        )
+        rivals = sorted({p[f"region_{k}"] for p in pairs for k in "ab"} - {region})
+        rows = _region_rows(cfg, conn, run, [region, *rivals])
+    every = np.unique(np.concatenate(list(rows.values())))
+    path = need(prepared_file(cfg), "prepare")
+    names = feature_cols(
+        pl.read_parquet_schema(path).names(), cfg.num_cols, cfg.cat_cols
+    ).num
+    numbers = _rows_at(path, every, names).to_numpy().reshape(len(every), len(names))
+    data = need(data_file(cfg), "clean")
+    cat = feature_cols(
+        pl.read_parquet_schema(data).names(), cfg.num_cols, cfg.cat_cols
+    ).cat
+    texts = _rows_at(data, every, cat).select(pl.all().cast(pl.String))
+    weights = read_weights(cfg)
+    means, top = {}, {}
+    for r, own in rows.items():
+        at, w = np.searchsorted(every, own), weights[own]
+        mean = (numbers[at] * w[:, None]).sum(0) / w.sum() if len(own) else []
+        means[str(r)] = [_finite(v) for v in mean]
+        top[str(r)] = {c: _weighted_mode(texts[c].to_numpy()[at], w) for c in cat}
+    return {
+        "region": region,
+        "rivals": rivals,
+        "columns": names,
+        "means": means,
+        "top": top,
+    }
+
+
+def _rows_at(path: Path, rows: np.ndarray, columns: list[str]) -> pl.DataFrame:
+    """Return some columns of some rows of a parquet file, the rows in order."""
+    return (
+        pl.scan_parquet(path)
+        .with_row_index("__row__")
+        .join(
+            pl.LazyFrame({"__row__": pl.Series(rows, dtype=pl.UInt32)}),
+            on="__row__",
+            how="semi",
+        )
+        .sort("__row__")
+        .select(columns)
+        .collect()
+    )
+
+
+def _weighted_mode(values: np.ndarray, weights: np.ndarray) -> str | None:
+    """Return the value of most weight, ties to the first in text order, a null last."""
+    if not len(values):
+        return None
+    votes = (
+        pl.DataFrame(
+            {"v": values, "w": weights}, schema={"v": pl.String, "w": pl.Float64}
+        )
+        .group_by("v")
+        .agg(pl.col("w").sum())
+        .sort(["w", "v"], descending=[True, False], nulls_last=True)
+    )
+    return votes["v"][0]
+
+
+def _params(
+    conn: sqlite3.Connection, run: Mapping[str, Any], stage: str
+) -> dict[str, Any]:
+    """Return HYPERPARAMETERS[stage] as the config of run set them.
+
+    A name is looked up in the dataset (min_class_count), then in the
+    method (distance), then in its groups (method.quality.tau); one the
+    config lacks is left out.
+    """
+    (text,) = conn.execute(
+        "SELECT config FROM runs WHERE id = ?", (run["id"],)
+    ).fetchone()
+    config = json.loads(text)
+    method = config.get("method", {})
+    places = [config, method, *(v for v in method.values() if isinstance(v, dict))]
+    found = {}
+    for name in HYPERPARAMETERS[stage]:
+        place = next((p for p in places if name in p), None)
+        if place is not None:
+            found[name] = place[name]
+    return found
+
+
+def _region_rows(
+    cfg: DatasetConfig,
+    conn: sqlite3.Connection,
+    run: Mapping[str, Any],
+    regions: list[int],
+) -> dict[int, np.ndarray]:
+    """Return the rows of the data file of each region, sorted, by region.
+
+    Its cells are those of quality_cells in run, their rows those of
+    assignments.parquet; a region without cells has none.
+    """
+    marks = ", ".join("?" * len(regions))
+    cells = _where(conn, "quality_cells", run, f"region IN ({marks})", *regions)
+    assigned = pl.read_parquet(
+        need(assignments_file(cfg), "cells"), columns=["row", "cell"]
+    )
+    row, cell = assigned["row"].to_numpy(), assigned["cell"].to_numpy()
+    return {
+        r: np.sort(row[np.isin(cell, [c["cell"] for c in cells if c["region"] == r])])
+        for r in regions
+    }
+
+
+def _provenance_of(cfg: DatasetConfig, rows: np.ndarray, tau: float) -> dict[str, Any]:
+    """Return where the CSV rows of some rows of the data file come from.
+
+    Over the CSV rows that are copies of rows (provenance.parquet), an
+    empty value left out.
+
+    Args:
+        cfg: The dataset.
+        rows: Rows of the data file.
+        tau: quality.tau, the share of the CSV rows the time window may
+            leave out (provenance.time_window).
+
+    Returns:
+        provenance: per key of provenance.KEYS the dataset names, in
+        order, {key, n_values (the distinct values), top, top_share (its
+        share of the rows with a value; provenance.concentration),
+        repeat (the mean CSV rows of a value among those of more than
+        one, null when none is)}; time: {time_from, time_to,
+        time_window} when it names a time, else null. No key without a
+        provenance.parquet.
+    """
+    path = provenance_file(cfg)
+    if cfg.provenance is None or not path.exists():
+        return {"provenance": [], "time": None}
+    origin = (
+        pl.scan_parquet(path)
+        .join(
+            pl.LazyFrame({"row": pl.Series(rows, dtype=pl.Int64)}), on="row", how="semi"
+        )
+        .collect()
+    )
+    group = np.zeros(origin.height, dtype=np.int64)
+    found = []
+    for key in KEYS:
+        if key not in origin.columns:
+            continue
+        top = concentration(group, origin[key], 1).row(0, named=True)
+        counts = origin[key].drop_nulls().value_counts(name="n")["n"]
+        repeated = counts.filter(counts > 1)
+        found.append(
+            {
+                "key": key,
+                "n_values": top["n_values"],
+                "top": top["top"],
+                "top_share": top["top_share"],
+                "repeat": float(repeated.mean()) if len(repeated) else None,
+            }
+        )
+    time = None
+    if TIME in origin.columns:
+        window = time_window(group, origin[TIME], 1, tau).row(0, named=True)
+        time = {
+            k: v.isoformat() if isinstance(v, dt.datetime) else _json_value(v)
+            for k, v in window.items()
+        }
+    return {"provenance": found, "time": time}
+
+
 def _listed(row: dict[str, Any]) -> dict[str, Any]:
     """Return a quality_regions or quality_cells row with its comma lists as lists."""
     out = dict(row)
     for key in ("defects", "overlap_with", "shortcut_with", "conflict_with"):
         out[key] = row[key].split(",") if row[key] else []
     return out
+
+
+def _cell_defects(
+    conn: sqlite3.Connection, cfg: DatasetConfig, cells_run: Mapping[str, Any]
+) -> dict[int, dict[str, Any]]:
+    """Return the region and defects of every cell, by cell, as quality_report judged them.
+
+    From quality_cells of the last ok quality_report run, when it ran
+    after cells_run (an older one judged other cells); none otherwise.
+    """
+    try:
+        run = _latest_run(conn, "quality_report", cfg)
+    except LookupError:
+        return {}
+    if run["id"] < cells_run["id"]:
+        return {}
+    return {
+        row["cell"]: {"region": row["region"], "defects": row["defects"]}
+        for row in map(_listed, _where(conn, "quality_cells", run, "1"))
+    }
 
 
 def _pair_row(row: dict[str, Any]) -> dict[str, Any]:

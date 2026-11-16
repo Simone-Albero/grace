@@ -95,6 +95,10 @@ def create_app(dataset_dir: Path = DATASET_DIR) -> FastAPI:
     def quality_region(dataset: str, region: int) -> Any:
         return _query(queries.quality_region, load_dataset(dataset), region)
 
+    @app.get("/api/{dataset}/quality/profile")
+    def quality_profile(dataset: str, region: int) -> Any:
+        return _query(queries.quality_profile, load_dataset(dataset), region)
+
     @app.get("/api/{dataset}/quality/map")
     def quality_map(dataset: str, region: int) -> Any:
         return _query(queries.quality_map, load_dataset(dataset), region)

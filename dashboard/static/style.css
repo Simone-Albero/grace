@@ -151,24 +151,49 @@ button.chip:hover { color: var(--text); border-color: var(--muted); }
 .zoomable.dragging { cursor: grabbing; }
 
 /* quality report */
-.flag .sign { color: var(--warning); font-weight: 400; font-size: 10px; margin-right: 4px; }
-.chip.flag { color: var(--text); }
+.chip.defect { color: var(--text); border-color: var(--muted); white-space: nowrap; }
+b.over { color: var(--text); font-weight: 600; }
 td .chips { display: inline-flex; flex-wrap: nowrap; }
 td .chips:empty::after { content: "–"; }
 button.chip[aria-pressed="true"] { color: var(--text); border-color: var(--accent); background: rgba(57, 135, 229, 0.12); }
 
-/* quality: two panels, a region's detail */
+h3.gap { margin-top: 16px; }
+.filter-line { margin: -4px 0 12px; color: var(--text-2); font-size: 13px; display: flex; align-items: center;
+  gap: 8px; flex-wrap: wrap; }
+.filter-line .chips { display: inline-flex; }
+/* a closed card: what is there for those who look further */
+details.more > summary { cursor: pointer; color: var(--text-2); font-size: 13px; }
+details.more[open] > summary { margin-bottom: 12px; }
+details.more h3 { margin-top: 20px; color: var(--text-2); }
+
+/* quality: the matrix of classes by defect */
+.matrix td.pick { cursor: pointer; }
+.matrix td.pick:hover { outline: 1px solid var(--muted); outline-offset: -1px; }
+.matrix td.picked { outline: 2px solid var(--text); outline-offset: -2px; }
+.matrix tr.total td { border-top: 1px solid var(--axis); font-weight: 500; }
+.matrix th { white-space: normal; vertical-align: bottom; }
+/* quality: a region's defects with what was found, its evidence */
+.why { display: grid; gap: 4px; }
+.why .chip { white-space: nowrap; }
+.evidence { margin-top: 20px; }
+.evidence > h3 { color: var(--text); font-size: 13px; font-family: var(--mono); }
+.deltas td, .deltas th { padding: 4px 10px; }
+.deltas th { white-space: nowrap; vertical-align: bottom; }
+.chips.rivals { align-items: center; margin-bottom: 8px; }
+.chips.rivals .chip i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 6px; }
+.map-box:not(:empty) { margin-top: 16px; }
+.glossary { margin: 0; display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; font-size: 13px; }
+.glossary dt { color: var(--text); font-family: var(--mono); font-size: 12px; }
+.glossary dd { margin: 0; color: var(--text-2); }
+@media (max-width: 600px) {
+  .glossary { grid-template-columns: 1fr; }
+}
+
+/* quality: a region's detail */
 .stack { display: grid; gap: 16px; min-width: 0; }
 .panel > *, .stack > * { min-width: 0; }
 .summary { margin: 0; color: var(--text-2); }
 .summary b { color: var(--text); font-weight: 500; }
-.howto { padding: 10px 16px; }
-.howto summary { cursor: pointer; color: var(--text-2); font-size: 13px; }
-.howto dl { margin: 12px 0 0; display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; font-size: 13px; }
-.howto dt { color: var(--text); font-family: var(--mono); font-size: 12px; }
-.howto dd { margin: 0; color: var(--text-2); }
-.view-switch { margin: 0; }
-.view-switch .chip { padding: 4px 14px; font-size: 13px; }
 td.wrap { white-space: normal; min-width: 120px; max-width: 320px; }
 #tab-quality td, #tab-quality th { padding: 6px 8px; }
 .detail-head .chips { display: inline-flex; vertical-align: middle; }
@@ -176,15 +201,11 @@ td.wrap { white-space: normal; min-width: 120px; max-width: 320px; }
 td.text, td.wrap, th.text { text-align: left; }
 td.wrap .chips { flex-wrap: wrap; }
 .detail-head { margin: -4px 0 16px; color: var(--text-2); }
-#qr-detail h3 { margin-top: 20px; color: var(--text-2); }
-@media (max-width: 600px) {
-  .howto dl { grid-template-columns: 1fr; }
-}
 #qr-detail-title { display: flex; align-items: center; justify-content: space-between; }
 #qr-detail-title .close { text-transform: none; letter-spacing: 0; }
 .panel, .stack { grid-template-columns: minmax(0, 1fr); }
 /* identical rows: the classes of a group stay in view while its values scroll */
-#qr-conflicts th:first-child, #qr-conflicts td:first-child { position: sticky; left: 0; z-index: 1; background: var(--surface); box-shadow: 1px 0 0 var(--axis); }
+.conflicts th:first-child, .conflicts td:first-child { position: sticky; left: 0; z-index: 1; background: var(--surface); box-shadow: 1px 0 0 var(--axis); }
 #qr-neighbours td.wrap { min-width: 96px; }
 #qr-neighbours th { white-space: normal; vertical-align: bottom; }
 /* maps: curves or curves and points */

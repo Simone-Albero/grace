@@ -1,14 +1,21 @@
 """The dashboard API over the done workspace."""
 
+import sqlite3
+from contextlib import closing
+
 import numpy as np
+import polars as pl
 import pytest
 import yaml
 from fastapi.testclient import TestClient
 
 from dashboard.app import create_app
 from dashboard.queries import CONFLICT_GROUPS, MAP_MAX_POINTS, MAP_PER_CELL
-from src.provenance import KEYS, TIME
+from src.config import load_config
+from src.data import DUPLICATES, feature_cols
+from src.provenance import KEYS, TIME, time_window
 from src.quality import DEFECTS
+from stages.paths import assignments_file, data_file, prepared_file, provenance_file
 
 
 @pytest.fixture(scope="module")
@@ -88,7 +95,8 @@ def test_prepare(client):
 
 def test_cells(client):
     data = _get(client, "/api/toy/cells")
-    assert set(data) == {"run", "stats", "classes", "cells", "tree"}
+    assert set(data) == {"run", "params", "stats", "classes", "cells", "tree"}
+    assert {"region", "defects"} <= set(data["cells"][0])
     assert data["stats"]["n_cells"] == len(data["cells"])
     assert {"max_rows", "min_rows", "distance"} <= set(data["stats"])
     assert sum(c["n_cells"] for c in data["classes"]) == len(data["cells"])
@@ -151,7 +159,7 @@ def test_the_region_routes_of_the_cells_stage_are_gone(client):
 
 def test_quality(reported, client):
     data = _get(client, "/api/toy/quality")
-    assert set(data) == {"run", "stats", "classes", "regions", "missing"}
+    assert set(data) == {"run", "params", "stats", "classes", "regions", "missing"}
     assert len(data["classes"]) == 9 and data["regions"]
     shares = {f"share_{d}" for d in DEFECTS} | {"share_no_defect"}
     for row in [data["stats"], *data["classes"]]:
@@ -222,6 +230,147 @@ def test_quality_region_without_label_conflicts(reported, client):
 def test_quality_region_of_an_unknown_region_is_404(reported, client):
     assert client.get("/api/toy/quality/region?region=-1").status_code == 404
     assert client.get("/api/toy/quality/map?region=100000").status_code == 404
+
+
+def test_cells_carry_the_region_and_defects_quality_report_gave_them(reported, client):
+    data = _get(client, "/api/toy/cells")
+    with closing(sqlite3.connect(reported.db_path)) as conn:
+        (run,) = conn.execute(
+            "SELECT max(id) FROM runs WHERE stage = 'quality_report' AND status = 'ok'"
+        ).fetchone()
+        judged = {
+            cell: (region, defects.split(",") if defects else [])
+            for cell, region, defects in conn.execute(
+                "SELECT cell, region, defects FROM quality_cells WHERE run_id = ?",
+                (run,),
+            )
+        }
+    assert {c["cell"]: (c["region"], c["defects"]) for c in data["cells"]} == judged
+    assert any(c["defects"] for c in data["cells"])
+
+
+def test_cells_without_a_quality_report_after_them_carry_no_defects(copy_of_done):
+    folder = copy_of_done.folder / "datasets"
+    folder.mkdir()
+    (folder / "toy.yaml").write_text(copy_of_done.dataset.read_text())
+    client = TestClient(create_app(folder))
+
+    def judged() -> list[tuple]:
+        cells = _get(client, "/api/toy/cells")["cells"]
+        assert cells
+        return [(c["region"], c["defects"]) for c in cells]
+
+    # quality_report judged the cells before the last cells run: other cells
+    copy_of_done.run("quality_report")
+    copy_of_done.run("cells")
+    assert set(judged()) == {(None, None)}
+    with closing(sqlite3.connect(copy_of_done.db_path)) as conn, conn:
+        conn.execute("DELETE FROM runs WHERE stage = 'quality_report'")
+    assert set(judged()) == {(None, None)}
+
+
+def test_every_tab_shows_the_hyperparameters_its_run_used(reported, client):
+    dataset = yaml.safe_load(reported.dataset.read_text())
+    method = yaml.safe_load(reported.method.read_text())
+    expected = {
+        "clean": {"min_class_count": dataset["min_class_count"]},
+        "prepare": {
+            "top_n": dataset["top_n"],
+            "cat_cost": method["prepare"]["cat_cost"],
+        },
+        "cells": {
+            "distance": method["distance"],
+            **{
+                k: method["cells"][k]
+                for k in ("max_rows", "min_rows", "max_fit_samples")
+            },
+            "seed": dataset["seed"],
+        },
+        "quality": {
+            k: method["quality"][k]
+            for k in ("tau", "rival_rows", "max_rows_per_cell", "max_group")
+        },
+    }
+    for tab, params in expected.items():
+        assert _get(client, f"/api/toy/{tab}")["params"] == params
+
+
+def _rows_of_region(cfg, region: int, detail: dict) -> np.ndarray:
+    """The rows of the data file in the cells of a region."""
+    cells = [c["cell"] for c in detail["cells"]]
+    assigned = pl.read_parquet(assignments_file(cfg))
+    return np.sort(assigned.filter(pl.col("cell").is_in(cells))["row"].to_numpy())
+
+
+def test_quality_region_tells_where_its_csv_rows_come_from(reported, client):
+    cfg = load_config(str(reported.dataset), str(reported.method))
+    quality = _get(client, "/api/toy/quality")
+    region = max(quality["regions"], key=lambda r: r["n_cells"])["region"]
+    detail = _get(client, f"/api/toy/quality/region?region={region}")
+    rows = _rows_of_region(cfg, region, detail)
+    origin = pl.read_parquet(provenance_file(cfg)).filter(pl.col("row").is_in(rows))
+    found = {p["key"]: p for p in detail["provenance"]}
+    assert list(found) == [k for k in KEYS if k in origin.columns]
+    for key, p in found.items():
+        counts = origin[key].drop_nulls().cast(pl.String).value_counts(name="n")
+        counts = counts.sort(["n", key], descending=[True, False])
+        top, n = counts.row(0)
+        repeated = counts.filter(pl.col("n") > 1)["n"]
+        assert p["n_values"] == counts.height
+        assert p["top"] == top
+        assert p["top_share"] == pytest.approx(n / counts["n"].sum())
+        assert p["repeat"] == (
+            pytest.approx(repeated.mean()) if len(repeated) else None
+        )
+    times = origin[TIME]
+    window = time_window(np.zeros(len(times), dtype=np.int64), times, 1, 0.1)
+    assert detail["time"]["time_window"] == pytest.approx(window["time_window"][0])
+    assert detail["time"]["time_from"].startswith(
+        str(window["time_from"][0])[:19].replace(" ", "T")
+    )
+
+
+def test_quality_profile_means_a_region_and_the_regions_of_its_rivals(reported, client):
+    cfg = load_config(str(reported.dataset), str(reported.method))
+    quality = _get(client, "/api/toy/quality")
+    region = next(r["region"] for r in quality["regions"] if r["overlap_with"])
+    detail = _get(client, f"/api/toy/quality/region?region={region}")
+    rivals = sorted(
+        {p[f"region_{k}"] for p in detail["pairs"] for k in "ab"} - {region}
+    )
+    data = _get(client, f"/api/toy/quality/profile?region={region}")
+    assert data["region"] == region and data["rivals"] == rivals
+    prepared = pl.read_parquet(prepared_file(cfg))
+    names = feature_cols(prepared.columns, cfg.num_cols, cfg.cat_cols)
+    assert data["columns"] == list(names.num)
+    rows = pl.read_parquet(data_file(cfg))
+    weights = rows[DUPLICATES].cast(pl.Float64).to_numpy()
+    assigned = pl.read_parquet(assignments_file(cfg)).sort("row")["cell"].to_numpy()
+    cells = {}
+    for r in [region, *rivals]:
+        detail_r = _get(client, f"/api/toy/quality/region?region={r}")
+        cells[r] = [c["cell"] for c in detail_r["cells"]]
+    for r, own in cells.items():
+        mine = np.isin(assigned, own)
+        w = weights[mine]
+        means = prepared.select(names.num).to_numpy()[mine]
+        assert data["means"][str(r)] == pytest.approx(
+            list((means * w[:, None]).sum(0) / w.sum())
+        )
+        for column in names.cat:
+            votes = (
+                pl.DataFrame(
+                    {"v": rows[column].cast(pl.String).to_numpy()[mine], "w": w}
+                )
+                .group_by("v")
+                .agg(pl.col("w").sum())
+                .sort(["w", "v"], descending=[True, False], nulls_last=True)
+            )
+            assert data["top"][str(r)][column] == votes["v"][0]
+
+
+def test_quality_profile_of_an_unknown_region_is_404(reported, client):
+    assert client.get("/api/toy/quality/profile?region=99999").status_code == 404
 
 
 def test_quality_map_shows_a_region_and_its_rivals(reported, client):

@@ -162,25 +162,39 @@ without a source address)
 runs; to drop the old ones, delete the DB.
 
 Dashboard: `make dashboard` (`PORT=` to change it) or `python -m uvicorn dashboard.app:app` serves a read-only page
-on 127.0.0.1, one tab per stage, for the datasets of `configs/datasets/`. Each tab shows the latest `ok` run of its
-stage on that dataset, and says which stage to run when there is none. The cells tab draws the cut of each class, at
-most 63 nodes at a time: from the top, the node with the most rows is opened first; a node left closed is drawn a
-level down on a click, and a path leads back up. A click on a node maps its rows (at most 2,000 per cell, 20,000 in
-all) on their first two principal components, computed on the click. A map draws each colour (a class, or a subtree) as the density of its rows, each sampled row
-counting for the rows of its cell it stands for: curves enclosing 25, 50, 75 and 95% of them, smoothed by a
-Gaussian as wide as the median square around a row holding n^(-1/3)/π of its colour's rows (Scott's bandwidth for a
-Gaussian cloud, but local), and their density along each axis in strips above and on the right; a switch adds the
-rows as points. The quality tab has a summary line, a "How to read" box with every definition (each column header also
-explains itself on hover) and two panels. Classes: per class, its cells and regions and the share of its CSV rows
-with each defect and with none. Regions: filtered by class and by defect, one column per defect saying what was found
-(which null cells, the copies, how many rows identical to which classes, the classes of `class_overlap` and of
-`shortcut`, the host of `atypical_source`; a defect the dataset does not measure is left out). A click on a region
-opens its detail (`/quality/region`, `/quality/map`): its cells, where their rows come from and how much more of one
-value they hold than the typical cell of their class (when the dataset names its provenance), every pair of one of
-them and a rival with every measure from its side, the confusion of the most confused pairs with every column and
-after each key column removed, a map of its cells and their rivals by class, the heaviest groups of rows identical to
-rows of other classes with their values, and its null cells by column. The URL hash keeps tab and dataset, on the
-cells tab class and node, on the quality tab panel and region.
+on 127.0.0.1 for the datasets of `configs/datasets/`, in three tabs, each topped by a table of the hyperparameters its
+run used (`HYPERPARAMETERS` of `dashboard/queries.py`, read from the run's config). Each shows the latest `ok` run of
+its stages on that dataset, and says which stage to run when there is none. Counts are of CSV rows (copies included,
+as a classifier is trained on them); the distinct rows are on hover.
+
+- quality (quality_report) calls *cell* what the stage calls a region, and never shows the leaves inside it: a matrix
+  of the classes, the most CSV rows first, then the whole dataset, by their clear ratio (the share of their CSV rows
+  with no defect) and their share with each defect, darker as the share grows (a defect the dataset does not measure
+  is left out); a click on a share lists its cells, the most CSV rows first, each defect with what was found. A click
+  on a cell opens one section per defect, named by it: its null and invalid values by column; its groups of rows
+  identical to rows of other classes (class a, class b, their CSV rows, the values); for `class_overlap`, feature by
+  feature, the difference of the mean numeric features from each rival over τ (logged and standardized, so in
+  standard deviations of the dataset; `/quality/profile`) and the most frequent categorical values; for `shortcut`,
+  per rival, the confusion with every column and without the shortcut columns; for `atypical_source`, the host, its
+  share and excess, the top destination port and the time window. Then a map of the cell and the rivals picked
+  (`/quality/map`), and, closed, its rivals (nn_error and the confusion as the key columns are removed) and its
+  provenance (per column its distinct values, the most frequent and the CSV rows per repeated value). A rival is a
+  whole cell, measured by its most confused pair of leaves. A glossary closes the tab.
+- cells (cells) calls the cells of the stage *leaves*: per class its leaves and how many distinct rows they hold
+  (median, least and most), then the cut of a class, at most 63 nodes at a time: from the top, the node with the most
+  rows is opened first; a node left closed is drawn a level down on a click, and a path leads back up. A click on a
+  node maps its rows (at most 2,000 per leaf, 20,000 in all) on their first two principal components, computed on the
+  click. The tree and the map are coloured by subtree, or, once quality_report judged the leaves (`/cells` carries
+  their region and defects), by whether a leaf has a defect; a mapped leaf links to its cell in quality.
+- data (clean and prepare): the rows read, the copies, the rows kept, the classes and the features; per class its
+  distinct and CSV rows; the classes and columns removed; the provenance columns.
+
+A map draws each colour (a cell, a subtree, or the leaves with and without a defect) as the density of its rows, each
+sampled row counting for the rows of its leaf it stands for: curves enclosing 25, 50, 75 and 95% of them, smoothed by
+a Gaussian as wide as the median square around a row holding n^(-1/3)/π of its colour's rows (Scott's bandwidth for
+a Gaussian cloud, but local), and their density along each axis in strips above and on the right; a switch adds the
+rows as points. The URL hash keeps tab and dataset, on the quality tab the cell, on the cells tab class and node (a
+link to the former clean and prepare tabs opens data).
 
 Layout:
 - `main.py`: the CLI, one stage per call inside a logged run

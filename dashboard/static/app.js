@@ -1,20 +1,20 @@
-// Dashboard front-end: one page, one tab per stage. Charts are hand-made SVG, no dependencies.
+// Dashboard front-end: one page, three tabs (quality, cells, data). Charts are hand-made SVG, no dependencies.
 
 /**
  * UI state.
- * @type {{dataset: string|null, tab: "clean"|"prepare"|"cells"|"quality", cls: string|null, node: number|null,
- *   view: "classes"|"regions", qclass: string|null, qfilter: string|null, region: number|null}}
- *   node: the cell tree node whose map is shown (null: the root of state.cls), the tree drawn from the level that
- *   shows it (treeLevels); view: the quality panel shown; qclass,
- *   qfilter: the filters of the quality regions (null: all), qfilter "none" or one of DEFECTS; region: the quality
- *   region whose detail is shown (null: none)
+ * @type {{dataset: string|null, tab: "quality"|"cells"|"data", cls: string|null, node: number|null,
+ *   colorBy: string|null, qclass: string|null, qfilter: string|null, region: number|null}}
+ *   cls, node: the class whose tree is drawn and the node whose map is shown (null: its root), the tree drawn from the
+ *   level that shows it (treeLevels); colorBy: what colours the tree and the map, null their subtrees, "any" any
+ *   defect, else one of DEFECTS; qclass, qfilter: the regions listed, picked in the matrix (null: all), qfilter "none"
+ *   or one of DEFECTS; region: the region whose detail is shown (null: none)
  */
 const state = {
-  dataset: null, tab: "clean", cls: null, node: null,
-  view: "regions", qclass: null, qfilter: null, region: null,
+  dataset: null, tab: "quality", cls: null, node: null, colorBy: null,
+  qclass: null, qfilter: null, region: null,
 };
 
-const last = { cells: null, quality: null }; // last responses, for the controls that only redraw
+const last = { cells: null, cellInfo: null, quality: null }; // last responses, for the controls that only redraw
 let loadId = 0; // drops answers of superseded requests
 
 const $ = (id) => document.getElementById(id);
@@ -39,6 +39,9 @@ const duration = (v) => {
   if (v < 86400) return `${short(v / 3600)} h`;
   return `${short(v / 86400)} days`;
 };
+const plural = (n, one, many = `${one}s`) => `${num(n)} ${n === 1 ? one : many}`;
+// the first names of a list, then how many more
+const some = (names, k = 3) => names.slice(0, k).join(", ") + (names.length > k ? ` and ${names.length - k} more` : "");
 
 // --- dom helpers ---
 
@@ -65,12 +68,12 @@ function table(headers, rows) {
  * @param {{key: string, label: string, format?: (v: any, row: object) => any, help?: string, wrap?: boolean}[]} columns
  *   help: the header's tooltip; wrap: the cells may wrap; text: left-aligned, as text
  * @param {object[]} rows one object per row, keyed by column key
- * @param {{onClick?: (row: object) => void, selected?: (row: object) => boolean, empty?: string}} [opts]
- *   empty: the note shown instead of a table without rows
+ * @param {{onClick?: (row: object) => void, selected?: (row: object) => boolean, empty?: string, by?: string}} [opts]
+ *   empty: the note shown instead of a table without rows; by: the key sorted on first (default: none, rows in order)
  */
 function sortable(el, columns, rows, opts = {}) {
   if (!rows.length) { el.replaceChildren(h("p", { class: "note" }, opts.empty ?? "Nothing to show.")); return; }
-  let by = null, dir = 1;
+  let by = opts.by ?? null, dir = 1;
   const draw = () => {
     const sorted = by == null ? rows : [...rows].sort((a, b) => {
       const x = a[by], y = b[by];
@@ -99,11 +102,23 @@ function sortable(el, columns, rows, opts = {}) {
   draw();
 }
 
+/** A sortable table in a new container. @returns {HTMLElement} */
+function sortableIn(columns, rows, opts) {
+  const el = h("div", { class: "table-wrap" });
+  sortable(el, columns, rows, opts);
+  return el;
+}
+
 function tile(label, value, sub) {
   return h("div", { class: "tile" },
     h("div", { class: "label" }, label),
     h("div", { class: "value" }, value),
     sub ? h("div", { class: "sub" }, sub) : null);
+}
+
+/** The hyperparameters of a run as a table: their names, then the values. @param {Object<string, any>} params */
+function paramTable(params) {
+  return table(Object.keys(params), [Object.values(params).map(String)]);
 }
 
 function fill(id, ...kids) {
@@ -124,6 +139,9 @@ async function api(path) {
   return body;
 }
 
+const TABS = ["quality", "cells", "data"];
+const OLD_TABS = { clean: "data", prepare: "data" }; // links written before data held both stages
+
 /** Fill the dataset selector from /api/options, restore tab/dataset from the URL hash, wire the controls, load the tab. */
 async function init() {
   const opts = await api("/options");
@@ -134,17 +152,15 @@ async function init() {
     if (location.hash === shownHash) return;
     readHash(opts.datasets);
     await showTab(state.tab);
-    if (state.tab === "quality" && state.view === "regions" && state.region != null) scrollUnderHeader($("qr-detail"));
+    if (state.tab === "quality" && state.region != null) scrollUnderHeader($("qr-detail"));
   };
   $("dataset").onchange = (e) => {
     state.dataset = e.target.value;
-    state.cls = state.node = state.qclass = state.qfilter = state.region = null;
+    state.cls = state.node = state.colorBy = state.qclass = state.qfilter = state.region = null;
     load();
   };
   $("rg-class").onchange = (e) => selectClass(e.target.value);
-  $("rg-tree-nodes").textContent = TREE_NODES;
-  $("qr-class").onchange = (e) => { state.qclass = e.target.value || null; drawRegionList(); };
-  for (const b of document.querySelectorAll(".view-switch button")) b.onclick = () => showView(b.dataset.view, true);
+  $("rg-color").onchange = (e) => { state.colorBy = e.target.value || null; drawClass(); };
   for (const b of document.querySelectorAll(".tabs button")) b.onclick = () => showTab(b.dataset.tab);
   showTab(state.tab);
 }
@@ -152,22 +168,23 @@ async function init() {
 let shownHash = ""; // the hash last written by saveHash: a hashchange to it is our own
 
 /**
- * Set state from the URL hash: tab, dataset, and the cells tab's class and node or the quality tab's view and region.
+ * Set state from the URL hash: tab, dataset, and the quality tab's region or the cells tab's class and node.
  * @param {string[]} datasets the known datasets; an unknown one falls back to the first
  */
 function readHash(datasets) {
-  const [tab, dataset, cls, node] = location.hash.slice(1).split("/").map(decodeURIComponent);
-  if ([...document.querySelectorAll(".tabs button")].some((b) => b.dataset.tab === tab)) state.tab = tab;
+  const [named, dataset, a, b] = location.hash.slice(1).split("/").map(decodeURIComponent);
+  const tab = OLD_TABS[named] ?? named;
+  if (TABS.includes(tab)) state.tab = tab;
   const next = datasets.includes(dataset) ? dataset : datasets[0];
-  if (next !== state.dataset) state.qclass = state.qfilter = null;
+  if (next !== state.dataset) state.qclass = state.qfilter = state.colorBy = null;
   state.dataset = next;
   if (tab === "quality") {
-    state.view = cls === "classes" ? "classes" : "regions";
-    state.region = node ? Number(node) : null;
+    const region = ["classes", "regions"].includes(a) ? b : a; // older links name a panel first
+    state.region = region ? Number(region) : null;
   }
   if (tab === "cells") {
-    state.cls = cls || null;
-    state.node = node ? Number(node) : null;
+    state.cls = a || null;
+    state.node = b ? Number(b) : null;
   }
   $("dataset").value = state.dataset;
 }
@@ -181,19 +198,29 @@ function showTab(tab) {
 }
 
 /**
- * Keep tab, dataset and, on the cells tab, class and node, on the quality tab view and region, in the URL hash.
- * @param {boolean} [push] a step the back button returns from (opening a region, switching panel); else the entry is replaced
+ * Keep tab, dataset and, on the quality tab the region, on the cells tab class and node, in the URL hash.
+ * @param {boolean} [push] a step the back button returns from (opening a region or a node); else the entry is replaced
  */
 function saveHash(push = false) {
   const parts = [state.tab, state.dataset];
-  if (state.tab === "quality") parts.push(state.view, ...(state.view === "regions" && state.region != null ? [state.region] : []));
-  if (state.tab === "cells" && state.cls != null && state.node != null) {
-    parts.push(state.cls, state.node);
-  } else if (state.tab === "cells" && state.cls != null) parts.push(state.cls);
+  if (state.tab === "quality" && state.region != null) parts.push(state.region);
+  if (state.tab === "cells" && state.cls != null) parts.push(state.cls, ...(state.node != null ? [state.node] : []));
   shownHash = `#${parts.map((p) => encodeURIComponent(p)).join("/")}`;
   if (shownHash === location.hash) return;
   if (push) history.pushState(null, "", shownHash);
   else history.replaceState(null, "", shownHash);
+}
+
+/**
+ * The data of a tab: its stage's answer; data holds clean's and, under prepare, prepare's or {error} when it has not run.
+ * @param {string} tab
+ * @param {string} d the dataset's path, "/<dataset>"
+ */
+async function fetchTab(tab, d) {
+  if (tab !== "data") return api(`${d}/${tab}`);
+  const [clean, prepare] = await Promise.all([
+    api(`${d}/clean`), api(`${d}/prepare`).catch((e) => ({ error: e.message }))]);
+  return { ...clean, prepare };
 }
 
 /** Fetch the data of state.tab and render it; on error show the message in the tab's empty state. */
@@ -203,19 +230,12 @@ async function load() {
   saveHash();
   const panel = $(`tab-${tab}`);
   const empty = panel.querySelector(".empty");
-  const d = `/${encodeURIComponent(state.dataset)}`;
-  const path = {
-    clean: `${d}/clean`,
-    prepare: `${d}/prepare`,
-    cells: `${d}/cells`,
-    quality: `${d}/quality`,
-  }[tab];
   try {
-    const data = await api(path);
+    const data = await fetchTab(tab, `/${encodeURIComponent(state.dataset)}`);
     if (id !== loadId) return;
     panel.classList.remove("failed");
     empty.hidden = true;
-    ({ clean: renderClean, prepare: renderPrepare, cells: renderCells, quality: renderQuality })[tab](data);
+    ({ quality: renderQuality, cells: renderCells, data: renderData })[tab](data);
     renderRun(data.run);
   } catch (e) {
     if (id !== loadId) return;
@@ -233,18 +253,25 @@ function renderRun(run) {
   $("run-info").textContent = run ? `run #${run.id} · ${when(run.finished || run.started)}` : "";
 }
 
-/** Tiles, classes with inline bars, dropped classes and columns, features. @param {object} data response of /clean */
-function renderClean(data) {
+/**
+ * Hyperparameters, tiles, classes with inline bars, what was removed, provenance.
+ * @param {object} data response of /clean, with prepare: the response of /prepare or {error}
+ */
+function renderData(data) {
   const s = data.summary;
+  fill("sp-params", paramTable({ ...data.params, ...(data.prepare.params ?? {}) }));
+  const features = tile("features", `${num(data.features.num.length)} + ${num(data.features.cat.length)}`,
+    "numeric + categorical");
+  features.title = `numeric: ${data.features.num.join(", ")}\ncategorical: ${data.features.cat.join(", ") || "none"}`;
   fill("sp-tiles",
-    tile("rows read", num(s.n_raw)),
-    tile("duplicates dropped", num(s.n_duplicate), pct(s.n_duplicate / s.n_raw)),
-    tile("rows kept", num(s.n_kept), `${num(s.n_rare)} in rare classes`),
+    tile("CSV rows read", num(s.n_raw)),
+    tile("copies", num(s.n_duplicate), `${pct(s.n_duplicate / s.n_raw)} of the CSV rows`),
+    tile("distinct rows kept", num(s.n_kept), `${num(s.n_rare)} in rare classes`),
     tile("classes", num(s.n_classes), `${data.dropped_classes.length} dropped`),
-    tile("constant columns", num(s.n_constant)));
+    features);
   const top = Math.max(...data.classes.map((c) => c.n_rows), 1);
   fill("sp-classes", table(
-    ["class", "rows", "share", "read", "duplicates"],
+    ["class", "distinct rows", "share", "CSV rows", "copies"],
     data.classes.map((c) => [
       c.label,
       h("span", {}, h("i", { class: "bar", style: `width:${Math.round((c.n_rows / top) * 60)}px` }), num(c.n_rows)),
@@ -254,11 +281,6 @@ function renderClean(data) {
     ])));
   fill("sp-dropped", data.dropped_classes.map((c) => h("span", { class: "chip" }, `${c.label} (${num(c.n_rows)})`)));
   fill("sp-constant", data.dropped_columns.map((c) => h("span", { class: "chip" }, c)));
-  fill("sp-features",
-    h("h3", {}, `numeric (${data.features.num.length})`),
-    h("div", { class: "chips" }, data.features.num.map((c) => h("span", { class: "chip" }, c))),
-    h("h3", { style: "margin-top:12px" }, `categorical (${data.features.cat.length})`),
-    h("div", { class: "chips" }, data.features.cat.map((c) => h("span", { class: "chip" }, c))));
   sortable($("sp-provenance"), [
     { key: "key", label: "key", text: true },
     { key: "column", label: "column", text: true },
@@ -270,66 +292,59 @@ function renderClean(data) {
   ], data.provenance, { empty: "The dataset names no provenance columns (a provenance block in its yaml)." });
 }
 
-/** Tiles, numeric columns with their scaling, categorical slots with their rows. @param {object} data response of /prepare */
-function renderPrepare(data) {
-  const s = data.summary;
-  fill("pp-tiles",
-    tile("rows", num(s.n_rows)),
-    tile("numeric columns", num(s.n_num)),
-    tile("categorical columns", num(s.n_cat)),
-    tile("prepared columns", num(s.n_columns)),
-    tile("numbers set to 0", num(s.n_missing), `${num(s.n_missing_rows)} rows · ${pct(s.n_missing_rows / s.n_rows)}`));
-  sortable($("pp-num"), [
-    { key: "column", label: "column" },
-    { key: "mean", label: "mean (log)", format: (v) => dec(v, 4) },
-    { key: "std", label: "std (log)", format: (v) => dec(v, 4) },
-  ], data.columns.filter((c) => c.kind === "num"));
-  sortable($("pp-cat"), [
-    { key: "source", label: "column" },
-    { key: "value", label: "value" },
-    { key: "n_rows", label: "rows", format: num },
-    { key: "n_rows", label: "share", format: (v) => pct(v / s.n_rows) },
-    { key: "weight", label: "weight", format: (v) => dec(v, 3) },
-    { key: "weight", label: "mismatch cost", format: (v) => dec(v == null ? null : 2 * v * v, 2) },
-  ], data.columns.filter((c) => c.kind === "cat"));
-}
-
-/** Tiles, class tree and map, cells per class, cells. @param {object} data response of /cells */
+/**
+ * Hyperparameters, leaves per class, and the tree and map of a class. The cells of stage cells are the leaves of
+ * their class's tree here: the quality tab calls cell what it merged them into.
+ * @param {object} data response of /cells
+ */
 function renderCells(data) {
   last.cells = data;
-  const s = data.stats;
-  const rows = data.classes.reduce((a, c) => a + c.n_rows, 0);
-  fill("rg-tiles",
-    tile("cells", num(s.n_cells), `${num(rows)} rows`),
-    tile("rows per cell", `≤ ${num(s.max_rows)}`, `at least ${num(s.min_rows)}`),
-    tile("tree built on", num(s.max_fit_samples), "rows per class at most"),
-    tile("distance", s.distance));
+  last.cellInfo = new Map(data.cells.map((c) => [c.cell, c]));
+  fill("rg-params", paramTable(data.params));
+  const sizes = new Map();
+  for (const c of data.cells) sizes.set(c.class, [...(sizes.get(c.class) ?? []), c.n_rows]);
+  const rows = data.classes.map((c) => {
+    const v = (sizes.get(c.class) ?? []).sort((a, b) => a - b);
+    return { ...c, median: v[Math.floor((v.length - 1) / 2)], min: v[0], max: v.at(-1) };
+  });
   sortable($("rg-classes"), [
-    { key: "class", label: "class" },
-    { key: "n_rows", label: "rows", format: num },
-    { key: "n_read", label: "CSV rows", format: num },
-    { key: "n_cells", label: "cells", format: num },
-  ], data.classes, { onClick: (r) => selectClass(r.class), selected: (r) => r.class === state.cls });
+    { key: "class", label: "class", text: true },
+    { key: "n_read", label: "CSV rows", format: (v, r) => h("span", { title: `${num(r.n_rows)} distinct rows` }, num(v)),
+      help: HELP.read },
+    { key: "n_cells", label: "leaves", format: num },
+    { key: "median", label: "rows per leaf, median", format: num,
+      help: "the distinct rows of its leaves (lower median), the rows max_rows bounds" },
+    { key: "max", label: "least – most", format: (v, r) => `${num(r.min)} – ${num(v)}`,
+      help: "the fewest and the most distinct rows of one of its leaves" },
+  ], rows, { onClick: (r) => selectClass(r.class), selected: (r) => r.class === state.cls, by: "n_read" });
   const classes = data.classes.map((c) => c.class);
   if (!classes.includes(state.cls)) { state.cls = classes[0]; state.node = null; }
   $("rg-class").replaceChildren(...data.classes.map((c) =>
-    h("option", { value: c.class }, `${c.class} · ${num(c.n_cells)} ${c.n_cells > 1 ? "cells" : "cell"}`)));
-  const sizes = data.cells.map((c) => c.n_rows);
-  const edges = Array.from({ length: 21 }, (_, i) => (Math.max(...sizes, 1) * i) / 20);
-  histogram($("rg-sizes"), edges, [{
-    name: "cells by rows", color: "var(--accent)",
-    values: edges.slice(0, -1).map((lo, i) => sizes.filter((v) => v >= lo && (v < edges[i + 1] || i === 19)).length),
-  }], { format: num });
-  const leafOf = new Map(data.tree.filter((n) => n.cell != null).map((n) => [n.cell, n.node]));
-  sortable($("rg-table"), [
-    { key: "cell", label: "cell" },
-    { key: "class", label: "class" },
-    { key: "n_rows", label: "rows", format: num },
-    { key: "n_read", label: "CSV rows", format: num },
-  ], data.cells, {
-    onClick: (r) => { selectNode(leafOf.get(r.cell), true); scrollUnderHeader($("rg-map-title")); },
-  });
+    h("option", { value: c.class }, `${c.class} · ${plural(c.n_cells, "leaf", "leaves")}`)));
+  colorChoices(data.cells);
   drawClass();
+}
+
+/**
+ * The options of "colour by": the subtrees, then, when quality_report judged the cells, any defect and each defect
+ * some cell has, with its cells; hidden without a judgement. A colouring no longer offered falls back to subtrees.
+ * @param {object[]} cells the cells of /cells
+ */
+function colorChoices(cells) {
+  const judged = cells.some((c) => c.defects != null);
+  const count = (d) => cells.filter((c) => hasDefect(c.cell, d)).length;
+  const offered = judged ? ["any", ...DEFECTS].filter((d) => count(d)) : [];
+  if (!offered.includes(state.colorBy)) state.colorBy = null;
+  $("rg-color").replaceChildren(h("option", { value: "" }, "subtree"), ...offered.map((d) =>
+    h("option", { value: d }, `${d === "any" ? "any defect" : d} · ${plural(count(d), "leaf", "leaves")}`)));
+  $("rg-color").value = state.colorBy ?? "";
+  $("rg-color").parentElement.hidden = !judged;
+}
+
+/** Whether quality_report gave a cell a defect: d one of DEFECTS, or "any". */
+function hasDefect(cell, d) {
+  const found = last.cellInfo.get(cell)?.defects ?? [];
+  return d === "any" ? found.length > 0 : found.includes(d);
 }
 
 /** Show the tree of a class, mapped from its root. @param {string} cls */
@@ -352,7 +367,7 @@ function selectNode(node, push = false) {
 
 /**
  * Tree and map of state.cls; state.node falls back to the root of the class. The tree is drawn from the last of its
- * levels down to state.node, with the levels above it as a path.
+ * levels down to state.node, with the levels above it as a path; coloured by state.colorBy.
  * @param {boolean} [push] passed to saveHash
  */
 function drawClass(push = false) {
@@ -362,10 +377,28 @@ function drawClass(push = false) {
   saveHash(push);
   const levels = treeLevels(t, state.node);
   const view = treeView(t, levels.at(-1));
-  const colors = leafColor(t, state.node, view.open);
+  const colors = state.colorBy ? defectColor(t, state.colorBy) : leafColor(t, state.node, view.open);
   drawPath(levels, t);
   treeDiagram($("rg-tree"), t, view, colors);
+  drawRegionLink(t.byId.get(state.node));
   drawMap(t.nodes, colors);
+}
+
+/**
+ * Under the map of a leaf, the cell of the quality tab it is part of, with a link to it; hidden for other nodes, or
+ * when quality_report has not judged the leaves.
+ * @param {object} n the cell_tree row of state.node
+ */
+function drawRegionLink(n) {
+  const info = n.cell != null ? last.cellInfo.get(n.cell) : null;
+  $("rg-region").hidden = info?.region == null;
+  if (info?.region == null) return;
+  const open = h("button", { class: "chip", type: "button" }, `open cell ${info.region} in quality`);
+  open.onclick = () => {
+    state.qclass = state.qfilter = null;
+    location.hash = `#quality/${encodeURIComponent(state.dataset)}/${info.region}`;
+  };
+  fill("rg-region", `Leaf ${n.cell} is part of cell ${info.region}.`, open);
 }
 
 // categorical slots, in fixed order; validated on the dark surface: every adjacent pair passes (worst CVD ΔE 8.4),
@@ -457,16 +490,45 @@ function leafColor(t, selected, open) {
   const groups = openLargest(t, selected, (leaves) => leaves <= SERIES.length, (v) => open.has(v)).leaves;
   const colored = groups.map((node, i) => ({ node, color: SERIES[i] }));
   const byCell = new Map();
-  for (const g of colored) {
-    const stack = [g.node];
-    while (stack.length) {
-      const id = stack.pop();
-      const n = t.byId.get(id);
-      if (n.cell != null) byCell.set(n.cell, g);
-      stack.push(...(t.kids.get(id) ?? []));
-    }
-  }
+  for (const g of colored) for (const c of cellsBelow(t, g.node)) byCell.set(c, g);
   return { groups: colored, byCell };
+}
+
+/** The cells below a node of a class tree, itself for a cell. @param {object} t from classTree @param {number} node */
+function cellsBelow(t, node) {
+  const cells = [], stack = [node];
+  while (stack.length) {
+    const id = stack.pop();
+    const n = t.byId.get(id);
+    if (n.cell != null) cells.push(n.cell);
+    stack.push(...(t.kids.get(id) ?? []));
+  }
+  return cells;
+}
+
+const WITH = "var(--warning)", WITHOUT = "var(--accent)"; // the cells with and without the defect coloured by
+
+/**
+ * The colours of a class tree by a defect: its cells with it in WITH, the others in WITHOUT; a closed node in WITH
+ * when a cell below has it (with how many in its tooltip). Shaped as leafColor, with no group ringed.
+ * @param {object} t from classTree
+ * @param {string} d one of DEFECTS, or "any"
+ * @returns {{groups: [], byCell: Map<number, {node: null, color: string}>, tintOf: (node: number) => string,
+ *   tipOf: (node: number) => string, legend: {color: string, label: string}[], nameOf: (color: string) => string}}
+ */
+function defectColor(t, d) {
+  const name = d === "any" ? "a defect" : d;
+  const byCell = new Map(t.nodes.filter((n) => n.cell != null)
+    .map((n) => [n.cell, { node: null, color: hasDefect(n.cell, d) ? WITH : WITHOUT }]));
+  const found = (v) => cellsBelow(t, v).filter((c) => byCell.get(c).color === WITH).length;
+  return {
+    groups: [],
+    byCell,
+    tintOf: (v) => (found(v) ? WITH : WITHOUT),
+    tipOf: (v) => `${num(found(v))} of ${plural(t.cells.get(v), "leaf", "leaves")} with ${name}`,
+    legend: [{ color: WITH, label: `with ${name}` }, { color: WITHOUT, label: `without ${name}` }],
+    nameOf: (color) => (color === WITH ? `leaves with ${name}` : `leaves without ${name}`),
+  };
 }
 
 /**
@@ -476,8 +538,11 @@ function leafColor(t, selected, open) {
  * @param {boolean} [closed] a closed node of the drawing
  */
 function nodeTip(n, t, closed = false) {
-  const what = n.cell != null ? `cell ${n.cell}` : `node ${n.node} · ${num(t.cells.get(n.node))} cells`;
-  return `${what} · ${num(n.n_rows)} rows · ${num(n.n_read)} CSV rows${closed ? " · click to open" : ""}`;
+  const what = n.cell != null ? `leaf ${n.cell}` : `node ${n.node} · ${plural(t.cells.get(n.node), "leaf", "leaves")}`;
+  const info = n.cell != null ? last.cellInfo.get(n.cell) : null;
+  const judged = info?.region == null ? ""
+    : ` · part of cell ${info.region} · ${info.defects.length ? info.defects.join(", ") : "no defect"}`;
+  return `${what} · ${num(n.n_read)} CSV rows · ${num(n.n_rows)} distinct${judged}${closed ? " · click to open" : ""}`;
 }
 
 /**
@@ -490,7 +555,7 @@ function drawPath(levels, t) {
   el.hidden = levels.length < 2;
   el.replaceChildren(...levels.flatMap((v, i) => {
     const n = t.byId.get(v);
-    const name = `${n.parent < 0 ? `class ${n.class}` : `node ${n.node}`} · ${num(t.cells.get(v))} cells`;
+    const name = `${n.parent < 0 ? `class ${n.class}` : `node ${n.node}`} · ${plural(t.cells.get(v), "leaf", "leaves")}`;
     const here = i === levels.length - 1;
     const crumb = here ? h("span", { class: "here", "aria-current": "location" }, name)
       : h("button", { type: "button", class: "chip" }, name);
@@ -508,7 +573,8 @@ function drawPath(levels, t) {
  * @param {HTMLElement} el container, replaced
  * @param {object} t from classTree
  * @param {{top: number, leaves: number[], open: Set<number>}} view from treeView
- * @param {{groups: object[], byCell: Map<number, {node: number, color: string}>}} colors from leafColor
+ * @param {{groups: object[], byCell: Map<number, {node: number, color: string}>}} colors from leafColor or
+ *   defectColor
  */
 function treeDiagram(el, t, view, colors) {
   const shown = [...view.open, ...view.leaves].sort((a, b) => a - b).map((v) => t.byId.get(v)); // pre-order
@@ -537,7 +603,8 @@ function treeDiagram(el, t, view, colors) {
     const picked = n.node === state.node;
     const closed = t.kids.has(n.node) && !view.open.has(n.node);
     const cx = x(n.node), cy = y(n);
-    const tint = colors.byCell.get(t.first.get(n.node))?.color ?? "var(--axis)"; // a closed node is in one group
+    const tint = colors.tintOf?.(n.node) // a closed node is in one group of leafColor
+      ?? colors.byCell.get(t.first.get(n.node))?.color ?? "var(--axis)";
     const fill = n.cell != null ? tint : "var(--surface)";
     const ring = picked ? "var(--text)" : groupOf.get(n.node) ?? (n.cell != null ? "var(--surface)" : "var(--muted)");
     const style = `fill:${fill};stroke:${ring};stroke-width:${picked ? 2.5 : 1.5}`;
@@ -553,7 +620,8 @@ function treeDiagram(el, t, view, colors) {
       ? sv("text", { x: cx, y: cy + size / 2 + 12, "text-anchor": "middle" }, num(n.n_rows))
       : null;
     const g = sv("g", { class: "node" }, mark, subtree, label);
-    g.onmousemove = (ev) => tip(ev, nodeTip(n, t, closed));
+    const found = colors.tipOf && n.cell == null ? ` · ${colors.tipOf(n.node)}` : "";
+    g.onmousemove = (ev) => tip(ev, nodeTip(n, t, closed) + found);
     g.onmouseleave = () => tip(null);
     g.onclick = () => selectNode(n.node, true);
     return g;
@@ -569,91 +637,43 @@ let mapId = 0; // drops map answers of superseded requests
  * two principal components, coloured by their group of leafColor; one scale for both axes, framed on the 1st to 99th
  * percentiles; navigable with panZoom; answers of a node selected in the meantime are dropped.
  * @param {object[]} nodes the cell_tree rows of state.cls
- * @param {{groups: object[], byCell: Map<number, {node: number, color: string}>}} colors from leafColor
+ * @param {{groups: object[], byCell: Map<number, {node: number, color: string}>}} colors from leafColor or
+ *   defectColor
  */
 async function drawMap(nodes, colors) {
   const id = ++mapId;
   const el = $("rg-map");
   const sel = nodes.find((n) => n.node === state.node);
-  const what = sel.parent < 0 ? `class ${sel.class}` : sel.cell != null ? `cell ${sel.cell}` : `node ${sel.node}`;
+  const what = sel.parent < 0 ? `class ${sel.class}` : sel.cell != null ? `leaf ${sel.cell}` : `node ${sel.node}`;
   $("rg-map-title").textContent = `Map of ${what}`;
   let data;
   try {
     data = await api(`/${encodeURIComponent(state.dataset)}/cells/map?node=${sel.node}`);
   } catch (e) {
-    if (id === mapId) { el.replaceChildren(h("p", { class: "note" }, e.message)); $("rg-map-note").textContent = ""; }
+    if (id === mapId) el.replaceChildren(h("p", { class: "note" }, e.message));
     return;
   }
   if (id !== mapId) return;
   const byId = new Map(nodes.map((n) => [n.node, n]));
   const cellNode = new Map(nodes.filter((n) => n.cell != null).map((n) => [n.cell, n]));
-  const leaves = nodes.filter((n) => colors.byCell.has(n.cell)).length;
-  $("rg-map-note").textContent = `The rows of ${what} on the first two principal components of ` +
-    `${num(data.points.length)} of them taken at random (at most 2,000 per cell, 20,000 in all), in the space of the ` +
-    "cells. " +
-    (colors.groups.length < leaves
-      ? `Its ${num(leaves)} cells are coloured by the ${colors.groups.length} subtrees ringed in the tree; click one to go deeper. `
-      : "Each cell has its colour. ") +
-    MAP_HOWTO;
-  const legend = h("div", { class: "legend" }, colors.groups.map((g) => {
-    const n = byId.get(g.node);
-    const name = n.cell != null ? `cell ${n.cell}` : `node ${n.node}`;
-    return h("span", {}, h("i", { style: `background:${g.color}` }), `${name} · ${num(n.n_rows)} rows`);
-  }));
+  const swatch = (color, text) => h("span", {}, h("i", { style: `background:${color}` }), text);
+  const legend = h("div", { class: "legend" }, colors.legend?.map((l) => swatch(l.color, l.label)) ??
+    colors.groups.map((g) => {
+      const n = byId.get(g.node);
+      return swatch(g.color, `${n.cell != null ? `leaf ${n.cell}` : `node ${n.node}`} · ${num(n.n_read)} CSV rows`);
+    }));
   const names = new Map(colors.groups.map((g) => {
     const n = byId.get(g.node);
-    return [g.color, n.cell != null ? `cell ${n.cell}` : `node ${n.node}`];
+    return [g.color, n.cell != null ? `leaf ${n.cell}` : `node ${n.node}`];
   }));
   const map = pointMap(data, (c) => colors.byCell.get(c)?.color ?? "var(--muted)", (c) => {
     const n = cellNode.get(c);
     return n ? nodeTip(n) : null;
-  }, (color) => names.get(color) ?? "other cells", `map-clip-${id}`);
+  }, colors.nameOf ?? ((color) => names.get(color) ?? "other leaves"), `map-clip-${id}`);
   el.replaceChildren(legend, map);
 }
 
-const OTHER_CLASS = "var(--muted)"; // the colour of the classes past the palette
-
-/**
- * The colour of every class, in the fixed order of the classes; past the palette the classes share OTHER_CLASS.
- * @param {string[]} classes in class order: only those a view shows, so that they rarely outnumber the palette
- * @returns {Map<string, string>}
- */
-function classColor(classes) {
-  return new Map(classes.map((c, i) => [c, i < SERIES.length ? SERIES[i] : OTHER_CLASS]));
-}
-
-/**
- * Legend entries of some classes, in class order: one per class with a hue of its own, then one for those sharing
- * OTHER_CLASS that names them all, so no class is told by colour alone.
- * @param {Map<string, string>} colors from classColor
- * @param {Map<string, string>} shown the classes to list, each with its label
- * @returns {HTMLElement[]}
- */
-function classLegend(colors, shown) {
-  const entries = [...colors].filter(([c]) => shown.has(c));
-  const swatch = (col, text) => h("span", {}, h("i", { style: `background:${col}` }), text);
-  const rest = entries.filter(([, col]) => col === OTHER_CLASS).map(([c]) => shown.get(c));
-  return [
-    ...entries.filter(([, col]) => col !== OTHER_CLASS).map(([c, col]) => swatch(col, shown.get(c))),
-    ...(rest.length ? [swatch(OTHER_CLASS, `other classes: ${rest.join(", ")}`)] : []),
-  ];
-}
-
-/**
- * The name of the classes drawn in each colour, for the tooltip of a map's curves.
- * @param {Map<string, string>} colors from classColor
- * @returns {(color: string) => string}
- */
-function colorClass(colors) {
-  const names = new Map([...colors].map(([c, col]) => [col, c]));
-  return (color) => (color === OTHER_CLASS ? "other classes" : names.get(color) ?? "other classes");
-}
-
-// how to read a map of pointMap, the end of every map's note
-const MAP_HOWTO = "Each colour's curves enclose 25, 50, 75 and 95% of its rows (a sampled row counts for the rows of " +
-  "its cell it stands for); the strips show its rows along each axis, scaled to its own peak. Hover the plot for " +
-  "the curves you are inside, or a point for its cell; drag to pan, pinch or ctrl + scroll to zoom, double click " +
-  "to reset.";
+const OTHER_CLASS = "var(--muted)"; // the colour of the cells past the palette
 
 const LEVELS = [0.25, 0.5, 0.75, 0.95]; // the share of a group's rows inside each of its curves, innermost first
 const LEVEL_OPACITY = [1, 0.75, 0.55, 0.35];
@@ -719,7 +739,9 @@ function pointMap(data, colorOf, tipOf, nameOf, clip) {
     r: 2.5, "data-cell": p.cell, style: `fill:${colorOf(p.cell)};opacity:0.8`,
   }));
   const dotLayer = sv("g", {}, dots);
-  dotLayer.hidden = !showPoints;
+  // an SVG element has no hidden property: display shows and hides the points
+  const pointsShown = () => dotLayer.getAttribute("display") !== "none";
+  dotLayer.setAttribute("display", showPoints ? "inline" : "none");
 
   const rect = (id, x, y, width, height) => sv("clipPath", { id }, sv("rect", { x, y, width, height }));
   const svg = sv("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", class: "zoomable", style: "min-width:640px" },
@@ -741,7 +763,7 @@ function pointMap(data, colorOf, tipOf, nameOf, clip) {
     curves.setAttribute("transform", `matrix(${t.k} 0 0 ${t.k} ${t.x} ${t.y})`);
     top.setAttribute("transform", `matrix(${t.k} 0 0 1 ${t.x} 0)`);
     right.setAttribute("transform", `matrix(1 0 0 ${t.k} 0 ${t.y})`);
-    if (dotLayer.hidden) return;
+    if (!pointsShown()) return;
     dots.forEach((d, i) => {
       d.setAttribute("cx", (t.k * bx[i] + t.x).toFixed(1));
       d.setAttribute("cy", (t.k * by[i] + t.y).toFixed(1));
@@ -766,7 +788,7 @@ function pointMap(data, colorOf, tipOf, nameOf, clip) {
     const b = h("button", { class: "chip", type: "button", "aria-pressed": String(showPoints === on) }, label);
     b.onclick = () => {
       showPoints = on;
-      dotLayer.hidden = !on;
+      dotLayer.setAttribute("display", on ? "inline" : "none");
       for (const x of b.parentElement.children) x.setAttribute("aria-pressed", String(x === b));
       draw(now);
     };
@@ -947,88 +969,122 @@ function panZoom(svg, draw) {
   draw(t);
 }
 
-// the defects of a cell or a region, in the order of src.quality.DEFECTS
+// The quality tab calls cell what quality_report calls a region (its id the region's): the leaves of a class's tree
+// merged where their defects agree. It never shows the leaves.
+
+// the defects of a cell, in the order of src.quality.DEFECTS
 const DEFECTS = ["invalid_values", "duplicates", "label_conflict", "class_overlap", "shortcut", "atypical_source"];
 
 /** The defects the last quality run measured: atypical_source needs the source address (share null without it). */
 const measuredDefects = () => DEFECTS.filter((d) => last.quality.stats[`share_${d}`] != null);
-const RIVAL_BARS = 12; // most pairs drawn as bars in a region's detail, the most confused first
+const RIVAL_COLUMNS = 6; // most rivals compared feature by feature, the most confused first
+const RIVAL_BARS = 12; // most rivals drawn as bars, the most confused first
 
-/** One sentence per column of the quality tables, shown on hover of the header. */
-const HELP = {
-  rows: "distinct rows (as kept by stage clean)",
-  read: "rows of the CSV, copies included",
-  cells: "the cells merged into the region: neighbours in the tree of the class with the same defects between cells",
-  defects: "the defects of the region (see How to read); none: it has none",
-  missing: "rows with at least one empty, unparsable, NaN or infinite cell, and in which columns (invalid_values)",
-  copies: "share of the CSV rows that repeat another row exactly (duplicates when above 0)",
-  conflicts: "rows identical on every feature to rows of another class, and of which classes (label_conflict)",
-  overlap: "the classes its cells have class_overlap against, then the highest confusion of its cells with a rival",
-  shortcut: "the classes its cells have shortcut against: a separation that rests on a few columns",
-  atypical: "the source host its cells hold the most over the typical cell of their class, and by how much " +
-    "(atypical_source from τ); otherwise the highest such excess of its cells",
-  confusion: "share of the cell's rows the better of 1-NN and the best single-column rule confuses with the rival's " +
-    "(class_overlap from τ), and that rival's class",
-  nn: "share of rows whose nearest row is in the other cell (0 apart, about 0.5 mixed)",
-  bayes: "least error any classifier could reach, from the pair's nn_error (Cover & Hart, approximate)",
-  single: "balanced accuracy of the best rule on one column alone, and that column",
-  key: "the columns removed one at a time, each the one whose removal raises the 1-NN error the most",
+/** What each defect means, one line: the glossary and the tooltip of its chips. */
+const DEFINITION = {
+  invalid_values: "at least one row holds an empty, unparsable, NaN or infinite value",
+  duplicates: "at least one row comes more than once in the CSV, label included: copies can fall on both sides of a " +
+    "train/test split",
+  label_conflict: "at least one row is identical on every feature to a row of another class: no classifier can tell " +
+    "them apart",
+  class_overlap: "against at least one rival, τ or more of the cell's rows are confused with the rival's",
+  shortcut: "against a rival the confusion is under τ, but it reaches τ once at most max_group key columns are " +
+    "removed: the separation rests on those columns",
+  atypical_source: "at least τ of the cell's CSV rows come from one source host more than in the typical cell of its " +
+    "class (the median of the host's share over the class's cells)",
 };
 
-/**
- * Show a quality panel, classes or regions.
- * @param {"classes"|"regions"} view
- * @param {boolean} [push] a click: the back button returns to the panel before
- */
-function showView(view, push = false) {
-  state.view = view;
-  for (const b of document.querySelectorAll(".view-switch button")) b.setAttribute("aria-pressed", String(b.dataset.view === view));
-  $("qr-classes-view").hidden = view !== "classes";
-  $("qr-regions-view").hidden = view !== "regions";
-  saveHash(push);
-  if (view === "regions" && last.quality) drawRegionList();
-}
-
-/**
- * The summary line, the How to read values, then the panel of state.view.
- * @param {object} data response of /quality
- */
-function renderQuality(data) {
-  last.quality = data;
-  const s = data.stats;
-  fill("qr-summary",
-    h("b", {}, `${num(s.regions_no_defect)} of ${num(s.n_regions)} regions without defects`),
-    ` · ${pctSmall(s.share_no_defect)} of the CSV rows with none · ${num(s.n_cells)} cells measured, ` +
-    `${num(s.n_pairs)} pairs of a cell and a rival · τ = ${s.tau}`);
-  for (const el of document.querySelectorAll("#tab-quality [data-stat]")) el.textContent = s[el.dataset.stat] ?? "–";
-  drawClassTable();
-  if (!data.regions.some((r) => r.region === state.region)) state.region = null;
-  showView(state.view);
-}
+/** The other words of the quality tab, one line each. */
+const TERMS = {
+  "CSV rows": "the rows of the CSV, copies included, as a classifier is trained on them; every share is of them",
+  cell: "a compact group of rows of one class, the unit every defect is measured on: neighbouring leaves of the " +
+    "class's tree (the cells tab) with the same defects against the same classes and the same host",
+  rival: "a cell of another class that holds the nearest row of another class to one of the cell's rows",
+  confusion: "the share of a cell's rows that the better of the 1-NN and the best single-column rule gets wrong " +
+    "against a rival",
+  "clear ratio": "the share of the CSV rows with none of the defects",
+};
 
 /** Which rows of the CSV have each defect: the row itself for the first three, its cell for the others. */
 const ROWS_WITH = {
-  invalid_values: "that hold a null or invalid value",
-  duplicates: "that repeat a row read before them (the first copy of a row does not)",
-  label_conflict: "identical to a row of another class",
-  class_overlap: "in a cell with class_overlap",
-  shortcut: "in a cell with shortcut",
-  atypical_source: "in a cell with atypical_source",
+  invalid_values: "hold a null or invalid value",
+  duplicates: "repeat a row read before them (the first copy of a row does not)",
+  label_conflict: "are identical to a row of another class",
+  class_overlap: "lie in a cell with class_overlap",
+  shortcut: "lie in a cell with shortcut",
+  atypical_source: "lie in a cell with atypical_source",
 };
 
-/** The classes table: per defect, the share of the class's CSV rows with it, and with none. */
-function drawClassTable() {
-  sortable($("qr-classes"), [
-    { key: "class", label: "class", wrap: true },
-    { key: "n_rows", label: "rows", format: num, help: HELP.rows },
-    { key: "n_read", label: "CSV rows", format: num, help: HELP.read },
-    { key: "n_cells", label: "cells", format: num },
-    { key: "n_regions", label: "regions", format: num },
-    { key: "share_no_defect", label: "no defect", format: share,
-      help: "share of the class's CSV rows with none of the defects" },
-    ...measuredDefects().map((d) => ({ key: `share_${d}`, label: d, format: pctSmall,
-      help: `share of the class's CSV rows ${ROWS_WITH[d]}` })),
-  ], last.quality.classes);
+/** One sentence per column of the quality tables, shown on hover of the header. */
+const HELP = {
+  read: "rows of the CSV, copies included (hover a number for the distinct rows)",
+  why: "each defect of the cell with what was found",
+  nn: "share of this cell's rows whose nearest row is the rival's (0 apart, about 0.5 mixed)",
+  without: "this cell's confusion with the rival with every column, then after removing the key columns one at a time",
+  key: "the columns removed one at a time, each the one whose removal raises the 1-NN error the most",
+};
+
+/** The hyperparameters, the matrix, the cells and the glossary. @param {object} data response of /quality */
+function renderQuality(data) {
+  last.quality = data;
+  fill("qr-params", paramTable(data.params));
+  const term = (name, text) => [h("dt", {}, name), h("dd", {}, text)];
+  fill("qr-glossary",
+    Object.entries(TERMS).map(([k, v]) => term(k, v)),
+    measuredDefects().map((d) => term(d, DEFINITION[d].replaceAll("τ", `τ = ${data.params.tau}`))));
+  if (!data.regions.some((r) => r.region === state.region)) state.region = null;
+  drawMatrix();
+  drawCellList();
+}
+
+/**
+ * Pick the cells listed: those of a class (null: every class) with a defect ("none": without; null: any).
+ * @param {string|null} cls
+ * @param {string|null} filter
+ */
+function pick(cls, filter) {
+  state.qclass = cls;
+  state.qfilter = filter;
+  state.region = null;
+  saveHash(true);
+  drawMatrix();
+  drawCellList();
+  scrollUnderHeader($("qr-list"));
+}
+
+/**
+ * The classes by their clear ratio and their share of CSV rows with each defect, the most CSV rows first, then the
+ * whole dataset: one hue, darker as the share grows. A share picks its cells on a click.
+ */
+function drawMatrix() {
+  const data = last.quality, s = data.stats, measured = measuredDefects();
+  const total = data.classes.reduce((a, c) => a + c.n_read, 0);
+  const lines = [...data.classes].sort((a, b) => b.n_read - a.n_read || a.class.localeCompare(b.class))
+    .map((c) => ({ cls: c.class, name: c.class, n_read: c.n_read, n_cells: c.n_regions, of: c }));
+  lines.push({ cls: null, name: "dataset", n_read: total, n_cells: s.n_regions, of: s });
+  // every cell is listed when nothing is picked: no share stands for that
+  const picked = (cls, f) => state.qclass === cls && state.qfilter === f && (cls != null || f != null);
+  const cell = (line, f, content, title, v) => {
+    const td = h("td", { class: `pick${picked(line.cls, f) ? " picked" : ""}`, title, tabindex: "0" }, content);
+    if (v != null && v > 0 && f !== "none") td.style.background = `color-mix(in srgb, var(--accent) ${Math.round(3 + 55 * v)}%, transparent)`;
+    td.onclick = () => pick(line.cls, f);
+    td.onkeydown = (e) => { if (e.key === "Enter") pick(line.cls, f); };
+    return td;
+  };
+  const head = h("tr", {},
+    h("th", { class: "text" }, "class"), h("th", { title: HELP.read }, "CSV rows"),
+    h("th", { title: TERMS["clear ratio"] }, "clear ratio"),
+    measured.map((d) => h("th", { title: DEFINITION[d] }, colName(d))));
+  const body = lines.map((line) => h("tr", { class: line.cls == null ? "total" : "" },
+    cell(line, null, line.name, `${line.name}: its ${plural(line.n_cells, "cell")}`),
+    h("td", {}, num(line.n_read)),
+    cell(line, "none", share(line.of.share_no_defect), `the cells of ${line.name} without defects`),
+    measured.map((d) => {
+      const v = line.of[`share_${d}`];
+      return cell(line, d, v ? pctSmall(v) : h("span", { class: "muted" }, "0"),
+        `${pctSmall(v)} of the CSV rows of ${line.name} ${ROWS_WITH[d]}: click for its cells with ${d}`, v);
+    })));
+  fill("qr-matrix", h("table", { class: "matrix" }, h("thead", {}, head), h("tbody", {}, body)));
 }
 
 /** A column name that may break after its underscores. @param {string} name */
@@ -1041,77 +1097,68 @@ function colNames(names) {
   return h("span", {}, names.split(",").flatMap((n, i) => (i ? [", ", colName(n)] : [colName(n)])));
 }
 
-/** Whether a quality region passes a filter of the regions panel: null all, "none" no defect, else that defect. */
+/** Whether a cell passes a filter of the list: null all, "none" no defect, else that defect. */
 function passes(r, f) {
   if (f == null) return true;
   if (f === "none") return !r.defects.length;
   return r.defects.includes(f);
 }
 
-/** The filters, the regions table with one column per defect, and the detail of state.region. */
-function drawRegionList() {
+/**
+ * Each defect of a cell with what was found, one line each; without a defect its highest confusion, muted.
+ * @param {object} r a quality_regions row
+ * @param {Map<number, object[]>} missingOf the null and invalid values of each cell, by column and kind
+ */
+function why(r, missingOf) {
+  if (!r.defects.length) {
+    return h("span", { class: "muted" },
+      r.confusion == null ? "no defect · no rival measured" : `no defect · highest confusion ${dec(r.confusion, 2)} (${r.rival_class})`);
+  }
+  const found = {
+    invalid_values: () => `${plural(r.missing_read, "CSV row")} with a null or invalid value, in ` +
+      some([...new Set((missingOf.get(r.region) ?? []).map((m) => m.column))]),
+    duplicates: () => `${pct(r.dup_share)} of its CSV rows are copies`,
+    label_conflict: () => `${plural(r.conflict_read, "CSV row")} identical to rows of ${r.conflict_with.join(", ")}`,
+    class_overlap: () => `confused with ${r.overlap_with.join(", ")} (highest ${dec(r.confusion, 2)})`,
+    shortcut: () => `apart from ${r.shortcut_with.join(", ")} on a few columns only`,
+    atypical_source: () => `host ${r.src_ip_excess_value}, ${signed(r.src_ip_excess)} over the typical cell of its class`,
+  };
+  return h("div", { class: "why" }, r.defects.map((d) => h("div", {}, diagnosisChip(d), " ", found[d]())));
+}
+
+/** The filter line and the cells picked, the most CSV rows first, then the detail of state.region. */
+function drawCellList() {
   const data = last.quality;
   const missingOf = new Map();
   for (const m of data.missing) missingOf.set(m.region, [...(missingOf.get(m.region) ?? []), m]);
-  const classes = data.classes.map((c) => c.class);
-  if (!classes.includes(state.qclass)) state.qclass = null;
-  $("qr-class").replaceChildren(h("option", { value: "" }, "all classes"), ...classes.map((c) => h("option", { value: c }, c)));
-  $("qr-class").value = state.qclass ?? "";
-  const ofClass = data.regions.filter((r) => state.qclass == null || r.class === state.qclass);
-  const measured = measuredDefects();
-  fill("qr-filters", [null, "none", ...measured].map((f) => {
-    const chip = h("button", { class: "chip", type: "button", "aria-pressed": String(state.qfilter === f) },
-      `${f ?? "all"} (${num(ofClass.filter((r) => passes(r, f)).length)})`);
-    chip.onclick = () => { state.qfilter = f; drawRegionList(); };
-    return chip;
-  }));
-  const missingText = (v, r) => {
-    if (!v) return "";
-    const cells = (missingOf.get(r.region) ?? []).map((m) => `${m.column} ${m.kind}`);
-    const more = cells.length > 3 ? ` and ${cells.length - 3} more` : "";
-    return flagged(`${num(v)} ${v === 1 ? "row" : "rows"}: ${cells.slice(0, 3).join(", ")}${more}`, true);
-  };
-  const conflictText = (v, r) => (v
-    ? flagged(`${num(v)} ${v === 1 ? "row" : "rows"} · with ${r.conflict_with.join(", ")}`, true)
-    : "");
-  const overlapText = (v, r) => {
-    const worst = r.confusion == null ? "" : `highest confusion ${dec(r.confusion, 2)} (${r.rival_class})`;
-    if (!v.length) return h("span", { class: "muted" }, worst || "no rival measured");
-    return h("span", {}, flagged(`with ${v.join(", ")}`, true), h("span", { class: "muted" }, ` · ${worst}`));
-  };
-  const atypicalText = (v, r) => {
-    if (r.src_ip_excess_value != null) return flagged(`${r.src_ip_excess_value} · ${signed(v)}`, true);
-    return v == null ? "" : h("span", { class: "muted" }, `highest excess ${signed(v)}`);
-  };
-  sortable($("qr-regions"), [
-    { key: "region", label: "region" },
+  const shown = data.regions.filter((r) => (state.qclass == null || r.class === state.qclass) && passes(r, state.qfilter));
+  const of = state.qclass == null ? "of every class" : `of ${state.qclass}`;
+  const what = state.qfilter == null ? "" : state.qfilter === "none" ? " without defects" : ` with ${state.qfilter}`;
+  const all = h("button", { class: "chip", type: "button" }, "show every cell");
+  all.onclick = () => pick(null, null);
+  fill("qr-filter", `${plural(shown.length, "cell")} ${of}${what}`,
+    state.qclass != null || state.qfilter != null ? all : null);
+  sortable($("qr-cells"), [
+    { key: "region", label: "cell" },
     { key: "class", label: "class", text: true },
-    { key: "n_cells", label: "cells", format: num, help: HELP.cells },
-    { key: "n_rows", label: "rows", format: num, help: HELP.rows },
-    { key: "n_read", label: "CSV rows", format: num, help: HELP.read },
-    { key: "defects", label: "defects", format: chips, help: HELP.defects, wrap: true },
-    { key: "missing_rows", label: "null / invalid", format: missingText, help: HELP.missing, wrap: true },
-    { key: "dup_share", label: "copies", format: (v) => flagged(pct(v), v > 0), help: HELP.copies },
-    { key: "conflict_rows", label: "label conflicts", format: conflictText, help: HELP.conflicts, wrap: true },
-    { key: "overlap_with", label: "class_overlap", format: overlapText, help: HELP.overlap, wrap: true },
-    { key: "shortcut_with", label: "shortcut", format: (v) => (v.length ? flagged(`with ${v.join(", ")}`, true) : ""),
-      help: HELP.shortcut, wrap: true },
-    ...(measured.includes("atypical_source") ? [{ key: "src_ip_excess", label: "atypical_source",
-      format: atypicalText, help: HELP.atypical, wrap: true }] : []),
-  ], ofClass.filter((r) => passes(r, state.qfilter)), {
-    onClick: (r) => selectRegion(r.region),
+    { key: "n_read", label: "CSV rows", format: (v, r) => h("span", { title: `${num(r.n_rows)} distinct rows` }, num(v)),
+      help: HELP.read },
+    { key: "defects", label: "defects", format: (v, r) => why(r, missingOf), help: HELP.why, wrap: true },
+  ], shown, {
+    onClick: (r) => selectCell(r.region),
     selected: (r) => r.region === state.region,
-    empty: "No region matches these filters.",
+    empty: "No cell.",
+    by: "n_read",
   });
   drawDetail();
 }
 
-/** Open the detail of a region (null: close it). @param {number|null} region */
-function selectRegion(region) {
-  state.region = region;
+/** Open the detail of a cell (null: close it). @param {number|null} cell its region id */
+function selectCell(cell) {
+  state.region = cell;
   saveHash(true);
-  drawRegionList();
-  if (region != null) scrollUnderHeader($("qr-detail"));
+  drawCellList();
+  if (cell != null) scrollUnderHeader($("qr-detail"));
 }
 
 /** Scroll an element to the top of the window, below the sticky header. @param {HTMLElement} el */
@@ -1120,162 +1167,148 @@ function scrollUnderHeader(el) {
   window.scrollTo({ top: Math.max(0, top), behavior: "smooth" });
 }
 
+/**
+ * The rival cells of a cell, one per rival, each by its most confused pair of leaves among those kept, the most
+ * confused first.
+ * @param {object} d the detail of the cell (/quality/region)
+ * @param {object} row its quality_regions row
+ * @param {(side: object) => boolean} [keep] the pairs to look at, from this cell's side
+ * @returns {{region: number, class: string, here: number|null, there: number|null, without: number[], nn: number|null,
+ *   key: string|null}[]}
+ */
+function rivalCells(d, row, keep = () => true) {
+  const best = new Map();
+  for (const p of d.pairs) {
+    const [s, o] = p.region_a === row.region ? ["a", "b"] : ["b", "a"];
+    const side = {
+      region: p[`region_${o}`], class: p[`class_${o}`], here: p[`confusion_${s}`], there: p[`confusion_${o}`],
+      without: p[`confusion_without_${s}`], nn: p[`nn_error_${s}`], key: p.key_columns,
+    };
+    if (!keep(side)) continue;
+    const was = best.get(side.region);
+    if (was == null || (side.here ?? -1) > (was.here ?? -1)) best.set(side.region, side);
+  }
+  return [...best.values()].sort((a, b) => (b.here ?? -1) - (a.here ?? -1) || a.region - b.region);
+}
+
 let detailId = 0; // drops detail answers of superseded requests
 
-/** Fetch the detail of state.region and draw its cells, their rivals, bars, map, identical rows and null values. */
+/** One part of a cell's evidence: the defect's name, then its content. @param {string} d one of DEFECTS */
+function evidence(d, ...kids) {
+  return h("section", { class: "evidence" }, h("h3", {}, d), ...kids);
+}
+
+/**
+ * Fetch the detail of state.region, as a cell, and draw the evidence of each of its defects, its map with the rivals
+ * picked, and, closed, its rivals and where its rows come from.
+ */
 async function drawDetail() {
   const id = ++detailId;
   const card = $("qr-detail");
   const row = last.quality.regions.find((r) => r.region === state.region);
   card.hidden = row == null;
   if (row == null) return;
-  const tau = last.quality.stats.tau;
+  const tau = last.quality.params.tau;
   const close = h("button", { class: "chip close", type: "button", title: "close the detail" }, "close");
-  close.onclick = () => selectRegion(null);
-  fill("qr-detail-title", `Region ${row.region} · ${row.class}`, close);
+  close.onclick = () => selectCell(null);
+  fill("qr-detail-title", `Cell ${row.region} · ${row.class}`, close);
   fill("qr-detail-head",
-    `${num(row.n_cells)} ${row.n_cells === 1 ? "cell" : "cells"} · ${num(row.n_rows)} rows · ${num(row.n_read)} CSV rows · ` +
-    `${pct(row.dup_share)} copies · `,
-    row.defects.length ? h("span", {}, "defects: ", chips(row.defects)) : "no defect");
-  for (const el of ["qr-cells", "qr-provenance", "qr-neighbours", "qr-bars", "qr-conflicts", "qr-missing"]) {
-    fill(el, h("p", { class: "note" }, "loading…"));
-  }
+    `${num(row.n_read)} CSV rows (${num(row.n_rows)} distinct) · `,
+    flagged(`${pct(row.dup_share)} copies`, row.defects.includes("duplicates")), " · ",
+    row.defects.length ? chips(row.defects) : "no defect");
+  $("qr-all").open = false;
+  fill("qr-evidence", h("p", { class: "note" }, "loading…"));
+  for (const el of ["qr-map", "qr-rivals", "qr-provenance"]) fill(el);
   const ds = encodeURIComponent(state.dataset);
-  let d;
+  let d, profile;
   try {
-    d = await api(`/${ds}/quality/region?region=${row.region}`);
+    [d, profile] = await Promise.all([
+      api(`/${ds}/quality/region?region=${row.region}`),
+      api(`/${ds}/quality/profile?region=${row.region}`).catch((e) => ({ error: e.message })),
+    ]);
   } catch (e) {
-    if (id === detailId) fill("qr-cells", h("p", { class: "note" }, e.message));
+    if (id === detailId) fill("qr-evidence", h("p", { class: "note" }, e.message));
     return;
   }
   if (id !== detailId) return;
-  const confusionOf = (v, r) => (v == null ? "–" : h("span", {}, flagged(dec(v, 3), v >= tau), ` with ${r.rival_class}`));
-  sortable($("qr-cells"), [
-    { key: "cell", label: "cell" },
-    { key: "n_rows", label: "rows", format: num, help: HELP.rows },
-    { key: "n_read", label: "CSV rows", format: num, help: HELP.read },
-    { key: "confusion", label: "highest confusion", format: confusionOf, help: HELP.confusion, wrap: true },
-    { key: "shortcut_columns", label: "shortcut columns",
-      format: (v, r) => (v ? h("span", {}, flagged(colNames(v), r.confusion_without >= tau), ` → ${dec(r.confusion_without, 2)}`) : "–"),
-      help: "against the rival under τ whose confusion rises the most as key columns are removed: those columns, and " +
-        "its confusion without them", wrap: true },
-    { key: "defects", label: "defects", format: chips, wrap: true },
-  ], d.cells);
-  drawProvenance(d.cells, tau);
-  const sides = d.pairs.map((p) => {
-    const [s, o] = p.region_a === row.region ? ["a", "b"] : ["b", "a"];
-    return {
-      cell: p[`cell_${s}`], rival: p[`cell_${o}`], class: p[`class_${o}`], region: p[`region_${o}`],
-      n_conflicts: p.n_conflicts, n_conflicts_read: p.n_conflicts_read,
-      here: p[`confusion_${s}`], there: p[`confusion_${o}`], without: p[`confusion_without_${s}`],
-      nn: p[`nn_error_${s}`], bayes: p.bayes_error_low,
-      acc: p[`single_column_acc_${s}`], column: p.single_column, key: p.key_columns,
-    };
-  }).sort((a, b) => (b.here ?? -1) - (a.here ?? -1) || a.cell - b.cell || a.rival - b.rival);
-  const steps = (v, r) => (r.here == null ? "–"
-    : h("span", {}, [r.here, ...v].map((e, i) => (i ? ` → ${dec(e, 2)}` : dec(e, 2))).join(""),
-      r.here < tau && v.some((e) => e >= tau) ? h("span", {}, " ", diagnosisChip("shortcut")) : ""));
-  sortable($("qr-neighbours"), [
-    { key: "cell", label: "cell", help: "this region's cell" },
-    { key: "rival", label: "rival cell" },
-    { key: "class", label: "rival class", wrap: true },
-    { key: "region", label: "rival region" },
-    { key: "here", label: "confusion here / there",
-      format: (v, r) => (v == null ? "–" : h("span", {}, flagged(dec(v, 3), v >= tau), ` / ${dec(r.there, 3)}`)),
-      help: "share of this cell's rows / of the rival's rows confused with the other side (class_overlap from τ)" },
-    { key: "without", label: "confusion without key columns", format: steps, wrap: true,
-      help: "this cell's confusion with every column, then after removing the key columns one at a time" },
-    { key: "key", label: "key columns", format: (v) => (v ? colNames(v) : "–"), help: HELP.key, wrap: true },
-    { key: "nn", label: "nn_error here", format: (v) => dec(v, 3), help: HELP.nn },
-    { key: "acc", label: "single column here", format: (v, r) => (r.column == null ? "–" : h("span", {}, `${pct(v)} `, colName(r.column))), help: HELP.single, wrap: true },
-    { key: "bayes", label: "bayes_error_low", format: (v) => dec(v, 3), help: HELP.bayes },
-    { key: "n_conflicts", label: "identical rows",
-      format: (v, r) => (v ? h("span", { title: `${num(r.n_conflicts_read)} CSV rows` }, flagged(num(v), true)) : "0"),
-      help: "rows of the two cells identical on every feature (hover: CSV rows)" },
-  ], sides, { onClick: (r) => selectRegion(r.region), empty: "No cell of another class was measured against its cells." });
-  const judged = sides.filter((s) => s.here != null);
-  $("qr-bars-note").textContent = (judged.length > RIVAL_BARS ? `The ${RIVAL_BARS} most confused of its ${num(judged.length)} pairs, ` : "Every pair, ") +
-    "this region's side. A shortcut is a first bar short of τ and a later one past it: the classes mix once those " +
-    "columns are gone.";
-  errorBars($("qr-bars"), judged.slice(0, RIVAL_BARS), tau);
-  drawConflicts(d, row);
-  if (d.missing.length) {
-    sortable($("qr-missing"), [
-      { key: "column", label: "column" },
-      { key: "kind", label: "kind", help: "empty, unparsable (not a number), nan or inf", text: true },
-      { key: "n_rows", label: "rows", format: num, help: HELP.rows },
-      { key: "n_read", label: "CSV rows", format: num, help: HELP.read },
-    ], d.missing);
-  } else fill("qr-missing", h("p", { class: "note" }, "None: every cell of the region is a valid value."));
-  drawQualityMap(row, d, id);
-}
-
-// the provenance columns of src.provenance.KEYS, in order; measured per cell when the dataset names them
-const PROVENANCE = ["src_ip", "src_port", "dst_ip", "dst_port"];
-
-/** "YYYY-MM-DD HH:MM:SS → HH:MM:SS", the day written once when both times fall on it. */
-const span = (from, to) => `${from} → ${to.slice(0, 10) === from.slice(0, 10) ? to.slice(11) : to}`;
-
-/**
- * The provenance of a region's cells: per column its top value and share, its values and its excess over the
- * typical cell of its class, and the time window with its share of the class's.
- * @param {object[]} cells the quality_cells rows of the region
- * @param {number} tau quality.tau: atypical_source from it, on src_ip
- */
-function drawProvenance(cells, tau) {
-  const keys = PROVENANCE.filter((k) => cells.some((c) => c[`${k}_n_values`] != null));
-  const timed = cells.some((c) => c.time_window != null);
-  if (!keys.length && !timed) {
-    $("qr-provenance-note").textContent = "";
-    fill("qr-provenance", h("p", { class: "note" }, "The dataset names no provenance columns (a provenance block in its yaml)."));
-    return;
-  }
-  $("qr-provenance-note").textContent = "Per cell and column, over its CSV rows: the most frequent value and its share, " +
-    "then the distinct values and the effective number (exp of the entropy; 1: one value), then the excess: the most " +
-    "the cell holds of one value over the typical cell of its class (its value named when it is not the top one); " +
-    `atypical_source from τ on src_ip. The window holds the central 1 − τ of the cell's rows, then its share of the ` +
-    "class's window. Sorted on a column, by the share of its top value.";
-  const excessOf = (k, r) => {
-    const v = r[`${k}_excess`];
-    if (v == null) return "";
-    const named = r[`${k}_excess_value`] !== r[`${k}_top`] ? ` (${r[`${k}_excess_value`]})` : "";
-    const text = `${signed(v)} over its class${named}`;
-    return k === "src_ip" && v >= tau ? h("span", {}, " · ", flagged(text, true)) : h("span", { class: "muted" }, ` · ${text}`);
+  const overlap = rivalCells(d, row, (s) => s.here != null && s.here >= tau);
+  const shortcut = rivalCells(d, row, (s) => s.here != null && s.here < tau && s.without.some((e) => e >= tau));
+  const parts = {
+    invalid_values: () => evidence("invalid_values", sortableIn([
+      { key: "column", label: "column", text: true },
+      { key: "kind", label: "kind", text: true, help: "empty, unparsable (not a number), nan or inf" },
+      { key: "n_read", label: "CSV rows", format: (v, r) => h("span", { title: `${num(r.n_rows)} distinct rows` }, num(v)) },
+    ], d.missing, { by: "n_read" })),
+    duplicates: () => null, // its copies are in the head
+    label_conflict: () => evidence("label_conflict", conflicts(d, row)),
+    class_overlap: () => evidence("class_overlap", featureDeltas(profile, row, overlap.slice(0, RIVAL_COLUMNS))),
+    shortcut: () => evidence("shortcut", shortcutBars(shortcut.slice(0, RIVAL_BARS), tau)),
+    atypical_source: () => evidence("atypical_source", sourceTable(d, row, tau)),
   };
-  const valueOf = (k) => (v, r) => (r[`${k}_n_values`] ? h("span", {},
-    h("span", {}, `${r[`${k}_top`]} · ${pct(v)}`),
-    h("span", { class: "muted" }, ` · ${num(r[`${k}_n_values`])} ${r[`${k}_n_values`] === 1 ? "value" : "values"}` +
-      (r[`${k}_n_values`] > 1 ? `, eff ${short(r[`${k}_eff_n`])}` : "")),
-    excessOf(k, r)) : "–");
-  sortable($("qr-provenance"), [
-    { key: "cell", label: "cell" },
-    { key: "n_read", label: "CSV rows", format: num, help: HELP.read },
-    ...keys.map((k) => ({ key: `${k}_top_share`, label: k, format: valueOf(k), wrap: true,
-      help: `the most frequent ${k} of the cell's CSV rows and its share, its distinct values and their effective ` +
-        "number, and the most it holds of one value over the typical cell of its class" })),
-    ...(timed ? [{ key: "time_window", label: "time window", wrap: true,
-      format: (v, r) => (v == null ? "–" : h("span", {}, duration(v), h("span", { class: "muted" },
-        ` · ${span(r.time_from, r.time_to)}` + (r.time_window_share == null ? "" : ` · ${pct(r.time_window_share)} of its class's`)))),
-      help: "the window holding the central 1 − τ of the cell's CSV rows in time, its first and last second, and its " +
-        "share of the same window of its class's CSV rows" }] : []),
-  ], cells);
+  fill("qr-evidence", row.defects.map((x) => parts[x]()).filter(Boolean));
+  const rivals = rivalCells(d, row);
+  sortable($("qr-rivals"), [
+    { key: "region", label: "cell" },
+    { key: "class", label: "class", text: true },
+    { key: "nn", label: "nn_error here", format: (v) => dec(v, 3), help: HELP.nn },
+    { key: "without", label: "without key columns", wrap: true, help: HELP.without,
+      format: (v, r) => (r.here == null ? "–" : [r.here, ...v].map((e, i) => (i ? ` → ${dec(e, 2)}` : dec(e, 2))).join("")) },
+    { key: "key", label: "key columns", format: (v) => (v ? colNames(v) : "–"), help: HELP.key, wrap: true },
+  ], rivals, { onClick: (r) => selectCell(r.region), empty: "No cell of another class was measured against it." });
+  drawCellProvenance(d);
+  const involved = new Set([...overlap, ...shortcut].map((r) => r.region));
+  drawCellMap(row, d, rivals, involved.size ? involved : new Set(rivals.slice(0, 1).map((r) => r.region)), id);
 }
 
 /**
- * One group of horizontal bars per pair: this region's cell's confusion with every column, then after removing the key
- * columns one at a time, darker as more are removed (one hue, ordered); one axis from 0, τ dashed; a tooltip per bar.
- * @param {HTMLElement} el container, replaced
- * @param {object[]} sides the pairs drawn, in display order
- * @param {number} tau quality.tau
+ * Feature by feature, how far this cell lies from each rival: the difference of their mean numeric features (logged
+ * and standardized: in standard deviations of the dataset), darker as it grows; the most frequent value of each
+ * categorical feature, its own muted where it is this cell's.
+ * @param {object} profile response of /quality/profile, or {error}
+ * @param {object} row the cell's quality_regions row
+ * @param {object[]} rivals from rivalCells, the columns
  */
-function errorBars(el, sides, tau) {
-  if (!sides.length) { el.replaceChildren(h("p", { class: "note" }, "No pair measured: too few rows.")); return; }
-  const k = Math.max(...sides.map((s) => s.without.length));
-  const opacity = Array.from({ length: k + 1 }, (_, i) => 0.35 + (0.65 * i) / Math.max(k, 1));
-  const top = Math.min(1, niceMax(Math.max(tau * 2, ...sides.flatMap((s) => [s.here, ...s.without]))));
-  const bar = 7, gap = 2, rowH = (k + 1) * (bar + gap) + 12;
-  const W = Math.max(560, el.clientWidth || 1100); // drawn at the width it is shown, so text keeps its size
-  const m = { l: 230, r: 24, t: 22, b: 26 }, H = m.t + m.b + rowH * sides.length;
+function featureDeltas(profile, row, rivals) {
+  if (profile.error) return h("p", { class: "note" }, profile.error);
+  const mine = profile.means[String(row.region)], top = profile.top[String(row.region)];
+  const shade = (v) => `background: color-mix(in srgb, var(--accent) ${Math.round(55 * Math.min(Math.abs(v) / 2, 1))}%, transparent)`;
+  const head = h("tr", {}, h("th", { class: "text" }, "feature"), h("th", { title: "its mean, in standard deviations, or its most frequent value" }, "this cell"),
+    rivals.map((r) => h("th", { title: `confusion ${dec(r.here, 3)} here, ${dec(r.there, 3)} there` },
+      `cell ${r.region}`, h("br"), h("span", { class: "muted" }, r.class))));
+  const numeric = profile.columns.map((c, i) => h("tr", {}, h("td", { class: "text" }, c), h("td", {}, dec(mine[i], 2)),
+    rivals.map((r) => {
+      const v = profile.means[String(r.region)]?.[i];
+      const delta = v == null || mine[i] == null ? null : v - mine[i];
+      return h("td", delta == null ? {} : { style: shade(delta), title: `its mean ${dec(v, 2)}` },
+        delta == null ? "–" : `${delta < 0 ? "−" : "+"}${dec(Math.abs(delta), 2)}`);
+    })));
+  const categorical = Object.keys(top).map((c) => h("tr", {}, h("td", { class: "text" }, c), h("td", {}, top[c] ?? "null"),
+    rivals.map((r) => {
+      const v = profile.top[String(r.region)]?.[c];
+      return h("td", v === top[c] ? { class: "muted" } : {}, v ?? "null");
+    })));
+  return h("div", { class: "table-wrap" },
+    h("table", { class: "deltas" }, h("thead", {}, head), h("tbody", {}, numeric, categorical)));
+}
+
+/**
+ * One group of bars per rival this cell is apart from on a few columns only: its confusion with every column, then
+ * without its shortcut columns (the key columns up to the first whose removal brings the confusion to τ), named at
+ * the end of the bar; one axis from 0, τ dashed.
+ * @param {object[]} rivals from rivalCells, the shortcut pairs
+ * @param {number} tau
+ * @returns {HTMLElement}
+ */
+function shortcutBars(rivals, tau) {
+  if (!rivals.length) return h("p", { class: "note" }, "No pair measured.");
+  const steps = rivals.map((r) => {
+    const k = r.without.findIndex((e) => e >= tau);
+    return [{ label: "every column", value: r.here },
+      { label: `without ${r.key.split(",").slice(0, k + 1).join(", ")}`, value: r.without[k] }];
+  });
+  const top = Math.min(1, niceMax(Math.max(tau * 2, ...steps.flat().map((s) => s.value))));
+  const bar = 10, gap = 4, rowH = 2 * (bar + gap) + 14;
+  const W = 1100, m = { l: 200, r: 260, t: 22, b: 26 }, H = m.t + m.b + rowH * rivals.length;
   const x = (v) => m.l + (Math.min(v, top) / top) * (W - m.l - m.r);
   const kids = [];
   for (let t = 0; t <= 4; t++) {
@@ -1285,101 +1318,128 @@ function errorBars(el, sides, tau) {
   }
   kids.push(sv("line", { x1: x(tau), x2: x(tau), y1: m.t - 10, y2: H - m.b, style: "stroke:var(--text-2);stroke-dasharray:4 4" }),
     sv("text", { x: x(tau) + 4, y: m.t - 10 }, `τ = ${tau}`));
-  const stepName = (s, i) => (i ? `without ${s.key.split(",").slice(0, i).join(", ")}` : "every column");
-  sides.forEach((s, row) => {
+  rivals.forEach((r, row) => {
     const y0 = m.t + row * rowH;
-    const name = `cell ${s.cell} vs ${s.class} ${s.rival}`;
-    kids.push(sv("text", { x: m.l - 8, y: y0 + bar + 2, "text-anchor": "end" }, name));
-    [s.here, ...s.without].forEach((v, i) => {
-      const y = y0 + i * (bar + gap);
-      const w = Math.max(0, x(v) - x(0));
-      const r = Math.min(3, w, bar / 2); // rounded data end, square at the baseline
-      const mark = sv("path", {
-        d: `M${x(0)},${y}h${w - r}a${r},${r} 0 0 1 ${r},${r}v${bar - 2 * r}a${r},${r} 0 0 1 ${-r},${r}h${-(w - r)}z`,
-        style: `fill:var(--accent);fill-opacity:${opacity[i]}`,
-      });
-      const hit = sv("rect", { x: x(0), y, width: W - m.l - m.r, height: bar + gap, fill: "transparent" });
-      hit.onmousemove = (ev) => tip(ev, `${name} · confusion ${stepName(s, i)}: ${dec(v, 3)}`);
-      hit.onmouseleave = () => tip(null);
-      kids.push(mark, hit);
+    kids.push(sv("text", { x: m.l - 8, y: y0 + bar, "text-anchor": "end" }, `vs cell ${r.region} · ${r.class}`));
+    steps[row].forEach((s, i) => {
+      const y = y0 + i * (bar + gap), w = Math.max(0, x(s.value) - x(0)), rr = Math.min(3, w, bar / 2);
+      kids.push(sv("path", {
+        d: `M${x(0)},${y}h${w - rr}a${rr},${rr} 0 0 1 ${rr},${rr}v${bar - 2 * rr}a${rr},${rr} 0 0 1 ${-rr},${rr}h${-(w - rr)}z`,
+        style: `fill:var(--accent);fill-opacity:${i ? 1 : 0.4}`,
+      }), sv("text", { x: x(s.value) + 6, y: y + bar - 1 }, `${s.label} · ${dec(s.value, 2)}`));
     });
   });
-  el.replaceChildren(
-    h("div", { class: "legend" }, opacity.map((o, i) => h("span", {},
-      h("i", { style: `background:var(--accent);opacity:${o}` }),
-      i === 0 ? "every column" : i === 1 ? "without the first key column" : `without the first ${i} key columns`))),
-    sv("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "confusion per pair, as key columns are removed" }, kids));
+  return h("div", { class: "table-wrap" }, sv("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", style: "min-width:640px",
+    "aria-label": "confusion with every column and without the shortcut columns, per rival" }, kids));
 }
 
-/** The label conflict groups of the region: one table row per group, its classes then its feature values. */
-function drawConflicts(d, row) {
-  if (!d.conflicts.length) {
-    $("qr-conflicts-note").textContent = "";
-    fill("qr-conflicts", h("p", { class: "note" }, "None: no row of this region is identical to a row of another class."));
-    return;
-  }
-  const some = d.conflicts.length < d.n_groups ? `The ${d.conflicts.length} with the most CSV rows; each` : "Each";
-  $("qr-conflicts-note").textContent = `${num(row.conflict_rows)} rows of this region (${num(row.conflict_read)} CSV rows) ` +
-    `fall in ${num(d.n_groups)} ${d.n_groups === 1 ? "group" : "groups"} of rows identical on every feature but labelled ` +
-    `with different classes. ${some} line is one group: which classes carry it, then the values all its rows share.`;
+/**
+ * The cell's source host: its share of the cell's CSV rows (known when it is the most frequent), the excess over the
+ * typical cell of its class, the most frequent destination port and the time window of the cell.
+ * @param {object} d the detail of the cell (/quality/region)
+ * @param {object} row its quality_regions row
+ * @param {number} tau
+ */
+function sourceTable(d, row, tau) {
+  const of = new Map(d.provenance.map((p) => [p.key, p]));
+  const src = of.get("src_ip"), port = of.get("dst_port");
+  const host = row.src_ip_excess_value;
+  return h("div", { class: "table-wrap" }, table(
+    ["host", "its share", "excess over its class", "destination port", "time window"],
+    [[host,
+      src?.top === host ? pct(src.top_share) : "–",
+      flagged(signed(row.src_ip_excess), row.src_ip_excess >= tau),
+      port?.top == null ? "–" : `${port.top} · ${pct(port.top_share)}`,
+      d.time?.time_window == null ? "–" : h("span", {}, duration(d.time.time_window),
+        h("span", { class: "muted" }, ` · ${span(d.time.time_from.replace("T", " "), d.time.time_to.replace("T", " "))}`))]]));
+}
+
+/** "YYYY-MM-DD HH:MM:SS → HH:MM:SS", the day written once when both times fall on it. */
+const span = (from, to) => `${from.slice(0, 19)} → ${to.slice(0, 10) === from.slice(0, 10) ? to.slice(11, 19) : to.slice(0, 19)}`;
+
+/** Per provenance column, over the cell's CSV rows: its distinct values, the most frequent, the rows per repeated value. */
+function drawCellProvenance(d) {
+  sortable($("qr-provenance"), [
+    { key: "key", label: "column", text: true },
+    { key: "n_values", label: "distinct values", format: num },
+    { key: "top_share", label: "most frequent", text: true, format: (v, r) => (r.top == null ? "–" : `${r.top} · ${pct(v)}`) },
+    { key: "repeat", label: "CSV rows per repeated value", format: (v) => (v == null ? "–" : short(v)),
+      help: "the mean CSV rows of a value, over the values of more than one" },
+  ], d.provenance, { empty: "The dataset names no provenance columns (a provenance block in its yaml)." });
+}
+
+/**
+ * The label conflict groups of a cell: per group the classes on its two sides, this cell's and the others, with their
+ * CSV rows, then the values all its rows share.
+ * @returns {HTMLElement}
+ */
+function conflicts(d, row) {
+  if (!d.conflicts.length) return h("p", { class: "note" }, "No group of identical rows was kept.");
   const columns = Object.keys(d.conflicts[0].values);
   const value = (v) => (v == null ? h("span", { class: "muted" }, "null") : String(v));
-  fill("qr-conflicts", table(
-    ["class (cell, region) × CSV rows", "CSV rows", ...columns],
-    d.conflicts.map((g) => [
-      h("span", { class: "cell-wrap" },
-        g.rows.map((r) => `${r.class} (cell ${r.cell}, region ${r.region}) ×${num(r.n_read)}`).join(" · ")),
-      num(g.n_read),
-      ...columns.map((c) => value(g.values[c])),
-    ])));
+  const sum = (rows) => rows.reduce((a, r) => a + r.n_read, 0);
+  return h("div", { class: "table-wrap conflicts" }, table(
+    ["class a", "class b", "CSV rows a", "CSV rows b", ...columns],
+    d.conflicts.map((g) => {
+      const a = g.rows.filter((r) => r.class === row.class), b = g.rows.filter((r) => r.class !== row.class);
+      return [row.class, [...new Set(b.map((r) => r.class))].join(", "), num(sum(a)), num(sum(b)),
+        ...columns.map((c) => value(g.values[c]))];
+    })));
 }
 
 let qualityMapId = 0; // drops quality map answers of superseded requests
 
 /**
- * Fetch and draw the map of a region's cells and of their rival cells, coloured by class.
- * @param {object} row its quality_regions row
- * @param {object} d its detail (/quality/region): the class and region of every cell shown
+ * Fetch the map of a cell and its rivals, then draw it with the rivals picked by the chips above it, each cell in its
+ * colour: this one first, a rival by its place among the rivals (so its colour stays as others are picked).
+ * @param {object} row the cell's quality_regions row
+ * @param {object} d its detail (/quality/region)
+ * @param {object[]} rivals from rivalCells, every rival
+ * @param {Set<number>} picked the rivals drawn first
  * @param {number} detail the detailId of the detail it belongs to
  */
-async function drawQualityMap(row, d, detail) {
+async function drawCellMap(row, d, rivals, picked, detail) {
   const id = ++qualityMapId;
-  $("qr-map-title").textContent = `Map of region ${row.region} and its rivals`;
-  $("qr-map-note").textContent = "";
-  fill("qr-map", h("p", { class: "note" }, "loading…"));
+  const el = $("qr-map");
+  el.replaceChildren(h("p", { class: "note" }, "loading…"));
   let data;
   try {
     data = await api(`/${encodeURIComponent(state.dataset)}/quality/map?region=${row.region}`);
   } catch (e) {
-    if (id === qualityMapId) fill("qr-map", h("p", { class: "note" }, e.message));
+    if (id === qualityMapId) el.replaceChildren(h("p", { class: "note" }, e.message));
     return;
   }
   if (id !== qualityMapId || detail !== detailId) return;
   shuffle(data.points); // drawn interleaved: no cell covers the others where they mix
-  const of = new Map(d.cells.map((c) => [c.cell, { class: c.class, region: row.region }]));
-  for (const p of d.pairs) {
-    for (const k of ["a", "b"]) if (!of.has(p[`cell_${k}`])) of.set(p[`cell_${k}`], { class: p[`class_${k}`], region: p[`region_${k}`] });
-  }
-  const order = last.quality.classes.map((c) => c.class);
-  // in the dataset's class order, so a class keeps its colour from one region's map to the next
-  const shown = [...new Set(data.cells.map((c) => of.get(c).class))];
-  shown.sort((a, b) => order.indexOf(a) - order.indexOf(b));
-  const colors = classColor(shown);
-  const rivals = data.cells.filter((c) => of.get(c).region !== row.region);
-  const labels = new Map(shown.map((c) => {
-    if (c === row.class) return [c, `${c} · region ${row.region} (this one)`];
-    const k = rivals.filter((r) => of.get(r).class === c).length;
-    return [c, `${c} · ${k} rival ${k === 1 ? "cell" : "cells"}`];
-  }));
-  $("qr-map-note").textContent = `The rows of region ${row.region} (${num(row.n_cells)} ` +
-    `${row.n_cells === 1 ? "cell" : "cells"}) and of its ${num(rivals.length)} rival ` +
-    `${rivals.length === 1 ? "cell" : "cells"} by class, on the first two principal components of ` +
-    `${num(data.points.length)} of them taken at random (at most 2,000 per cell, 20,000 in all). ${MAP_HOWTO}`;
-  const map = pointMap(data, (c) => colors.get(of.get(c)?.class) ?? OTHER_CLASS, (c) => {
-    const x = of.get(c);
-    return x ? `cell ${c} · ${x.class} · region ${x.region}` : null;
-  }, colorClass(colors), `quality-clip-${id}`);
-  fill("qr-map", h("div", { class: "legend" }, classLegend(colors, labels)), map);
+  const cellOf = new Map(d.cells.map((c) => [c.cell, row.region])); // a leaf's cell
+  for (const p of d.pairs) for (const k of ["a", "b"]) cellOf.set(p[`cell_${k}`], p[`region_${k}`]);
+  const colorOf = new Map([[row.region, SERIES[0]],
+    ...rivals.map((r, i) => [r.region, i + 1 < SERIES.length ? SERIES[i + 1] : OTHER_CLASS])]);
+  const name = new Map([[row.region, `cell ${row.region} · ${row.class} (this one)`],
+    ...rivals.map((r) => [r.region, `cell ${r.region} · ${r.class}`])]);
+  const box = h("div");
+  const draw = () => {
+    const shown = new Set([row.region, ...picked]);
+    const keep = (leaf) => shown.has(cellOf.get(leaf));
+    const part = { shares: data.shares, points: data.points.filter((p) => keep(p[2])), sampled: data.sampled.filter((s) => keep(s[0])) };
+    const legend = h("div", { class: "legend" }, [...shown].map((c) =>
+      h("span", {}, h("i", { style: `background:${colorOf.get(c)}` }), name.get(c))));
+    const byColor = new Map([...shown].map((c) => [colorOf.get(c), name.get(c)]));
+    box.replaceChildren(legend, pointMap(part, (leaf) => colorOf.get(cellOf.get(leaf)) ?? OTHER_CLASS,
+      (leaf) => name.get(cellOf.get(leaf)) ?? null, (color) => byColor.get(color) ?? "other cells", `quality-clip-${id}`));
+  };
+  const toggles = rivals.map((r) => {
+    const b = h("button", { class: "chip", type: "button", "aria-pressed": String(picked.has(r.region)),
+      title: `confusion ${dec(r.here, 3)} here` }, h("i", { style: `background:${colorOf.get(r.region)}` }), name.get(r.region));
+    b.onclick = () => {
+      if (picked.has(r.region)) picked.delete(r.region); else picked.add(r.region);
+      b.setAttribute("aria-pressed", String(picked.has(r.region)));
+      draw();
+    };
+    return b;
+  });
+  el.replaceChildren(h("div", { class: "chips rivals" }, h("span", { class: "muted" }, "rivals"), toggles), box);
+  draw();
 }
 
 /** Shuffle an array in place, the same way every time (a fixed seed), so a redraw looks the same. @param {any[]} a */
@@ -1398,15 +1458,14 @@ function chips(v) {
   return v.length ? h("span", { class: "chips" }, v.map(diagnosisChip)) : "–";
 }
 
-/** A defect as a chip: the warning sign and its name. @param {string} d */
+/** A defect as a chip, its definition on hover. @param {string} d */
 function diagnosisChip(d) {
-  return h("span", { class: "chip flag" }, h("b", { class: "sign", "aria-hidden": "true" }, "▲"), d);
+  return h("span", { class: "chip defect", title: `${d}: ${DEFINITION[d]}` }, d);
 }
 
-/** A value, with the warning sign when it shows a defect. @param {string|Node} text @param {boolean} over */
+/** A value, in bold when it shows a defect. @param {string|Node} text @param {boolean} over */
 function flagged(text, over) {
-  return over ? h("span", { class: "flag", title: "a defect" },
-    h("b", { class: "sign", "aria-label": "a defect" }, "▲"), text) : text;
+  return over ? h("b", { class: "over", title: "over its threshold" }, text) : text;
 }
 
 /** A share in [0, 1] as an inline bar and a percentage. */
@@ -1421,56 +1480,6 @@ function share(v) {
 function niceMax(v) {
   const p = 10 ** Math.floor(Math.log10(v));
   return [1, 2, 5, 10].map((m) => m * p).find((x) => x >= v);
-}
-
-/** Y-axis gridlines and tick labels from lo to hi. */
-function yTicks(kids, y, lo, hi, m, W, format = short) {
-  for (let k = 0; k <= 4; k++) {
-    const v = lo + ((hi - lo) * k) / 4;
-    kids.push(
-      sv("line", { class: k ? "grid" : "axis", x1: m.l, x2: W - m.r, y1: y(v), y2: y(v) }),
-      sv("text", { x: m.l - 8, y: y(v) + 4, "text-anchor": "end" }, format(v)));
-  }
-}
-
-/**
- * Clustered bins per series with a legend.
- * @param {HTMLElement} el container, replaced
- * @param {number[]} edges bins + 1 values
- * @param {{name: string, color: string, values: number[]}[]} series one value per bin
- * @param {{format?: (v: number) => string}} [opts] y axis and tooltip number format
- */
-function histogram(el, edges, series, opts = {}) {
-  const format = opts.format ?? short;
-  const W = 800, H = 240, m = { l: 52, r: 24, t: 8, b: 26 };
-  const bins = edges.length - 1;
-  const top = niceMax(Math.max(...series.flatMap((s) => s.values), 1e-9));
-  const pw = W - m.l - m.r, ph = H - m.t - m.b;
-  const bw = pw / bins;
-  const y = (v) => m.t + ph - (v / top) * ph;
-  const kids = [];
-  yTicks(kids, y, 0, top, m, W, format);
-  for (let k = 0; k <= 4; k++) {
-    const i = Math.round((bins * k) / 4);
-    kids.push(sv("text", { x: m.l + i * bw, y: H - 8, "text-anchor": "middle" }, short(edges[i])));
-  }
-  const slot = (bw - 4) / series.length;
-  for (let i = 0; i < bins; i++) {
-    series.forEach((s, j) => {
-      kids.push(sv("rect", {
-        x: m.l + i * bw + 2 + j * slot, y: y(s.values[i]), width: Math.max(1, slot - 2), height: ph - (y(s.values[i]) - m.t),
-        rx: 2, style: `fill:${s.color}`,
-      }));
-    });
-    const hit = sv("rect", { x: m.l + i * bw, y: m.t, width: bw, height: ph, fill: "transparent" });
-    const text = `${short(edges[i])} – ${short(edges[i + 1])}: ` + series.map((s) => `${s.name} ${format(s.values[i])}`).join(" · ");
-    hit.onmousemove = (ev) => tip(ev, text);
-    hit.onmouseleave = () => tip(null);
-    kids.push(hit);
-  }
-  el.replaceChildren(
-    h("div", { class: "legend" }, series.map((s) => h("span", {}, h("i", { style: `background:${s.color}` }), s.name))),
-    sv("svg", { viewBox: `0 0 ${W} ${H}`, role: "img" }, kids));
 }
 
 /** Show #tooltip near the pointer with the given text, or hide it when text is null. @param {MouseEvent} ev @param {string|null} text */

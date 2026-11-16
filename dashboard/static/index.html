@@ -16,196 +16,66 @@
       <span id="run-info" class="muted"></span>
     </div>
     <nav class="tabs" role="tablist">
-      <button role="tab" data-tab="clean" aria-selected="true">clean</button>
-      <button role="tab" data-tab="prepare" aria-selected="false">prepare</button>
+      <button role="tab" data-tab="quality" aria-selected="true">quality</button>
       <button role="tab" data-tab="cells" aria-selected="false">cells</button>
-      <button role="tab" data-tab="quality" aria-selected="false">quality</button>
+      <button role="tab" data-tab="data" aria-selected="false">data</button>
     </nav>
   </header>
 
   <main>
-    <!-- clean -->
-    <section id="tab-clean" class="panel">
+    <!-- quality -->
+    <section id="tab-quality" class="panel">
       <p class="empty">Select a dataset.</p>
-      <div id="sp-tiles" class="tiles"></div>
-      <div class="card"><h2>Classes</h2>
-        <p class="note">Rows equal on every column, the class included, are kept once; n_duplicates counts their
-          copies (1 when unique) and is the row's weight in the regions, not a feature. Then the classes under
-          min_class_count distinct rows are dropped. Rows with a missing or infinite value are kept: stage prepare puts
-          them on the mean.</p>
-        <div id="sp-classes" class="table-wrap"></div></div>
-      <div class="card"><h2>Dropped classes</h2><div id="sp-dropped" class="chips"></div></div>
-      <div class="card"><h2>Dropped columns</h2>
-        <p class="note">Configured columns with a single value over the kept rows.</p>
-        <div id="sp-constant" class="chips"></div></div>
-      <div class="card"><h2>Features</h2><div id="sp-features"></div></div>
-      <div class="card"><h2>Provenance</h2>
-        <p class="note">The columns the dataset names for where each row of the CSV comes from (provenance in its
-          yaml): never features. They are read for every row of a kept class, copies included, each copy with its own
-          (the copies of a row may come from different hosts at different times); the quality tab measures them per
-          cell.</p>
-        <div id="sp-provenance" class="table-wrap"></div></div>
-    </section>
-
-    <!-- prepare -->
-    <section id="tab-prepare" class="panel" hidden>
-      <p class="empty">Select a dataset.</p>
-      <div id="pp-tiles" class="tiles"></div>
-      <div class="card"><h2>Numeric columns</h2>
-        <p class="note">Each number becomes sign(x)·log1p(|x|), then is standardized with the mean and standard
-          deviation below (of the logged finite values); a missing or infinite one lands on the mean, 0, and the
-          n_missing column counts, unscaled, how many numbers of the row did (present even when none). It is a
-          diagnostic: no distance sees it.</p>
-        <div id="pp-num" class="table-wrap"></div></div>
-      <div class="card"><h2>Categorical slots</h2>
-        <p class="note">The top_n most frequent values of a column (a missing one counts as a value) get their own
-          one-hot slot; the others share the &lt;other&gt; slot. The active slot weighs sqrt(cat_cost / g), with g the
-          chance two rows differ on the column: on average a column adds cat_cost times what a number adds, and a
-          mismatch on a concentrated column costs more (2·weight² in squared distance).</p>
-        <div id="pp-cat" class="table-wrap"></div></div>
+      <div class="card"><h2>Hyperparameters</h2><div id="qr-params" class="table-wrap"></div></div>
+      <div class="card"><h2>Defects by class</h2><div id="qr-matrix" class="table-wrap"></div></div>
+      <div id="qr-detail" class="card" hidden>
+        <h2 id="qr-detail-title"></h2>
+        <p id="qr-detail-head" class="detail-head"></p>
+        <div id="qr-evidence"></div>
+        <section class="evidence"><h3>Map</h3><div id="qr-map"></div></section>
+        <details id="qr-all" class="more">
+          <summary>All measures</summary>
+          <h3>Rivals</h3>
+          <div id="qr-rivals" class="table-wrap"></div>
+          <h3>Provenance</h3>
+          <div id="qr-provenance" class="table-wrap"></div>
+        </details>
+      </div>
+      <div id="qr-list" class="card"><h2>Cells</h2>
+        <p id="qr-filter" class="filter-line"></p>
+        <div id="qr-cells" class="table-wrap"></div></div>
+      <div class="card"><h2>Glossary</h2><dl id="qr-glossary" class="glossary"></dl></div>
     </section>
 
     <!-- cells -->
     <section id="tab-cells" class="panel" hidden>
       <p class="empty">Select a dataset.</p>
-      <div id="rg-tiles" class="tiles"></div>
+      <div class="card"><h2>Hyperparameters</h2><div id="rg-params" class="table-wrap"></div></div>
+      <div class="card"><h2>Leaves per class</h2><div id="rg-classes" class="table-wrap"></div></div>
       <div class="card"><h2>Tree of a class</h2>
-        <p class="note">Each class is cut on its own, by geometry alone, into cells of about the same size: the units
-          every defect is measured on. A Ward tree is built on a sample of the class's distinct rows (each weighted by
-          its copies in the CSV), and every row joins its nearest sampled row; from the root, a node of more than
-          max_rows rows is split into its two children, until every node left is a cell. A branch under min_rows rows
-          is no cell of its own: its rows join the nearest cell. The cells have the same size limit in every class, so
-          that two cells compared are sampled alike, and a defect touching a share of a cell is not diluted in a larger
-          group. The tree drawn is this cut: its leaves are the cells, each node counts the distinct rows of the cells
-          below it (hover for the rows of the CSV). A drawing holds at most <span id="rg-tree-nodes"></span> nodes:
-          from its top, the node with the most rows is opened first, as the cut splits; a node left closed hangs a
-          triangle over the number of its cells, and a click on it draws it on its own, a level down. The path above
-          the tree leads back up. Click a node to map its rows.</p>
-        <div class="filters"><label class="inline">class <select id="rg-class"></select></label></div>
+        <div class="filters">
+          <label class="inline">class <select id="rg-class"></select></label>
+          <label class="inline">colour by <select id="rg-color"></select></label>
+        </div>
         <nav id="rg-path" class="crumbs" aria-label="levels of the tree" hidden></nav>
         <div id="rg-tree"></div>
         <h3 id="rg-map-title">Map</h3>
-        <p class="note" id="rg-map-note"></p>
+        <p id="rg-region" class="filter-line" hidden></p>
         <div id="rg-map"></div></div>
-      <div class="card"><h2>Cells per class</h2>
-        <div id="rg-classes" class="table-wrap"></div></div>
-      <div class="card"><h2>Cells</h2>
-        <div id="rg-sizes"></div>
-        <div id="rg-table" class="table-wrap"></div></div>
     </section>
 
-    <!-- quality -->
-    <section id="tab-quality" class="panel" hidden>
+    <!-- data -->
+    <section id="tab-data" class="panel" hidden>
       <p class="empty">Select a dataset.</p>
-      <p id="qr-summary" class="summary"></p>
-      <details class="card howto">
-        <summary>How to read</summary>
-        <dl>
-          <dt>rows, CSV rows</dt>
-          <dd>Rows are the distinct rows stage clean kept; CSV rows count their copies too. Every measure is computed
-            on distinct rows; shares of the dataset are in CSV rows.</dd>
-          <dt>cells and regions</dt>
-          <dd>Every defect is measured on the cells, compact groups of at most the same number of rows in every class
-            (see the cells tab). For reading, neighbouring cells of a class are merged into a region up their tree,
-            while they have the same defects between cells (class_overlap and shortcut) against the same classes,
-            and the same host of atypical_source; the defects of single rows (invalid_values, duplicates,
-            label_conflict) are counted over the region. A region so hides nothing its cells show.</dd>
-          <dt>defects</dt>
-          <dd>A cell or a region has a defect when its definition below holds; there is one threshold, &tau; =
-            <span data-stat="tau"></span>, the share of a cell's rows that may be confused with another class's.
-            Defects are listed in the order invalid_values, duplicates, label_conflict, class_overlap, shortcut,
-            atypical_source.</dd>
-          <dt>invalid_values</dt>
-          <dd>At least one row holds a cell that is empty, not a number where a number is due (unparsable), NaN or
-            infinite.</dd>
-          <dt>duplicates</dt>
-          <dd>At least one row comes more than once in the CSV, label included: copies can fall on both sides of a
-            train/test split (Flood et al., EuroS&amp;P 2024).</dd>
-          <dt>label_conflict</dt>
-          <dd>At least one row is identical on every feature, as read from the CSV, to a row of another class: no
-            classifier can tell them apart.</dd>
-          <dt>provenance</dt>
-          <dd>Where the CSV rows of a cell come from, when the dataset names the columns (source and destination
-            address and port, time): never a feature; only the source address has a defect, atypical_source, the
-            rest are facts to read beside the defects. Per column, over the cell's CSV rows (each copy with its own,
-            an empty value left out): the most frequent value and its share, the distinct values, the effective
-            number, exp of the entropy of their shares (Hill's number of order 1): as many equally frequent values
-            have the same entropy, 1 for a single value; and the <i>excess</i>, the most the cell holds of one value
-            over the typical cell of its class (below). For the time, the window holding the central
-            1 &minus; &tau; of the cell's rows (from the &tau;/2 to the 1 &minus; &tau;/2 quantile), so a few stray
-            rows do not widen it, and its share of the same window of its class. A cell from one host in a few
-            minutes is likely one recording, which a classifier can learn by heart. The destination and the ports
-            follow the service, so a cell of one of them is common; the source is the machine.</dd>
-          <dt>rivals</dt>
-          <dd>The cells of other classes a cell is measured against: for each of
-            <span data-stat="rival_rows"></span> random rows of it, the nearest row of another class; the cells those
-            rows lie in are its rivals. Each pair is measured on at most <span data-stat="max_rows_per_cell"></span>
-            random rows per cell.</dd>
-          <dt>confusion</dt>
-          <dd>The share of a cell's rows that the better of two simple classifiers gets wrong against a rival: the
-            1-NN on every column (<i>nn_error</i>: the row's nearest other row is the rival's) and the best rule on a
-            single column (a threshold on a number, a value-to-class map on a categorical; OneR, Holte 1993). Any
-            classifier errs at least as much as the best one can; the 1-NN alone overstates the error when columns
-            that do not separate swamp the distance. <i>bayes_error_low</i> is the least error any classifier could
-            reach, from the pair's nn_error (Cover &amp; Hart; an approximation on few rows).</dd>
-          <dt>class_overlap</dt>
-          <dd>Against at least one rival, the confusion of the cell's rows is &tau; or more.</dd>
-          <dt>shortcut</dt>
-          <dd>Against at least one rival the confusion is under &tau;, but removing at most
-            <span data-stat="max_group"></span> columns (the <i>key columns</i>, each the one whose removal raises the
-            1-NN error the most, chosen on half of the rows and measured on the other half) brings it to &tau;: the
-            separation rests on those few columns.</dd>
-          <dt>atypical_source</dt>
-          <dd>At least &tau; of the cell's CSV rows come from one source address more than in the typical cell of
-            its class: its share of that host less the host's typical share, the median of its shares in the cells
-            of the class (a cell without it counting 0; so 0 for a host in at most half of them). One machine's
-            traffic in a class of many, which a classifier can learn by heart, or traffic of another kind under the
-            class's label; a class that all comes from one host has none. Measured when the dataset names its source
-            address.</dd>
-        </dl>
-      </details>
-      <div class="filters view-switch" role="tablist">
-        <button class="chip" type="button" data-view="classes">classes</button>
-        <button class="chip" type="button" data-view="regions">regions</button>
-      </div>
-      <div id="qr-classes-view" class="card"><h2>Classes</h2>
-        <p class="note">Per defect, the share of the class's CSV rows that have it: invalid_values, duplicates and
-          label_conflict are facts of the row itself (of the copies of a row, all but the first are duplicates),
-          class_overlap, shortcut and atypical_source of its cell. no defect: the rows with none of them.</p>
-        <div id="qr-classes" class="table-wrap"></div></div>
-      <div id="qr-regions-view" class="stack">
-        <div id="qr-detail" class="card" hidden>
-          <h2 id="qr-detail-title"></h2>
-          <p id="qr-detail-head" class="detail-head"></p>
-          <h3>Cells</h3>
-          <div id="qr-cells" class="table-wrap"></div>
-          <h3>Where its rows come from</h3>
-          <p id="qr-provenance-note" class="note"></p>
-          <div id="qr-provenance" class="table-wrap"></div>
-          <h3>Rivals of other classes</h3>
-          <p class="note">Every pair of one of its cells and a cell of another class, the most confused first. "here"
-            is this region's cell, "there" the rival. Click one to open the rival's region.</p>
-          <div id="qr-neighbours" class="table-wrap"></div>
-          <h3>Confusion with every column and without the key columns</h3>
-          <p id="qr-bars-note" class="note"></p>
-          <div id="qr-bars"></div>
-          <h3 id="qr-map-title">Map</h3>
-          <p id="qr-map-note" class="note"></p>
-          <div id="qr-map"></div>
-          <h3>Rows identical to rows of other classes</h3>
-          <p id="qr-conflicts-note" class="note"></p>
-          <div id="qr-conflicts" class="table-wrap"></div>
-          <h3>Null and invalid values</h3>
-          <div id="qr-missing" class="table-wrap"></div>
-        </div>
-        <div class="card"><h2>Regions</h2>
-          <div class="filters">
-            <label class="inline">class <select id="qr-class"></select></label>
-            <div id="qr-filters" class="chips"></div>
-          </div>
-          <p class="note">Click a region for its cells, their rivals, identical rows and null values.</p>
-          <div id="qr-regions" class="table-wrap"></div></div>
-      </div>
+      <div class="card"><h2>Hyperparameters</h2><div id="sp-params" class="table-wrap"></div></div>
+      <div id="sp-tiles" class="tiles"></div>
+      <div class="card"><h2>Classes</h2><div id="sp-classes" class="table-wrap"></div></div>
+      <div class="card"><h2>Removed</h2>
+        <h3>Classes under min_class_count distinct rows</h3>
+        <div id="sp-dropped" class="chips"></div>
+        <h3 class="gap">Columns with a single value</h3>
+        <div id="sp-constant" class="chips"></div></div>
+      <div class="card"><h2>Provenance</h2><div id="sp-provenance" class="table-wrap"></div></div>
     </section>
 
   </main>
