@@ -5,12 +5,22 @@ A dataset may name the columns of its rows' source and destination
 say whether a group of rows is many hosts at many times or one host in
 a few minutes. Stage clean reads them for every row of the CSV, copies
 included (the copies of a row may come from different hosts), and stage
-quality_report measures them per cell.
+quality_report measures them per cell: how concentrated its values are
+(concentration, time_window), and how much more of one value it holds
+than the typical cell of its class (excess), the measure of the defect
+atypical_source (src.quality) on the source address.
 """
 
 from __future__ import annotations
 
-__all__ = ["KEYS", "TIME", "concentration", "read_provenance", "time_window"]
+__all__ = [
+    "KEYS",
+    "TIME",
+    "concentration",
+    "excess",
+    "read_provenance",
+    "time_window",
+]
 
 from collections.abc import Mapping
 
@@ -86,6 +96,76 @@ def concentration(group: np.ndarray, values: pl.Series, m: int) -> pl.DataFrame:
         every.join(by_group, on="group", how="left")
         .sort("group")
         .with_columns(pl.col("n_values").fill_null(0))
+        .drop("group")
+    )
+
+
+def excess(
+    group: np.ndarray, values: pl.Series, group_class: np.ndarray, m: int
+) -> pl.DataFrame:
+    """Return, per group of rows, the value it holds most over the typical group of its class.
+
+    The share of a value in a group is over the group's rows with a
+    value, as in concentration. Its typical share in a class is the
+    median of its shares in the n groups of the class with a value: the
+    ceil(n / 2)-th smallest, a group without it counting 0, every group
+    alike (the groups are the units, each a cell). It is so 0 for a
+    value in at most half of the groups, and a part of the class that
+    holds one value apart does not move the others' typical share, as
+    the mean would. The excess of a group is the most its share of one
+    of its values exceeds that value's typical share: 0 in a class of a
+    single group, near 1 for a group of one value its class seldom has.
+
+    Args:
+        group: The group of every row (its cell), in [0, m).
+        values: The value of every row, text or Categorical; a null is
+            unknown and left out.
+        group_class: The class of every group, shape (m,).
+        m: The number of groups.
+
+    Returns:
+        One row per group, 0 to m - 1 in order: excess_value (String:
+        the value of the highest excess, ties to the first in text
+        order) and excess (Float64: its share in the group less its
+        typical share in the class); null for a group without a value.
+    """
+    groups = pl.DataFrame(
+        {"group": np.arange(m, dtype=group.dtype), "cls": np.asarray(group_class)}
+    )
+    rows = pl.DataFrame({"group": group, "value": values}).drop_nulls("value")
+    shares = (
+        rows.group_by("group", "value")
+        .len()
+        .with_columns(pl.col("value").cast(pl.String))
+        .with_columns(share=pl.col("len") / pl.col("len").sum().over("group"))
+        .join(groups, on="group")
+        .with_columns(
+            n=pl.col("group").n_unique().over("cls"),  # its class's groups with a value
+            held=pl.len().over("cls", "value"),  # those holding this value
+            rank=pl.col("share").rank("ordinal").over("cls", "value"),
+        )
+    )
+    # The ceil(n / 2)-th smallest share, after the n - held zeros: none
+    # of the held shares when the zeros reach it, and the typical share 0.
+    position = (pl.col("n") + 1) // 2 - (pl.col("n") - pl.col("held"))
+    typical = shares.filter(pl.col("rank") == position).select(
+        "cls", "value", typical="share"
+    )
+    best = (
+        shares.join(typical, on=["cls", "value"], how="left")
+        .select(
+            "group",
+            excess_value="value",
+            excess=pl.col("share") - pl.col("typical").fill_null(0.0),
+        )
+        .sort(["group", "excess", "excess_value"], descending=[False, True, False])
+        .group_by("group", maintain_order=True)
+        .first()
+    )
+    return (
+        groups.select("group")
+        .join(best, on="group", how="left")
+        .sort("group")
         .drop("group")
     )
 

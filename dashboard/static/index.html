@@ -107,13 +107,14 @@
           <dt>cells and regions</dt>
           <dd>Every defect is measured on the cells, compact groups of at most the same number of rows in every class
             (see the cells tab). For reading, neighbouring cells of a class are merged into a region up their tree,
-            while they have the same defects between cells (class_overlap and shortcut) against the same classes;
-            the defects of single rows (invalid_values, duplicates, label_conflict) are counted over the region. A
-            region so hides nothing its cells show.</dd>
+            while they have the same defects between cells (class_overlap and shortcut) against the same classes,
+            and the same host of atypical_source; the defects of single rows (invalid_values, duplicates,
+            label_conflict) are counted over the region. A region so hides nothing its cells show.</dd>
           <dt>defects</dt>
           <dd>A cell or a region has a defect when its definition below holds; there is one threshold, &tau; =
             <span data-stat="tau"></span>, the share of a cell's rows that may be confused with another class's.
-            Defects are listed in the order invalid_values, duplicates, label_conflict, class_overlap, shortcut.</dd>
+            Defects are listed in the order invalid_values, duplicates, label_conflict, class_overlap, shortcut,
+            atypical_source.</dd>
           <dt>invalid_values</dt>
           <dd>At least one row holds a cell that is empty, not a number where a number is due (unparsable), NaN or
             infinite.</dd>
@@ -125,13 +126,16 @@
             classifier can tell them apart.</dd>
           <dt>provenance</dt>
           <dd>Where the CSV rows of a cell come from, when the dataset names the columns (source and destination
-            address and port, time): never a feature and never a defect, a fact to read beside them. Per column, over
-            the cell's CSV rows (each copy with its own, an empty value left out): the most frequent value and its
-            share, the distinct values, and the effective number, exp of the entropy of their shares (Hill's number
-            of order 1): as many equally frequent values have the same entropy, 1 for a single value. For the time,
-            the window holding the central 1 &minus; &tau; of the cell's rows (from the &tau;/2 to the
-            1 &minus; &tau;/2 quantile), so a few stray rows do not widen it. A cell from one host in a few minutes
-            is likely one recording, which a classifier can learn by heart.</dd>
+            address and port, time): never a feature; only the source address has a defect, atypical_source, the
+            rest are facts to read beside the defects. Per column, over the cell's CSV rows (each copy with its own,
+            an empty value left out): the most frequent value and its share, the distinct values, the effective
+            number, exp of the entropy of their shares (Hill's number of order 1): as many equally frequent values
+            have the same entropy, 1 for a single value; and the <i>excess</i>, the most the cell holds of one value
+            over the typical cell of its class (below). For the time, the window holding the central
+            1 &minus; &tau; of the cell's rows (from the &tau;/2 to the 1 &minus; &tau;/2 quantile), so a few stray
+            rows do not widen it, and its share of the same window of its class. A cell from one host in a few
+            minutes is likely one recording, which a classifier can learn by heart. The destination and the ports
+            follow the service, so a cell of one of them is common; the source is the machine.</dd>
           <dt>rivals</dt>
           <dd>The cells of other classes a cell is measured against: for each of
             <span data-stat="rival_rows"></span> random rows of it, the nearest row of another class; the cells those
@@ -151,6 +155,13 @@
             <span data-stat="max_group"></span> columns (the <i>key columns</i>, each the one whose removal raises the
             1-NN error the most, chosen on half of the rows and measured on the other half) brings it to &tau;: the
             separation rests on those few columns.</dd>
+          <dt>atypical_source</dt>
+          <dd>At least &tau; of the cell's CSV rows come from one source address more than in the typical cell of
+            its class: its share of that host less the host's typical share, the median of its shares in the cells
+            of the class (a cell without it counting 0; so 0 for a host in at most half of them). One machine's
+            traffic in a class of many, which a classifier can learn by heart, or traffic of another kind under the
+            class's label; a class that all comes from one host has none. Measured when the dataset names its source
+            address.</dd>
         </dl>
       </details>
       <div class="filters view-switch" role="tablist">
@@ -160,7 +171,7 @@
       <div id="qr-classes-view" class="card"><h2>Classes</h2>
         <p class="note">Per defect, the share of the class's CSV rows that have it: invalid_values, duplicates and
           label_conflict are facts of the row itself (of the copies of a row, all but the first are duplicates),
-          class_overlap and shortcut of its cell. no defect: the rows with none of the five.</p>
+          class_overlap, shortcut and atypical_source of its cell. no defect: the rows with none of them.</p>
         <div id="qr-classes" class="table-wrap"></div></div>
       <div id="qr-regions-view" class="stack">
         <div id="qr-detail" class="card" hidden>

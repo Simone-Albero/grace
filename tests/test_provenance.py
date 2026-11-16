@@ -7,7 +7,7 @@ import numpy as np
 import polars as pl
 import pytest
 
-from src.provenance import TIME, concentration, read_provenance, time_window
+from src.provenance import TIME, concentration, excess, read_provenance, time_window
 
 FORMAT = "%Y-%m-%d %H:%M:%S%.f"
 
@@ -63,6 +63,49 @@ def test_concentration_of_each_group_by_hand():
     for g in (2, 3):
         assert out.row(g) == (None, None, 0, None)
     as_categories = concentration(group, values.cast(pl.Categorical), 5)
+    assert as_categories.equals(out)
+
+
+def test_excess_against_the_typical_group_of_its_class_by_hand():
+    # Class 0: groups 0-3; class 1: groups 4-7; class 2: groups 8-9.
+    rows = [
+        (0, "a"), (0, "a"), (0, "a"), (0, "b"),
+        (1, "a"), (1, "b"),
+        (2, "a"), (2, "a"), (2, "a"), (2, "a"),
+        (3, "a"), (3, "c"), (3, "c"), (3, "c"),
+        (4, "a"), (4, "a"), (4, "d"), (4, "d"),
+        (5, "d"), (5, "e"),
+        (6, "d"), (6, "e"), (6, None),
+        (7, None),
+        (8, "e"), (8, "f"), (8, "f"),
+    ]  # fmt: skip
+    order = np.random.default_rng(0).permutation(len(rows))  # in no order
+    group = np.array([rows[i][0] for i in order])
+    values = pl.Series([rows[i][1] for i in order])
+    group_class = np.array([0, 0, 0, 0, 1, 1, 1, 1, 2, 2])
+    out = excess(group, values, group_class, 10)
+    assert out.columns == ["excess_value", "excess"]
+    assert out.schema == {"excess_value": pl.String, "excess": pl.Float64}
+    # Class 0, four groups with a value, the typical share the 2nd
+    # smallest: a is in all four (0.75, 0.5, 1, 0.25), typically 0.5; b
+    # in half of them and c in one, typically 0.
+    # Group 0: a 0.75 - 0.5 and b 0.25 - 0 tie, to the first in text order.
+    assert out.row(0) == ("a", 0.25)
+    assert out.row(1) == ("b", 0.5)
+    assert out.row(2) == ("a", 0.5)
+    # Its share of a is under the typical one, of c far over.
+    assert out.row(3) == ("c", 0.75)
+    # Class 1, three groups with a value (group 7 holds a null only), the
+    # 2nd smallest: d is in all three at 0.5, e in two of three (more
+    # than half: 0, 0.5, 0.5 gives 0.5), a in one (0); class 0's a,
+    # typically 0.5 there, is not class 1's.
+    assert out.row(4) == ("a", 0.5)
+    assert out.row(5) == out.row(6) == ("d", 0.0)
+    assert out.row(7) == (None, None)
+    # Class 2, one group with a value: it is its own typical group.
+    assert out.row(8) == ("e", 0.0)
+    assert out.row(9) == (None, None)
+    as_categories = excess(group, values.cast(pl.Categorical), group_class, 10)
     assert as_categories.equals(out)
 
 

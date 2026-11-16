@@ -163,6 +163,10 @@ def test_quality(reported, client):
         assert set(region["defects"]) <= set(DEFECTS)
         for key in ("overlap_with", "shortcut_with", "conflict_with"):
             assert isinstance(region[key], list)
+        # the host of its atypical_source, and the highest excess of its cells
+        assert {"src_ip_excess_value", "src_ip_excess"} <= set(region)
+        if "atypical_source" in region["defects"]:
+            assert region["src_ip_excess_value"] is not None
     assert any(r["defects"] for r in data["regions"])
 
 
@@ -177,10 +181,13 @@ def test_quality_region_of_a_region_in_a_label_conflict(reported, client):
     assert len(cells) == data["region"]["n_cells"]
     assert all(c["region"] == region for c in data["cells"])
     measured = {
-        f"{k}_{m}" for k in KEYS for m in ("top", "top_share", "n_values", "eff_n")
+        f"{k}_{m}"
+        for k in KEYS
+        for m in ("top", "top_share", "n_values", "eff_n", "excess_value", "excess")
     }
+    timed = {"time_from", "time_to", "time_window", "time_window_share"}
     for cell in data["cells"]:
-        assert measured | {"time_from", "time_to", "time_window"} <= set(cell)
+        assert measured | timed <= set(cell)
         assert 0 < cell["src_ip_top_share"] <= 1 and cell["src_ip_n_values"] >= 1
     assert sum(c["n_rows"] for c in data["cells"]) == data["region"]["n_rows"]
     assert data["pairs"] and all(

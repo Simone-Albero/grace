@@ -1,6 +1,7 @@
 """Every stage end to end on the small synthetic dataset."""
 
 import json
+import math
 import sqlite3
 from collections import Counter
 from datetime import datetime
@@ -382,7 +383,9 @@ def test_quality_classes_count_the_rows_of_every_class(reported):
 def test_quality_classes_share_the_csv_rows_with_each_defect(reported):
     classes = _table(reported, "quality_classes").sort("class")
     cells = _table(reported, "quality_cells").with_columns(
-        rival=pl.col("defects").fill_null("").str.contains("class_overlap|shortcut")
+        of_cell=pl.col("defects")
+        .fill_null("")
+        .str.contains("class_overlap|shortcut|atypical_source")
     )
     has = lambda d: pl.col("defects").fill_null("").str.contains(d)  # noqa: E731
     by_hand = (
@@ -394,15 +397,17 @@ def test_quality_classes_share_the_csv_rows_with_each_defect(reported):
             label_conflict=pl.col("conflict_read").sum(),
             class_overlap=pl.col("n_read").filter(has("class_overlap")).sum(),
             shortcut=pl.col("n_read").filter(has("shortcut")).sum(),
+            atypical_source=pl.col("n_read").filter(has("atypical_source")).sum(),
             # a row with no defect: a first copy, with no null value and in no
-            # conflict, in a cell without class_overlap or shortcut
-            lo=pl.when(pl.col("rival"))
+            # conflict, in a cell without class_overlap, shortcut or
+            # atypical_source
+            lo=pl.when(pl.col("of_cell"))
             .then(0)
             .otherwise(
                 pl.col("n_rows") - pl.col("missing_rows") - pl.col("conflict_rows")
             )
             .sum(),
-            hi=pl.when(pl.col("rival"))
+            hi=pl.when(pl.col("of_cell"))
             .then(0)
             .otherwise(
                 pl.col("n_rows") - pl.max_horizontal("missing_rows", "conflict_rows")
@@ -484,6 +489,7 @@ def test_quality_cells_judge_every_cell(reported):
             r["conflict_rows"],
             overlap,
             shortcut,
+            r["src_ip_excess"] >= tau,
         )
         assert r["defects"] == (",".join(defects) or None)
         if r["shortcut_rival"] is not None:
@@ -497,8 +503,13 @@ def test_quality_regions_are_the_largest_branches_of_cells_that_agree(reported):
     cells = _table(reported, "quality_cells").sort("cell")
     regions = _table(reported, "quality_regions").sort("region")
     tree = _read(reported, "cell_tree.parquet").sort("node")
+    host = [
+        r["src_ip_excess_value"] if "atypical_source" in (r["defects"] or "") else None
+        for r in cells.iter_rows(named=True)
+    ]
     profile = [
-        (r["overlap_with"], r["shortcut_with"]) for r in cells.iter_rows(named=True)
+        (r["overlap_with"], r["shortcut_with"], h)
+        for r, h in zip(cells.iter_rows(named=True), host)
     ]
     expected, offset = [], 0
     for code in range(len(classes)):
@@ -528,6 +539,7 @@ def test_quality_regions_are_the_largest_branches_of_cells_that_agree(reported):
             pl.col("overlap_with").unique(),
             pl.col("shortcut_with").unique(),
             pl.col("confusion").max(),
+            pl.col("src_ip_excess").max(),
         )
         .sort("region")
     )
@@ -538,10 +550,17 @@ def test_quality_regions_are_the_largest_branches_of_cells_that_agree(reported):
     assert regions["confusion"].to_list() == pytest.approx(
         summed["confusion"].to_list()
     )
+    assert regions["src_ip_excess"].to_list() == pytest.approx(
+        summed["src_ip_excess"].to_list()
+    )
+    of_region = cells["region"].to_numpy()
     for r, s in zip(regions.iter_rows(named=True), summed.iter_rows(named=True)):
-        # the cells of a region share their classes of class_overlap and shortcut
+        # the cells of a region share their classes of class_overlap and
+        # shortcut, and the host of atypical_source
         assert s["overlap_with"] == [r["overlap_with"]]
         assert s["shortcut_with"] == [r["shortcut_with"]]
+        (shared,) = {host[c] for c in np.flatnonzero(of_region == r["region"])}
+        assert r["src_ip_excess_value"] == shared
         defects = defects_of(
             r["missing_rows"],
             r["n_rows"],
@@ -549,6 +568,7 @@ def test_quality_regions_are_the_largest_branches_of_cells_that_agree(reported):
             r["conflict_rows"],
             _codes(r["overlap_with"], classes),
             _codes(r["shortcut_with"], classes),
+            shared is not None,
         )
         assert r["defects"] == (",".join(defects) or None)
 
@@ -646,6 +666,13 @@ def test_quality_report_refuses_cells_of_other_data(copy_of_done):
         copy_of_done.run("quality_report")
 
 
+def _central(times: list, tau: Fraction) -> tuple:
+    """The first and last time left once k = floor((n - 1) tau / 2) are cut at each end."""
+    times = sorted(times)
+    k = int((len(times) - 1) * tau / 2)
+    return times[k], times[len(times) - 1 - k]
+
+
 def test_quality_cells_measure_where_their_csv_rows_come_from(reported):
     cfg = load_config(str(reported.dataset), method=str(reported.method))
     tau = Fraction(str(cfg.method.quality.tau))
@@ -653,6 +680,7 @@ def test_quality_cells_measure_where_their_csv_rows_come_from(reported):
     provenance = _read(reported, "provenance.parquet")
     cell = _read(reported, "assignments.parquet").sort("row")["cell"].to_numpy()
     of = cell[provenance["row"].to_numpy()]
+    shares = {key: [] for key in KEYS}  # per key, per cell: {value: its share}
     for c, row in enumerate(cells.iter_rows(named=True)):
         assert row["cell"] == c
         mine = provenance.filter(pl.Series(of == c))
@@ -665,12 +693,41 @@ def test_quality_cells_measure_where_their_csv_rows_come_from(reported):
             assert row[f"{key}_top_share"] == pytest.approx(counts[top] / len(values))
             assert row[f"{key}_n_values"] == len(counts)
             assert row[f"{key}_eff_n"] == pytest.approx(np.exp(-(p * np.log(p)).sum()))
-        times = sorted(mine[TIME].drop_nulls().to_list())
-        k = int((len(times) - 1) * tau / 2)
-        first, last = times[k], times[len(times) - 1 - k]
+            shares[key].append({v: Fraction(n, len(values)) for v, n in counts.items()})
+        first, last = _central(mine[TIME].drop_nulls().to_list(), tau)
         assert row["time_from"] == first.strftime("%Y-%m-%d %H:%M:%S")
         assert row["time_to"] == last.strftime("%Y-%m-%d %H:%M:%S")
         assert row["time_window"] == pytest.approx((last - first).total_seconds())
+    # The excess: a cell's share of one of its values less the typical
+    # share of that value in its class, the ceil(n / 2)-th smallest of its
+    # shares in the class's n cells (0 in a cell without it).
+    of_class = cells["class"].to_list()
+    for key in KEYS:
+        for c, row in enumerate(cells.iter_rows(named=True)):
+            mates = [
+                shares[key][o]
+                for o in range(cells.height)
+                if of_class[o] == of_class[c]
+            ]
+            over = {}
+            for v, share in shares[key][c].items():
+                typical = sorted(d.get(v, Fraction(0)) for d in mates)
+                over[v] = share - typical[math.ceil(len(mates) / 2) - 1]
+            best = max(over.values())
+            assert row[f"{key}_excess"] == pytest.approx(float(best))
+            assert over[row[f"{key}_excess_value"]] == best
+    # The time window as a share of the window of the class's CSV rows.
+    for name in set(of_class):
+        own = [c for c in range(cells.height) if of_class[c] == name]
+        times = provenance.filter(pl.Series(np.isin(of, own)))[TIME]
+        first, last = _central(times.drop_nulls().to_list(), tau)
+        whole = (last - first).total_seconds()
+        for c in own:
+            share = cells["time_window_share"][c]
+            if whole > 0:
+                assert share == pytest.approx(cells["time_window"][c] / whole)
+            else:
+                assert share is None
 
 
 def test_the_planted_provenance_shows_in_its_cells(reported):
@@ -689,3 +746,42 @@ def test_the_planted_provenance_shows_in_its_cells(reported):
     # The background has many hosts in every cell.
     background = cells.filter(pl.col("class") == "class_1")
     assert (background["src_ip_eff_n"] > 10).all()
+
+
+def test_the_planted_source_is_atypical_for_its_class(reported):
+    cells = _table(reported, "quality_cells")
+    atypical = cells.filter(
+        pl.col("defects").fill_null("").str.contains("atypical_source")
+    )
+    # The canonical sub-group of class_4 comes from a host the rest of
+    # its class never has: every cell of it, and only of it, in class_4.
+    planted = cells.filter(
+        (pl.col("class") == "class_4") & (pl.col("src_ip_top") == "18.99.9.9")
+    )
+    assert planted.height and (planted["src_ip_top_share"] > 0.9).all()
+    assert set(planted["cell"]) == set(
+        atypical.filter(pl.col("class") == "class_4")["cell"]
+    )
+    assert set(planted["src_ip_excess_value"]) == {"18.99.9.9"}
+    assert (planted["src_ip_excess"] > 0.9).all()
+    # class_5 comes all from one host: typical of it, so no cell is
+    # atypical; nor is any of the background, of many hosts.
+    assert not atypical["class"].is_in(["class_1", "class_5"]).any()
+
+
+def test_quality_without_a_source_address_does_not_measure_atypical_source(
+    copy_of_done,
+):
+    raw = yaml.safe_load(copy_of_done.dataset.read_text())
+    del raw["provenance"]
+    copy_of_done.dataset.write_text(yaml.safe_dump(raw, sort_keys=False))
+    copy_of_done.run("quality_report")
+    stats = _table(copy_of_done, "quality_stats").row(0, named=True)
+    assert stats["share_atypical_source"] is None
+    assert stats["regions_atypical_source"] is None
+    assert stats["share_no_defect"] is not None
+    classes = _table(copy_of_done, "quality_classes")
+    assert classes["share_atypical_source"].is_null().all()
+    for table in ("quality_cells", "quality_regions"):
+        defects = _table(copy_of_done, table)["defects"].fill_null("")
+        assert not defects.str.contains("atypical_source").any()

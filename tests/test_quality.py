@@ -5,6 +5,7 @@ import polars as pl
 import pytest
 
 from src.quality import (
+    CLASS_DEFECTS,
     DEFECTS,
     RIVAL_DEFECTS,
     ROW_DEFECTS,
@@ -225,7 +226,9 @@ def _judge(case: str) -> tuple[tuple[int, ...], tuple[str, ...], tuple[str, ...]
     dependence = feature_dependence(a, b, column_of, 3, seed=0)
     confusion = pair_confusion(a, b, column_of, numeric, dependence)
     a_defects, b_defects = (
-        defects_of(0, 10, 10.0, 0, *rival_defects([(1, confusion[:, side])], 0.1))
+        defects_of(
+            0, 10, 10.0, 0, *rival_defects([(1, confusion[:, side])], 0.1), False
+        )
         for side in (0, 1)
     )
     return dependence.group, a_defects, b_defects
@@ -307,11 +310,12 @@ def test_rival_defects_by_hand():
 
 
 def test_defects_of_by_hand():
-    assert defects_of(0, 10, 10.0, 0, (), ()) == ()
-    assert defects_of(1, 10, 10.0, 0, (), ()) == ("invalid_values",)
-    assert defects_of(0, 10, 12.0, 0, (), ()) == ("duplicates",)
-    assert defects_of(0, 10, 10.0, 2, (), ()) == ("label_conflict",)
-    assert defects_of(0, 10, 10.0, 0, (2,), ()) == ("class_overlap",)
-    assert defects_of(0, 10, 10.0, 0, (), (3,)) == ("shortcut",)
-    assert defects_of(1, 10, 11.0, 1, [4], [2]) == DEFECTS
-    assert DEFECTS == ROW_DEFECTS + RIVAL_DEFECTS
+    assert defects_of(0, 10, 10.0, 0, (), (), False) == ()
+    assert defects_of(1, 10, 10.0, 0, (), (), False) == ("invalid_values",)
+    assert defects_of(0, 10, 12.0, 0, (), (), False) == ("duplicates",)
+    assert defects_of(0, 10, 10.0, 2, (), (), False) == ("label_conflict",)
+    assert defects_of(0, 10, 10.0, 0, (2,), (), False) == ("class_overlap",)
+    assert defects_of(0, 10, 10.0, 0, (), (3,), False) == ("shortcut",)
+    assert defects_of(0, 10, 10.0, 0, (), (), True) == ("atypical_source",)
+    assert defects_of(1, 10, 11.0, 1, [4], [2], True) == DEFECTS
+    assert DEFECTS == ROW_DEFECTS + RIVAL_DEFECTS + CLASS_DEFECTS

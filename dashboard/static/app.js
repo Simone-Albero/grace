@@ -28,6 +28,8 @@ const pctSmall = (v) => (v > 0 && v < 0.001 ? `${Number((v * 100).toPrecision(1)
 const num = (v) => (v == null ? "–" : Number(v).toLocaleString("en-US"));
 const dec = (v, d = 3) => (v == null ? "–" : Number(v).toFixed(d));
 const short = (v) => (v == null ? "–" : String(Number(Number(v).toPrecision(3))));
+// a difference of shares, with its sign: +12.5%, −3.0%
+const signed = (v) => (v == null ? "–" : `${v < 0 ? "−" : "+"}${pct(Math.abs(v))}`);
 const when = (iso) => (iso ? `${iso.replace("T", " ").slice(0, 16)} UTC` : "–");
 // a span of seconds in its largest unit: 45 s, 12 min, 3.2 h, 2.1 days
 const duration = (v) => {
@@ -946,7 +948,10 @@ function panZoom(svg, draw) {
 }
 
 // the defects of a cell or a region, in the order of src.quality.DEFECTS
-const DEFECTS = ["invalid_values", "duplicates", "label_conflict", "class_overlap", "shortcut"];
+const DEFECTS = ["invalid_values", "duplicates", "label_conflict", "class_overlap", "shortcut", "atypical_source"];
+
+/** The defects the last quality run measured: atypical_source needs the source address (share null without it). */
+const measuredDefects = () => DEFECTS.filter((d) => last.quality.stats[`share_${d}`] != null);
 const RIVAL_BARS = 12; // most pairs drawn as bars in a region's detail, the most confused first
 
 /** One sentence per column of the quality tables, shown on hover of the header. */
@@ -960,6 +965,8 @@ const HELP = {
   conflicts: "rows identical on every feature to rows of another class, and of which classes (label_conflict)",
   overlap: "the classes its cells have class_overlap against, then the highest confusion of its cells with a rival",
   shortcut: "the classes its cells have shortcut against: a separation that rests on a few columns",
+  atypical: "the source host its cells hold the most over the typical cell of their class, and by how much " +
+    "(atypical_source from τ); otherwise the highest such excess of its cells",
   confusion: "share of the cell's rows the better of 1-NN and the best single-column rule confuses with the rival's " +
     "(class_overlap from τ), and that rival's class",
   nn: "share of rows whose nearest row is in the other cell (0 apart, about 0.5 mixed)",
@@ -1006,6 +1013,7 @@ const ROWS_WITH = {
   label_conflict: "identical to a row of another class",
   class_overlap: "in a cell with class_overlap",
   shortcut: "in a cell with shortcut",
+  atypical_source: "in a cell with atypical_source",
 };
 
 /** The classes table: per defect, the share of the class's CSV rows with it, and with none. */
@@ -1017,8 +1025,8 @@ function drawClassTable() {
     { key: "n_cells", label: "cells", format: num },
     { key: "n_regions", label: "regions", format: num },
     { key: "share_no_defect", label: "no defect", format: share,
-      help: "share of the class's CSV rows with none of the five defects" },
-    ...DEFECTS.map((d) => ({ key: `share_${d}`, label: d, format: pctSmall,
+      help: "share of the class's CSV rows with none of the defects" },
+    ...measuredDefects().map((d) => ({ key: `share_${d}`, label: d, format: pctSmall,
       help: `share of the class's CSV rows ${ROWS_WITH[d]}` })),
   ], last.quality.classes);
 }
@@ -1050,7 +1058,8 @@ function drawRegionList() {
   $("qr-class").replaceChildren(h("option", { value: "" }, "all classes"), ...classes.map((c) => h("option", { value: c }, c)));
   $("qr-class").value = state.qclass ?? "";
   const ofClass = data.regions.filter((r) => state.qclass == null || r.class === state.qclass);
-  fill("qr-filters", [null, "none", ...DEFECTS].map((f) => {
+  const measured = measuredDefects();
+  fill("qr-filters", [null, "none", ...measured].map((f) => {
     const chip = h("button", { class: "chip", type: "button", "aria-pressed": String(state.qfilter === f) },
       `${f ?? "all"} (${num(ofClass.filter((r) => passes(r, f)).length)})`);
     chip.onclick = () => { state.qfilter = f; drawRegionList(); };
@@ -1070,6 +1079,10 @@ function drawRegionList() {
     if (!v.length) return h("span", { class: "muted" }, worst || "no rival measured");
     return h("span", {}, flagged(`with ${v.join(", ")}`, true), h("span", { class: "muted" }, ` · ${worst}`));
   };
+  const atypicalText = (v, r) => {
+    if (r.src_ip_excess_value != null) return flagged(`${r.src_ip_excess_value} · ${signed(v)}`, true);
+    return v == null ? "" : h("span", { class: "muted" }, `highest excess ${signed(v)}`);
+  };
   sortable($("qr-regions"), [
     { key: "region", label: "region" },
     { key: "class", label: "class", text: true },
@@ -1083,6 +1096,8 @@ function drawRegionList() {
     { key: "overlap_with", label: "class_overlap", format: overlapText, help: HELP.overlap, wrap: true },
     { key: "shortcut_with", label: "shortcut", format: (v) => (v.length ? flagged(`with ${v.join(", ")}`, true) : ""),
       help: HELP.shortcut, wrap: true },
+    ...(measured.includes("atypical_source") ? [{ key: "src_ip_excess", label: "atypical_source",
+      format: atypicalText, help: HELP.atypical, wrap: true }] : []),
   ], ofClass.filter((r) => passes(r, state.qfilter)), {
     onClick: (r) => selectRegion(r.region),
     selected: (r) => r.region === state.region,
@@ -1146,7 +1161,7 @@ async function drawDetail() {
         "its confusion without them", wrap: true },
     { key: "defects", label: "defects", format: chips, wrap: true },
   ], d.cells);
-  drawProvenance(d.cells);
+  drawProvenance(d.cells, tau);
   const sides = d.pairs.map((p) => {
     const [s, o] = p.region_a === row.region ? ["a", "b"] : ["b", "a"];
     return {
@@ -1201,8 +1216,13 @@ const PROVENANCE = ["src_ip", "src_port", "dst_ip", "dst_port"];
 /** "YYYY-MM-DD HH:MM:SS → HH:MM:SS", the day written once when both times fall on it. */
 const span = (from, to) => `${from} → ${to.slice(0, 10) === from.slice(0, 10) ? to.slice(11) : to}`;
 
-/** The provenance of a region's cells: per column its top value and share, its values, and the time window. */
-function drawProvenance(cells) {
+/**
+ * The provenance of a region's cells: per column its top value and share, its values and its excess over the
+ * typical cell of its class, and the time window with its share of the class's.
+ * @param {object[]} cells the quality_cells rows of the region
+ * @param {number} tau quality.tau: atypical_source from it, on src_ip
+ */
+function drawProvenance(cells, tau) {
   const keys = PROVENANCE.filter((k) => cells.some((c) => c[`${k}_n_values`] != null));
   const timed = cells.some((c) => c.time_window != null);
   if (!keys.length && !timed) {
@@ -1211,20 +1231,33 @@ function drawProvenance(cells) {
     return;
   }
   $("qr-provenance-note").textContent = "Per cell and column, over its CSV rows: the most frequent value and its share, " +
-    "then the distinct values and the effective number (exp of the entropy; 1: one value). The window holds the central " +
-    `1 − τ of the cell's rows. Sorted on a column, by the share of its top value.`;
+    "then the distinct values and the effective number (exp of the entropy; 1: one value), then the excess: the most " +
+    "the cell holds of one value over the typical cell of its class (its value named when it is not the top one); " +
+    `atypical_source from τ on src_ip. The window holds the central 1 − τ of the cell's rows, then its share of the ` +
+    "class's window. Sorted on a column, by the share of its top value.";
+  const excessOf = (k, r) => {
+    const v = r[`${k}_excess`];
+    if (v == null) return "";
+    const named = r[`${k}_excess_value`] !== r[`${k}_top`] ? ` (${r[`${k}_excess_value`]})` : "";
+    const text = `${signed(v)} over its class${named}`;
+    return k === "src_ip" && v >= tau ? h("span", {}, " · ", flagged(text, true)) : h("span", { class: "muted" }, ` · ${text}`);
+  };
   const valueOf = (k) => (v, r) => (r[`${k}_n_values`] ? h("span", {},
     h("span", {}, `${r[`${k}_top`]} · ${pct(v)}`),
     h("span", { class: "muted" }, ` · ${num(r[`${k}_n_values`])} ${r[`${k}_n_values`] === 1 ? "value" : "values"}` +
-      (r[`${k}_n_values`] > 1 ? `, eff ${short(r[`${k}_eff_n`])}` : ""))) : "–");
+      (r[`${k}_n_values`] > 1 ? `, eff ${short(r[`${k}_eff_n`])}` : "")),
+    excessOf(k, r)) : "–");
   sortable($("qr-provenance"), [
     { key: "cell", label: "cell" },
     { key: "n_read", label: "CSV rows", format: num, help: HELP.read },
     ...keys.map((k) => ({ key: `${k}_top_share`, label: k, format: valueOf(k), wrap: true,
-      help: `the most frequent ${k} of the cell's CSV rows and its share, its distinct values and their effective number` })),
+      help: `the most frequent ${k} of the cell's CSV rows and its share, its distinct values and their effective ` +
+        "number, and the most it holds of one value over the typical cell of its class" })),
     ...(timed ? [{ key: "time_window", label: "time window", wrap: true,
-      format: (v, r) => (v == null ? "–" : h("span", {}, duration(v), h("span", { class: "muted" }, ` · ${span(r.time_from, r.time_to)}`))),
-      help: "the window holding the central 1 − τ of the cell's CSV rows in time, and its first and last second" }] : []),
+      format: (v, r) => (v == null ? "–" : h("span", {}, duration(v), h("span", { class: "muted" },
+        ` · ${span(r.time_from, r.time_to)}` + (r.time_window_share == null ? "" : ` · ${pct(r.time_window_share)} of its class's`)))),
+      help: "the window holding the central 1 − τ of the cell's CSV rows in time, its first and last second, and its " +
+        "share of the same window of its class's CSV rows" }] : []),
   ], cells);
 }
 

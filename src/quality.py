@@ -13,11 +13,17 @@ when (DEFECTS, defects_of):
 - shortcut: against a rival that share is under tau, but removing at
   most max_group columns, chosen on half of the rows and measured on
   the other half (feature_dependence), brings it to tau: the separation
-  rests on those few columns.
+  rests on those few columns;
+- atypical_source: at least tau of its rows come from one source host
+  more than in the typical cell of its class (src.provenance.excess of
+  the source address): one machine's traffic, which a classifier can
+  learn by heart, or traffic of another kind under the class's label.
 The first three are facts of single rows (ROW_DEFECTS): counted in any
-group of rows, they are never diluted. The last two are measured between
+group of rows, they are never diluted. The next two are measured between
 two cells (RIVAL_DEFECTS, rival_defects), so the cells are small enough
-that a defect touching tau of a cell's rows is seen. The rows confused
+that a defect touching tau of a cell's rows is seen. The last is
+measured between a cell and the other cells of its class
+(CLASS_DEFECTS), when the dataset names its source address. The rows confused
 are those that the better of two simple classifiers gets wrong
 (pair_confusion): the leave-one-out 1-NN on every column (nearest_error;
 by Cover & Hart its error lies between the least error any classifier
@@ -36,6 +42,7 @@ pair.
 from __future__ import annotations
 
 __all__ = [
+    "CLASS_DEFECTS",
     "DEFECTS",
     "RIVAL_DEFECTS",
     "ROW_DEFECTS",
@@ -67,7 +74,8 @@ from src.graph import sample_rows
 
 ROW_DEFECTS = ("invalid_values", "duplicates", "label_conflict")
 RIVAL_DEFECTS = ("class_overlap", "shortcut")
-DEFECTS = ROW_DEFECTS + RIVAL_DEFECTS
+CLASS_DEFECTS = ("atypical_source",)
+DEFECTS = ROW_DEFECTS + RIVAL_DEFECTS + CLASS_DEFECTS
 
 
 def label_conflicts(features: pl.DataFrame, labels: np.ndarray) -> np.ndarray:
@@ -496,13 +504,15 @@ def defects_of(
     conflict_rows: int,
     overlap: Iterable[int],
     shortcut: Iterable[int],
+    atypical: bool,
 ) -> tuple[str, ...]:
     """Return the defects of a cell or of a region of cells, in DEFECTS order.
 
     invalid_values when a row has a null or invalid cell, duplicates
     when it has copies (n_read > n_rows), label_conflict when a row
     equals a row of another class; class_overlap and shortcut when
-    there is a class against which it has them (rival_defects).
+    there is a class against which it has them (rival_defects);
+    atypical_source when its source is atypical for its class.
 
     Args:
         missing_rows: Its rows with a null or invalid cell.
@@ -511,6 +521,8 @@ def defects_of(
         conflict_rows: Its rows equal to a row of another class.
         overlap: The classes it has class_overlap against.
         shortcut: The classes it has shortcut against.
+        atypical: Whether the excess of its source address
+            (src.provenance.excess) is tau or more.
 
     Returns:
         The defects; empty when it has none.
@@ -521,6 +533,7 @@ def defects_of(
         "label_conflict": conflict_rows > 0,
         "class_overlap": bool(tuple(overlap)),
         "shortcut": bool(tuple(shortcut)),
+        "atypical_source": bool(atypical),
     }
     return tuple(defect for defect in DEFECTS if found[defect])
 

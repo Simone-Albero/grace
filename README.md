@@ -2,8 +2,8 @@
 
 Data quality through the geometry of the data: each class is cut into cells of about the same size, every cell is
 checked for the defects of a dataset after the data design smells of Flood et al. (EuroS&P 2024) (invalid values,
-duplicates, label conflicts, class overlap and shortcuts), and neighbouring cells with the same defects are merged into
-regions for reading. Each defect has a one-line definition, and the report has a single threshold, tau, the share of a
+duplicates, label conflicts, class overlap and shortcuts) and against the other cells of its class (a source atypical
+for it), and neighbouring cells with the same defects are merged into regions for reading. Each defect has a one-line definition, and the report has a single threshold, tau, the share of a
 cell's rows that may be confused with another class's.
 
 ```
@@ -94,29 +94,43 @@ Stages (each writes its files into the dataset's `output_dir` and its rows into 
   | `label_conflict` | a row equals a row of another class on every feature | no classifier can tell them apart |
   | `class_overlap` | against a rival cell, its confusion is tau or more | even the better classifier mixes the two |
   | `shortcut` | against a rival cell its confusion is under tau, but removing at most `max_group` key columns brings it to tau | the separation rests on those few columns |
+  | `atypical_source` | at least tau of its CSV rows come from one source address more than in the typical cell of its class | one machine's traffic, which a classifier can learn by heart, or traffic of another kind under the class's label |
 
-  The first three are facts of single rows: counted in a group of any size, they are never diluted. The last two are
-  measured between cells, at the resolution of the cells. The cells of a class are then merged into regions up their
-  tree: a region is the largest branch whose cells all have the same classes of `class_overlap` and of `shortcut`,
-  and its row defects are counted over its rows. Measuring the merged regions instead would dilute again: on
+  The first three are facts of single rows: counted in a group of any size, they are never diluted. The next two are
+  measured between cells, at the resolution of the cells. The last compares a cell with the other cells of its class,
+  on the source address of the provenance (below); a dataset without it does not measure it (its shares are null).
+  The cells of a class are then merged into regions up their tree: a region is the largest branch whose cells all
+  have the same classes of `class_overlap` and of `shortcut` and the same host of `atypical_source`, and its row
+  defects are counted over its rows. Measuring the merged regions instead would dilute again: on
   cic_2018_v2 it loses 1.9% of the rows with `class_overlap` and 2.5% with `shortcut` (8% and 12% on the synthetic
   dataset), so the regions only gather what the cells found. Per cell (`quality_cells`) and per region
   (`quality_regions`): the copies, the rows in a label conflict and the classes they conflict with, the rows with a
   null or invalid value by kind, the classes of `class_overlap` and of `shortcut`, the highest confusion with a rival
-  and its class, and the `defects`; per cell also the rival under tau whose confusion rises most when columns are
-  removed (`shortcut_rival`, `shortcut_columns`, `confusion_without`). Per class (`quality_classes`) and over the
-  dataset (`quality_stats`): the share of the CSV rows with each defect and with none. A row has `invalid_values`,
-  `duplicates` (all copies of a row but the first) and `label_conflict` itself, `class_overlap` and `shortcut` through
-  its cell: a region flagged for one conflicting row does not count its other rows as conflicting.
+  and its class, the highest excess of the source (`src_ip_excess`; per region also the host of its
+  `atypical_source`, `src_ip_excess_value`), and the `defects`; per cell also the rival under tau whose confusion rises
+  most when columns are removed (`shortcut_rival`, `shortcut_columns`, `confusion_without`). Per class
+  (`quality_classes`) and over the dataset (`quality_stats`): the share of the CSV rows with each defect and with none.
+  A row has `invalid_values`, `duplicates` (all copies of a row but the first) and `label_conflict` itself,
+  `class_overlap`, `shortcut` and `atypical_source` through its cell: a region flagged for one conflicting row does not
+  count its other rows as conflicting.
 
   Provenance (`src/provenance.py`), when the dataset names its columns: per cell, over its CSV rows (each copy with its
   own, an empty value left out), for each of `src_ip`, `src_port`, `dst_ip` and `dst_port` the most frequent value
   and its share (`<key>_top`, `<key>_top_share`), the distinct values (`<key>_n_values`) and the effective number
   (`<key>_eff_n`, exp of the Shannon entropy of their shares, Hill's number of order 1: as many equally frequent
-  values have the same entropy); for the time, the window holding the central 1 - tau of the cell's rows, from the
-  tau/2 to the 1 - tau/2 quantile (`time_from`, `time_to`, `time_window` in seconds), so a few stray rows do not
-  widen it. A measure, not a defect: no threshold. A cell from one host in a few minutes is likely one recording,
-  which a classifier can learn by heart, and geometry alone does not see it.
+  values have the same entropy), and the excess (`<key>_excess`, `<key>_excess_value`): the most the cell's share of
+  one of its values exceeds that value's typical share in its class, the median of its shares in the n cells of the
+  class (the ceil(n/2)-th smallest, a cell without it counting 0, every cell alike); for the time, the window holding
+  the central 1 - tau of the cell's rows, from the tau/2 to the 1 - tau/2 quantile (`time_from`, `time_to`,
+  `time_window` in seconds), so a few stray rows do not widen it, and its share of the same window of its class's rows
+  (`time_window_share`). A cell from one host in a few minutes is likely one recording, which a classifier can learn by
+  heart, and geometry alone does not see it. Only the source address has a defect, `atypical_source`: its excess
+  reaches tau. Against the class, not as a share alone, so a class that all comes from one host (an attack from one
+  machine) has none, and a host in a class of many does. Against the typical cell, not the class's mean: a part of the
+  class from one host would lower the mean share of every other host, and the cells of the rest would rise over it
+  (on the synthetic dataset, a cell of class_4 at 0.102 with the mean; with the median, only the planted cells).
+  The destination and the ports follow the service (on cic_2018_v2 nearly every Benign cell has one destination
+  port), so their excess is a measure only.
 
 Configs:
 - `configs/datasets/`: one yaml per dataset: `name`, `path`, `label_col`, `num_cols`, `cat_cols`,
@@ -142,7 +156,8 @@ kind), `dropped_classes`, `dropped_columns`,
 each class, each node with the distinct and CSV rows below it), `class_cells`, `cell_stats` (cells); `quality_pairs`
 (every pair of a cell and a rival), `quality_cells`, `quality_regions`, `quality_classes`, `cell_missing` (the null and
 invalid cells by cell, column and kind), `label_conflict_groups` (every row in a label conflict, with its group),
-`quality_stats` (with tau and the share of the CSV rows with each defect and with none)
+`quality_stats` (with tau and the share of the CSV rows with each defect and with none; `atypical_source` null
+without a source address)
 (quality_report). There are no migrations: a new column is added to its table, an old one stays, empty for the new
 runs; to drop the old ones, delete the DB.
 
@@ -159,8 +174,9 @@ rows as points. The quality tab has a summary line, a "How to read" box with eve
 explains itself on hover) and two panels. Classes: per class, its cells and regions and the share of its CSV rows
 with each defect and with none. Regions: filtered by class and by defect, one column per defect saying what was found
 (which null cells, the copies, how many rows identical to which classes, the classes of `class_overlap` and of
-`shortcut`). A click on a region opens its detail (`/quality/region`, `/quality/map`): its cells, where their rows
-come from (when the dataset names its provenance), every pair of one of
+`shortcut`, the host of `atypical_source`; a defect the dataset does not measure is left out). A click on a region
+opens its detail (`/quality/region`, `/quality/map`): its cells, where their rows come from and how much more of one
+value they hold than the typical cell of their class (when the dataset names its provenance), every pair of one of
 them and a rival with every measure from its side, the confusion of the most confused pairs with every column and
 after each key column removed, a map of its cells and their rivals by class, the heaviest groups of rows identical to
 rows of other classes with their values, and its null cells by column. The URL hash keeps tab and dataset, on the
@@ -174,8 +190,8 @@ Layout:
 - `dashboard/`: FastAPI `app.py`, read-only `queries.py`, `static/` (one page, hand-made SVG charts)
 - `generate_synthetic.py`: the synthetic dataset, a ladder of sub-groups per class that overlap their rivals by
   known margins (the `true_subgroup` column records it; no stage reads it), and the provenance of every row, with two
-  planted artefacts: class_5 from a single host, the canonical sub-group of class_4 from one host on one source port
-  within 5 minutes
+  planted artefacts: class_5 from a single host (typical of it: no `atypical_source`), the canonical sub-group of
+  class_4 from one host on one source port within 5 minutes (its cells, and only they, have `atypical_source`)
 - `tests/`: the suite; the session fixture runs every stage once on a 12,000-row synthetic CSV
 
 To add:
@@ -183,7 +199,8 @@ To add:
   columns and `output_dir`, and pass its name to `--dataset`.
 - a pair measure: a function of `src/quality.py` called in `_pair_measures` of `stages/quality_report.py`, per side
   (`_a`, `_b`) and their mean.
-- a defect: its rule in `defects_of` (and in `rival_defects` if it is measured against a rival) and its name in
+- a defect: its rule in `defects_of` (and in `rival_defects` if it is measured against a rival, in the profile of
+  `_merge` if it is measured on a cell) and its name in
   `DEFECTS` (`src/quality.py`), and its line in the table above: one definition, and tau as its threshold if it needs
   one.
 

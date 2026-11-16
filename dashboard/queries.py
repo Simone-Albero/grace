@@ -190,7 +190,9 @@ def quality(cfg: DatasetConfig) -> dict[str, Any]:
         cfg: The dataset.
 
     Returns:
-        run; stats (the quality_stats row); classes (quality_classes);
+        run; stats (the quality_stats row; regions_ and
+        share_atypical_source null when the dataset names no source
+        address, and so the classes'); classes (quality_classes);
         regions (quality_regions, defects and the class lists as
         lists); missing (cell_missing summed by region, column and
         kind: [{region, column, kind, n_rows, n_read}], none when no
