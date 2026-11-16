@@ -16,6 +16,7 @@ from src import db
 from src.cells import CellTree, merge_cells
 from src.config import DatasetConfig
 from src.data import DUPLICATES, KINDS, LABEL
+from src.provenance import KEYS, TIME, concentration, time_window
 from src.quality import (
     DEFECTS,
     RIVAL_DEFECTS,
@@ -40,6 +41,7 @@ from stages.paths import (
     read_classes,
     read_data,
     read_points,
+    read_provenance,
     read_unparsable,
     read_weights,
 )
@@ -68,7 +70,12 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     class_overlap and of shortcut; region id = region + offset, by class
     -> per region: quality.defects_of on its rows and the classes its
     cells share -> per class and over the dataset: the share of the CSV
-    rows with each defect and with none (_shares).
+    rows with each defect and with none (_shares). With cfg.provenance,
+    on provenance.parquet (paths.read_provenance: every row of the CSV,
+    with the row of the data file it is a copy of; "run clean again"
+    when they disagree): per cell, provenance.concentration of each of
+    its keys of provenance.KEYS and provenance.time_window (q.tau) of
+    its time, over the CSV rows of the cell.
 
     Logs: quality_pairs (cell_a, class_a, region_a, cell_b, class_b,
     region_b, n_conflicts, n_conflicts_read; nn_error_a, nn_error_b,
@@ -93,7 +100,11 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     whose removal of key columns raises its side's confusion the most,
     shortcut_columns (the first key columns that bring it to tau, all
     of them otherwise) and confusion_without (its confusion without
-    them); defects joined by ","; null for an empty list),
+    them); defects joined by ","; null for an empty list; with
+    cfg.provenance, per configured key of provenance.KEYS <key>_top,
+    <key>_top_share, <key>_n_values and <key>_eff_n, and with its time
+    time_from and time_to ("YYYY-MM-DD HH:MM:SS") and time_window
+    (seconds)),
     quality_regions (region, class, n_cells, then the counts of
     quality_cells summed over its cells, conflict_with, overlap_with
     and shortcut_with as its cells', confusion: the highest of its
@@ -192,6 +203,9 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
         )
         for c in range(len(cell_class))
     ]
+    if cfg.provenance is not None:
+        for row, measured in zip(cell_rows, _provenance(cfg, cell, weights, q.tau)):
+            row.update(measured)
     region_rows = _region_rows(cell_rows, region, classes)
     class_rows = _class_rows(cell_rows, region_rows, clean, classes)
     found = {d: sum(d in _listed(r["defects"]) for r in region_rows) for d in DEFECTS}
@@ -521,6 +535,45 @@ def _shares(cell_rows: list[dict], clean: np.ndarray) -> dict[str, float]:
         **{f"share_{d}": found[d] / n_read for d in DEFECTS},
         "share_no_defect": sum(int(clean[r["cell"]]) for r in cell_rows) / n_read,
     }
+
+
+def _provenance(
+    cfg: DatasetConfig, cell: np.ndarray, weights: np.ndarray, tau: float
+) -> list[dict]:
+    """Return, per cell, the provenance columns of its quality_cells row.
+
+    Args:
+        cfg: The dataset config, with a provenance.
+        cell: The cell of every row of the data file.
+        weights: The copies of every row of the data file in the CSV.
+        tau: quality.tau, the share of a cell's rows its time window may
+            leave out.
+
+    Returns:
+        One dict per cell, in cell order: <key>_top, <key>_top_share,
+        <key>_n_values and <key>_eff_n per key of provenance.KEYS in the
+        file, then time_from, time_to and time_window with its time.
+
+    Raises:
+        ValueError: When provenance.parquet is not of the rows of the
+            data file ("run clean again").
+    """
+    origin = read_provenance(cfg)
+    row = origin["row"].to_numpy()
+    if not np.array_equal(np.bincount(row, minlength=len(cell)), weights):
+        raise ValueError("the provenance is of other rows: run clean again")
+    group, m = cell[row], int(cell.max()) + 1
+    parts = [
+        concentration(group, origin[key], m).rename(lambda c, k=key: f"{k}_{c}")
+        for key in KEYS
+        if key in origin.columns
+    ]
+    if TIME in origin.columns:
+        window = time_window(group, origin[TIME], m, tau)
+        text = pl.col("time_from", "time_to").dt.to_string("%Y-%m-%d %H:%M:%S")
+        parts.append(window.with_columns(text))
+    print(f"[quality_report] provenance of {len(row)} CSV rows measured", flush=True)
+    return pl.concat(parts, how="horizontal").to_dicts()
 
 
 def _missing_rows(

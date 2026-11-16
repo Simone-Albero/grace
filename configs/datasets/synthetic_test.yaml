@@ -28,6 +28,14 @@ cat_cols:
   - cat_1
   - cat_2
 
+provenance:  # where each CSV row comes from, never a feature: measured per cell
+  src_ip: src_ip
+  src_port: src_port
+  dst_ip: dst_ip
+  dst_port: dst_port
+  time: timestamp
+  time_format: "%Y-%m-%d %H:%M:%S%.f"
+
 min_class_count: 3000  # classes with fewer rows are dropped
 top_n: 128  # most frequent values of a categorical column with their own one-hot slot; the others share one
 seed: 42

@@ -1,6 +1,8 @@
 """Shared fixtures: a small synthetic dataset through every stage."""
 
 __all__ = [
+    "COPY_SRC",
+    "COPY_TIME",
     "N_DUPLICATES",
     "ROOT",
     "STAGE_ORDER",
@@ -25,6 +27,8 @@ ROOT = Path(__file__).resolve().parents[1]
 STAGE_ORDER = ("clean", "prepare", "cells")
 N_DUPLICATES = 52  # copies synthetic_csv appends
 UNPARSABLE_ROW = 100  # the first row of class_1 from here gets num_1 = "n/a"
+COPY_SRC = "10.255.0.1"  # the source of the copies of rows 0-49
+COPY_TIME = "2018-02-21 08:00:00.000000"  # and their time, a day after the capture
 
 
 @dataclass(frozen=True)
@@ -92,11 +96,14 @@ def synthetic_csv(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """A 12000-row synthetic CSV; class_10 keeps 500 rows, too few.
 
     A constant column, flat, is added for stage clean to drop, and
-    N_DUPLICATES copies at the end: rows 0-49 once more, row 50 twice
-    more. The first row of class_1 from UNPARSABLE_ROW on reads "n/a" in
-    num_1, and comes back once more with num_1 empty: no copy, two rows.
-    Row 51 comes back under another class, which is not a copy but a
-    label conflict, the last row of the data.
+    N_DUPLICATES copies at the end: rows 0-49 once more, from COPY_SRC
+    at COPY_TIME (a copy is equal on the features, not on where it
+    comes from), row 50 twice more, once with no src_ip and once with a
+    timestamp that is no time. The first row of class_1 from
+    UNPARSABLE_ROW on reads "n/a" in num_1, and comes back once more
+    with num_1 empty: no copy, two rows. Row 51 comes back under another
+    class, which is not a copy but a label conflict, the last row of the
+    data.
     """
     csv = tmp_path_factory.mktemp("data") / "synthetic.csv"
     subprocess.run(
@@ -112,7 +119,13 @@ def synthetic_csv(tmp_path_factory: pytest.TempPathFactory) -> Path:
         .otherwise(pl.lit("class_1"))
     )
     relabelled = rows.slice(51, 1).with_columns(other_class.alias("label"))
-    copies = [rows.head(50), rows.slice(50, 1), rows.slice(50, 1)]
+    copies = [
+        rows.head(50).with_columns(
+            src_ip=pl.lit(COPY_SRC), timestamp=pl.lit(COPY_TIME)
+        ),
+        rows.slice(50, 1).with_columns(src_ip=pl.lit(None, pl.String)),
+        rows.slice(50, 1).with_columns(timestamp=pl.lit("n/a")),
+    ]
     bad = rows.with_row_index("i").filter(
         (pl.col("i") >= UNPARSABLE_ROW) & (pl.col("label") == "class_1")
     )["i"][0]

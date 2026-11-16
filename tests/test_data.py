@@ -2,6 +2,7 @@
 
 import math
 
+import numpy as np
 import polars as pl
 import pytest
 
@@ -59,11 +60,14 @@ def test_drop_duplicates_counts_copies_within_a_label():
             "y": ["a", "a", "a", "a", "b", "b", "b"],
         }
     )
-    kept = drop_duplicates(rows)
+    kept, copy_of = drop_duplicates(rows)
     assert kept.columns == ["v", "c", "y", DUPLICATES]
     assert kept["c"].to_list() == ["x", "y", None, "x"]
     assert kept["y"].to_list() == ["a", "a", "b", "b"]
     assert kept[DUPLICATES].to_list() == [2, 2, 2, 1]
+    # Every row read points at its kept copy.
+    assert copy_of.dtype == np.int64
+    assert copy_of.tolist() == [0, 1, 0, 1, 2, 2, 3]
 
 
 def _text() -> pl.DataFrame:
@@ -104,7 +108,7 @@ def test_unparsable_cells_list_the_kept_columns_row_by_row():
 
 def test_drop_duplicates_keeps_an_unparsable_cell_apart_from_an_empty_one():
     text = pl.DataFrame({"a": ["n/a", None, None], "y": ["k", "k", "k"]})
-    kept = drop_duplicates(read_numbers(text, ["a"]))
+    kept, _ = drop_duplicates(read_numbers(text, ["a"]))
     assert kept[UNPARSABLE].to_list() == ["a", None]
     assert kept[DUPLICATES].to_list() == [1, 2]
 

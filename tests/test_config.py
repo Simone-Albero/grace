@@ -157,3 +157,35 @@ def test_shortcut_cols_are_unknown(tmp_path):
     path.write_text(yaml.safe_dump({**raw, "shortcut_cols": ["num_1"]}))
     with pytest.raises(ValueError, match="unknown keys"):
         load_config(str(path))
+
+
+def test_the_provenance_block_is_read_and_optional():
+    provenance = load_config("synthetic_test").provenance
+    assert provenance.columns() == {
+        "src_ip": "src_ip",
+        "src_port": "src_port",
+        "dst_ip": "dst_ip",
+        "dst_port": "dst_port",
+        "time": "timestamp",
+    }
+    assert provenance.time_format == "%Y-%m-%d %H:%M:%S%.f"
+    netflow = load_config("cic_2018_v2").provenance
+    assert list(netflow.columns()) == ["src_ip", "src_port", "dst_ip", "dst_port"]
+    assert load_config("letter_recognition").provenance is None
+
+
+@pytest.mark.parametrize(
+    "block, match",
+    [
+        ({"time": "timestamp"}, "time_format"),
+        ({"src_ip": "src_ip", "time_format": "%Y"}, "time_format"),
+        ({"host": "src_ip"}, "provenance.host"),
+        ({"src_ip": None}, "names no column"),
+    ],
+)
+def test_a_bad_provenance_block_fails(tmp_path, block, match):
+    raw = yaml.safe_load((DATASET_DIR / "synthetic_test.yaml").read_text())
+    path = tmp_path / "provenance.yaml"
+    path.write_text(yaml.safe_dump({**raw, "provenance": block}))
+    with pytest.raises(ValueError, match=match):
+        load_config(str(path))

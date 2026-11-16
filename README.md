@@ -32,7 +32,11 @@ Stages (each writes its files into the dataset's `output_dir` and its rows into 
   quality report can tell them. No row is dropped for a missing or infinite value and nothing is scaled or encoded:
   stage prepare does it. Writes `data.parquet` (the kept columns as read, `n_duplicates`, the class as its code; a
   row's position is its id downstream), `classes.json` and `unparsable.parquet` (row and column of every cell that was
-  not a number).
+  not a number). When the dataset names its provenance columns, it also writes `provenance.parquet`: for every row of
+  the CSV of a kept class, in reading order, the row of `data.parquet` it is a copy of and its source and destination
+  address and port and its time, as read (a copy is equal on the features, not on where it comes from: each keeps its
+  own); `provenance_columns` logs, per column, its empty values, the times `time_format` does not read and the
+  distinct values.
 - `prepare`: the features every distance is measured on (`src/prepare.py`). Each number becomes sign(x)·log1p(|x|),
   then is standardized (mean 0, standard deviation 1; a missing or infinite one lands on the mean, and the column
   `n_missing`, always present and unscaled, counts how many numbers of the row did; it is a diagnostic, no distance
@@ -105,9 +109,21 @@ Stages (each writes its files into the dataset's `output_dir` and its rows into 
   `duplicates` (all copies of a row but the first) and `label_conflict` itself, `class_overlap` and `shortcut` through
   its cell: a region flagged for one conflicting row does not count its other rows as conflicting.
 
+  Provenance (`src/provenance.py`), when the dataset names its columns: per cell, over its CSV rows (each copy with its
+  own, an empty value left out), for each of `src_ip`, `src_port`, `dst_ip` and `dst_port` the most frequent value
+  and its share (`<key>_top`, `<key>_top_share`), the distinct values (`<key>_n_values`) and the effective number
+  (`<key>_eff_n`, exp of the Shannon entropy of their shares, Hill's number of order 1: as many equally frequent
+  values have the same entropy); for the time, the window holding the central 1 - tau of the cell's rows, from the
+  tau/2 to the 1 - tau/2 quantile (`time_from`, `time_to`, `time_window` in seconds), so a few stray rows do not
+  widen it. A measure, not a defect: no threshold. A cell from one host in a few minutes is likely one recording,
+  which a classifier can learn by heart, and geometry alone does not see it.
+
 Configs:
 - `configs/datasets/`: one yaml per dataset: `name`, `path`, `label_col`, `num_cols`, `cat_cols`,
-  `min_class_count`, `top_n`, `seed`, `output_dir`, `db_path`. Four network datasets (`nb15_v2`,
+  `min_class_count`, `top_n`, `seed`, `output_dir`, `db_path`, and optionally `provenance`: the columns of where each
+  row comes from, never features (`src_ip`, `src_port`, `dst_ip`, `dst_port`, `time` with its `time_format`, the
+  chrono format polars reads, e.g. `"%Y-%m-%d %H:%M:%S%.f"`; each optional, a missing one fails clean as a missing
+  feature does). The NetFlow v2 datasets have no time column. Four network datasets (`nb15_v2`,
   `cic_2018_v2`, `ton_iot_v2`, `bot_iot_v2`), five general benchmarks (`bank_marketing`, `covertype`,
   `letter_recognition`, `statlog_landsat_satellite`, `thyroid_disease`) and `synthetic_test`; their CSVs are not in
   the repo.
@@ -122,7 +138,7 @@ SQLite file, `db_path` (`resources/processed/grace.db`). Table `runs` holds one 
 whole config as JSON, status `running`, `ok` or `failed`, start and end); every other table carries the `run_id` of the
 run that wrote it and is created by its first insert: `clean_summary` (with the null and invalid cells read, by
 kind), `dropped_classes`, `dropped_columns`,
-`class_counts`, `features` (clean); `prepare_summary`, `prepared_columns` (prepare); `cells`, `cell_tree` (the cut of
+`class_counts`, `features`, `sources`, `provenance_columns` (clean); `prepare_summary`, `prepared_columns` (prepare); `cells`, `cell_tree` (the cut of
 each class, each node with the distinct and CSV rows below it), `class_cells`, `cell_stats` (cells); `quality_pairs`
 (every pair of a cell and a rival), `quality_cells`, `quality_regions`, `quality_classes`, `cell_missing` (the null and
 invalid cells by cell, column and kind), `label_conflict_groups` (every row in a label conflict, with its group),
@@ -143,7 +159,8 @@ rows as points. The quality tab has a summary line, a "How to read" box with eve
 explains itself on hover) and two panels. Classes: per class, its cells and regions and the share of its CSV rows
 with each defect and with none. Regions: filtered by class and by defect, one column per defect saying what was found
 (which null cells, the copies, how many rows identical to which classes, the classes of `class_overlap` and of
-`shortcut`). A click on a region opens its detail (`/quality/region`, `/quality/map`): its cells, every pair of one of
+`shortcut`). A click on a region opens its detail (`/quality/region`, `/quality/map`): its cells, where their rows
+come from (when the dataset names its provenance), every pair of one of
 them and a rival with every measure from its side, the confusion of the most confused pairs with every column and
 after each key column removed, a map of its cells and their rivals by class, the heaviest groups of rows identical to
 rows of other classes with their values, and its null cells by column. The URL hash keeps tab and dataset, on the
@@ -152,10 +169,13 @@ cells tab class and node, on the quality tab panel and region.
 Layout:
 - `main.py`: the CLI, one stage per call inside a logged run
 - `stages/`: one file per stage, `run(cfg, conn, run_id)`; `stages/paths.py` names every file a stage writes
-- `src/`: config and DB logging, then the method on arrays and frames: data, prepare, graph, cells, quality
+- `src/`: config and DB logging, then the method on arrays and frames: data, prepare, graph, cells, quality,
+  provenance
 - `dashboard/`: FastAPI `app.py`, read-only `queries.py`, `static/` (one page, hand-made SVG charts)
 - `generate_synthetic.py`: the synthetic dataset, a ladder of sub-groups per class that overlap their rivals by
-  known margins (the `true_subgroup` column records it; no stage reads it)
+  known margins (the `true_subgroup` column records it; no stage reads it), and the provenance of every row, with two
+  planted artefacts: class_5 from a single host, the canonical sub-group of class_4 from one host on one source port
+  within 5 minutes
 - `tests/`: the suite; the session fixture runs every stage once on a 12,000-row synthetic CSV
 
 To add:

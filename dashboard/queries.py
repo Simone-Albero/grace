@@ -62,7 +62,9 @@ def clean(cfg: DatasetConfig) -> dict[str, Any]:
         run; summary {n_raw, n_duplicate, n_rare, n_kept, n_classes,
         n_constant}; classes [{label, n_read, n_rows}] sorted by label;
         dropped_classes [{label, n_rows}]; dropped_columns [column];
-        features {num: [...], cat: [...]}.
+        features {num: [...], cat: [...]}; provenance [{key, column,
+        n_read, n_empty, n_unparsable, n_values}] (the provenance_columns
+        rows, none when the dataset names no provenance).
     """
     with closing(_connect(cfg)) as conn:
         run = _latest_run(conn, "clean", cfg)
@@ -86,6 +88,9 @@ def clean(cfg: DatasetConfig) -> dict[str, Any]:
                 kind: [f["column"] for f in features if f["kind"] == kind]
                 for kind in ("num", "cat")
             },
+            "provenance": _rows(
+                conn, "clean", "provenance_columns", run, missing_ok=True
+            ),
         }
 
 
@@ -214,7 +219,8 @@ def quality_region(cfg: DatasetConfig, region: int) -> dict[str, Any]:
 
     Returns:
         region (its quality_regions row, as quality's); cells (its
-        quality_cells rows, the lists as lists); pairs (the quality_pairs
+        quality_cells rows, the lists as lists, with the provenance
+        columns when the dataset names some); pairs (the quality_pairs
         rows with one of its cells, confusion_without_a and _b as
         lists); missing (its cell_missing rows summed by column and
         kind); n_groups (the label conflict groups with a row in it) and

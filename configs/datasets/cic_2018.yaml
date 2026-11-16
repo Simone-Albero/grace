@@ -1,7 +1,7 @@
 # CSE-CIC-IDS2018, corrected release (flows extracted again, Attempted Category added), one CSV per capture day.
-# Not read, as in bruno: id (the raw row id), Flow ID, Src/Dst IP, Src Port, Timestamp, Attempted Category
-# (tied to the label), ICMP Code/Type and the columns that repeat others (Packet Length Variance, Average
-# Packet Size, Fwd/Bwd Segment Size Avg, Subflow *).
+# Not features, as in bruno: id (the raw row id), Flow ID, Src/Dst IP, Src Port, Timestamp (Src/Dst IP and Port and
+# Timestamp are read as provenance), Attempted Category (tied to the label), ICMP Code/Type and the columns that
+# repeat others (Packet Length Variance, Average Packet Size, Fwd/Bwd Segment Size Avg, Subflow *).
 name: cic_2018
 path: resources/raw_data/cic_2018/*.csv  # a glob: every day, read in sorted order
 label_col: Label
@@ -82,6 +82,14 @@ num_cols:
 cat_cols:
   - Protocol
   - Dst Port
+
+provenance:  # where each CSV row comes from, never a feature: measured per cell
+  src_ip: Src IP
+  src_port: Src Port
+  dst_ip: Dst IP
+  dst_port: Dst Port
+  time: Timestamp
+  time_format: "%Y-%m-%d %H:%M:%S%.f"
 
 min_class_count: 50  # classes with fewer rows are dropped
 top_n: 32  # most frequent values of a categorical column with their own one-hot slot; the others share one

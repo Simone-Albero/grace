@@ -43,6 +43,12 @@ cat_cols:
   - DNS_QUERY_TYPE
   - FTP_COMMAND_RET_CODE
 
+provenance:  # where each CSV row comes from, never a feature: measured per cell (NetFlow v2 has no time)
+  src_ip: IPV4_SRC_ADDR
+  src_port: L4_SRC_PORT
+  dst_ip: IPV4_DST_ADDR
+  dst_port: L4_DST_PORT
+
 min_class_count: 5000  # classes with fewer rows are dropped
 top_n: 128  # most frequent values of a categorical column with their own one-hot slot; the others share one
 seed: 42

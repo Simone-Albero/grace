@@ -29,6 +29,14 @@ const num = (v) => (v == null ? "–" : Number(v).toLocaleString("en-US"));
 const dec = (v, d = 3) => (v == null ? "–" : Number(v).toFixed(d));
 const short = (v) => (v == null ? "–" : String(Number(Number(v).toPrecision(3))));
 const when = (iso) => (iso ? `${iso.replace("T", " ").slice(0, 16)} UTC` : "–");
+// a span of seconds in its largest unit: 45 s, 12 min, 3.2 h, 2.1 days
+const duration = (v) => {
+  if (v == null) return "–";
+  if (v < 60) return `${short(v)} s`;
+  if (v < 3600) return `${short(v / 60)} min`;
+  if (v < 86400) return `${short(v / 3600)} h`;
+  return `${short(v / 86400)} days`;
+};
 
 // --- dom helpers ---
 
@@ -249,6 +257,15 @@ function renderClean(data) {
     h("div", { class: "chips" }, data.features.num.map((c) => h("span", { class: "chip" }, c))),
     h("h3", { style: "margin-top:12px" }, `categorical (${data.features.cat.length})`),
     h("div", { class: "chips" }, data.features.cat.map((c) => h("span", { class: "chip" }, c))));
+  sortable($("sp-provenance"), [
+    { key: "key", label: "key", text: true },
+    { key: "column", label: "column", text: true },
+    { key: "n_read", label: "CSV rows", format: num, help: "rows of the CSV of the kept classes, copies included" },
+    { key: "n_empty", label: "empty", format: (v) => flagged(num(v), v > 0) },
+    { key: "n_unparsable", label: "not a time", format: (v, r) => (r.key === "time" ? flagged(num(v), v > 0) : "–"),
+      help: "times that time_format does not read: unknown, as the empty ones" },
+    { key: "n_values", label: "distinct values", format: num },
+  ], data.provenance, { empty: "The dataset names no provenance columns (a provenance block in its yaml)." });
 }
 
 /** Tiles, numeric columns with their scaling, categorical slots with their rows. @param {object} data response of /prepare */
@@ -1105,7 +1122,7 @@ async function drawDetail() {
     `${num(row.n_cells)} ${row.n_cells === 1 ? "cell" : "cells"} · ${num(row.n_rows)} rows · ${num(row.n_read)} CSV rows · ` +
     `${pct(row.dup_share)} copies · `,
     row.defects.length ? h("span", {}, "defects: ", chips(row.defects)) : "no defect");
-  for (const el of ["qr-cells", "qr-neighbours", "qr-bars", "qr-conflicts", "qr-missing"]) {
+  for (const el of ["qr-cells", "qr-provenance", "qr-neighbours", "qr-bars", "qr-conflicts", "qr-missing"]) {
     fill(el, h("p", { class: "note" }, "loading…"));
   }
   const ds = encodeURIComponent(state.dataset);
@@ -1129,6 +1146,7 @@ async function drawDetail() {
         "its confusion without them", wrap: true },
     { key: "defects", label: "defects", format: chips, wrap: true },
   ], d.cells);
+  drawProvenance(d.cells);
   const sides = d.pairs.map((p) => {
     const [s, o] = p.region_a === row.region ? ["a", "b"] : ["b", "a"];
     return {
@@ -1175,6 +1193,39 @@ async function drawDetail() {
     ], d.missing);
   } else fill("qr-missing", h("p", { class: "note" }, "None: every cell of the region is a valid value."));
   drawQualityMap(row, d, id);
+}
+
+// the provenance columns of src.provenance.KEYS, in order; measured per cell when the dataset names them
+const PROVENANCE = ["src_ip", "src_port", "dst_ip", "dst_port"];
+
+/** "YYYY-MM-DD HH:MM:SS → HH:MM:SS", the day written once when both times fall on it. */
+const span = (from, to) => `${from} → ${to.slice(0, 10) === from.slice(0, 10) ? to.slice(11) : to}`;
+
+/** The provenance of a region's cells: per column its top value and share, its values, and the time window. */
+function drawProvenance(cells) {
+  const keys = PROVENANCE.filter((k) => cells.some((c) => c[`${k}_n_values`] != null));
+  const timed = cells.some((c) => c.time_window != null);
+  if (!keys.length && !timed) {
+    $("qr-provenance-note").textContent = "";
+    fill("qr-provenance", h("p", { class: "note" }, "The dataset names no provenance columns (a provenance block in its yaml)."));
+    return;
+  }
+  $("qr-provenance-note").textContent = "Per cell and column, over its CSV rows: the most frequent value and its share, " +
+    "then the distinct values and the effective number (exp of the entropy; 1: one value). The window holds the central " +
+    `1 − τ of the cell's rows. Sorted on a column, by the share of its top value.`;
+  const valueOf = (k) => (v, r) => (r[`${k}_n_values`] ? h("span", {},
+    h("span", {}, `${r[`${k}_top`]} · ${pct(v)}`),
+    h("span", { class: "muted" }, ` · ${num(r[`${k}_n_values`])} ${r[`${k}_n_values`] === 1 ? "value" : "values"}` +
+      (r[`${k}_n_values`] > 1 ? `, eff ${short(r[`${k}_eff_n`])}` : ""))) : "–");
+  sortable($("qr-provenance"), [
+    { key: "cell", label: "cell" },
+    { key: "n_read", label: "CSV rows", format: num, help: HELP.read },
+    ...keys.map((k) => ({ key: `${k}_top_share`, label: k, format: valueOf(k), wrap: true,
+      help: `the most frequent ${k} of the cell's CSV rows and its share, its distinct values and their effective number` })),
+    ...(timed ? [{ key: "time_window", label: "time window", wrap: true,
+      format: (v, r) => (v == null ? "–" : h("span", {}, duration(v), h("span", { class: "muted" }, ` · ${span(r.time_from, r.time_to)}`))),
+      help: "the window holding the central 1 − τ of the cell's CSV rows in time, and its first and last second" }] : []),
+  ], cells);
 }
 
 /**

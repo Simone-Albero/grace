@@ -2,16 +2,28 @@
 
 import json
 import sqlite3
+from collections import Counter
+from datetime import datetime
+from fractions import Fraction
 
 import numpy as np
 import polars as pl
 import pytest
-from conftest import N_DUPLICATES, STAGE_ORDER, Workspace, make_workspace
+import yaml
+from conftest import (
+    COPY_SRC,
+    COPY_TIME,
+    N_DUPLICATES,
+    STAGE_ORDER,
+    Workspace,
+    make_workspace,
+)
 
 from src.cells import CellTree, merge_cells
 from src.config import load_config
 from src.data import DUPLICATES, KINDS, LABEL
 from src.prepare import MISSING, OTHER
+from src.provenance import KEYS, TIME
 from src.quality import DEFECTS, defects_of, rival_defects
 from stages.paths import read_points
 
@@ -87,6 +99,63 @@ def test_clean_names_the_cell_that_was_not_a_number(done):
     assert same.height == 2
     logged = _rows(done, f"SELECT kind FROM features WHERE column = '{DUPLICATES}'")
     assert logged == []
+
+
+def test_clean_writes_where_every_csv_row_comes_from(done, synthetic_csv):
+    provenance = _read(done, "provenance.parquet")
+    data = _read(done, "data.parquet")
+    assert provenance.columns == ["row", *KEYS, TIME]
+    # One row per copy of every row of the data file.
+    reads = np.bincount(provenance["row"].to_numpy(), minlength=data.height)
+    assert np.array_equal(reads, data[DUPLICATES].to_numpy())
+    # In reading order: the rows of the CSV of the kept classes.
+    classes = json.loads((done.output_dir / "classes.json").read_text())
+    csv = pl.read_csv(synthetic_csv, infer_schema=False).with_row_index("line")
+    kept = csv.filter(pl.col("label").is_in(classes))
+    assert provenance.height == kept.height
+    for key in KEYS:
+        assert provenance[key].cast(pl.String).to_list() == kept[key].to_list()
+    assert provenance[TIME][0] == datetime.fromisoformat(kept["timestamp"][0])
+    # A copy is the row of its first copy, with its own source and time.
+    at = {line: i for i, line in enumerate(kept["line"].to_list())}
+    generated = csv.height - N_DUPLICATES - 2
+    copied = [i for i in range(50) if i in at]
+    assert copied
+    for i in copied:
+        original, copy = at[i], at[generated + i]
+        assert provenance["row"][original] == provenance["row"][copy]
+        assert provenance["src_ip"][copy] == COPY_SRC
+        assert provenance[TIME][copy] == datetime.fromisoformat(COPY_TIME)
+    logged = {
+        r[0]: r[1:]
+        for r in _rows(
+            done,
+            "SELECT key, column, n_read, n_empty, n_unparsable, n_values "
+            "FROM provenance_columns",
+        )
+    }
+    assert list(logged) == [*KEYS, TIME]
+    n_src = kept["src_ip"].drop_nulls().n_unique()
+    assert logged["src_ip"] == ("src_ip", kept.height, 1, 0, n_src)
+    for key in ("src_port", "dst_ip", "dst_port"):
+        assert logged[key][1:4] == (kept.height, 0, 0)
+    # The timestamp that is no time.
+    assert logged[TIME] == ("timestamp", kept.height, 0, 1, None)
+    assert provenance[TIME].null_count() == 1
+
+
+def test_clean_without_provenance_writes_none(copy_of_done):
+    raw = yaml.safe_load(copy_of_done.dataset.read_text())
+    del raw["provenance"]
+    copy_of_done.dataset.write_text(yaml.safe_dump(raw, sort_keys=False))
+    assert (copy_of_done.output_dir / "provenance.parquet").exists()
+    copy_of_done.run("clean")
+    assert not (copy_of_done.output_dir / "provenance.parquet").exists()
+    (run,) = _rows(copy_of_done, "SELECT max(id) FROM runs WHERE stage = 'clean'")[0]
+    logged = _rows(
+        copy_of_done, f"SELECT count(*) FROM provenance_columns WHERE run_id = {run}"
+    )
+    assert logged == [(0,)]
 
 
 def test_prepare_has_one_finite_row_per_data_row(done):
@@ -575,3 +644,48 @@ def test_quality_report_refuses_cells_of_other_data(copy_of_done):
     prepared.with_columns(pl.Series(LABEL, shuffled)).write_parquet(prepared_file)
     with pytest.raises(ValueError, match="run cells again"):
         copy_of_done.run("quality_report")
+
+
+def test_quality_cells_measure_where_their_csv_rows_come_from(reported):
+    cfg = load_config(str(reported.dataset), method=str(reported.method))
+    tau = Fraction(str(cfg.method.quality.tau))
+    cells = _table(reported, "quality_cells").sort("cell")
+    provenance = _read(reported, "provenance.parquet")
+    cell = _read(reported, "assignments.parquet").sort("row")["cell"].to_numpy()
+    of = cell[provenance["row"].to_numpy()]
+    for c, row in enumerate(cells.iter_rows(named=True)):
+        assert row["cell"] == c
+        mine = provenance.filter(pl.Series(of == c))
+        for key in KEYS:
+            values = mine[key].cast(pl.String).drop_nulls().to_list()
+            counts = Counter(values)
+            top = min(counts, key=lambda v: (-counts[v], v))
+            p = np.array(list(counts.values())) / len(values)
+            assert row[f"{key}_top"] == top
+            assert row[f"{key}_top_share"] == pytest.approx(counts[top] / len(values))
+            assert row[f"{key}_n_values"] == len(counts)
+            assert row[f"{key}_eff_n"] == pytest.approx(np.exp(-(p * np.log(p)).sum()))
+        times = sorted(mine[TIME].drop_nulls().to_list())
+        k = int((len(times) - 1) * tau / 2)
+        first, last = times[k], times[len(times) - 1 - k]
+        assert row["time_from"] == first.strftime("%Y-%m-%d %H:%M:%S")
+        assert row["time_to"] == last.strftime("%Y-%m-%d %H:%M:%S")
+        assert row["time_window"] == pytest.approx((last - first).total_seconds())
+
+
+def test_the_planted_provenance_shows_in_its_cells(reported):
+    cells = _table(reported, "quality_cells")
+    # class_5 comes from one host: every cell of it, but for the copies.
+    single = cells.filter(pl.col("class") == "class_5")
+    assert set(single["src_ip_top"]) == {"18.5.0.99"}
+    assert (single["src_ip_top_share"] > 0.9).all()
+    # The canonical sub-group of class_4: one host, one port, 5 minutes.
+    planted = cells.filter(pl.col("class") == "class_4").sort(
+        "src_ip_top_share", descending=True
+    )
+    first = planted.row(0, named=True)
+    assert first["src_ip_top"] == "18.99.9.9" and first["src_port_top"] == "31337"
+    assert first["src_ip_top_share"] > 0.9 and first["time_window"] <= 300
+    # The background has many hosts in every cell.
+    background = cells.filter(pl.col("class") == "class_1")
+    assert (background["src_ip_eff_n"] > 10).all()

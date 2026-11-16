@@ -7,6 +7,7 @@ __all__ = ["run"]
 import json
 import sqlite3
 
+import numpy as np
 import polars as pl
 
 from src import db
@@ -26,9 +27,12 @@ from src.data import (
     read_numbers,
     unparsable_cells,
 )
-from stages.paths import classes_file, data_file, unparsable_file
+from src.provenance import TIME, read_provenance
+from stages.paths import classes_file, data_file, provenance_file, unparsable_file
 
 _HEADER = "__header__"
+_ORIGIN = "__provenance__"  # prefix of the provenance keys while the rows are read
+_UNREAD_TIME = "__unread_time__"  # a time that time_format does not read
 
 
 def _read(cfg: DatasetConfig) -> tuple[pl.DataFrame, list[dict[str, object]]]:
@@ -41,18 +45,28 @@ def _read(cfg: DatasetConfig) -> tuple[pl.DataFrame, list[dict[str, object]]]:
     large dataset is never held in memory.
 
     Returns:
-        The rows (as data.read_numbers returns them) and, per file, its
-        name, n_read (its rows kept) and n_header (its repeated header
-        lines dropped).
+        The rows (as data.read_numbers returns them), then, with
+        cfg.provenance, the provenance of each (provenance.
+        read_provenance, every key named _ORIGIN + key, and _UNREAD_TIME
+        True on a time that time_format does not read); and, per file,
+        its name, n_read (its rows kept) and n_header (its repeated
+        header lines dropped).
     """
     columns = [*cfg.num_cols, *cfg.cat_cols, cfg.label_col]
+    origin = cfg.provenance.columns() if cfg.provenance else {}
+    reads = read_provenance(origin, cfg.provenance and cfg.provenance.time_format)
+    extra = [expr.alias(f"{_ORIGIN}{key}") for key, expr in reads.items()]
+    if TIME in origin:
+        unread = pl.col(origin[TIME]).is_not_null() & reads[TIME].is_null()
+        extra.append(unread.alias(_UNREAD_TIME))
     parts, sources = [], []
     for file in csv_files(cfg.path):
         scan = pl.scan_csv(file, infer_schema=False)
-        missing = sorted(set(columns) - set(scan.collect_schema().names()))
+        names = set(scan.collect_schema().names())
+        missing = sorted({*columns, *origin.values()} - names)
         if missing:
             raise ValueError(f"columns missing from {file}: {missing}")
-        flagged = scan.select(columns).with_columns(header_rows(columns).alias(_HEADER))
+        flagged = scan.select(*columns, *extra, header_rows(columns).alias(_HEADER))
         rows = read_numbers(flagged, cfg.num_cols).collect(engine="streaming")
         n_header = int(rows[_HEADER].sum())
         if n_header:
@@ -73,11 +87,13 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
 
     Order: read num_cols, cat_cols and label_col of each CSV of cfg.path
     (data.csv_files: one file or a glob pattern, in sorted order) as
-    text, without the header lines a file repeats (data.header_rows) ->
-    data.read_numbers (num_cols as Float64; a text that is not a number
-    becomes null, marked in UNPARSABLE) -> data.count_kinds ->
-    data.drop_duplicates (one copy of each row equal on every column,
-    the label and UNPARSABLE included, with DUPLICATES = its copies, 1
+    text, without the header lines a file repeats (data.header_rows),
+    with the provenance columns of cfg.provenance when the dataset names
+    them (provenance.read_provenance) -> data.read_numbers (num_cols as
+    Float64; a text that is not a number becomes null, marked in
+    UNPARSABLE) -> data.count_kinds -> data.drop_duplicates (one copy
+    of each row equal on every column, the label and UNPARSABLE
+    included but not the provenance, with DUPLICATES = its copies, 1
     when unique) ->
     data.drop_rare_classes(min_class_count), on the distinct rows ->
     data.constant_columns of num_cols and cat_cols, dropped -> classes
@@ -92,7 +108,13 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     order of first copies among the kept rows, so a row's position is
     its id everywhere downstream),
     classes.json (the names, indexed by code), unparsable.parquet (row of
-    data.parquet, column: the cells whose text was not a number).
+    data.parquet, column: the cells whose text was not a number),
+    provenance.parquet (with cfg.provenance, else removed: one row per
+    row of the CSV of a kept class, in reading order, so the copies of
+    a row each keep their own: row, the row of data.parquet it is a
+    copy of, then the configured keys of provenance.KEYS (Categorical,
+    as read, null when empty) and provenance.TIME (Datetime, null when
+    empty or not a time in time_format)).
     Logs: clean_summary (one row: n_raw, n_duplicate (copies dropped),
     n_rare, n_kept, n_classes, n_constant; n_kept = n_raw -
     n_duplicate - n_rare; then n_empty, n_unparsable, n_nan, n_inf:
@@ -100,7 +122,11 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     dropped_columns (column), class_counts (label, n_read, n_rows:
     rows read and kept), features (column, kind "num" | "cat": the kept
     ones), sources (file, n_read: its rows read, n_header: its repeated
-    header lines dropped; one row per CSV, in reading order).
+    header lines dropped; one row per CSV, in reading order),
+    provenance_columns (with cfg.provenance, one row per configured
+    key: key, column, n_read (the rows of provenance.parquet), n_empty,
+    n_unparsable (times that time_format does not read, 0 for the
+    other keys), n_values (the distinct values, null for the time)).
 
     Raises:
         FileNotFoundError: When cfg.path matches no file.
@@ -109,11 +135,14 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     """
     print(f"[clean] reading {cfg.path}", flush=True)
     raw, sources = _read(cfg)
+    origins = [c for c in raw.columns if c.startswith(_ORIGIN) or c == _UNREAD_TIME]
+    provenance = raw.select(origins)
+    raw = raw.drop(origins)
     n_unlabelled = raw[cfg.label_col].null_count()
     if n_unlabelled:
         raise ValueError(f"{n_unlabelled} rows of {cfg.path} have no {cfg.label_col}")
     kinds = count_kinds(raw, cfg.num_cols, cfg.cat_cols)
-    distinct = drop_duplicates(raw)
+    distinct, copy_of = drop_duplicates(raw)
     kept, rare_classes = drop_rare_classes(distinct, cfg.label_col, cfg.min_class_count)
     if kept.is_empty():
         raise ValueError(f"no class has min_class_count={cfg.min_class_count} rows")
@@ -142,6 +171,16 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
         unparsable_file(cfg)
     )
     classes_file(cfg).write_text(json.dumps(classes))
+    provenance_rows = []
+    if cfg.provenance is None:
+        provenance_file(cfg).unlink(missing_ok=True)
+    else:
+        is_kept = ~np.isin(distinct[cfg.label_col].to_numpy(), rare_classes)
+        kept_row = np.where(is_kept, np.cumsum(is_kept) - 1, -1)
+        provenance, provenance_rows = _provenance(
+            provenance, kept_row[copy_of], cfg.provenance.columns()
+        )
+        provenance.write_parquet(provenance_file(cfg))
     print(f"[clean] saved {data.height} rows", flush=True)
 
     raw_counts = dict(raw[cfg.label_col].value_counts().iter_rows())
@@ -195,3 +234,47 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
         [{"column": column, "kind": "num"} for column in features.num]
         + [{"column": column, "kind": "cat"} for column in features.cat],
     )
+    db.log_table(conn, run_id, "provenance_columns", provenance_rows)
+
+
+def _provenance(
+    origins: pl.DataFrame, row: np.ndarray, columns: dict[str, str]
+) -> tuple[pl.DataFrame, list[dict]]:
+    """Return the rows of provenance.parquet and of the provenance_columns log.
+
+    Args:
+        origins: The provenance of every row read (_read's _ORIGIN and
+            _UNREAD_TIME columns).
+        row: Per row read, its row of the data file, -1 when its class
+            was dropped.
+        columns: The configured keys and their columns.
+    """
+    read = origins.with_columns(pl.Series("row", row)).filter(pl.col("row") >= 0)
+    unread = int(read[_UNREAD_TIME].sum()) if _UNREAD_TIME in read.columns else 0
+    rows = read.select(
+        "row", *(pl.col(f"{_ORIGIN}{key}").alias(key) for key in columns)
+    )
+    logged = []
+    for key, column in columns.items():
+        n_unparsable = unread if key == TIME else 0
+        values = rows[key].drop_nulls()
+        logged.append(
+            {
+                "key": key,
+                "column": column,
+                "n_read": rows.height,
+                "n_empty": rows[key].null_count() - n_unparsable,
+                "n_unparsable": n_unparsable,
+                "n_values": None if key == TIME else values.n_unique(),
+            }
+        )
+    print(
+        f"[clean] provenance of {rows.height} rows: "
+        + ", ".join(
+            f"{r['key']} {r['n_empty']} empty"
+            + (f", {r['n_unparsable']} not in time_format" if r["key"] == TIME else "")
+            for r in logged
+        ),
+        flush=True,
+    )
+    return rows, logged

@@ -15,9 +15,11 @@ __all__ = [
     "need",
     "prepared_columns",
     "prepared_file",
+    "provenance_file",
     "read_classes",
     "read_data",
     "read_points",
+    "read_provenance",
     "read_unparsable",
     "read_weights",
     "unparsable_file",
@@ -89,6 +91,19 @@ def classes_file(cfg: DatasetConfig) -> Path:
         The JSON path; the file is a list of names indexed by code.
     """
     return cfg.output_dir / "classes.json"
+
+
+def provenance_file(cfg: DatasetConfig) -> Path:
+    """Return the file of where every row of the CSV comes from (stage clean).
+
+    Args:
+        cfg: The dataset config.
+
+    Returns:
+        The parquet path; stage clean writes it only when the dataset
+        names provenance columns.
+    """
+    return cfg.output_dir / "provenance.parquet"
 
 
 def prepared_file(cfg: DatasetConfig) -> Path:
@@ -236,6 +251,23 @@ def read_unparsable(cfg: DatasetConfig) -> pl.DataFrame:
         FileNotFoundError: When stage clean has not run.
     """
     return pl.read_parquet(need(unparsable_file(cfg), "clean"))
+
+
+def read_provenance(cfg: DatasetConfig) -> pl.DataFrame:
+    """Return where every row of the CSV comes from.
+
+    Args:
+        cfg: The dataset config.
+
+    Returns:
+        The rows of provenance.parquet, as stage clean wrote them: row
+        (the row of the data file it is a copy of), then the configured
+        keys of provenance.KEYS and provenance.TIME.
+
+    Raises:
+        FileNotFoundError: When stage clean has not written it.
+    """
+    return pl.read_parquet(need(provenance_file(cfg), "clean"))
 
 
 def read_weights(cfg: DatasetConfig) -> np.ndarray:

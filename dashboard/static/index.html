@@ -39,6 +39,12 @@
         <p class="note">Configured columns with a single value over the kept rows.</p>
         <div id="sp-constant" class="chips"></div></div>
       <div class="card"><h2>Features</h2><div id="sp-features"></div></div>
+      <div class="card"><h2>Provenance</h2>
+        <p class="note">The columns the dataset names for where each row of the CSV comes from (provenance in its
+          yaml): never features. They are read for every row of a kept class, copies included, each copy with its own
+          (the copies of a row may come from different hosts at different times); the quality tab measures them per
+          cell.</p>
+        <div id="sp-provenance" class="table-wrap"></div></div>
     </section>
 
     <!-- prepare -->
@@ -117,6 +123,15 @@
           <dt>label_conflict</dt>
           <dd>At least one row is identical on every feature, as read from the CSV, to a row of another class: no
             classifier can tell them apart.</dd>
+          <dt>provenance</dt>
+          <dd>Where the CSV rows of a cell come from, when the dataset names the columns (source and destination
+            address and port, time): never a feature and never a defect, a fact to read beside them. Per column, over
+            the cell's CSV rows (each copy with its own, an empty value left out): the most frequent value and its
+            share, the distinct values, and the effective number, exp of the entropy of their shares (Hill's number
+            of order 1): as many equally frequent values have the same entropy, 1 for a single value. For the time,
+            the window holding the central 1 &minus; &tau; of the cell's rows (from the &tau;/2 to the
+            1 &minus; &tau;/2 quantile), so a few stray rows do not widen it. A cell from one host in a few minutes
+            is likely one recording, which a classifier can learn by heart.</dd>
           <dt>rivals</dt>
           <dd>The cells of other classes a cell is measured against: for each of
             <span data-stat="rival_rows"></span> random rows of it, the nearest row of another class; the cells those
@@ -153,6 +168,9 @@
           <p id="qr-detail-head" class="detail-head"></p>
           <h3>Cells</h3>
           <div id="qr-cells" class="table-wrap"></div>
+          <h3>Where its rows come from</h3>
+          <p id="qr-provenance-note" class="note"></p>
+          <div id="qr-provenance" class="table-wrap"></div>
           <h3>Rivals of other classes</h3>
           <p class="note">Every pair of one of its cells and a cell of another class, the most confused first. "here"
             is this region's cell, "there" the rival. Click one to open the rival's region.</p>

@@ -44,6 +44,11 @@ def test_clean_reads_a_glob_as_the_concatenation_of_its_files(
         assert (workspace.output_dir / name).read_bytes() == (
             done.output_dir / name
         ).read_bytes()
+    # The provenance of each row read follows it, whatever file it is in.
+    texts = pl.col(pl.Categorical).cast(pl.String)
+    split_origin = pl.read_parquet(workspace.output_dir / "provenance.parquet")
+    whole_origin = pl.read_parquet(done.output_dir / "provenance.parquet")
+    assert split_origin.with_columns(texts).equals(whole_origin.with_columns(texts))
     with sqlite3.connect(workspace.db_path) as conn:
         sources = conn.execute("SELECT file, n_read, n_header FROM sources").fetchall()
         (n_raw,) = conn.execute("SELECT n_raw FROM clean_summary").fetchone()
@@ -63,6 +68,17 @@ def test_clean_names_the_file_that_lacks_a_column(tmp_path, synthetic_csv):
     rows.drop("num_1").write_csv(folder / "b.csv")
     workspace = make_workspace(tmp_path, folder / "*.csv")
     with pytest.raises(ValueError, match=r"missing from .*b\.csv: \['num_1'\]"):
+        workspace.run("clean")
+
+
+def test_clean_names_the_file_that_lacks_a_provenance_column(tmp_path, synthetic_csv):
+    rows = pl.read_csv(synthetic_csv, infer_schema=False)
+    folder = tmp_path / "raw"
+    folder.mkdir()
+    rows.write_csv(folder / "a.csv")
+    rows.drop("src_port").write_csv(folder / "b.csv")
+    workspace = make_workspace(tmp_path, folder / "*.csv")
+    with pytest.raises(ValueError, match=r"missing from .*b\.csv: \['src_port'\]"):
         workspace.run("clean")
 
 

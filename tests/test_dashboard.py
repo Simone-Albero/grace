@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from dashboard.app import create_app
 from dashboard.queries import CONFLICT_GROUPS, MAP_MAX_POINTS, MAP_PER_CELL
+from src.provenance import KEYS, TIME
 from src.quality import DEFECTS
 
 
@@ -65,6 +66,12 @@ def test_clean(client):
     assert data["dropped_columns"] == ["flat"]
     assert "flat" not in data["features"]["num"]
     assert set(data["features"]) == {"num", "cat"}
+    provenance = {p["key"]: p for p in data["provenance"]}
+    assert list(provenance) == [*KEYS, TIME]
+    assert provenance[TIME]["column"] == "timestamp"
+    assert provenance[TIME]["n_unparsable"] == 1
+    n_read = sum(c["n_read"] for c in data["classes"])  # the CSV rows of kept classes
+    assert all(p["n_read"] == n_read for p in provenance.values())
 
 
 def test_prepare(client):
@@ -169,6 +176,12 @@ def test_quality_region_of_a_region_in_a_label_conflict(reported, client):
     cells = {c["cell"] for c in data["cells"]}
     assert len(cells) == data["region"]["n_cells"]
     assert all(c["region"] == region for c in data["cells"])
+    measured = {
+        f"{k}_{m}" for k in KEYS for m in ("top", "top_share", "n_values", "eff_n")
+    }
+    for cell in data["cells"]:
+        assert measured | {"time_from", "time_to", "time_window"} <= set(cell)
+        assert 0 < cell["src_ip_top_share"] <= 1 and cell["src_ip_n_values"] >= 1
     assert sum(c["n_rows"] for c in data["cells"]) == data["region"]["n_rows"]
     assert data["pairs"] and all(
         {p["cell_a"], p["cell_b"]} & cells for p in data["pairs"]

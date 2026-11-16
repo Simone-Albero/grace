@@ -3,10 +3,11 @@
 Run `python generate_synthetic.py [--rows N] [--out PATH]`. The CSV goes
 to `resources/raw_data/synthetic/synthetic_test.csv`, or to `--out`: 20
 numerical and two categorical features, a `label` and the
-`true_subgroup` each row was drawn from. A difficulty ladder of
-sub-groups makes the classes overlap by known margins. About 300 Inf and
-200 NaN values are injected. `--rows` sets the total row count (default
-69,500).
+`true_subgroup` each row was drawn from, then where the row comes from:
+`src_ip`, `src_port`, `dst_ip`, `dst_port` and `timestamp`. A difficulty
+ladder of sub-groups makes the classes overlap by known margins. About
+300 Inf and 200 NaN values are injected. `--rows` sets the total row
+count (default 69,500).
 """
 
 __all__ = []
@@ -47,6 +48,21 @@ _MIX_SIGMA = 1.5
 
 _SEED = 42
 _RNG = np.random.default_rng(_SEED)
+
+_START = np.datetime64("2018-02-20T08:00:00", "us")  # the capture's first second
+_SERVICES = (443, 80, 53, 22)  # the destination ports of class_1, the background
+_SERVICE_WEIGHTS = (0.5, 0.3, 0.15, 0.05)
+_ATTACK_PORTS = (
+    80,
+    22,
+    21,
+    445,
+    3389,
+    8080,
+    25,
+    443,
+    23,
+)  # one per other class, in order
 
 
 @dataclass(frozen=True)
@@ -335,7 +351,71 @@ def _build_dataset(total_rows: int) -> pd.DataFrame:
         ignore_index=True,
     )
     dataset = _inject_edge_cases(dataset)
-    return dataset.sample(frac=1, random_state=_SEED).reset_index(drop=True)
+    dataset = dataset.sample(frac=1, random_state=_SEED).reset_index(drop=True)
+    return _add_provenance(dataset)
+
+
+def _add_provenance(dataset: pd.DataFrame) -> pd.DataFrame:
+    """Append where each row comes from: src_ip, src_port, dst_ip, dst_port, timestamp.
+
+    class_1 is the background: 300 hosts (the first ones busier, Zipf)
+    towards 500 servers on four services, over 12 hours. Every other
+    class is an attack: 5 to 20 hosts of its own against 3 victims on
+    one port, within its own hour. Source ports are random (1024-65535).
+    Two artefacts only the provenance shows are planted: class_5 comes
+    from a single host, and the canonical sub-group of class_4 from one
+    host of its own, on source port 31337, within 5 minutes. Drawn with
+    a generator of their own after the features, so the features are
+    the same as without these columns.
+
+    Args:
+        dataset: The shuffled dataset, with label and true_subgroup.
+
+    Returns:
+        A copy with the five columns appended; timestamp as text,
+        "YYYY-MM-DD HH:MM:SS.ffffff".
+    """
+    rng = np.random.default_rng(_SEED + 1)
+    labels = dataset["label"].to_numpy()
+    n_rows = len(dataset)
+    src = np.empty(n_rows, dtype=object)
+    dst = np.empty(n_rows, dtype=object)
+    dst_port = np.empty(n_rows, dtype=np.int64)
+    seconds = np.empty(n_rows)  # after _START
+    for k, label in enumerate(_CLASSES):
+        rows = np.flatnonzero(labels == label)
+        if k == 0:
+            hosts = [f"192.168.{i // 250}.{i % 250}" for i in range(300)]
+            weights = 1 / np.arange(1, 301) ** 1.2
+            src[rows] = rng.choice(hosts, len(rows), p=weights / weights.sum())
+            servers = [f"10.0.{i // 250}.{i % 250}" for i in range(500)]
+            dst[rows] = rng.choice(servers, len(rows))
+            dst_port[rows] = rng.choice(_SERVICES, len(rows), p=_SERVICE_WEIGHTS)
+            seconds[rows] = rng.uniform(0, 12 * 3600, len(rows))
+            continue
+        hosts = [f"18.{k}.0.{i}" for i in range(int(rng.integers(5, 21)))]
+        src[rows] = rng.choice(hosts, len(rows))
+        dst[rows] = rng.choice([f"172.31.{k}.{i}" for i in range(3)], len(rows))
+        dst_port[rows] = _ATTACK_PORTS[k - 1]
+        seconds[rows] = 3600 * k + rng.uniform(0, 3600, len(rows))
+    src_port = rng.integers(1024, 65536, n_rows)
+    src[labels == "class_5"] = "18.5.0.99"
+    planted = (labels == "class_4") & (
+        dataset["true_subgroup"].to_numpy() == "canonical"
+    )
+    src[planted] = "18.99.9.9"
+    src_port[planted] = 31337
+    seconds[planted] = 3600 * 3 + 1200 + rng.uniform(0, 300, planted.sum())
+    stamps = _START + (seconds * 1e6).astype(np.int64).astype("timedelta64[us]")
+    out = dataset.copy()
+    out["src_ip"] = src
+    out["src_port"] = src_port
+    out["dst_ip"] = dst
+    out["dst_port"] = dst_port
+    out["timestamp"] = np.char.replace(
+        np.datetime_as_string(stamps, unit="us"), "T", " "
+    )
+    return out
 
 
 def main() -> None:

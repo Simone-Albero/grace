@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeVar
 
+import numpy as np
 import polars as pl
 
 Frame = TypeVar("Frame", pl.DataFrame, pl.LazyFrame)
@@ -35,6 +36,7 @@ DUPLICATES = (
 )
 UNPARSABLE = "__unparsable__"  # clean's mark of the numeric cells that were not numbers
 KINDS = ("empty", "unparsable", "nan", "inf")  # the null and invalid values, by kind
+_READ = "__read__"  # the position of a row read, while its copies are grouped
 
 
 @dataclass(frozen=True)
@@ -205,7 +207,7 @@ def count_kinds(
     }
 
 
-def drop_duplicates(rows: pl.DataFrame) -> pl.DataFrame:
+def drop_duplicates(rows: pl.DataFrame) -> tuple[pl.DataFrame, np.ndarray]:
     """Keep one copy of each distinct row and count its copies.
 
     Two rows are copies when every column is equal, the label included,
@@ -218,10 +220,21 @@ def drop_duplicates(rows: pl.DataFrame) -> pl.DataFrame:
     Returns:
         The first copy of each distinct row, in order of first
         appearance, with DUPLICATES appended: its number of copies
-        (Int64), 1 for a row without duplicates.
+        (Int64), 1 for a row without duplicates; and, for every row of
+        rows, the position of its distinct row in that frame (Int64,
+        shape (rows.height,)).
     """
-    count = pl.len().cast(pl.Int64).alias(DUPLICATES)
-    return rows.group_by(rows.columns, maintain_order=True).agg(count)
+    groups = (
+        rows.with_row_index(_READ)
+        .group_by(rows.columns, maintain_order=True)
+        .agg(pl.len().cast(pl.Int64).alias(DUPLICATES), pl.col(_READ))
+    )
+    copy_of = np.empty(rows.height, dtype=np.int64)
+    copies = groups[DUPLICATES].to_numpy()
+    copy_of[groups[_READ].explode().to_numpy()] = np.repeat(
+        np.arange(groups.height), copies
+    )
+    return groups.drop(_READ), copy_of
 
 
 def drop_rare_classes(

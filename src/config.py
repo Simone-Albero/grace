@@ -10,6 +10,7 @@ from __future__ import annotations
 __all__ = [
     "DATASET_DIR",
     "DatasetConfig",
+    "ProvenanceConfig",
     "dataset_names",
     "load_config",
 ]
@@ -23,6 +24,7 @@ import yaml
 
 from src.data import DUPLICATES
 from src.prepare import MISSING
+from src.provenance import KEYS, TIME
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
 DATASET_DIR = CONFIG_DIR / "datasets"
@@ -106,6 +108,37 @@ class MethodConfig:
 
 
 @dataclass(frozen=True)
+class ProvenanceConfig:
+    """The columns that say where each row of the CSV comes from (`src.provenance`).
+
+    Never features: stage clean reads them for every row of the CSV and
+    stage quality_report measures them per cell. Each is optional.
+
+    Attributes:
+        src_ip: The column of the source address.
+        src_port: The column of the source port.
+        dst_ip: The column of the destination address.
+        dst_port: The column of the destination port.
+        time: The column of the time of the row.
+        time_format: The format of time's text (chrono's strftime, as
+            polars reads it, e.g. "%Y-%m-%d %H:%M:%S%.f"), set with time
+            and only with it.
+    """
+
+    src_ip: str | None = None
+    src_port: str | None = None
+    dst_ip: str | None = None
+    dst_port: str | None = None
+    time: str | None = None
+    time_format: str | None = None
+
+    def columns(self) -> dict[str, str]:
+        """Return the configured keys, in the order of KEYS then TIME, with their columns."""
+        keys = (*KEYS, TIME)
+        return {key: getattr(self, key) for key in keys if getattr(self, key)}
+
+
+@dataclass(frozen=True)
 class DatasetConfig:
     """A dataset and its method.
 
@@ -121,6 +154,8 @@ class DatasetConfig:
         seed: The seed of every stage.
         output_dir: The folder of every file of every stage.
         db_path: The SQLite file.
+        provenance: The columns of where each row comes from, or None
+            when the dataset names none.
         method: The method.
     """
 
@@ -134,6 +169,7 @@ class DatasetConfig:
     seed: int
     output_dir: Path
     db_path: Path
+    provenance: ProvenanceConfig | None
     method: MethodConfig
 
 
@@ -232,6 +268,20 @@ def load_method_config(name_or_path: str = "default") -> MethodConfig:
     return method
 
 
+def _provenance(raw: Mapping[str, Any] | None, path: Path) -> ProvenanceConfig | None:
+    """Return the provenance block of a dataset yaml, None when absent or empty."""
+    if not raw:
+        return None
+    _check_keys(raw, ProvenanceConfig, path, prefix="provenance.")
+    provenance = ProvenanceConfig(**raw)
+    _check(
+        bool(provenance.time) == bool(provenance.time_format),
+        f"provenance.time and provenance.time_format go together in {path}",
+    )
+    _check(bool(provenance.columns()), f"provenance names no column in {path}: {raw}")
+    return provenance
+
+
 def load_config(dataset: str, method: str = "default") -> DatasetConfig:
     """Load a dataset config with its method.
 
@@ -268,5 +318,6 @@ def load_config(dataset: str, method: str = "default") -> DatasetConfig:
         seed=raw["seed"],
         output_dir=Path(raw["output_dir"]),
         db_path=Path(raw["db_path"]),
+        provenance=_provenance(raw.get("provenance"), path),
         method=load_method_config(method),
     )
