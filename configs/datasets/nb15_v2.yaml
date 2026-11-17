@@ -49,8 +49,8 @@ provenance:  # where each CSV row comes from, never a feature: measured per cell
   dst_ip: IPV4_DST_ADDR
   dst_port: L4_DST_PORT
 
-min_class_count: 3000  # classes with fewer rows are dropped
-top_n: 128  # most frequent values of a categorical column with their own one-hot slot; the others share one
+min_class_count: 50  # classes with fewer rows are dropped
+top_n: 32  # most frequent values of a categorical column with their own one-hot slot; the others share one
 seed: 42
 output_dir: resources/processed/nb15_v2
 db_path: resources/processed/grace.db

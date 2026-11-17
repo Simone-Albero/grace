@@ -22,7 +22,7 @@ num_cols:
 
 cat_cols: []
 
-min_class_count: 100  # classes with fewer rows are dropped
+min_class_count: 50  # classes with fewer rows are dropped
 top_n: 32  # most frequent values of a categorical column with their own one-hot slot; the others share one
 seed: 42
 output_dir: resources/processed/letter_recognition
