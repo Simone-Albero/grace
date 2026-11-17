@@ -236,7 +236,9 @@ def merge_cells(tree: CellTree, profile: Sequence[Hashable]) -> np.ndarray:
     A node is uniform when it is a cell, or when both its children are
     uniform with the same profile; a region is a uniform node whose
     parent is not uniform, or the root when it is uniform. A region is so
-    the largest branch of the cut whose cells all share a profile.
+    the largest branch of the cut whose cells all share a profile, and
+    it is named by its top node: the same branch has the same name
+    whatever the profiles of the cells outside it.
 
     Args:
         tree: The cut of the class (class_cells).
@@ -244,8 +246,8 @@ def merge_cells(tree: CellTree, profile: Sequence[Hashable]) -> np.ndarray:
             profiles compare equal.
 
     Returns:
-        The region of every cell, 0.. with no gap, numbered in the
-        pre-order of the cut.
+        The region of every cell: the index in the cut of the top node
+        of its region (so not numbered from 0, nor without gaps).
     """
     parent = np.asarray(tree.parent, dtype=np.int64)
     k = len(parent)
@@ -263,7 +265,6 @@ def merge_cells(tree: CellTree, profile: Sequence[Hashable]) -> np.ndarray:
         if a is not _MIXED and b is not _MIXED and a == b:
             shared[v] = a
     region_of_node = np.full(k, -1, dtype=np.int64)
-    n_regions = 0
     for v in range(k):
         if shared[v] is _MIXED:
             continue
@@ -271,8 +272,7 @@ def merge_cells(tree: CellTree, profile: Sequence[Hashable]) -> np.ndarray:
         if up >= 0 and shared[up] is not _MIXED:
             region_of_node[v] = region_of_node[up]
         else:
-            region_of_node[v] = n_regions
-            n_regions += 1
+            region_of_node[v] = v
     leaf = tree.cell >= 0
     region = np.empty(int(leaf.sum()), dtype=np.int64)
     region[tree.cell[leaf]] = region_of_node[leaf]

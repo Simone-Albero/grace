@@ -511,7 +511,7 @@ def test_quality_regions_are_the_largest_branches_of_cells_that_agree(reported):
         (r["overlap_with"], r["shortcut_with"], h)
         for r, h in zip(cells.iter_rows(named=True), host)
     ]
-    expected, offset = [], 0
+    expected = []
     for code in range(len(classes)):
         part = tree.filter(pl.col("class") == code)
         if not part.height:
@@ -524,10 +524,9 @@ def test_quality_regions_are_the_largest_branches_of_cells_that_agree(reported):
             cell=np.where(part["cell"].is_null(), -1, part["cell"].fill_null(0) - base),
         )
         merged = merge_cells(cut, profile[base : base + len(own)])
-        expected += (merged + offset).tolist()
-        offset += int(merged.max()) + 1
+        expected += (merged + first).tolist()
     assert cells["region"].to_list() == expected
-    assert regions["region"].to_list() == list(range(offset))
+    assert regions["region"].to_list() == sorted(set(expected))
     summed = (
         cells.group_by("region")
         .agg(
@@ -666,16 +665,16 @@ def test_quality_report_refuses_cells_of_other_data(copy_of_done):
         copy_of_done.run("quality_report")
 
 
-def _central(times: list, tau: Fraction) -> tuple:
-    """The first and last time left once k = floor((n - 1) tau / 2) are cut at each end."""
+def _central(times: list, share: Fraction) -> tuple:
+    """The first and last time left once k = floor((n - 1) (1 - share) / 2) are cut at each end."""
     times = sorted(times)
-    k = int((len(times) - 1) * tau / 2)
+    k = int((len(times) - 1) * (1 - share) / 2)
     return times[k], times[len(times) - 1 - k]
 
 
 def test_quality_cells_measure_where_their_csv_rows_come_from(reported):
     cfg = load_config(str(reported.dataset), method=str(reported.method))
-    tau = Fraction(str(cfg.method.quality.tau))
+    held = Fraction(str(cfg.method.quality.time_share))
     cells = _table(reported, "quality_cells").sort("cell")
     provenance = _read(reported, "provenance.parquet")
     cell = _read(reported, "assignments.parquet").sort("row")["cell"].to_numpy()
@@ -694,7 +693,7 @@ def test_quality_cells_measure_where_their_csv_rows_come_from(reported):
             assert row[f"{key}_n_values"] == len(counts)
             assert row[f"{key}_eff_n"] == pytest.approx(np.exp(-(p * np.log(p)).sum()))
             shares[key].append({v: Fraction(n, len(values)) for v, n in counts.items()})
-        first, last = _central(mine[TIME].drop_nulls().to_list(), tau)
+        first, last = _central(mine[TIME].drop_nulls().to_list(), held)
         assert row["time_from"] == first.strftime("%Y-%m-%d %H:%M:%S")
         assert row["time_to"] == last.strftime("%Y-%m-%d %H:%M:%S")
         assert row["time_window"] == pytest.approx((last - first).total_seconds())
@@ -720,7 +719,7 @@ def test_quality_cells_measure_where_their_csv_rows_come_from(reported):
     for name in set(of_class):
         own = [c for c in range(cells.height) if of_class[c] == name]
         times = provenance.filter(pl.Series(np.isin(of, own)))[TIME]
-        first, last = _central(times.drop_nulls().to_list(), tau)
+        first, last = _central(times.drop_nulls().to_list(), held)
         whole = (last - first).total_seconds()
         for c in own:
             share = cells["time_window_share"][c]

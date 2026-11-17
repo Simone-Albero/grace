@@ -85,7 +85,8 @@ Stages (each writes its files into the dataset's `output_dir` and its rows into 
     second, the confusion is measured after each removal (`confusion_without`, the single column then sought among
     the columns left), so choosing does not inflate it.
 
-  A cell, or a region, has a defect when (`quality.tau` = 0.1):
+  A cell, or a region, has a defect when (`quality.tau` = 0.1, the threshold the run logs its verdicts at; see
+  "tau, after the run" below):
 
   | defect | when | why |
   |---|---|---|
@@ -100,8 +101,9 @@ Stages (each writes its files into the dataset's `output_dir` and its rows into 
   measured between cells, at the resolution of the cells. The last compares a cell with the other cells of its class,
   on the source address of the provenance (below); a dataset without it does not measure it (its shares are null).
   The cells of a class are then merged into regions up their tree: a region is the largest branch whose cells all
-  have the same classes of `class_overlap` and of `shortcut` and the same host of `atypical_source`, and its row
-  defects are counted over its rows. Measuring the merged regions instead would dilute again: on
+  have the same classes of `class_overlap` and of `shortcut` and the same host of `atypical_source`, named by the
+  node of the tree at its top (so the same branch has the same name at any tau), and its row defects are counted over
+  its rows. Measuring the merged regions instead would dilute again: on
   cic_2018_v2 it loses 1.9% of the rows with `class_overlap` and 2.5% with `shortcut` (8% and 12% on the synthetic
   dataset), so the regions only gather what the cells found. Per cell (`quality_cells`) and per region
   (`quality_regions`): the copies, the rows in a label conflict and the classes they conflict with, the rows with a
@@ -121,8 +123,8 @@ Stages (each writes its files into the dataset's `output_dir` and its rows into 
   values have the same entropy), and the excess (`<key>_excess`, `<key>_excess_value`): the most the cell's share of
   one of its values exceeds that value's typical share in its class, the median of its shares in the n cells of the
   class (the ceil(n/2)-th smallest, a cell without it counting 0, every cell alike); for the time, the window holding
-  the central 1 - tau of the cell's rows, from the tau/2 to the 1 - tau/2 quantile (`time_from`, `time_to`,
-  `time_window` in seconds), so a few stray rows do not widen it, and its share of the same window of its class's rows
+  the central `quality.time_share` (0.9) of the cell's rows, from the 5% to the 95% quantile (`time_from`,
+  `time_to`, `time_window` in seconds), so a few stray rows do not widen it, and its share of the same window of its class's rows
   (`time_window_share`). A cell from one host in a few minutes is likely one recording, which a classifier can learn by
   heart, and geometry alone does not see it. Only the source address has a defect, `atypical_source`: its excess
   reaches tau. Against the class, not as a share alone, so a class that all comes from one host (an attack from one
@@ -161,13 +163,27 @@ without a source address)
 (quality_report). There are no migrations: a new column is added to its table, an old one stays, empty for the new
 runs; to drop the old ones, delete the DB.
 
+**tau, after the run.** What the run measures does not depend on tau: the confusion of each pair of cells with every
+column and without the key ones (`quality_pairs`), the excess of the source of each cell (`src_ip_excess`), the
+counts, and `clear_rows` per cell (its distinct rows with no null or invalid value and in no label conflict, which the
+share with no defect needs). tau only compares them. `src/report.py` (`judge`) turns these measures into the verdicts
+at any tau: the defects of the cells, the regions they merge into, the shares per class and over the dataset. The
+stage calls it once, at `quality.tau`, and logs the result (`quality_pairs.region_*`, `quality_cells` from `region` and
+`overlap_with` on, `quality_regions`, `quality_classes`, the shares of `quality_stats`); the dashboard calls it per
+request, with the `tau` of the request. At the run's tau it gives the logged tables, and a test checks it. The
+description of the time window does not depend on tau either (`quality.time_share`).
+
 Dashboard: `make dashboard` (`PORT=` to change it) or `python -m uvicorn dashboard.app:app` serves a read-only page
 on 127.0.0.1 for the datasets of `configs/datasets/`, in three tabs, each topped by a table of the hyperparameters its
 run used (`HYPERPARAMETERS` of `dashboard/queries.py`, read from the run's config). Each shows the latest `ok` run of
 its stages on that dataset, and says which stage to run when there is none. Counts are of CSV rows (copies included,
 as a classifier is trained on them); the distinct rows are on hover.
 
-- quality (quality_report) calls *cell* what the stage calls a region, and never shows the leaves inside it: a matrix
+- quality (quality_report) calls *cell* what the stage calls a region, and never shows the leaves inside it. A slider
+  over the matrix sets τ (0.005 to 0.5): every number of the quality and cells tabs, the regions and what the detail
+  of a cell compares with τ are judged again at it, in the same code as the stage's (`?tau=` on `/quality`,
+  `/quality/region`, `/quality/map`, `/quality/profile` and `/cells`; the run's own when absent), and "back to the
+  run's τ" undoes it. A matrix
   of the classes, the most CSV rows first, then the whole dataset, by their clear ratio (the share of their CSV rows
   with no defect) and their share with each defect, darker as the share grows (a defect the dataset does not measure
   is left out); a click on a share lists its cells, the most CSV rows first, each defect with what was found. A click
@@ -193,14 +209,14 @@ A map draws each colour (a cell, a subtree, or the leaves with and without a def
 sampled row counting for the rows of its leaf it stands for: curves enclosing 25, 50, 75 and 95% of them, smoothed by
 a Gaussian as wide as the median square around a row holding n^(-1/3)/π of its colour's rows (Scott's bandwidth for
 a Gaussian cloud, but local), and their density along each axis in strips above and on the right; a switch adds the
-rows as points. The URL hash keeps tab and dataset, on the quality tab the cell, on the cells tab class and node (a
-link to the former clean and prepare tabs opens data).
+rows as points. The URL hash keeps tab and dataset, on the quality tab the cell, on the cells tab class and node, and
+a τ other than the run's (`?tau=0.15` after them); a link to the former clean and prepare tabs opens data.
 
 Layout:
 - `main.py`: the CLI, one stage per call inside a logged run
 - `stages/`: one file per stage, `run(cfg, conn, run_id)`; `stages/paths.py` names every file a stage writes
 - `src/`: config and DB logging, then the method on arrays and frames: data, prepare, graph, cells, quality,
-  provenance
+  provenance, and report (the verdicts at a tau, from what quality_report measured)
 - `dashboard/`: FastAPI `app.py`, read-only `queries.py`, `static/` (one page, hand-made SVG charts)
 - `generate_synthetic.py`: the synthetic dataset, a ladder of sub-groups per class that overlap their rivals by
   known margins (the `true_subgroup` column records it; no stage reads it), and the provenance of every row, with two

@@ -122,6 +122,14 @@ def test_tau_is_a_share_of_rows_under_one_half(tmp_path, value):
         load_config("synthetic_test", method=_method(tmp_path, quality__tau=value))
 
 
+@pytest.mark.parametrize("value", [0.0, 1.5])
+def test_time_share_is_a_share_of_rows(tmp_path, value):
+    with pytest.raises(ValueError, match="quality.time_share"):
+        load_config(
+            "synthetic_test", method=_method(tmp_path, quality__time_share=value)
+        )
+
+
 @pytest.mark.parametrize(
     "key",
     [
@@ -149,6 +157,7 @@ def test_the_default_method_loads():
     method = load_config("synthetic_test").method
     assert (method.cells.max_rows, method.cells.min_rows) == (1000, 20)
     assert method.quality.tau == 0.1 and method.quality.rival_rows == 100
+    assert method.quality.time_share == 0.9
 
 
 def test_shortcut_cols_are_unknown(tmp_path):

@@ -165,16 +165,17 @@ _TREE = CellTree(
 
 
 def test_merge_cells_by_hand():
+    # a region is named by the node at the top of its branch
     assert merge_cells(_TREE, ["a", "a", "a", "a"]).tolist() == [0, 0, 0, 0]
-    assert merge_cells(_TREE, ["a", "a", "b", "b"]).tolist() == [0, 0, 1, 1]
-    assert merge_cells(_TREE, ["a", "b", "b", "b"]).tolist() == [0, 1, 2, 2]
-    assert merge_cells(_TREE, ["a", "a", "b", "a"]).tolist() == [0, 0, 1, 2]
+    assert merge_cells(_TREE, ["a", "a", "b", "b"]).tolist() == [1, 1, 4, 4]
+    assert merge_cells(_TREE, ["a", "b", "b", "b"]).tolist() == [2, 3, 4, 4]
+    assert merge_cells(_TREE, ["a", "a", "b", "a"]).tolist() == [1, 1, 5, 6]
     # Equal profiles in different branches stay apart.
-    assert merge_cells(_TREE, ["a", "b", "a", "b"]).tolist() == [0, 1, 2, 3]
+    assert merge_cells(_TREE, ["a", "b", "a", "b"]).tolist() == [2, 3, 5, 6]
 
 
 def test_merge_cells_compares_tuples_and_one_cell():
     profile = [((), (2,)), ((), (2,)), ((1,), ()), ((1,), ())]
-    assert merge_cells(_TREE, profile).tolist() == [0, 0, 1, 1]
+    assert merge_cells(_TREE, profile).tolist() == [1, 1, 4, 4]
     one = CellTree(parent=np.array([-1]), cell=np.array([0]))
     assert merge_cells(one, [("x",)]).tolist() == [0]

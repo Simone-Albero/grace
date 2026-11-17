@@ -6,9 +6,9 @@ __all__ = ["app", "create_app"]
 
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -16,6 +16,10 @@ from dashboard import queries
 from src.config import DATASET_DIR, DatasetConfig, load_config
 
 STATIC = Path(__file__).parent / "static"
+
+
+# the threshold a request may judge the defects at (src.config: quality.tau in (0, 0.5])
+Tau = Annotated[float | None, Query(gt=0, le=0.5)]
 
 
 def _query(query: Callable[..., Any], *args: Any) -> Any:
@@ -80,28 +84,28 @@ def create_app(dataset_dir: Path = DATASET_DIR) -> FastAPI:
         return _query(queries.prepare, load_dataset(dataset))
 
     @app.get("/api/{dataset}/cells")
-    def cells(dataset: str) -> Any:
-        return _query(queries.cells, load_dataset(dataset))
+    def cells(dataset: str, tau: Tau = None) -> Any:
+        return _query(queries.cells, load_dataset(dataset), tau)
 
     @app.get("/api/{dataset}/cells/map")
     def cell_map(dataset: str, node: int) -> Any:
         return _query(queries.cell_map, load_dataset(dataset), node)
 
     @app.get("/api/{dataset}/quality")
-    def quality(dataset: str) -> Any:
-        return _query(queries.quality, load_dataset(dataset))
+    def quality(dataset: str, tau: Tau = None) -> Any:
+        return _query(queries.quality, load_dataset(dataset), tau)
 
     @app.get("/api/{dataset}/quality/region")
-    def quality_region(dataset: str, region: int) -> Any:
-        return _query(queries.quality_region, load_dataset(dataset), region)
+    def quality_region(dataset: str, region: int, tau: Tau = None) -> Any:
+        return _query(queries.quality_region, load_dataset(dataset), region, tau)
 
     @app.get("/api/{dataset}/quality/profile")
-    def quality_profile(dataset: str, region: int) -> Any:
-        return _query(queries.quality_profile, load_dataset(dataset), region)
+    def quality_profile(dataset: str, region: int, tau: Tau = None) -> Any:
+        return _query(queries.quality_profile, load_dataset(dataset), region, tau)
 
     @app.get("/api/{dataset}/quality/map")
-    def quality_map(dataset: str, region: int) -> Any:
-        return _query(queries.quality_map, load_dataset(dataset), region)
+    def quality_map(dataset: str, region: int, tau: Tau = None) -> Any:
+        return _query(queries.quality_map, load_dataset(dataset), region, tau)
 
     app.mount("/static", StaticFiles(directory=STATIC), name="static")
     return app

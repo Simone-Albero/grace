@@ -3,15 +3,16 @@
 /**
  * UI state.
  * @type {{dataset: string|null, tab: "quality"|"cells"|"data", cls: string|null, node: number|null,
- *   colorBy: string|null, qclass: string|null, qfilter: string|null, region: number|null}}
+ *   colorBy: string|null, qclass: string|null, qfilter: string|null, region: number|null, tau: number|null}}
  *   cls, node: the class whose tree is drawn and the node whose map is shown (null: its root), the tree drawn from the
  *   level that shows it (treeLevels); colorBy: what colours the tree and the map, null their subtrees, "any" any
  *   defect, else one of DEFECTS; qclass, qfilter: the regions listed, picked in the matrix (null: all), qfilter "none"
- *   or one of DEFECTS; region: the region whose detail is shown (null: none)
+ *   or one of DEFECTS; region: the region whose detail is shown (null: none); tau: the threshold the defects of the
+ *   quality and cells tabs are judged at (null: the run's own)
  */
 const state = {
   dataset: null, tab: "quality", cls: null, node: null, colorBy: null,
-  qclass: null, qfilter: null, region: null,
+  qclass: null, qfilter: null, region: null, tau: null,
 };
 
 const last = { cells: null, cellInfo: null, quality: null }; // last responses, for the controls that only redraw
@@ -127,6 +128,9 @@ function fill(id, ...kids) {
 
 // --- data ---
 
+/** The tau of the request, as a query string part (null tau: none). @param {"?"|"&"} [first] */
+const tauQuery = (first = "?") => (state.tau == null ? "" : `${first}tau=${state.tau}`);
+
 /**
  * GET a JSON endpoint under /api.
  * @param {string} path e.g. "/synthetic_test/clean"
@@ -156,23 +160,38 @@ async function init() {
   };
   $("dataset").onchange = (e) => {
     state.dataset = e.target.value;
-    state.cls = state.node = state.colorBy = state.qclass = state.qfilter = state.region = null;
+    state.cls = state.node = state.colorBy = state.qclass = state.qfilter = state.region = state.tau = null;
     load();
   };
+  $("qr-tau").oninput = (e) => { $("qr-tau-value").textContent = e.target.value; };
+  $("qr-tau").onchange = (e) => setTau(Number(e.target.value));
+  $("qr-tau-reset").onclick = () => setTau(null);
   $("rg-class").onchange = (e) => selectClass(e.target.value);
   $("rg-color").onchange = (e) => { state.colorBy = e.target.value || null; drawClass(); };
   for (const b of document.querySelectorAll(".tabs button")) b.onclick = () => showTab(b.dataset.tab);
   showTab(state.tab);
 }
 
+/**
+ * Judge the defects at another tau and draw the tab again; the run's own tau is null, never a number.
+ * @param {number|null} tau
+ */
+function setTau(tau) {
+  state.tau = tau === last.quality.params.tau ? null : tau;
+  load();
+}
+
 let shownHash = ""; // the hash last written by saveHash: a hashchange to it is our own
 
 /**
- * Set state from the URL hash: tab, dataset, and the quality tab's region or the cells tab's class and node.
+ * Set state from the URL hash: tab, dataset, the quality tab's region or the cells tab's class and node, and tau
+ * ("?tau=0.15" after them).
  * @param {string[]} datasets the known datasets; an unknown one falls back to the first
  */
 function readHash(datasets) {
-  const [named, dataset, a, b] = location.hash.slice(1).split("/").map(decodeURIComponent);
+  const [path, query] = location.hash.slice(1).split("?");
+  const [named, dataset, a, b] = path.split("/").map(decodeURIComponent);
+  state.tau = Number(new URLSearchParams(query).get("tau")) || null;
   const tab = OLD_TABS[named] ?? named;
   if (TABS.includes(tab)) state.tab = tab;
   const next = datasets.includes(dataset) ? dataset : datasets[0];
@@ -198,14 +217,14 @@ function showTab(tab) {
 }
 
 /**
- * Keep tab, dataset and, on the quality tab the region, on the cells tab class and node, in the URL hash.
+ * Keep tab, dataset and, on the quality tab the region, on the cells tab class and node, and tau, in the URL hash.
  * @param {boolean} [push] a step the back button returns from (opening a region or a node); else the entry is replaced
  */
 function saveHash(push = false) {
   const parts = [state.tab, state.dataset];
   if (state.tab === "quality" && state.region != null) parts.push(state.region);
   if (state.tab === "cells" && state.cls != null) parts.push(state.cls, ...(state.node != null ? [state.node] : []));
-  shownHash = `#${parts.map((p) => encodeURIComponent(p)).join("/")}`;
+  shownHash = `#${parts.map((p) => encodeURIComponent(p)).join("/")}${tauQuery()}`;
   if (shownHash === location.hash) return;
   if (push) history.pushState(null, "", shownHash);
   else history.replaceState(null, "", shownHash);
@@ -217,7 +236,7 @@ function saveHash(push = false) {
  * @param {string} d the dataset's path, "/<dataset>"
  */
 async function fetchTab(tab, d) {
-  if (tab !== "data") return api(`${d}/${tab}`);
+  if (tab !== "data") return api(`${d}/${tab}${tauQuery()}`);
   const [clean, prepare] = await Promise.all([
     api(`${d}/clean`), api(`${d}/prepare`).catch((e) => ({ error: e.message }))]);
   return { ...clean, prepare };
@@ -396,7 +415,7 @@ function drawRegionLink(n) {
   const open = h("button", { class: "chip", type: "button" }, `open cell ${info.region} in quality`);
   open.onclick = () => {
     state.qclass = state.qfilter = null;
-    location.hash = `#quality/${encodeURIComponent(state.dataset)}/${info.region}`;
+    location.hash = `#quality/${encodeURIComponent(state.dataset)}/${info.region}${tauQuery()}`;
   };
   fill("rg-region", `Leaf ${n.cell} is part of cell ${info.region}.`, open);
 }
@@ -1028,10 +1047,12 @@ const HELP = {
 function renderQuality(data) {
   last.quality = data;
   fill("qr-params", paramTable(data.params));
+  $("qr-tau").value = $("qr-tau-value").textContent = data.stats.tau;
+  $("qr-tau-reset").hidden = state.tau == null;
   const term = (name, text) => [h("dt", {}, name), h("dd", {}, text)];
   fill("qr-glossary",
     Object.entries(TERMS).map(([k, v]) => term(k, v)),
-    measuredDefects().map((d) => term(d, DEFINITION[d].replaceAll("τ", `τ = ${data.params.tau}`))));
+    measuredDefects().map((d) => term(d, DEFINITION[d].replaceAll("τ", `τ = ${data.stats.tau}`))));
   if (!data.regions.some((r) => r.region === state.region)) state.region = null;
   drawMatrix();
   drawCellList();
@@ -1208,7 +1229,7 @@ async function drawDetail() {
   const row = last.quality.regions.find((r) => r.region === state.region);
   card.hidden = row == null;
   if (row == null) return;
-  const tau = last.quality.params.tau;
+  const tau = last.quality.stats.tau;
   const close = h("button", { class: "chip close", type: "button", title: "close the detail" }, "close");
   close.onclick = () => selectCell(null);
   fill("qr-detail-title", `Cell ${row.region} · ${row.class}`, close);
@@ -1223,8 +1244,8 @@ async function drawDetail() {
   let d, profile;
   try {
     [d, profile] = await Promise.all([
-      api(`/${ds}/quality/region?region=${row.region}`),
-      api(`/${ds}/quality/profile?region=${row.region}`).catch((e) => ({ error: e.message })),
+      api(`/${ds}/quality/region?region=${row.region}${tauQuery("&")}`),
+      api(`/${ds}/quality/profile?region=${row.region}${tauQuery("&")}`).catch((e) => ({ error: e.message })),
     ]);
   } catch (e) {
     if (id === detailId) fill("qr-evidence", h("p", { class: "note" }, e.message));
@@ -1404,7 +1425,7 @@ async function drawCellMap(row, d, rivals, picked, detail) {
   el.replaceChildren(h("p", { class: "note" }, "loading…"));
   let data;
   try {
-    data = await api(`/${encodeURIComponent(state.dataset)}/quality/map?region=${row.region}`);
+    data = await api(`/${encodeURIComponent(state.dataset)}/quality/map?region=${row.region}${tauQuery("&")}`);
   } catch (e) {
     if (id === qualityMapId) el.replaceChildren(h("p", { class: "note" }, e.message));
     return;

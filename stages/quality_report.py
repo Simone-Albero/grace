@@ -13,26 +13,22 @@ import polars as pl
 from joblib import Parallel, delayed
 
 from src import db
-from src.cells import CellTree, merge_cells
 from src.config import DatasetConfig
 from src.data import DUPLICATES, KINDS, LABEL
 from src.provenance import KEYS, TIME, concentration, excess, time_window
 from src.quality import (
-    CLASS_DEFECTS,
     DEFECTS,
-    RIVAL_DEFECTS,
     cell_samples,
     cover_hart_low,
-    defects_of,
     feature_dependence,
     invalid_values,
     label_conflicts,
     pair_conflicts,
     pair_confusion,
-    rival_defects,
     rival_pairs,
     single_column,
 )
+from src.report import COUNTS, judge
 from stages.paths import (
     assignments_file,
     cell_tree_file,
@@ -46,9 +42,6 @@ from stages.paths import (
     read_unparsable,
     read_weights,
 )
-
-COUNTS = ("n_rows", "n_read", "conflict_rows", "conflict_read", "missing_rows")
-COUNTS += ("missing_read",) + tuple(f"{kind}_rows" for kind in KINDS)
 
 
 def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
@@ -65,21 +58,23 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     quality.label_conflicts on every feature -> quality.pair_conflicts
     -> per pair, on the measured rows: quality.single_column,
     quality.feature_dependence (q.max_group, seed (seed, a, b)) and
-    quality.pair_confusion -> per cell: quality.rival_defects (q.tau) on
-    its side of each pair; with cfg.provenance, on provenance.parquet
+    quality.pair_confusion; with cfg.provenance, on provenance.parquet
     (paths.read_provenance: every row of the CSV, with the row of the
     data file it is a copy of; "run clean again" when they disagree),
-    over the CSV rows of the cell, provenance.concentration and
+    over the CSV rows of each cell, provenance.concentration and
     provenance.excess (against the cells of its class) of each of its
-    keys of provenance.KEYS, provenance.time_window (q.tau) of its time
-    and of its class's; atypical_source when the excess of src_ip
-    reaches q.tau (never without src_ip) -> quality.defects_of on its
-    rows -> per class: cells.merge_cells of its cut, a cell's profile
-    its classes of class_overlap and of shortcut and the host of its
-    atypical_source; region id = region + offset, by class -> per
-    region: quality.defects_of on its rows and the profile its cells
-    share -> per class and over the dataset: the share of the CSV rows
-    with each defect and with none (_shares).
+    keys of provenance.KEYS, provenance.time_window (q.time_share) of
+    its time and of its class's -> src.report.judge at q.tau (the one
+    place tau is applied, so the dashboard can apply any other): per
+    cell quality.rival_defects on its side of each pair, atypical_source
+    when the excess of src_ip reaches q.tau (never without src_ip),
+    quality.defects_of on its rows; per class cells.merge_cells of its
+    cut, a cell's profile its classes of class_overlap and of shortcut
+    and the host of its atypical_source, a region named by the node at
+    the top of its branch of the cell tree; per region
+    quality.defects_of on its rows and the profile its cells share; per
+    class and over the dataset the share of the CSV rows with each
+    defect and with none.
 
     Logs: quality_pairs (cell_a, class_a, region_a, cell_b, class_b,
     region_b, n_conflicts, n_conflicts_read; nn_error_a, nn_error_b,
@@ -96,7 +91,9 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     conflict_rows, conflict_read, conflict_with (the classes its
     conflicting rows are shared with, joined by ","), missing_rows and
     missing_read (rows with a null or invalid value), then per kind of
-    data.KINDS <kind>_rows; n_rivals; rival: the rival cell its rows are
+    data.KINDS <kind>_rows, clear_rows (its distinct rows with no null
+    or invalid value and in no label conflict, which the share of rows
+    with no defect needs); n_rivals; rival: the rival cell its rows are
     most confused with (ties to the lower id), rival_class, its side's
     confusion, nn_error and single_column_acc, and single_column;
     overlap_with and shortcut_with (the classes of rival_defects,
@@ -109,7 +106,9 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     <key>_top_share, <key>_n_values and <key>_eff_n, <key>_excess_value
     and <key>_excess, and with its time time_from and time_to
     ("YYYY-MM-DD HH:MM:SS"), time_window (seconds) and
-    time_window_share (over its class's window, null when that is 0)),
+    time_window_share (over its class's window, null when that is 0);
+    what depends on tau, the region, the rival defects, shortcut_* and
+    defects, is judged by src.report.judge, the rest measured),
     quality_regions (region, class, n_cells, then the counts of
     quality_cells summed over its cells, conflict_with, overlap_with
     and shortcut_with as its cells', confusion: the highest of its
@@ -173,80 +172,35 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
         conflict_with[a].add(int(cell_class[b]))
         conflict_with[b].add(int(cell_class[a]))
 
-    sides = defaultdict(
-        list
-    )  # per cell: (rival, its confusion, the pair index, its side)
-    n_rivals = np.zeros(len(cell_class), dtype=np.int64)
-    for i, ((a, b), (_, _, confusion)) in enumerate(zip(pairs, measures)):
-        n_rivals[a] += 1
-        n_rivals[b] += 1
-        if confusion is not None:
-            sides[a].append((b, confusion[:, 0], i, "a"))
-            sides[b].append((a, confusion[:, 1], i, "b"))
     origins = (
-        _provenance(cfg, cell, cell_class, weights, q.tau)
+        _provenance(cfg, cell, cell_class, weights, q.time_share)
         if cfg.provenance is not None
         else [{} for _ in range(len(cell_class))]
     )
-    # A cell's profile: its classes of class_overlap and of shortcut, and
-    # the host of its atypical_source (None without it).
-    profile = [
-        (
-            *rival_defects([(cell_class[r], e) for r, e, _, _ in sides[c]], q.tau),
-            _atypical_host(origins[c], q.tau),
-        )
-        for c in range(len(cell_class))
-    ]
-    region = _merge(tree, profile)
     flawed = groups >= 0
     flawed[invalid["row"].to_numpy()] = True
-    of_cell = np.array([bool(o or s or h is not None) for o, s, h in profile])
-    clean = np.bincount(cell[~flawed & ~of_cell[cell]], minlength=len(cell_class))
+    clear = np.bincount(cell[~flawed], minlength=len(cell_class))
     pair_rows = [
-        _pair_row(a, b, measure, conflicts, cell_class, region, classes, columns)
+        _pair_row(a, b, measure, conflicts, cell_class, classes, columns)
         for (a, b), measure in zip(pairs, measures)
     ]
     cell_rows = [
-        _cell_row(
-            c,
-            region,
-            cell_class,
-            classes,
-            counts,
-            conflict_with,
-            n_rivals,
-            sides,
-            profile,
-            pair_rows,
-            q.tau,
-        )
-        for c in range(len(cell_class))
+        _cell_row(c, cell_class, classes, counts, conflict_with, clear, origin)
+        for c, origin in enumerate(origins)
     ]
-    for row, origin in zip(cell_rows, origins):
-        row.update(origin)
-    region_rows = _region_rows(cell_rows, region, classes)
-    # The defects the dataset cannot measure: atypical_source without the
-    # source address in its provenance.
-    unmeasured = () if "src_ip_excess" in origins[0] else CLASS_DEFECTS
-    class_rows = _class_rows(cell_rows, region_rows, clean, classes, unmeasured)
-    found = {
-        d: (
-            None
-            if d in unmeasured
-            else sum(d in _listed(r["defects"]) for r in region_rows)
-        )
-        for d in DEFECTS
-    }
+    judged = judge(cell_rows, pair_rows, tree, classes, q.tau)
+    region = np.array([row["region"] for row in judged.cells], dtype=np.int64)
+    found = {d: judged.stats[f"regions_{d}"] for d in DEFECTS}
     print(
         f"[quality_report] {len(pairs)} pairs, {int(groups.max()) + 1} label conflicts; "
-        f"{len(cell_rows)} cells merged into {len(region_rows)} regions; "
+        f"{len(judged.cells)} cells merged into {len(judged.regions)} regions; "
         f"regions by defect: {found}",
         flush=True,
     )
-    db.log_table(conn, run_id, "quality_pairs", pair_rows)
-    db.log_table(conn, run_id, "quality_cells", cell_rows)
-    db.log_table(conn, run_id, "quality_regions", region_rows)
-    db.log_table(conn, run_id, "quality_classes", class_rows)
+    db.log_table(conn, run_id, "quality_pairs", judged.pairs)
+    db.log_table(conn, run_id, "quality_cells", judged.cells)
+    db.log_table(conn, run_id, "quality_regions", judged.regions)
+    db.log_table(conn, run_id, "quality_classes", judged.classes)
     db.log_table(
         conn, run_id, "cell_missing", _missing_rows(invalid, cell, region, weights)
     )
@@ -278,11 +232,8 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
                 "max_group": q.max_group,
                 "n_pairs": len(pairs),
                 "n_groups": int(groups.max()) + 1,
-                "n_cells": len(cell_rows),
-                "n_regions": len(region_rows),
-                **{f"regions_{d}": found[d] for d in DEFECTS},
-                "regions_no_defect": sum(not r["defects"] for r in region_rows),
-                **_shares(cell_rows, clean, unmeasured),
+                "n_cells": len(judged.cells),
+                **{k: v for k, v in judged.stats.items() if k != "tau"},
             }
         ],
     )
@@ -317,44 +268,15 @@ def _counts(cell, m, weights, groups, invalid) -> dict[str, np.ndarray]:
     return counts
 
 
-def _merge(tree: pl.DataFrame, profile: list) -> np.ndarray:
-    """Return the region of every cell: cells.merge_cells class by class, ids offset by class."""
-    region = np.empty(len(profile), dtype=np.int64)
-    offset = 0
-    for _, part in tree.group_by("class", maintain_order=True):
-        first = int(part["node"][0])
-        own = part["cell"].drop_nulls().to_numpy()
-        base = int(own.min())
-        cut = CellTree(
-            parent=np.where(part["parent"] >= 0, part["parent"] - first, -1),
-            cell=np.where(part["cell"].is_null(), -1, part["cell"].fill_null(0) - base),
-        )
-        merged = merge_cells(cut, profile[base : base + len(own)])
-        region[base : base + len(own)] = merged + offset
-        offset += int(merged.max()) + 1
-    return region
-
-
-def _names(codes, classes: list[str]) -> str | None:
-    """Return the names of class codes in code order joined by ",", None for none."""
-    return ",".join(classes[c] for c in sorted(codes)) or None
-
-
-def _listed(value: str | None) -> list[str]:
-    return value.split(",") if value else []
-
-
-def _pair_row(a, b, measure, conflicts, cell_class, region, classes, columns) -> dict:
-    """Return the quality_pairs row of a pair of cells."""
+def _pair_row(a, b, measure, conflicts, cell_class, classes, columns) -> dict:
+    """Return the quality_pairs row of a pair of cells, without the regions (src.report.judge)."""
     one, dependence, confusion = measure
     n, read = conflicts.get((a, b), (0, 0.0))
     row = {
         "cell_a": a,
         "class_a": classes[cell_class[a]],
-        "region_a": int(region[a]),
         "cell_b": b,
         "class_b": classes[cell_class[b]],
-        "region_b": int(region[b]),
         "n_conflicts": n,
         "n_conflicts_read": read,
         **dict.fromkeys(("nn_error_a", "nn_error_b", "nn_error", "bayes_error_low")),
@@ -382,29 +304,11 @@ def _pair_row(a, b, measure, conflicts, cell_class, region, classes, columns) ->
     return row
 
 
-def _cell_row(
-    c,
-    region,
-    cell_class,
-    classes,
-    counts,
-    conflict_with,
-    n_rivals,
-    sides,
-    profile,
-    pair_rows,
-    tau,
-) -> dict:
-    """Return the quality_cells row of a cell."""
+def _cell_row(c, cell_class, classes, counts, conflict_with, clear, origin) -> dict:
+    """Return the quality_cells row of a cell without what tau decides (src.report.judge)."""
     own = {key: counts[key][c] for key in COUNTS}
-    overlap, shortcut, host = profile[c]
-    mine = sides[c]
-    rival = max(mine, key=lambda s: (s[1][0], -s[0]), default=None)
-    under = [s for s in mine if s[1][0] < tau]
-    cut = max(under, key=lambda s: (s[1][1:].max(), -s[0]), default=None)
-    row = {
+    return {
         "cell": c,
-        "region": int(region[c]),
         "class": classes[cell_class[c]],
         "n_rows": int(own["n_rows"]),
         "n_read": float(own["n_read"]),
@@ -416,173 +320,14 @@ def _cell_row(
         "missing_rows": int(own["missing_rows"]),
         "missing_read": float(own["missing_read"]),
         **{f"{kind}_rows": int(own[f"{kind}_rows"]) for kind in KINDS},
-        "n_rivals": int(n_rivals[c]),
-        **dict.fromkeys(("rival", "rival_class", "confusion", "nn_error")),
-        **dict.fromkeys(("single_column_acc", "single_column")),
-        "overlap_with": _names(overlap, classes),
-        "shortcut_with": _names(shortcut, classes),
-        **dict.fromkeys(("shortcut_rival", "shortcut_columns", "confusion_without")),
+        "clear_rows": int(clear[c]),
+        **origin,
     }
-    if rival is not None:
-        other, steps, i, side = rival
-        pair = pair_rows[i]
-        row.update(
-            rival=int(other),
-            rival_class=classes[cell_class[other]],
-            confusion=float(steps[0]),
-            nn_error=pair[f"nn_error_{side}"],
-            single_column_acc=pair[f"single_column_acc_{side}"],
-            single_column=pair["single_column"],
-        )
-    if cut is not None:
-        other, steps, i, _ = cut
-        reached = np.flatnonzero(steps[1:] >= tau)
-        k = int(reached[0]) + 1 if len(reached) else len(steps) - 1
-        row.update(
-            shortcut_rival=int(other),
-            shortcut_columns=",".join(pair_rows[i]["key_columns"].split(",")[:k]),
-            confusion_without=float(steps[k]),
-        )
-    row["defects"] = (
-        ",".join(
-            defects_of(
-                own["missing_rows"],
-                own["n_rows"],
-                own["n_read"],
-                own["conflict_rows"],
-                overlap,
-                shortcut,
-                host is not None,
-            )
-        )
-        or None
-    )
-    return row
 
 
-def _region_rows(
-    cell_rows: list[dict], region: np.ndarray, classes: list[str]
-) -> list[dict]:
-    """Return the quality_regions rows: the counts of their cells summed, the profile they share."""
-    rows = []
-    for r in range(int(region.max()) + 1):
-        own = [cell_rows[c] for c in np.flatnonzero(region == r)]
-        first = own[0]
-        summed = {key: sum(row[key] for row in own) for key in COUNTS}
-        worst = max(
-            (row for row in own if row["confusion"] is not None),
-            key=lambda row: row["confusion"],
-            default=None,
-        )
-        conflict = {
-            classes.index(n) for row in own for n in _listed(row["conflict_with"])
-        }
-        overlap = [classes.index(n) for n in _listed(first["overlap_with"])]
-        shortcut = [classes.index(n) for n in _listed(first["shortcut_with"])]
-        atypical = "atypical_source" in _listed(first["defects"])
-        excesses = [
-            r["src_ip_excess"] for r in own if r.get("src_ip_excess") is not None
-        ]
-        defects = defects_of(
-            summed["missing_rows"],
-            summed["n_rows"],
-            summed["n_read"],
-            summed["conflict_rows"],
-            overlap,
-            shortcut,
-            atypical,
-        )
-        rows.append(
-            {
-                "region": r,
-                "class": first["class"],
-                "n_cells": len(own),
-                "n_rows": int(summed["n_rows"]),
-                "n_read": float(summed["n_read"]),
-                "n_duplicates": float(summed["n_read"] - summed["n_rows"]),
-                "dup_share": float(1 - summed["n_rows"] / summed["n_read"]),
-                "conflict_rows": int(summed["conflict_rows"]),
-                "conflict_read": float(summed["conflict_read"]),
-                "conflict_with": _names(conflict, classes),
-                "missing_rows": int(summed["missing_rows"]),
-                "missing_read": float(summed["missing_read"]),
-                **{f"{kind}_rows": int(summed[f"{kind}_rows"]) for kind in KINDS},
-                "overlap_with": first["overlap_with"],
-                "shortcut_with": first["shortcut_with"],
-                "confusion": None if worst is None else worst["confusion"],
-                "rival_class": None if worst is None else worst["rival_class"],
-                "src_ip_excess_value": (
-                    first["src_ip_excess_value"] if atypical else None
-                ),
-                "src_ip_excess": max(excesses, default=None),
-                "defects": ",".join(defects) or None,
-            }
-        )
-    return rows
-
-
-def _class_rows(
-    cell_rows: list[dict],
-    region_rows: list[dict],
-    clean: np.ndarray,
-    classes: list[str],
-    unmeasured: tuple[str, ...],
-) -> list[dict]:
-    """Return the quality_classes rows: per class its counts and _shares."""
-    rows = []
-    for name in classes:
-        own = [r for r in cell_rows if r["class"] == name]
-        if not own:
-            continue
-        rows.append(
-            {
-                "class": name,
-                "n_rows": sum(r["n_rows"] for r in own),
-                "n_read": sum(r["n_read"] for r in own),
-                "n_cells": len(own),
-                "n_regions": sum(r["class"] == name for r in region_rows),
-                **_shares(own, clean, unmeasured),
-            }
-        )
-    return rows
-
-
-def _shares(
-    cell_rows: list[dict], clean: np.ndarray, unmeasured: tuple[str, ...]
-) -> dict[str, float | None]:
-    """Return share_<defect> and share_no_defect over the CSV rows of these cells.
-
-    A row of the CSV has invalid_values when it holds a null or invalid
-    value, duplicates when it repeats a row read before it (the first
-    copy of a row has not), label_conflict when it is identical to a
-    row of another class, class_overlap, shortcut and atypical_source
-    when its cell has them; it has no defect when it has none of the
-    six.
-
-    Args:
-        cell_rows: quality_cells rows.
-        clean: Per cell, its distinct rows without a null or invalid
-            value and in no label conflict, 0 for a cell with
-            class_overlap, shortcut or atypical_source: the first copies
-            with no defect.
-        unmeasured: The defects the dataset cannot measure: their
-            share is None.
-    """
-    n_read = sum(r["n_read"] for r in cell_rows)
-    found = {
-        "invalid_values": sum(r["missing_read"] for r in cell_rows),
-        "duplicates": sum(r["n_duplicates"] for r in cell_rows),
-        "label_conflict": sum(r["conflict_read"] for r in cell_rows),
-    }
-    for d in (*RIVAL_DEFECTS, *CLASS_DEFECTS):
-        found[d] = sum(r["n_read"] for r in cell_rows if d in _listed(r["defects"]))
-    return {
-        **{
-            f"share_{d}": None if d in unmeasured else found[d] / n_read
-            for d in DEFECTS
-        },
-        "share_no_defect": sum(int(clean[r["cell"]]) for r in cell_rows) / n_read,
-    }
+def _names(codes, classes: list[str]) -> str | None:
+    """Return the names of class codes in code order joined by ",", None for none."""
+    return ",".join(classes[c] for c in sorted(codes)) or None
 
 
 def _provenance(
@@ -590,7 +335,7 @@ def _provenance(
     cell: np.ndarray,
     cell_class: np.ndarray,
     weights: np.ndarray,
-    tau: float,
+    share: float,
 ) -> list[dict]:
     """Return, per cell, the provenance columns of its quality_cells row.
 
@@ -599,8 +344,8 @@ def _provenance(
         cell: The cell of every row of the data file.
         cell_class: The class of every cell.
         weights: The copies of every row of the data file in the CSV.
-        tau: quality.tau, the share of a cell's rows its time window may
-            leave out.
+        share: quality.time_share, the share of a cell's rows its time
+            window holds.
 
     Returns:
         One dict per cell, in cell order: per key of provenance.KEYS in
@@ -629,9 +374,9 @@ def _provenance(
         parts.append(concentration(group, origin[key], m).rename(rename))
         parts.append(excess(group, origin[key], cell_class, m).rename(rename))
     if TIME in origin.columns:
-        window = time_window(group, origin[TIME], m, tau)
+        window = time_window(group, origin[TIME], m, share)
         n_classes = int(cell_class.max()) + 1
-        of_class = time_window(cell_class[group], origin[TIME], n_classes, tau)
+        of_class = time_window(cell_class[group], origin[TIME], n_classes, share)
         whole = of_class["time_window"].to_numpy()[cell_class]
         share = window["time_window"] / pl.Series(whole)
         text = pl.col("time_from", "time_to").dt.to_string("%Y-%m-%d %H:%M:%S")
@@ -643,16 +388,6 @@ def _provenance(
         )
     print(f"[quality_report] provenance of {len(row)} CSV rows measured", flush=True)
     return pl.concat(parts, how="horizontal").to_dicts()
-
-
-def _atypical_host(origin: dict, tau: float) -> str | None:
-    """Return the host of a cell's atypical_source: its src_ip_excess_value when its src_ip_excess reaches tau."""
-    measured = origin.get("src_ip_excess")
-    return (
-        origin["src_ip_excess_value"]
-        if measured is not None and measured >= tau
-        else None
-    )
 
 
 def _missing_rows(

@@ -171,24 +171,24 @@ def excess(
 
 
 def time_window(
-    group: np.ndarray, times: pl.Series, m: int, tau: float
+    group: np.ndarray, times: pl.Series, m: int, share: float
 ) -> pl.DataFrame:
-    """Return, per group of rows, the window of time that holds the central 1 - tau of them.
+    """Return, per group of rows, the window of time that holds the central share of them.
 
     With the n times of a group sorted, the window leaves out the k
-    first and the k last, k = floor((n - 1) * tau / 2): from the tau/2
-    quantile (the lower of the two times around it) to the 1 - tau/2
-    quantile (the higher). At most tau of the group's rows lie outside
-    it, so a few stray rows (copies read on another day, say) do not
-    widen it.
+    first and the k last, k = floor((n - 1) * (1 - share) / 2): from the
+    (1 - share)/2 quantile (the lower of the two times around it) to
+    the (1 + share)/2 quantile (the higher). At most 1 - share of the
+    group's rows lie outside it, so a few stray rows (copies read on
+    another day, say) do not widen it.
 
     Args:
         group: The group of every row (its cell), in [0, m).
         times: The time of every row, Datetime; a null is unknown and
             left out.
         m: The number of groups.
-        tau: The share of a group's rows that may lie outside its
-            window, quality.tau.
+        share: The share of a group's rows its window holds, in (0, 1],
+            quality.time_share.
 
     Returns:
         One row per group, 0 to m - 1 in order: time_from and time_to
@@ -202,8 +202,8 @@ def time_window(
     at, own = at[order], own[order]
     n = np.bincount(own, minlength=m)
     start = np.concatenate([[0], np.cumsum(n)[:-1]])
-    # floor((n - 1) * tau / 2), with a margin for rounding: 20 * 0.05 may land under 1
-    k = np.floor((np.maximum(n, 1) - 1) * tau / 2 + 1e-9).astype(np.int64)
+    # floor((n - 1) * (1 - share) / 2), with a margin for rounding: 20 * 0.1 / 2 may land under 1
+    k = np.floor((np.maximum(n, 1) - 1) * (1 - share) / 2 + 1e-9).astype(np.int64)
     has = n > 0
     first = np.where(has, start + k, 0)
     last = np.where(has, start + n - 1 - k, 0)

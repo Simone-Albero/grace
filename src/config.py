@@ -81,12 +81,17 @@ class QualityConfig:
             compares every row with every other.
         max_group: The most columns removed from a pair to find a
             shortcut.
+        time_share: The share of a cell's rows its time window holds,
+            in (0, 1]: the window of the central rows, so that a few
+            stray ones do not widen it. Description only, no defect
+            depends on it.
     """
 
     tau: float
     max_rows_per_cell: int
     rival_rows: int
     max_group: int
+    time_share: float
 
 
 @dataclass(frozen=True)
@@ -232,6 +237,10 @@ def _validate_method(method: MethodConfig) -> None:
     )
     _check(
         0 < quality.tau <= 0.5, f"quality.tau must be in (0, 0.5], got {quality.tau}"
+    )
+    _check(
+        0 < quality.time_share <= 1,
+        f"quality.time_share must be in (0, 1], got {quality.time_share}",
     )
     cat_cost = method.prepare.cat_cost
     _check(cat_cost > 0, f"prepare.cat_cost must be > 0, got {cat_cost}")

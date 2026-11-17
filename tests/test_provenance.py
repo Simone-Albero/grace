@@ -109,7 +109,7 @@ def test_excess_against_the_typical_group_of_its_class_by_hand():
     assert as_categories.equals(out)
 
 
-def test_time_window_leaves_out_tau_of_the_rows_by_hand():
+def test_time_window_holds_the_central_share_of_the_rows_by_hand():
     start = datetime(2018, 2, 20, 8)
 
     def at(seconds):
@@ -121,7 +121,7 @@ def test_time_window_leaves_out_tau_of_the_rows_by_hand():
     group = np.array([0] * 21 + [1, 2, 2, 3])
     order = np.random.default_rng(0).permutation(len(group))  # in no order
     series = pl.Series([times[i] for i in order], dtype=pl.Datetime("us"))
-    out = time_window(group[order], series, 5, tau=0.1)
+    out = time_window(group[order], series, 5, share=0.9)
     assert out.columns == ["time_from", "time_to", "time_window"]
     # k = floor(20 * 0.1 / 2) = 1: the first and the last time are left
     # out, the day-late one among them.
@@ -131,5 +131,5 @@ def test_time_window_leaves_out_tau_of_the_rows_by_hand():
     assert out.row(2) == (at(0), at(30), 30.0)
     assert out.row(3) == out.row(4) == (None, None, None)
     # k = floor(20 * 0.5 / 2) = 5.
-    wide = time_window(group[order], series, 5, tau=0.5)
+    wide = time_window(group[order], series, 5, share=0.5)
     assert wide.row(0) == (at(5), at(15), 10.0)

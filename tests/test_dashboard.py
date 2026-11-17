@@ -178,6 +178,74 @@ def test_quality(reported, client):
     assert any(r["defects"] for r in data["regions"])
 
 
+def test_quality_judges_the_measures_at_any_tau(reported, client):
+    run = _get(client, "/api/toy/quality")
+    assert _get(client, "/api/toy/quality?tau=0.1") == run  # the run's own
+    high = _get(client, "/api/toy/quality?tau=0.5")
+    assert high["stats"]["tau"] == 0.5
+    assert high["params"] == run["params"]  # the run's settings stay its own
+    assert high["stats"]["n_regions"] == len(high["regions"])
+    for d in ("invalid_values", "duplicates", "label_conflict"):
+        assert high["stats"][f"share_{d}"] == run["stats"][f"share_{d}"]
+    for d in ("class_overlap", "atypical_source"):
+        assert high["stats"][f"share_{d}"] <= run["stats"][f"share_{d}"]
+    low = _get(client, "/api/toy/quality?tau=0.02")
+    assert low["stats"]["share_class_overlap"] >= run["stats"]["share_class_overlap"]
+    assert low["stats"]["share_class_overlap"] > high["stats"]["share_class_overlap"]
+    # what is measured does not move: the rows of every class
+    assert [c["n_read"] for c in low["classes"]] == [
+        c["n_read"] for c in run["classes"]
+    ]
+
+
+@pytest.mark.parametrize("tau", ["0", "0.6", "-0.1"])
+def test_a_tau_out_of_range_is_refused(reported, client, tau):
+    for route in (
+        "quality",
+        "cells",
+        "quality/region?region=0",
+        "quality/map?region=0",
+    ):
+        joint = "&" if "?" in route else "?"
+        assert client.get(f"/api/toy/{route}{joint}tau={tau}").status_code == 422
+
+
+def test_the_details_of_a_region_follow_tau(reported, client):
+    quality = _get(client, "/api/toy/quality?tau=0.5")
+    region = max(quality["regions"], key=lambda r: r["n_cells"])["region"]
+    detail = _get(client, f"/api/toy/quality/region?region={region}&tau=0.5")
+    assert detail["region"]["region"] == region
+    assert all(c["region"] == region for c in detail["cells"])
+    assert len(detail["cells"]) == detail["region"]["n_cells"]
+    assert all(region in (p["region_a"], p["region_b"]) for p in detail["pairs"])
+    assert (
+        _get(client, f"/api/toy/quality/profile?region={region}&tau=0.5")["region"]
+        == region
+    )
+    assert (
+        _get(client, f"/api/toy/quality/map?region={region}&tau=0.5")["region"]
+        == region
+    )
+    # a region that is not one of the regions at this tau
+    run = {r["region"] for r in _get(client, "/api/toy/quality")["regions"]}
+    gone = sorted(run - {r["region"] for r in quality["regions"]})
+    assert gone, "tau 0.5 merges cells the run's tau keeps apart"
+    for route in ("region", "profile", "map"):
+        url = f"/api/toy/quality/{route}?region={gone[0]}&tau=0.5"
+        assert client.get(url).status_code == 404
+
+
+def test_cells_carry_the_region_and_defects_judged_at_tau(reported, client):
+    quality = _get(client, "/api/toy/quality?tau=0.5")
+    cells = _get(client, "/api/toy/cells?tau=0.5")["cells"]
+    assert {c["region"] for c in cells} == {r["region"] for r in quality["regions"]}
+    assert all(set(c["defects"]) <= set(DEFECTS) for c in cells)
+    assert (
+        _get(client, "/api/toy/cells?tau=0.1")["cells"]
+        == _get(client, "/api/toy/cells")["cells"]
+    )
+
+
 def test_quality_region_of_a_region_in_a_label_conflict(reported, client):
     quality = _get(client, "/api/toy/quality")
     region = next(r["region"] for r in quality["regions"] if r["conflict_rows"])
@@ -288,7 +356,13 @@ def test_every_tab_shows_the_hyperparameters_its_run_used(reported, client):
         },
         "quality": {
             k: method["quality"][k]
-            for k in ("tau", "rival_rows", "max_rows_per_cell", "max_group")
+            for k in (
+                "tau",
+                "rival_rows",
+                "max_rows_per_cell",
+                "max_group",
+                "time_share",
+            )
         },
     }
     for tab, params in expected.items():
@@ -323,7 +397,7 @@ def test_quality_region_tells_where_its_csv_rows_come_from(reported, client):
             pytest.approx(repeated.mean()) if len(repeated) else None
         )
     times = origin[TIME]
-    window = time_window(np.zeros(len(times), dtype=np.int64), times, 1, 0.1)
+    window = time_window(np.zeros(len(times), dtype=np.int64), times, 1, 0.9)
     assert detail["time"]["time_window"] == pytest.approx(window["time_window"][0])
     assert detail["time"]["time_from"].startswith(
         str(window["time_from"][0])[:19].replace(" ", "T")
