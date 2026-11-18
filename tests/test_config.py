@@ -57,21 +57,17 @@ def test_the_kdn_reference_is_gone(tmp_path):
         load_config("synthetic_test", method=str(path))
 
 
-@pytest.mark.parametrize(
-    "key", ["cells__max_fit_samples", "cells__min_rows", "quality__rival_rows"]
-)
+@pytest.mark.parametrize("key", ["cells__max_fit_samples", "quality__rival_rows"])
 def test_degenerate_counts_fail(tmp_path, key):
     with pytest.raises(ValueError, match=key.replace("__", ".")):
         load_config("synthetic_test", method=_method(tmp_path, **{key: 0}))
 
 
-def test_a_cell_holds_two_of_the_smallest_branches(tmp_path):
-    # A node over max_rows always has a child of min_rows or more.
-    with pytest.raises(ValueError, match="cells.max_rows"):
-        load_config(
-            "synthetic_test",
-            method=_method(tmp_path, cells__max_rows=39, cells__min_rows=20),
-        )
+@pytest.mark.parametrize("key", ["max_rows", "min_rows"])
+def test_the_cell_sizes_are_gone(tmp_path, key):
+    # the cells are as small as the measures allow: tau and confidence say it
+    with pytest.raises(ValueError, match=f"cells.{key}"):
+        load_config("synthetic_test", method=_method(tmp_path, **{f"cells__{key}": 25}))
 
 
 def test_degenerate_preparation_fails(tmp_path):
@@ -155,9 +151,18 @@ def test_the_quality_group_is_checked(tmp_path):
 
 def test_the_default_method_loads():
     method = load_config("synthetic_test").method
-    assert (method.cells.max_rows, method.cells.min_rows) == (1000, 20)
+    # the fewest rows a cell can be measured on: 2 x 25 scored at tau 0.1, 95%
+    assert method.min_rows == 50
     assert method.quality.tau == 0.1 and method.quality.rival_rows == 100
-    assert method.quality.time_share == 0.9
+    assert method.quality.time_share == 0.9 and method.quality.confidence == 0.95
+
+
+@pytest.mark.parametrize("value", [0.5, 1.0, 0.3])
+def test_confidence_is_a_level_over_one_half(tmp_path, value):
+    with pytest.raises(ValueError, match="quality.confidence"):
+        load_config(
+            "synthetic_test", method=_method(tmp_path, quality__confidence=value)
+        )
 
 
 def test_shortcut_cols_are_unknown(tmp_path):
@@ -197,4 +202,13 @@ def test_a_bad_provenance_block_fails(tmp_path, block, match):
     path = tmp_path / "provenance.yaml"
     path.write_text(yaml.safe_dump({**raw, "provenance": block}))
     with pytest.raises(ValueError, match=match):
+        load_config(str(path))
+
+
+@pytest.mark.parametrize("kind", ["num_cols", "cat_cols"])
+def test_a_provenance_column_is_never_a_feature(tmp_path, kind):
+    raw = yaml.safe_load((DATASET_DIR / "synthetic_test.yaml").read_text())
+    path = tmp_path / "feature.yaml"
+    path.write_text(yaml.safe_dump({**raw, kind: [*(raw[kind] or []), "dst_port"]}))
+    with pytest.raises(ValueError, match="dst_port"):
         load_config(str(path))

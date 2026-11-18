@@ -83,7 +83,9 @@ def write_dataset_yaml(folder: Path, csv: Path, name: str = "toy") -> Path:
 def write_method_yaml(folder: Path) -> Path:
     """Write a method yaml of the defaults, scaled down for speed."""
     method = yaml.safe_load((ROOT / "configs/method/default.yaml").read_text())
-    method["cells"]["max_rows"] = 300  # cells enough per class for the merge
+    method["quality"][
+        "tau"
+    ] = 0.1  # min_rows = 50: cells of 50 to 99 rows, few enough to be fast
     method["quality"]["max_rows_per_cell"] = 100
     method["quality"]["rival_rows"] = 50
     path = folder / "method.yaml"

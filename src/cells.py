@@ -1,22 +1,23 @@
-"""Cells: each class cut into compact groups of rows of about the same size.
+"""Cells: each class cut into the smallest compact groups of rows a measure makes sense on.
 
-The cells are the units every defect is measured on (src.quality). Their
-size is the same for every class, so that two cells compared are sampled
-alike, and bounded, so that a defect touching a share of a cell's rows is
-not diluted in a larger group: the size sets the resolution of the report.
+The cells are the units every defect is measured on (src.quality). They
+are as small as min_rows allows, the fewest rows a measure makes sense
+on, so that a defect touching a share of a cell's rows is not diluted in
+a larger group; the regions the report merges them into set its
+granularity, large where a class is uniform, small where it is not.
 
 The rows of a class are deduplicated, each weighted by its copies in the
 CSV, so the weighted Ward tree of the distinct rows is the Ward tree of
 the rows as read. The tree is built on a uniform sample of the class,
 and every row joins its nearest sampled row, so each node of the tree
 holds the rows of the sampled rows below it. The tree is cut from the
-root: a node with more rows than a cell may hold is split into its two
-children, until every node left is a cell; a branch with too few rows to
-be measured is left out, its rows joining the nearest cell.
+root: a node is split into its two children while it holds rows enough
+for two cells, until every node left is a cell; a branch with too few
+rows to be measured is left out, its rows joining the nearest cell.
 
 The cut is the tree of the cells (CellTree): sibling cells are the most
-alike, so the report merges cells up this tree where their defects agree
-(merge_cells).
+alike, so the report merges cells up this tree where their defects do
+not contradict each other (merge_cells).
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ __all__ = [
     "ward_tree",
 ]
 
-from collections.abc import Hashable, Sequence
+from collections.abc import Hashable, Sequence, Set
 from dataclasses import dataclass
 
 import numpy as np
@@ -38,7 +39,6 @@ from sklearn.neighbors import NearestNeighbors
 from src.graph import sample_rows
 
 _NEAREST_ROWS = 100_000  # rows whose nearest sampled row is searched at once
-_MIXED = object()  # the profile of a node whose cells differ
 
 
 @dataclass(frozen=True)
@@ -160,27 +160,28 @@ def ward_tree(X: np.ndarray, weights: np.ndarray) -> WardTree:
 def class_cells(
     X: np.ndarray,
     weights: np.ndarray,
-    max_rows: int,
     min_rows: int,
     max_fit_samples: int,
     seed: int,
 ) -> tuple[np.ndarray, CellTree]:
-    """Cut one class into cells of at most max_rows distinct rows.
+    """Cut one class into cells of min_rows to 2 · min_rows - 1 distinct rows.
 
     A weighted Ward tree (ward_tree) is built on a uniform sample of at
     most max_fit_samples rows (graph.sample_rows); every row joins its
-    nearest sampled row (euclidean), so a node holds
-    the rows of its sampled rows. From the root, a node of more than
-    max_rows rows is split into its two children; a child of fewer than
-    min_rows rows is left out, its rows joining the cell of their nearest
-    sampled row in a cell, and the node goes on as its other child. Every
-    node left is a cell. A cell so holds at most max_rows rows, and the
-    rows of the small branches left out beside it.
+    nearest sampled row (euclidean), so a node holds the rows of its
+    sampled rows. From the root, a node of at least 2 · min_rows rows is
+    split into its two children; a child of fewer than min_rows rows is
+    left out, its rows joining the cell of their nearest sampled row in
+    a cell, and the node goes on as its other child. Every node left is
+    a cell. A cell so holds fewer than 2 · min_rows rows, and the rows
+    of the small branches left out beside it; a class of fewer than
+    2 · min_rows rows is one cell. A node is never smaller than its
+    sampled rows: with more rows than max_fit_samples · 2 · min_rows a
+    class is cut at most into its sampled rows.
 
     Args:
         X: The points of the class, shape (n, d), n >= 1.
         weights: The weight of every row (its copies in the CSV), > 0.
-        max_rows: The most distinct rows of a cell, >= 2 * min_rows.
         min_rows: The fewest distinct rows of a cell, >= 1.
         max_fit_samples: The most rows the tree is built on.
         seed: The seed of the sample.
@@ -202,10 +203,10 @@ def class_cells(
     stack = [(2 * m - 2, -1)]
     while stack:
         v, up = stack.pop()
-        while v >= m and size[v] > max_rows:
+        while v >= m and size[v] >= 2 * min_rows:
             a, b = tree.children[v - m]
             small_a, small_b = size[a] < min_rows, size[b] < min_rows
-            if small_a and small_b:  # never when max_rows >= 2 * min_rows
+            if small_a and small_b:  # never: one child holds half the rows
                 break
             if small_a or small_b:
                 v = b if small_a else a  # the small child is left out
@@ -230,20 +231,25 @@ def class_cells(
     )
 
 
-def merge_cells(tree: CellTree, profile: Sequence[Hashable]) -> np.ndarray:
-    """Merge the cells of a class into regions up its cut.
+def merge_cells(
+    tree: CellTree, yes: Sequence[Set[Hashable]], no: Sequence[Set[Hashable]]
+) -> np.ndarray:
+    """Merge the cells of a class into regions up its cut, where they do not contradict each other.
 
-    A node is uniform when it is a cell, or when both its children are
-    uniform with the same profile; a region is a uniform node whose
-    parent is not uniform, or the root when it is uniform. A region is so
-    the largest branch of the cut whose cells all share a profile, and
-    it is named by its top node: the same branch has the same name
-    whatever the profiles of the cells outside it.
+    Every cell has a verdict on some entries (a defect, against a class
+    or on a key): the entries it has (yes) and those it has not (no);
+    on the others it is undecided. A node is uniform when no entry is
+    in the yes of one of its cells and in the no of another; a region
+    is a uniform node whose parent is not uniform, or the root when it
+    is uniform. A region is so the largest branch of the cut whose
+    cells do not contradict each other (an undecided cell never splits
+    a branch), and it is named by its top node: the same branch has the
+    same name whatever the cells outside it.
 
     Args:
         tree: The cut of the class (class_cells).
-        profile: The profile of every cell, indexed by cell; two equal
-            profiles compare equal.
+        yes: Per cell, indexed by cell, the entries it has.
+        no: Per cell, the entries it has not; disjoint from its yes.
 
     Returns:
         The region of every cell: the index in the cut of the top node
@@ -251,28 +257,24 @@ def merge_cells(tree: CellTree, profile: Sequence[Hashable]) -> np.ndarray:
     """
     parent = np.asarray(tree.parent, dtype=np.int64)
     k = len(parent)
-    children: list[list[int]] = [[] for _ in range(k)]
-    for v in range(1, k):
-        children[parent[v]].append(v)
-    # The profile a node's cells share, _MIXED when they differ; children
-    # come after their parent, so walking back sees them first.
-    shared: list[object] = [_MIXED] * k
+    # The entries a node's cells have and have not; children come after
+    # their parent, so walking back adds each into its parent.
+    has: list[set] = [set() for _ in range(k)]
+    lacks: list[set] = [set() for _ in range(k)]
     for v in range(k - 1, -1, -1):
         if tree.cell[v] >= 0:
-            shared[v] = profile[tree.cell[v]]
-            continue
-        a, b = (shared[x] for x in children[v])
-        if a is not _MIXED and b is not _MIXED and a == b:
-            shared[v] = a
+            has[v] |= yes[tree.cell[v]]
+            lacks[v] |= no[tree.cell[v]]
+        if parent[v] >= 0:
+            has[parent[v]] |= has[v]
+            lacks[parent[v]] |= lacks[v]
+    uniform = [not (has[v] & lacks[v]) for v in range(k)]
     region_of_node = np.full(k, -1, dtype=np.int64)
     for v in range(k):
-        if shared[v] is _MIXED:
+        if not uniform[v]:
             continue
         up = parent[v]
-        if up >= 0 and shared[up] is not _MIXED:
-            region_of_node[v] = region_of_node[up]
-        else:
-            region_of_node[v] = v
+        region_of_node[v] = region_of_node[up] if up >= 0 and uniform[up] else v
     leaf = tree.cell >= 0
     region = np.empty(int(leaf.sum()), dtype=np.int64)
     region[tree.cell[leaf]] = region_of_node[leaf]

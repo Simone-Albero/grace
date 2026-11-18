@@ -20,12 +20,21 @@ from conftest import (
     make_workspace,
 )
 
-from src.cells import CellTree, merge_cells
 from src.config import load_config
 from src.data import DUPLICATES, KINDS, LABEL
 from src.prepare import MISSING, OTHER
 from src.provenance import KEYS, TIME
-from src.quality import DEFECTS, defects_of, rival_defects
+from src.quality import (
+    CLASS_DEFECTS,
+    DEFECTS,
+    RIVAL_DEFECTS,
+    decisive_rows,
+    defects_of,
+    provenance_verdict,
+    redundancy_verdict,
+    rival_defects,
+)
+from src.report import PROVENANCE
 from stages.paths import read_points
 
 
@@ -249,7 +258,7 @@ def test_assignments_cover_every_row_and_keep_its_class(done):
 
 
 def test_cells_count_the_rows_of_the_csv_and_keep_their_size(done):
-    limits = load_config(str(done.dataset), method=str(done.method)).method.cells
+    method = load_config(str(done.dataset), method=str(done.method)).method
     cells = _cells(done)
     data = _read(done, "data.parquet")
     read = dict(_rows(done, "SELECT label, n_read FROM class_counts"))
@@ -258,9 +267,9 @@ def test_cells_count_the_rows_of_the_csv_and_keep_their_size(done):
     for code, n_read in per_class.iter_rows():
         assert n_read == read[classes[code]]
     assert cells["n_read"].sum() == data[DUPLICATES].sum()
-    assert cells["n_rows"].min() >= limits.min_rows
-    # at most max_rows, and the rows of the small branches left beside it
-    assert cells["n_rows"].max() <= 1.25 * limits.max_rows
+    assert cells["n_rows"].min() >= method.min_rows
+    # under 2 · min_rows, but for the rows of the small branches left beside it
+    assert cells["n_rows"].median() < 2 * method.min_rows
     logged = _rows(done, "SELECT cell, class, n_rows, n_read FROM cells ORDER BY cell")
     assert [r[0] for r in logged] == cells["cell"].to_list()
     assert [classes.index(r[1]) for r in logged] == cells["class"].to_list()
@@ -269,11 +278,8 @@ def test_cells_count_the_rows_of_the_csv_and_keep_their_size(done):
     assert sorted(r[0] for r in by_class) == sorted(classes)
     assert sum(r[3] for r in by_class) == cells.height
     assert all(r[3] >= 1 for r in by_class)
-    ((n_cells, max_rows, min_rows),) = _rows(
-        done, "SELECT n_cells, max_rows, min_rows FROM cell_stats"
-    )
-    assert n_cells == cells.height
-    assert (max_rows, min_rows) == (limits.max_rows, limits.min_rows)
+    ((n_cells, min_rows),) = _rows(done, "SELECT n_cells, min_rows FROM cell_stats")
+    assert n_cells == cells.height and min_rows == method.min_rows
 
 
 def _tree(workspace: Workspace) -> pl.DataFrame:
@@ -385,7 +391,7 @@ def test_quality_classes_share_the_csv_rows_with_each_defect(reported):
     cells = _table(reported, "quality_cells").with_columns(
         of_cell=pl.col("defects")
         .fill_null("")
-        .str.contains("class_overlap|shortcut|atypical_source")
+        .str.contains("|".join(RIVAL_DEFECTS + CLASS_DEFECTS))
     )
     has = lambda d: pl.col("defects").fill_null("").str.contains(d)  # noqa: E731
     by_hand = (
@@ -395,12 +401,12 @@ def test_quality_classes_share_the_csv_rows_with_each_defect(reported):
             invalid_values=pl.col("missing_read").sum(),
             duplicates=pl.col("n_duplicates").sum(),
             label_conflict=pl.col("conflict_read").sum(),
-            class_overlap=pl.col("n_read").filter(has("class_overlap")).sum(),
-            shortcut=pl.col("n_read").filter(has("shortcut")).sum(),
-            atypical_source=pl.col("n_read").filter(has("atypical_source")).sum(),
+            **{
+                d: pl.col("n_read").filter(has(d)).sum()
+                for d in RIVAL_DEFECTS + CLASS_DEFECTS
+            },
             # a row with no defect: a first copy, with no null value and in no
-            # conflict, in a cell without class_overlap, shortcut or
-            # atypical_source
+            # conflict, in a cell without a defect of cell
             lo=pl.when(pl.col("of_cell"))
             .then(0)
             .otherwise(
@@ -444,12 +450,11 @@ def _codes(names: str | None, classes: list[str]) -> tuple[int, ...]:
 
 
 def test_quality_cells_judge_every_cell(reported):
-    tau = load_config(
-        str(reported.dataset), method=str(reported.method)
-    ).method.quality.tau
+    q = load_config(str(reported.dataset), method=str(reported.method)).method.quality
+    tau, confidence = q.tau, q.confidence
     classes = _classes(reported)
     cells = _table(reported, "quality_cells").sort("cell")
-    pairs = _table(reported, "quality_pairs")
+    measured = _table(reported, "quality_rivals")
     parquet = _cells(reported)
     assert cells["cell"].to_list() == parquet["cell"].to_list()
     assert cells["n_rows"].to_list() == parquet["n_rows"].to_list()
@@ -460,116 +465,114 @@ def test_quality_cells_judge_every_cell(reported):
         (1 - parquet["n_rows"] / parquet["n_read"]).to_list()
     )
     for r in cells.iter_rows(named=True):
-        own = pairs.filter(
-            (pl.col("cell_a") == r["cell"]) | (pl.col("cell_b") == r["cell"])
-        )
-        assert r["n_rivals"] == own.height > 0
+        own = measured.filter(pl.col("cell") == r["cell"])
+        assert own.height > 0
+        assert r["n_rivals"] == sum(len(json.loads(c)) for c in own["rival_cells"])
         rivals = []
         for p in own.iter_rows(named=True):
-            side, other = ("a", "b") if p["cell_a"] == r["cell"] else ("b", "a")
-            assert p[f"region_{side}"] == r["region"]
-            if p[f"confusion_{side}"] is None:
+            assert p["region"] == r["region"]
+            if p["confusion"] is None:
                 continue
-            steps = [
-                p[f"confusion_{side}"],
-                *json.loads(p[f"confusion_without_{side}"]),
-            ]
-            rivals.append((classes.index(p[f"class_{other}"]), np.array(steps)))
-            if p[f"cell_{other}"] == r["rival"]:
-                assert r["confusion"] == pytest.approx(p[f"confusion_{side}"])
-                assert r["rival_class"] == p[f"class_{other}"]
-        assert r["confusion"] == pytest.approx(max(e[0] for _, e in rivals))
-        overlap, shortcut = rival_defects(rivals, tau)
-        assert _codes(r["overlap_with"], classes) == overlap
-        assert _codes(r["shortcut_with"], classes) == shortcut
+            steps = [p["confusion"], *json.loads(p["confusion_without"])]
+            k = classes.index(p["rival_class"])
+            rivals.append((k, np.array(steps), p["n_scored"]))
+            if p["rival_class"] == r["rival_class"]:
+                assert r["confusion"] == pytest.approx(p["confusion"])
+                assert r["confusion_low"] <= r["confusion"] <= r["confusion_high"]
+        assert r["confusion"] == pytest.approx(max(e[0] for _, e, _ in rivals))
+        # the classes of each rival defect: those of a True verdict, and
+        # class_overlap only where it is no suspect_label
+        found = rival_defects(rivals, tau, confidence)
+        yes = lambda d: {k for (e, k), v in found.items() if e == d and v}  # noqa: E731
+        assert set(_codes(r["label_with"], classes)) == yes("suspect_label")
+        assert set(_codes(r["overlap_with"], classes)) == yes("class_overlap") - yes(
+            "suspect_label"
+        )
+        assert set(_codes(r["shortcut_with"], classes)) == yes("shortcut")
+        redundant = redundancy_verdict(
+            r["variance"],
+            r["variance_sd"],
+            r["n_rows"],
+            r["variance_typical"],
+            tau,
+            confidence,
+        )
+        keys = {
+            key
+            for key in PROVENANCE
+            if r[f"{key}_excess"] is not None
+            and provenance_verdict(
+                r[f"{key}_excess_share"],
+                r[f"{key}_excess"],
+                r[f"{key}_n"],
+                tau,
+                confidence,
+            )
+        }
+        assert set(_listed(r["provenance_with"])) == keys
+        established = {
+            "suspect_label": r["label_with"],
+            "class_overlap": r["overlap_with"],
+            "shortcut": r["shortcut_with"],
+            "redundancy": redundant,
+            "atypical_provenance": keys,
+        }
         defects = defects_of(
             r["missing_rows"],
             r["n_rows"],
             r["n_read"],
             r["conflict_rows"],
-            overlap,
-            shortcut,
-            r["src_ip_excess"] >= tau,
+            {d for d, held in established.items() if held},
         )
         assert r["defects"] == (",".join(defects) or None)
-        if r["shortcut_rival"] is not None:
-            assert r["shortcut_columns"]
-            assert (r["confusion_without"] >= tau) == ("shortcut" in defects)
+        assert not set(_listed(r["undecided"])) & set(defects)
         assert r["missing_rows"] >= max(r[f"{kind}_rows"] for kind in KINDS)
 
 
-def test_quality_regions_are_the_largest_branches_of_cells_that_agree(reported):
+def _listed(value: str | None) -> list[str]:
+    return value.split(",") if value else []
+
+
+def test_quality_regions_are_branches_of_the_cut_with_the_defects_of_their_cells(
+    reported,
+):
     classes = _classes(reported)
     cells = _table(reported, "quality_cells").sort("cell")
     regions = _table(reported, "quality_regions").sort("region")
     tree = _read(reported, "cell_tree.parquet").sort("node")
-    host = [
-        r["src_ip_excess_value"] if "atypical_source" in (r["defects"] or "") else None
-        for r in cells.iter_rows(named=True)
-    ]
-    profile = [
-        (r["overlap_with"], r["shortcut_with"], h)
-        for r, h in zip(cells.iter_rows(named=True), host)
-    ]
-    expected = []
-    for code in range(len(classes)):
-        part = tree.filter(pl.col("class") == code)
-        if not part.height:
+    parent = dict(zip(tree["node"].to_list(), tree["parent"].to_list()))
+    node_of = dict(zip(tree["cell"].to_list(), tree["node"].to_list()))
+    below = {}  # the cells under every node
+    for cell, node in node_of.items():
+        if cell is None:
             continue
-        first = part["node"][0]
-        own = part["cell"].drop_nulls().to_numpy()
-        base = int(own.min())
-        cut = CellTree(
-            parent=np.where(part["parent"] >= 0, part["parent"] - first, -1),
-            cell=np.where(part["cell"].is_null(), -1, part["cell"].fill_null(0) - base),
-        )
-        merged = merge_cells(cut, profile[base : base + len(own)])
-        expected += (merged + first).tolist()
-    assert cells["region"].to_list() == expected
-    assert regions["region"].to_list() == sorted(set(expected))
-    summed = (
-        cells.group_by("region")
-        .agg(
-            pl.len().alias("n_cells"),
-            *(
-                pl.col(c).sum()
-                for c in ("n_rows", "n_read", "conflict_rows", "missing_rows")
-            ),
-            pl.col("overlap_with").unique(),
-            pl.col("shortcut_with").unique(),
-            pl.col("confusion").max(),
-            pl.col("src_ip_excess").max(),
-        )
-        .sort("region")
-    )
-    assert regions["n_cells"].to_list() == summed["n_cells"].to_list()
-    for column in ("n_rows", "conflict_rows", "missing_rows"):
-        assert regions[column].to_list() == summed[column].to_list()
-    assert regions["n_read"].to_list() == pytest.approx(summed["n_read"].to_list())
-    assert regions["confusion"].to_list() == pytest.approx(
-        summed["confusion"].to_list()
-    )
-    assert regions["src_ip_excess"].to_list() == pytest.approx(
-        summed["src_ip_excess"].to_list()
-    )
-    of_region = cells["region"].to_numpy()
-    for r, s in zip(regions.iter_rows(named=True), summed.iter_rows(named=True)):
-        # the cells of a region share their classes of class_overlap and
-        # shortcut, and the host of atypical_source
-        assert s["overlap_with"] == [r["overlap_with"]]
-        assert s["shortcut_with"] == [r["shortcut_with"]]
-        (shared,) = {host[c] for c in np.flatnonzero(of_region == r["region"])}
-        assert r["src_ip_excess_value"] == shared
+        while node >= 0:
+            below.setdefault(node, set()).add(cell)
+            node = parent[node]
+    assert regions["region"].to_list() == sorted(set(cells["region"]))
+    for r in regions.iter_rows(named=True):
+        own = cells.filter(pl.col("region") == r["region"])
+        # a whole branch, named by the node at its top
+        assert set(own["cell"]) == below[r["region"]]
+        assert r["n_cells"] == own.height
+        for column in ("n_rows", "conflict_rows", "missing_rows"):
+            assert r[column] == own[column].sum()
+        assert r["n_read"] == pytest.approx(own["n_read"].sum())
+        assert r["confusion"] == pytest.approx(own["confusion"].max())
+        # the defects its cells have, against the classes or keys they have them
+        for key in ("label_with", "overlap_with", "shortcut_with", "provenance_with"):
+            union = {n for v in own[key] for n in _listed(v)}
+            assert set(_listed(r[key])) == union
+        held = {d for v in own["defects"] for d in _listed(v)}
         defects = defects_of(
             r["missing_rows"],
             r["n_rows"],
             r["n_read"],
             r["conflict_rows"],
-            _codes(r["overlap_with"], classes),
-            _codes(r["shortcut_with"], classes),
-            shared is not None,
+            held & set(RIVAL_DEFECTS + CLASS_DEFECTS),
         )
         assert r["defects"] == (",".join(defects) or None)
+        assert set(_listed(r["label_with"])) <= set(classes)
 
 
 def _bad_cells(series: pl.Series) -> int:
@@ -628,32 +631,35 @@ def test_the_copies_are_duplicates(reported):
         assert not alone["defects"].fill_null("").str.contains("duplicates").any()
 
 
-def test_quality_pairs_are_the_rivals_of_every_cell(reported):
+def test_quality_rivals_measure_every_cell_against_its_rival_classes(reported):
     cfg = load_config(str(reported.dataset), method=str(reported.method))
     quality = cfg.method.quality
-    pairs = _table(reported, "quality_pairs")
+    rivals = _table(reported, "quality_rivals")
     cells = _cells(reported)
-    assert pairs.height and (pairs["class_a"] != pairs["class_b"]).all()
-    assert (pairs["cell_a"] < pairs["cell_b"]).all()
-    assert pairs.select("cell_a", "cell_b").is_unique().all()
-    measured = set(pairs["cell_a"]) | set(pairs["cell_b"])
-    assert measured == set(cells["cell"])
+    classes = _classes(reported)
+    class_of = dict(zip(cells["cell"].to_list(), cells["class"].to_list()))
+    size = dict(zip(cells["cell"].to_list(), cells["n_rows"].to_list()))
+    assert rivals.height and (rivals["class"] != rivals["rival_class"]).all()
+    assert rivals.select("cell", "rival_class").is_unique().all()
+    assert set(rivals["cell"]) == set(cells["cell"])
     columns = set(cfg.num_cols + cfg.cat_cols)
-    for p in pairs.iter_rows(named=True):
-        for key in ("a", "b", ""):
-            assert 0 <= p[f"nn_error_{key}".rstrip("_")] <= 1
-        assert 0 <= p["bayes_error_low"] <= p["nn_error"]
-        assert p["nn_error"] == pytest.approx((p["nn_error_a"] + p["nn_error_b"]) / 2)
-        assert 0.5 <= p["single_column_acc"] <= 1 and p["single_column"] in columns
-        removed = p["key_columns"].split(",")
+    for r in rivals.iter_rows(named=True):
+        # the cell whole, its rival cells of one class pooled and capped
+        others = json.loads(r["rival_cells"])
+        assert others == sorted(others) and others
+        assert {classes[class_of[o]] for o in others} == {r["rival_class"]}
+        n_a, n_b = size[r["cell"]], sum(size[o] for o in others)
+        assert r["n_measured"] == n_a
+        assert r["n_rival_measured"] == min(n_b, quality.max_rows_per_cell)
+        # so a measure is decidable, as min_rows promises
+        assert r["n_scored"] >= decisive_rows(quality.tau, quality.confidence)
+        assert 0 <= r["bayes_error_low"] <= r["nn_error"] <= 1
+        assert 0 <= r["single_column_acc"] <= 1 and r["single_column"] in columns
+        removed = r["key_columns"].split(",")
         assert set(removed) <= columns and len(removed) == quality.max_group
-        one = (1 - p["single_column_acc_a"], 1 - p["single_column_acc_b"])
-        nearest = (p["nn_error_a"], p["nn_error_b"])
-        assert (p["confusion_a"], p["confusion_b"]) in (one, nearest)
-        for side in ("a", "b"):
-            without = json.loads(p[f"confusion_without_{side}"])
-            assert len(without) == len(removed)
-            assert all(0 <= e <= 1 for e in without)
+        without = json.loads(r["confusion_without"])
+        assert len(without) == len(removed) and all(0 <= e <= 1 for e in without)
+        assert 0 <= r["confusion"] <= 1
 
 
 def test_quality_report_refuses_cells_of_other_data(copy_of_done):
@@ -749,8 +755,8 @@ def test_the_planted_provenance_shows_in_its_cells(reported):
 
 def test_the_planted_source_is_atypical_for_its_class(reported):
     cells = _table(reported, "quality_cells")
-    atypical = cells.filter(
-        pl.col("defects").fill_null("").str.contains("atypical_source")
+    by_host = cells.filter(
+        pl.col("provenance_with").fill_null("").str.contains("src_ip")
     )
     # The canonical sub-group of class_4 comes from a host the rest of
     # its class never has: every cell of it, and only of it, in class_4.
@@ -759,16 +765,17 @@ def test_the_planted_source_is_atypical_for_its_class(reported):
     )
     assert planted.height and (planted["src_ip_top_share"] > 0.9).all()
     assert set(planted["cell"]) == set(
-        atypical.filter(pl.col("class") == "class_4")["cell"]
+        by_host.filter(pl.col("class") == "class_4")["cell"]
     )
+    assert planted["defects"].str.contains("atypical_provenance").all()
     assert set(planted["src_ip_excess_value"]) == {"18.99.9.9"}
     assert (planted["src_ip_excess"] > 0.9).all()
     # class_5 comes all from one host: typical of it, so no cell is
     # atypical; nor is any of the background, of many hosts.
-    assert not atypical["class"].is_in(["class_1", "class_5"]).any()
+    assert not by_host["class"].is_in(["class_1", "class_5"]).any()
 
 
-def test_quality_without_a_source_address_does_not_measure_atypical_source(
+def test_quality_without_a_provenance_does_not_measure_atypical_provenance(
     copy_of_done,
 ):
     raw = yaml.safe_load(copy_of_done.dataset.read_text())
@@ -776,11 +783,12 @@ def test_quality_without_a_source_address_does_not_measure_atypical_source(
     copy_of_done.dataset.write_text(yaml.safe_dump(raw, sort_keys=False))
     copy_of_done.run("quality_report")
     stats = _table(copy_of_done, "quality_stats").row(0, named=True)
-    assert stats["share_atypical_source"] is None
-    assert stats["regions_atypical_source"] is None
+    assert stats["share_atypical_provenance"] is None
+    assert stats["regions_atypical_provenance"] is None
     assert stats["share_no_defect"] is not None
+    assert stats["share_redundancy"] is not None  # geometry alone
     classes = _table(copy_of_done, "quality_classes")
-    assert classes["share_atypical_source"].is_null().all()
+    assert classes["share_atypical_provenance"].is_null().all()
     for table in ("quality_cells", "quality_regions"):
         defects = _table(copy_of_done, table)["defects"].fill_null("")
-        assert not defects.str.contains("atypical_source").any()
+        assert not defects.str.contains("atypical_provenance").any()

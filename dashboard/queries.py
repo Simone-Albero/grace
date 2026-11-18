@@ -43,6 +43,7 @@ from sklearn.decomposition import PCA
 from src.config import DatasetConfig
 from src.data import feature_cols
 from src.provenance import KEYS, TIME, concentration, time_window
+from src.quality import decisive_rows
 from src.report import Verdicts, judge
 from stages.paths import (
     assignments_file,
@@ -63,13 +64,14 @@ CONFLICT_GROUPS = 10  # most label conflict groups in a region's detail
 HYPERPARAMETERS = {
     "clean": ("min_class_count",),
     "prepare": ("top_n", "cat_cost"),
-    "cells": ("distance", "max_rows", "min_rows", "max_fit_samples", "seed"),
+    "cells": ("distance", "min_rows", "max_fit_samples", "seed"),
     "quality_report": (
         "tau",
         "rival_rows",
         "max_rows_per_cell",
         "max_group",
         "time_share",
+        "confidence",
     ),
 }
 
@@ -149,7 +151,7 @@ def cells(cfg: DatasetConfig, tau: float | None = None) -> dict[str, Any]:
 
     Returns:
         run; params (_params); stats (the cell_stats row: n_cells,
-        distance, max_rows, min_rows, max_fit_samples); classes [{class, n_rows, n_read,
+        distance, min_rows, max_fit_samples); classes [{class, n_rows, n_read,
         n_cells}]; cells [{cell, class, n_rows, n_read, region,
         defects}], region and defects (a list) those of the last
         quality_report run after this cells run, judged at tau (_judged),
@@ -226,11 +228,12 @@ def quality(cfg: DatasetConfig, tau: float | None = None) -> dict[str, Any]:
 
     Returns:
         run; params (_params: the run's own settings, its tau too);
-        stats (the quality_stats row, its tau the one judged at; n_regions,
-        regions_ and share_ judged at it; regions_ and share_
-        atypical_source null when the dataset names no source address,
-        and so the classes'); classes (quality_classes); regions
-        (quality_regions, defects and the class lists as lists); missing
+        stats (the quality_stats row, its tau the one judged at, at the
+        run's confidence; n_regions, regions_, undecided_ and share_
+        judged at it; those of atypical_provenance null when the dataset
+        names no provenance, and so the classes'); classes
+        (quality_classes); regions (quality_regions, defects and the
+        class and key lists as lists); missing
         (cell_missing summed by region, column and kind: [{region,
         column, kind, n_rows, n_read}], none when no cell is null or
         invalid).
@@ -264,9 +267,10 @@ def quality_region(
     Returns:
         region (its quality_regions row, as quality's); cells (its
         quality_cells rows, the lists as lists, with the provenance
-        columns when the dataset names some); pairs (the quality_pairs
-        rows with one of its cells, confusion_without_a and _b as
-        lists); missing (its cell_missing rows summed by column and
+        columns when the dataset names some); rivals (the quality_rivals
+        rows of its cells, one per cell and rival class, rival_cells,
+        rival_regions and confusion_without as lists); missing (its
+        cell_missing rows summed by column and
         kind); n_groups (the label conflict groups with a row in it) and
         conflicts: the CONFLICT_GROUPS of them with the most CSV rows,
         heaviest first (ties to the lower group), each {group, n_read,
@@ -286,7 +290,7 @@ def quality_region(
         if not rows:
             raise LookupError(f"no region {region} in quality_regions")
         cells = _cells_of(judged, region)
-        pairs = _pairs_of(judged, region)
+        rivals = _rivals_of(judged, region)
         missing = [
             {k: v for k, v in m.items() if k != "region"}
             for m in _missing_by_region(conn, run, judged)
@@ -312,12 +316,12 @@ def quality_region(
         by_group.items(), key=lambda g: (-sum(r["n_read"] for r in g[1]), g[0])
     )[:CONFLICT_GROUPS]
     values = _feature_values(cfg, [members[0]["row"] for _, members in heaviest])
-    own = _region_rows(cfg, judged, [region])[region]
+    (own,) = _rows_of_cells(cfg, [[c["cell"] for c in cells]])
     return {
         **_provenance_of(cfg, own, share),
         "region": _listed(rows[0]),
         "cells": [_listed(c) for c in cells],
-        "pairs": [_pair_row(p) for p in pairs],
+        "rivals": [_rival_row(r) for r in rivals],
         "missing": missing,
         "n_groups": len(by_group),
         "conflicts": [
@@ -338,11 +342,11 @@ def quality_region(
 def quality_map(
     cfg: DatasetConfig, region: int, tau: float | None = None
 ) -> dict[str, Any]:
-    """Return the rows of a region and of its rivals in their own plane.
+    """Return the rows of a region and of its rival cells in their own plane.
 
     As cell_map, with the cells of the region and every rival cell of
-    their pairs in the last quality_report run (quality_pairs), judged
-    at tau.
+    them in the last quality_report run (quality_rivals), judged at
+    tau.
 
     Args:
         cfg: The dataset.
@@ -363,25 +367,27 @@ def quality_map(
     own = _cells_of(judged, region)
     if not own:
         raise LookupError(f"no region {region} in quality_regions")
-    pairs = _pairs_of(judged, region)
     mine = sorted(c["cell"] for c in own)
-    paired = {p["cell_a"] for p in pairs} | {p["cell_b"] for p in pairs}
-    shown = [*mine, *sorted(paired - set(mine))]
+    rival = {
+        o for r in _rivals_of(judged, region) for o in json.loads(r["rival_cells"])
+    }
+    shown = [*mine, *sorted(rival - set(mine))]
     return {"region": region, "cells": shown, **_map_cells(cfg, shown)}
 
 
 def quality_profile(
     cfg: DatasetConfig, region: int, tau: float | None = None
 ) -> dict[str, Any]:
-    """Return the mean features of a region and of the regions of its rivals.
+    """Return the mean features of a region and of each of its rival classes.
 
-    Over the rows of each region (the cells of the last quality_report
-    run judged at tau, assignments.parquet), each weighted by its
-    copies in the CSV: the mean of every numeric column of the prepared
-    file (logged and standardized: a difference of means is in standard
-    deviations of the dataset, alike for every column), and the most
-    frequent value of every categorical column of the data file (ties
-    to the first in text order; null for a null).
+    Over the rows of the region (its cells in the last quality_report
+    run judged at tau, assignments.parquet) and, per rival class, of
+    the rival cells of that class of its cells (quality_rivals), each
+    row weighted by its copies in the CSV: the mean of every numeric
+    column of the prepared file (logged and standardized: a difference
+    of means is in standard deviations of the dataset, alike for every
+    column), and the most frequent value of every categorical column of
+    the data file (ties to the first in text order; null for a null).
 
     Args:
         cfg: The dataset.
@@ -389,11 +395,10 @@ def quality_profile(
         tau: The threshold, in (0, 0.5]; None: the run's own.
 
     Returns:
-        region; rivals (the other regions of its quality_pairs, in
-        order); columns (the numeric columns, in data file order);
-        means {region: [mean per column]} and top {region: {categorical
-        column: value}}, for the region and every rival, keyed by the
-        region as text.
+        region; columns (the numeric columns, in data file order); own
+        {means: [mean per column], top: {categorical column: value}};
+        rivals [{class, cells (its rival cells), means, top}] by class
+        name.
 
     Raises:
         LookupError: When quality_report has not run, or region is not
@@ -403,10 +408,14 @@ def quality_profile(
         judged = _judged(cfg, conn, _latest_run(conn, "quality_report", cfg), tau)
     if not any(r["region"] == region for r in judged.regions):
         raise LookupError(f"no region {region} in quality_regions")
-    pairs = _pairs_of(judged, region)
-    rivals = sorted({p[f"region_{k}"] for p in pairs for k in "ab"} - {region})
-    rows = _region_rows(cfg, judged, [region, *rivals])
-    every = np.unique(np.concatenate(list(rows.values())))
+    by_class: dict[str, set[int]] = defaultdict(set)
+    for r in _rivals_of(judged, region):
+        by_class[r["rival_class"]] |= set(json.loads(r["rival_cells"]))
+    names_of = sorted(by_class)
+    groups = [[c["cell"] for c in _cells_of(judged, region)]]
+    groups += [sorted(by_class[k]) for k in names_of]
+    rows = _rows_of_cells(cfg, groups)
+    every = np.unique(np.concatenate(rows))
     path = need(prepared_file(cfg), "prepare")
     names = feature_cols(
         pl.read_parquet_schema(path).names(), cfg.num_cols, cfg.cat_cols
@@ -418,18 +427,23 @@ def quality_profile(
     ).cat
     texts = _rows_at(data, every, cat).select(pl.all().cast(pl.String))
     weights = read_weights(cfg)
-    means, top = {}, {}
-    for r, own in rows.items():
+
+    def profile(own: np.ndarray) -> dict[str, Any]:
         at, w = np.searchsorted(every, own), weights[own]
         mean = (numbers[at] * w[:, None]).sum(0) / w.sum() if len(own) else []
-        means[str(r)] = [_finite(v) for v in mean]
-        top[str(r)] = {c: _weighted_mode(texts[c].to_numpy()[at], w) for c in cat}
+        return {
+            "means": [_finite(v) for v in mean],
+            "top": {c: _weighted_mode(texts[c].to_numpy()[at], w) for c in cat},
+        }
+
     return {
         "region": region,
-        "rivals": rivals,
         "columns": names,
-        "means": means,
-        "top": top,
+        "own": profile(rows[0]),
+        "rivals": [
+            {"class": k, "cells": cells, **profile(own)}
+            for k, cells, own in zip(names_of, groups[1:], rows[1:])
+        ],
     }
 
 
@@ -471,7 +485,8 @@ def _params(
 
     A name is looked up in the dataset (min_class_count), then in the
     method (distance), then in its groups (method.quality.tau); one the
-    config lacks is left out.
+    config lacks is left out. min_rows is no key of the config: it is
+    what the run's tau and confidence ask for (src.config.MethodConfig).
     """
     (text,) = conn.execute(
         "SELECT config FROM runs WHERE id = ?", (run["id"],)
@@ -479,6 +494,10 @@ def _params(
     config = json.loads(text)
     method = config.get("method", {})
     places = [config, method, *(v for v in method.values() if isinstance(v, dict))]
+    quality = method.get("quality", {})
+    if {"tau", "confidence"} <= set(quality):
+        rows = 2 * decisive_rows(quality["tau"], quality["confidence"])
+        places.insert(0, {"min_rows": rows})
     found = {}
     for name in HYPERPARAMETERS[stage]:
         place = next((p for p in places if name in p), None)
@@ -487,22 +506,13 @@ def _params(
     return found
 
 
-def _region_rows(
-    cfg: DatasetConfig, judged: Verdicts, regions: list[int]
-) -> dict[int, np.ndarray]:
-    """Return the rows of the data file of each region, sorted, by region.
-
-    Its cells are those of judged, their rows those of
-    assignments.parquet; a region without cells has none.
-    """
+def _rows_of_cells(cfg: DatasetConfig, groups: list[list[int]]) -> list[np.ndarray]:
+    """Return the rows of the data file of each group of cells, sorted (assignments.parquet)."""
     assigned = pl.read_parquet(
         need(assignments_file(cfg), "cells"), columns=["row", "cell"]
     )
     row, cell = assigned["row"].to_numpy(), assigned["cell"].to_numpy()
-    return {
-        r: np.sort(row[np.isin(cell, [c["cell"] for c in _cells_of(judged, r)])])
-        for r in regions
-    }
+    return [np.sort(row[np.isin(cell, cells)]) for cells in groups]
 
 
 def _cells_of(judged: Verdicts, region: int) -> list[dict[str, Any]]:
@@ -510,9 +520,9 @@ def _cells_of(judged: Verdicts, region: int) -> list[dict[str, Any]]:
     return [c for c in judged.cells if c["region"] == region]
 
 
-def _pairs_of(judged: Verdicts, region: int) -> list[dict[str, Any]]:
-    """Return the pairs with a cell in a region."""
-    return [p for p in judged.pairs if region in (p["region_a"], p["region_b"])]
+def _rivals_of(judged: Verdicts, region: int) -> list[dict[str, Any]]:
+    """Return the quality_rivals rows of the cells of a region."""
+    return [r for r in judged.rivals if r["region"] == region]
 
 
 def _provenance_of(
@@ -575,11 +585,23 @@ def _provenance_of(
     return {"provenance": found, "time": time}
 
 
+_LISTS = (
+    "defects",
+    "undecided",
+    "conflict_with",
+    "label_with",
+    "overlap_with",
+    "shortcut_with",
+    "provenance_with",
+)  # the comma lists of quality_cells and quality_regions
+
+
 def _listed(row: dict[str, Any]) -> dict[str, Any]:
     """Return a quality_regions or quality_cells row with its comma lists as lists."""
     out = dict(row)
-    for key in ("defects", "overlap_with", "shortcut_with", "conflict_with"):
-        out[key] = row[key].split(",") if row[key] else []
+    for key in _LISTS:
+        if key in row:
+            out[key] = row[key].split(",") if row[key] else []
     return out
 
 
@@ -617,7 +639,7 @@ def _judged(
 ) -> Verdicts:
     """Return the verdicts of a quality_report run at tau (src.report.judge).
 
-    What the run measured is read from quality_cells and quality_pairs,
+    What the run measured is read from quality_cells and quality_rivals,
     the cells' tree from cell_tree.parquet, as the stage did. Cached per
     database, run, tau and tree file.
 
@@ -628,11 +650,17 @@ def _judged(
         tau: The threshold, in (0, 0.5]; None: the run's own.
 
     Raises:
-        LookupError: When the cells tree is missing, or the run is of an
-            older quality_report (no clear_rows).
+        LookupError: When the cells tree is missing, the cells were cut
+            again after the run (its cells are not those of the tree),
+            or the run is of an older quality_report (no clear_rows,
+            pairs of cells instead of rival classes, or no confidence).
     """
-    if tau is None:
-        tau = _params(conn, run, "quality_report")["tau"]
+    if _latest_run(conn, "cells", cfg)["id"] > run["id"]:
+        raise LookupError("run quality_report again: the cells were cut after it")
+    params = _params(conn, run, "quality_report")
+    if "confidence" not in params:
+        raise LookupError("run quality_report again: it judged without intervals")
+    tau = params["tau"] if tau is None else tau
     path = need(cell_tree_file(cfg), "cells")
     key = (str(cfg.db_path.resolve()), run["id"], tau, path.stat().st_mtime_ns)
     if key not in _JUDGED:
@@ -642,11 +670,18 @@ def _judged(
         )
         if cells and "clear_rows" not in cells[0]:
             raise LookupError("run quality_report again: it did not log clear_rows")
-        pairs = _where(conn, "quality_pairs", run, "1")
+        if _where(conn, "quality_pairs", run, "1"):
+            raise LookupError("run quality_report again: it measured pairs of cells")
+        rivals = _where(conn, "quality_rivals", run, "1")
         if len(_JUDGED) >= 8:
             _JUDGED.clear()
         _JUDGED[key] = judge(
-            cells, pairs, pl.read_parquet(path).sort("node"), _classes(cfg), tau
+            cells,
+            rivals,
+            pl.read_parquet(path).sort("node"),
+            _classes(cfg),
+            tau,
+            params["confidence"],
         )
     return _JUDGED[key]
 
@@ -668,11 +703,10 @@ def _missing_by_region(
     ]
 
 
-def _pair_row(row: dict[str, Any]) -> dict[str, Any]:
-    """Return a quality_pairs row with its confusion without columns as lists."""
+def _rival_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Return a quality_rivals row with its JSON lists as lists."""
     out = dict(row)
-    for side in ("a", "b"):
-        key = f"confusion_without_{side}"
+    for key in ("rival_cells", "rival_regions", "confusion_without"):
         out[key] = json.loads(row[key]) if row[key] else []
     return out
 

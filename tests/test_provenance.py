@@ -7,7 +7,14 @@ import numpy as np
 import polars as pl
 import pytest
 
-from src.provenance import TIME, concentration, excess, read_provenance, time_window
+from src.provenance import (
+    TIME,
+    concentration,
+    excess,
+    read_provenance,
+    time_parts,
+    time_window,
+)
 
 FORMAT = "%Y-%m-%d %H:%M:%S%.f"
 
@@ -84,8 +91,17 @@ def test_excess_against_the_typical_group_of_its_class_by_hand():
     values = pl.Series([rows[i][1] for i in order])
     group_class = np.array([0, 0, 0, 0, 1, 1, 1, 1, 2, 2])
     out = excess(group, values, group_class, 10)
-    assert out.columns == ["excess_value", "excess"]
-    assert out.schema == {"excess_value": pl.String, "excess": pl.Float64}
+    assert out.columns == ["excess_value", "excess", "excess_share", "n"]
+    assert out.schema == {
+        "excess_value": pl.String,
+        "excess": pl.Float64,
+        "excess_share": pl.Float64,
+        "n": pl.Int64,
+    }
+    # the share of the value of the excess, over the group's rows with one
+    assert out["excess_share"].to_list()[:4] == [0.75, 0.5, 1.0, 0.75]
+    assert out["n"].to_list() == [4, 2, 4, 4, 4, 2, 2, None, 3, None]
+    out = out.select("excess_value", "excess")
     # Class 0, four groups with a value, the typical share the 2nd
     # smallest: a is in all four (0.75, 0.5, 1, 0.25), typically 0.5; b
     # in half of them and c in one, typically 0.
@@ -106,7 +122,26 @@ def test_excess_against_the_typical_group_of_its_class_by_hand():
     assert out.row(8) == ("e", 0.0)
     assert out.row(9) == (None, None)
     as_categories = excess(group, values.cast(pl.Categorical), group_class, 10)
-    assert as_categories.equals(out)
+    assert as_categories.select("excess_value", "excess").equals(out)
+
+
+def test_time_parts_cut_each_class_in_as_many_parts_as_cells():
+    # Class 0 has two cells (0, 1), class 1 one (2). Class 0's six times
+    # in order fall in two parts of three; two equal times share a part.
+    t = [datetime(2018, 2, 15, 10, m) for m in (0, 1, 2, 3, 4, 5, 9)]
+    times = pl.Series([t[3], t[0], t[1], None, t[5], t[2], t[4], t[6], t[6]])
+    group = np.array([1, 0, 0, 1, 1, 0, 1, 2, 2])
+    parts = time_parts(group, times, np.array([0, 0, 1]))
+    assert parts.dtype == pl.String and parts[3] is None
+    first, second = "2018-02-15 10:00:00 to 10:02:00", "2018-02-15 10:03:00 to 10:05:00"
+    assert parts.to_list() == [
+        second, first, first, None, second, first, second,
+        "2018-02-15 10:09:00 to 10:09:00", "2018-02-15 10:09:00 to 10:09:00",
+    ]  # fmt: skip
+    # a cell recorded at once holds one part: as a value, its excess is
+    # all its rows over the typical cell of the class
+    out = excess(group, parts, np.array([0, 0, 1]), 3)
+    assert out["excess_share"].to_list() == [1.0, 1.0, 1.0]
 
 
 def test_time_window_holds_the_central_share_of_the_rows_by_hand():

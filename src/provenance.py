@@ -15,10 +15,12 @@ from __future__ import annotations
 
 __all__ = [
     "KEYS",
+    "ORIGIN",
     "TIME",
     "concentration",
     "excess",
     "read_provenance",
+    "time_parts",
     "time_window",
 ]
 
@@ -28,7 +30,13 @@ import numpy as np
 import polars as pl
 
 KEYS = ("src_ip", "src_port", "dst_ip", "dst_port")  # measured as values, in this order
-TIME = "time"  # measured as a window
+TIME = (
+    "time"  # measured as a window, and as the part of its class's time a row falls in
+)
+# The keys atypical_provenance is judged on: where a group of rows comes from and when.
+# The destination follows the service, and a cell of one service is the rule, not a defect:
+# on the injection experiment nearly every clean BENIGN cell had one destination port.
+ORIGIN = ("src_ip", "src_port", TIME)
 
 
 def read_provenance(
@@ -126,8 +134,10 @@ def excess(
     Returns:
         One row per group, 0 to m - 1 in order: excess_value (String:
         the value of the highest excess, ties to the first in text
-        order) and excess (Float64: its share in the group less its
-        typical share in the class); null for a group without a value.
+        order), excess (Float64: its share in the group less its
+        typical share in the class), excess_share (Float64: its share
+        in the group) and n (Int64: the group's rows with a value, what
+        the share is of); null for a group without a value.
     """
     groups = pl.DataFrame(
         {"group": np.arange(m, dtype=group.dtype), "cls": np.asarray(group_class)}
@@ -137,7 +147,10 @@ def excess(
         rows.group_by("group", "value")
         .len()
         .with_columns(pl.col("value").cast(pl.String))
-        .with_columns(share=pl.col("len") / pl.col("len").sum().over("group"))
+        .with_columns(
+            share=pl.col("len") / pl.col("len").sum().over("group"),
+            rows=pl.col("len").sum().over("group").cast(pl.Int64),
+        )
         .join(groups, on="group")
         .with_columns(
             n=pl.col("group").n_unique().over("cls"),  # its class's groups with a value
@@ -157,6 +170,8 @@ def excess(
             "group",
             excess_value="value",
             excess=pl.col("share") - pl.col("typical").fill_null(0.0),
+            excess_share="share",
+            n="rows",
         )
         .sort(["group", "excess", "excess_value"], descending=[False, True, False])
         .group_by("group", maintain_order=True)
@@ -168,6 +183,58 @@ def excess(
         .sort("group")
         .drop("group")
     )
+
+
+def time_parts(
+    group: np.ndarray, times: pl.Series, group_class: np.ndarray
+) -> pl.Series:
+    """Return the part of its class's time each row falls in, as a value.
+
+    The rows of a class with a time, in order of time, are cut into as
+    many parts of equal rows as the class has groups (its cells); rows
+    of one time share a part. A part is so a value of the time, as an
+    address is a value of the source: a group recorded at once lies in
+    one part, as the rows of one host share one address, and excess
+    measures the time as it measures the keys of KEYS.
+
+    Args:
+        group: The group of every row (its cell).
+        times: The time of every row, Datetime; a null is unknown.
+        group_class: The class of every group.
+
+    Returns:
+        Per row, String: its part, written "<first time> to <last time>"
+        ("%Y-%m-%d %H:%M:%S", the last without the day); null for a row
+        without a time.
+    """
+    group_class = np.asarray(group_class)
+    cells = np.bincount(group_class)
+    rows = pl.DataFrame(
+        {
+            "cls": group_class[np.asarray(group)],
+            "t": times,
+        }
+    ).with_row_index("i")
+    known = rows.drop_nulls("t").with_columns(
+        n=pl.len().over("cls"),
+        r=pl.col("t").rank("min").over("cls").cast(pl.Int64) - 1,
+        k=pl.col("cls").replace_strict(
+            dict(enumerate(cells.tolist())), return_dtype=pl.Int64
+        ),
+    )
+    known = known.with_columns(part=pl.col("r") * pl.col("k") // pl.col("n"))
+    spans = known.group_by("cls", "part").agg(
+        first=pl.col("t").min(), last=pl.col("t").max()
+    )
+    label = known.join(spans, on=["cls", "part"]).select(
+        "i",
+        value=pl.concat_str(
+            pl.col("first").dt.to_string("%Y-%m-%d %H:%M:%S"),
+            pl.lit(" to "),
+            pl.col("last").dt.to_string("%H:%M:%S"),
+        ),
+    )
+    return rows.join(label, on="i", how="left").sort("i")["value"]
 
 
 def time_window(

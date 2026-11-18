@@ -3,6 +3,7 @@
 .DEFAULT_GOAL := help
 PYTHON ?= $(if $(wildcard venv/bin/python),venv/bin/python,python)
 DATA ?= synthetic_test
+METHOD ?= default
 PORT ?= 8000
 
 .PHONY: help test format generate run dashboard
@@ -24,12 +25,12 @@ format:
 generate:
 	$(PYTHON) generate_synthetic.py $(if $(ROWS),--rows $(ROWS),)
 
-## run: every stage in order on DATA (default synthetic_test)
+## run: every stage in order on DATA (default synthetic_test) with METHOD (default default)
 run:
-	$(PYTHON) main.py --stage clean --dataset $(DATA)
-	$(PYTHON) main.py --stage prepare --dataset $(DATA)
-	$(PYTHON) main.py --stage cells --dataset $(DATA)
-	$(PYTHON) main.py --stage quality_report --dataset $(DATA)
+	$(PYTHON) main.py --stage clean --dataset $(DATA) --method $(METHOD)
+	$(PYTHON) main.py --stage prepare --dataset $(DATA) --method $(METHOD)
+	$(PYTHON) main.py --stage cells --dataset $(DATA) --method $(METHOD)
+	$(PYTHON) main.py --stage quality_report --dataset $(DATA) --method $(METHOD)
 
 ## dashboard: the read-only dashboard on 127.0.0.1:PORT (default 8000)
 dashboard:

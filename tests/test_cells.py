@@ -81,9 +81,9 @@ def _blobs(sizes, d=3, gap=12.0, seed=0) -> tuple[np.ndarray, np.ndarray]:
     return X, np.repeat(np.arange(len(sizes)), sizes)
 
 
-def _cells(X, weights=None, max_rows=500, min_rows=20, max_fit_samples=20_000, seed=0):
+def _cells(X, weights=None, min_rows=20, max_fit_samples=20_000, seed=0):
     weights = np.ones(len(X)) if weights is None else weights
-    return class_cells(X, weights, max_rows, min_rows, max_fit_samples, seed)
+    return class_cells(X, weights, min_rows, max_fit_samples, seed)
 
 
 def _tree_is_valid(tree: CellTree, labels: np.ndarray) -> None:
@@ -100,27 +100,28 @@ def _tree_is_valid(tree: CellTree, labels: np.ndarray) -> None:
 
 
 def test_class_cells_keep_blobs_apart_and_whole():
-    # Three blobs of 400: the root (1200) and the node of two blobs (800)
-    # are split, each blob (400) is a cell.
+    # Three blobs of 400, min_rows 250: the root (1200) and the node of two
+    # blobs (800) are split, a blob (400 < 2 · 250) is a cell.
     X, blob = _blobs([400, 400, 400])
-    labels, tree = _cells(X, max_rows=500)
+    labels, tree = _cells(X, min_rows=250)
     _tree_is_valid(tree, labels)
     assert labels.max() == 2 and adjusted_rand_score(blob, labels) == 1.0
     assert len(tree.parent) == 5
 
 
-def test_class_cells_split_a_large_blob_down_to_max_rows():
+def test_class_cells_split_a_large_blob_down_to_two_min_rows():
     X = np.random.default_rng(1).normal(size=(5000, 3))
-    labels, tree = _cells(X, max_rows=400)
+    labels, tree = _cells(X, min_rows=20)
     _tree_is_valid(tree, labels)
     sizes = np.bincount(labels)
-    assert sizes.min() >= 20 and sizes.max() <= 400 * 1.1
-    assert np.median(sizes) >= 100 and len(sizes) >= 5000 // 400
+    # under 2 · min_rows, but for the rows of the small branches left beside it
+    assert sizes.min() >= 20 and np.median(sizes) < 40
+    assert len(sizes) >= 5000 // 40
 
 
 def test_class_cells_of_a_small_class_are_one_cell():
     X = np.random.default_rng(2).normal(size=(30, 3))
-    labels, tree = _cells(X, max_rows=500)
+    labels, tree = _cells(X, min_rows=20)  # 30 < 2 · 20
     assert labels.tolist() == [0] * 30
     assert tree.parent.tolist() == [-1] and tree.cell.tolist() == [0]
     labels, tree = _cells(X[:1])
@@ -130,7 +131,7 @@ def test_class_cells_of_a_small_class_are_one_cell():
 def test_class_cells_leave_a_small_branch_to_the_nearest_cell():
     # 5 far rows: under min_rows, they are no cell of their own.
     X, blob = _blobs([600, 5], gap=80.0, seed=3)
-    labels, tree = _cells(X, max_rows=400, min_rows=20)
+    labels, tree = _cells(X, min_rows=20)
     _tree_is_valid(tree, labels)
     assert np.bincount(labels).min() >= 20
     assert len(np.unique(labels[blob == 1])) == 1  # the far rows join one cell
@@ -138,7 +139,7 @@ def test_class_cells_leave_a_small_branch_to_the_nearest_cell():
 
 def test_class_cells_give_every_row_the_cell_of_its_nearest_sampled_row():
     X, blob = _blobs([1000, 1000, 1000], seed=4)
-    labels, tree = _cells(X, max_rows=1500, max_fit_samples=300, seed=7)
+    labels, tree = _cells(X, min_rows=600, max_fit_samples=300, seed=7)
     _tree_is_valid(tree, labels)
     assert adjusted_rand_score(blob, labels) == 1.0
     A = sample_rows(len(X), 300, 7)
@@ -151,7 +152,7 @@ def test_class_cells_count_distinct_rows_not_copies():
     X, blob = _blobs([300, 300], seed=5)
     weights = np.ones(600)
     weights[0] = 10_000.0
-    labels, _ = _cells(X, weights, max_rows=400)
+    labels, _ = _cells(X, weights, min_rows=200)
     assert adjusted_rand_score(blob, labels) == 1.0
 
 
@@ -164,18 +165,28 @@ _TREE = CellTree(
 )
 
 
+def _merge(*cells):
+    """merge_cells of _TREE, each cell as (yes, no) strings of entries."""
+    return merge_cells(_TREE, [set(y) for y, _ in cells], [set(n) for _, n in cells])
+
+
 def test_merge_cells_by_hand():
     # a region is named by the node at the top of its branch
-    assert merge_cells(_TREE, ["a", "a", "a", "a"]).tolist() == [0, 0, 0, 0]
-    assert merge_cells(_TREE, ["a", "a", "b", "b"]).tolist() == [1, 1, 4, 4]
-    assert merge_cells(_TREE, ["a", "b", "b", "b"]).tolist() == [2, 3, 4, 4]
-    assert merge_cells(_TREE, ["a", "a", "b", "a"]).tolist() == [1, 1, 5, 6]
-    # Equal profiles in different branches stay apart.
-    assert merge_cells(_TREE, ["a", "b", "a", "b"]).tolist() == [2, 3, 5, 6]
+    assert _merge(("a", ""), ("a", ""), ("a", ""), ("a", "")).tolist() == [0, 0, 0, 0]
+    assert _merge(("a", ""), ("a", ""), ("", "a"), ("", "a")).tolist() == [1, 1, 4, 4]
+    assert _merge(("a", ""), ("", "a"), ("", "a"), ("", "a")).tolist() == [2, 3, 4, 4]
+    # cells that agree in different branches stay apart
+    assert _merge(("a", ""), ("", "a"), ("a", ""), ("", "a")).tolist() == [2, 3, 5, 6]
 
 
-def test_merge_cells_compares_tuples_and_one_cell():
-    profile = [((), (2,)), ((), (2,)), ((1,), ()), ((1,), ())]
-    assert merge_cells(_TREE, profile).tolist() == [1, 1, 4, 4]
+def test_merge_cells_never_split_on_an_undecided_cell():
+    # cell 1 is undecided on a: the branch of cells 0 and 1 holds, and
+    # with no contradiction anywhere the class is one region
+    assert _merge(("a", ""), ("", ""), ("a", "b"), ("a", "b")).tolist() == [0] * 4
+    # a yes against a no splits, on any entry
+    assert _merge(("a", ""), ("", ""), ("a", "b"), ("ab", "")).tolist() == [1, 1, 5, 6]
+
+
+def test_merge_cells_of_one_cell():
     one = CellTree(parent=np.array([-1]), cell=np.array([0]))
-    assert merge_cells(one, [("x",)]).tolist() == [0]
+    assert merge_cells(one, [{"x"}], [set()]).tolist() == [0]

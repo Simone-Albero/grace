@@ -29,8 +29,8 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     numbers scaled for distance, the categorical slots, not MISSING;
     every distance from here on is euclidean on them) and the weight of
     every row (paths.read_weights: its copies in the CSV). Per class,
-    ascending: cells.class_cells with method.cells (max_rows, min_rows,
-    max_fit_samples) and seed -> cell id = cell + offset, offset += the
+    ascending: cells.class_cells with method.min_rows (what tau and
+    the confidence ask for) and method.cells (max_fit_samples) and seed -> cell id = cell + offset, offset += the
     class's cells; node id = node + node offset.
 
     Writes to output_dir: cells.parquet (cell, class code, n_rows,
@@ -41,7 +41,7 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     Logs: cells (cell, class name, n_rows, n_read), cell_tree (node,
     class name, parent, depth (0 at a root), cell, n_rows and n_read of
     the cells below), class_cells (class, n_rows, n_read, n_cells),
-    cell_stats (one row: n_cells, distance, max_rows, min_rows,
+    cell_stats (one row: n_cells, distance, min_rows,
     max_fit_samples). n_rows counts distinct rows, n_read rows of the
     CSV (the summed weights).
     """
@@ -57,8 +57,7 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
         own, tree = class_cells(
             points[rows],
             weights[rows],
-            limits.max_rows,
-            limits.min_rows,
+            cfg.method.min_rows,
             limits.max_fit_samples,
             cfg.seed,
         )
@@ -130,8 +129,7 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
             {
                 "n_cells": offset,
                 "distance": cfg.method.distance,
-                "max_rows": limits.max_rows,
-                "min_rows": limits.min_rows,
+                "min_rows": cfg.method.min_rows,
                 "max_fit_samples": limits.max_fit_samples,
             }
         ],

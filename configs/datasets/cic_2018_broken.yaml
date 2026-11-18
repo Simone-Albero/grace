@@ -69,7 +69,6 @@ num_cols:
 
 cat_cols:
   - Protocol
-  - Dst Port
 
 # No provenance: Src IP and Src Port are in Thuesday-20-02 only, and the times are written on 12 hours without
 # AM/PM (an attack of 17:14 in cic_2018 reads 01:14 here).

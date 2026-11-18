@@ -98,7 +98,7 @@ def test_cells(client):
     assert set(data) == {"run", "params", "stats", "classes", "cells", "tree"}
     assert {"region", "defects"} <= set(data["cells"][0])
     assert data["stats"]["n_cells"] == len(data["cells"])
-    assert {"max_rows", "min_rows", "distance"} <= set(data["stats"])
+    assert {"min_rows", "distance"} <= set(data["stats"])
     assert sum(c["n_cells"] for c in data["classes"]) == len(data["cells"])
     leaves = [n for n in data["tree"] if n["cell"] is not None]
     assert sorted(n["cell"] for n in leaves) == [c["cell"] for c in data["cells"]]
@@ -169,12 +169,18 @@ def test_quality(reported, client):
     assert data["missing"] and {"region", "column", "kind"} <= set(data["missing"][0])
     for region in data["regions"]:
         assert set(region["defects"]) <= set(DEFECTS)
-        for key in ("overlap_with", "shortcut_with", "conflict_with"):
+        for key in (
+            "label_with",
+            "overlap_with",
+            "shortcut_with",
+            "provenance_with",
+            "conflict_with",
+        ):
             assert isinstance(region[key], list)
-        # the host of its atypical_source, and the highest excess of its cells
-        assert {"src_ip_excess_value", "src_ip_excess"} <= set(region)
-        if "atypical_source" in region["defects"]:
-            assert region["src_ip_excess_value"] is not None
+        # the keys of its atypical_provenance
+        if "atypical_provenance" in region["defects"]:
+            assert set(region["provenance_with"]) <= {*KEYS, TIME}
+    assert data["stats"]["confidence"] == 0.95
     assert any(r["defects"] for r in data["regions"])
 
 
@@ -187,7 +193,7 @@ def test_quality_judges_the_measures_at_any_tau(reported, client):
     assert high["stats"]["n_regions"] == len(high["regions"])
     for d in ("invalid_values", "duplicates", "label_conflict"):
         assert high["stats"][f"share_{d}"] == run["stats"][f"share_{d}"]
-    for d in ("class_overlap", "atypical_source"):
+    for d in ("class_overlap", "atypical_provenance"):
         assert high["stats"][f"share_{d}"] <= run["stats"][f"share_{d}"]
     low = _get(client, "/api/toy/quality?tau=0.02")
     assert low["stats"]["share_class_overlap"] >= run["stats"]["share_class_overlap"]
@@ -217,7 +223,7 @@ def test_the_details_of_a_region_follow_tau(reported, client):
     assert detail["region"]["region"] == region
     assert all(c["region"] == region for c in detail["cells"])
     assert len(detail["cells"]) == detail["region"]["n_cells"]
-    assert all(region in (p["region_a"], p["region_b"]) for p in detail["pairs"])
+    assert detail["rivals"] and all(r["region"] == region for r in detail["rivals"])
     assert (
         _get(client, f"/api/toy/quality/profile?region={region}&tau=0.5")["region"]
         == region
@@ -266,10 +272,11 @@ def test_quality_region_of_a_region_in_a_label_conflict(reported, client):
         assert measured | timed <= set(cell)
         assert 0 < cell["src_ip_top_share"] <= 1 and cell["src_ip_n_values"] >= 1
     assert sum(c["n_rows"] for c in data["cells"]) == data["region"]["n_rows"]
-    assert data["pairs"] and all(
-        {p["cell_a"], p["cell_b"]} & cells for p in data["pairs"]
-    )
-    assert all(isinstance(p["confusion_without_a"], list) for p in data["pairs"])
+    assert data["rivals"] and all(r["cell"] in cells for r in data["rivals"])
+    for r in data["rivals"]:
+        assert r["rival_class"] != data["region"]["class"]
+        for key in ("rival_cells", "rival_regions", "confusion_without"):
+            assert isinstance(r[key], list)
     assert data["missing"] == [
         {k: m[k] for k in m if k != "region"}
         for m in quality["missing"]
@@ -337,6 +344,19 @@ def test_cells_without_a_quality_report_after_them_carry_no_defects(copy_of_done
     assert set(judged()) == {(None, None)}
 
 
+def test_a_quality_report_older_than_the_cells_is_not_judged(copy_of_done):
+    folder = copy_of_done.folder / "datasets"
+    folder.mkdir()
+    (folder / "toy.yaml").write_text(copy_of_done.dataset.read_text())
+    client = TestClient(create_app(folder))
+    copy_of_done.run("quality_report")
+    copy_of_done.run("cells")
+    for route in ("quality", "quality/region?region=0", "quality/map?region=0"):
+        response = client.get(f"/api/toy/{route}")
+        assert response.status_code == 404
+        assert "cells were cut after it" in response.json()["detail"]
+
+
 def test_every_tab_shows_the_hyperparameters_its_run_used(reported, client):
     dataset = yaml.safe_load(reported.dataset.read_text())
     method = yaml.safe_load(reported.method.read_text())
@@ -348,10 +368,8 @@ def test_every_tab_shows_the_hyperparameters_its_run_used(reported, client):
         },
         "cells": {
             "distance": method["distance"],
-            **{
-                k: method["cells"][k]
-                for k in ("max_rows", "min_rows", "max_fit_samples")
-            },
+            "min_rows": 50,  # 2 x decisive_rows at tau 0.1 and 0.95
+            "max_fit_samples": method["cells"]["max_fit_samples"],
             "seed": dataset["seed"],
         },
         "quality": {
@@ -362,6 +380,7 @@ def test_every_tab_shows_the_hyperparameters_its_run_used(reported, client):
                 "max_rows_per_cell",
                 "max_group",
                 "time_share",
+                "confidence",
             )
         },
     }
@@ -404,31 +423,31 @@ def test_quality_region_tells_where_its_csv_rows_come_from(reported, client):
     )
 
 
-def test_quality_profile_means_a_region_and_the_regions_of_its_rivals(reported, client):
+def test_quality_profile_means_a_region_and_each_of_its_rival_classes(reported, client):
     cfg = load_config(str(reported.dataset), str(reported.method))
     quality = _get(client, "/api/toy/quality")
     region = next(r["region"] for r in quality["regions"] if r["overlap_with"])
     detail = _get(client, f"/api/toy/quality/region?region={region}")
-    rivals = sorted(
-        {p[f"region_{k}"] for p in detail["pairs"] for k in "ab"} - {region}
-    )
+    rivals = {}
+    for r in detail["rivals"]:
+        rivals.setdefault(r["rival_class"], set()).update(r["rival_cells"])
     data = _get(client, f"/api/toy/quality/profile?region={region}")
-    assert data["region"] == region and data["rivals"] == rivals
+    assert data["region"] == region
+    assert [r["class"] for r in data["rivals"]] == sorted(rivals)
+    assert all(r["cells"] == sorted(rivals[r["class"]]) for r in data["rivals"])
     prepared = pl.read_parquet(prepared_file(cfg))
     names = feature_cols(prepared.columns, cfg.num_cols, cfg.cat_cols)
     assert data["columns"] == list(names.num)
     rows = pl.read_parquet(data_file(cfg))
     weights = rows[DUPLICATES].cast(pl.Float64).to_numpy()
     assigned = pl.read_parquet(assignments_file(cfg)).sort("row")["cell"].to_numpy()
-    cells = {}
-    for r in [region, *rivals]:
-        detail_r = _get(client, f"/api/toy/quality/region?region={r}")
-        cells[r] = [c["cell"] for c in detail_r["cells"]]
-    for r, own in cells.items():
+    profiles = [(data["own"], [c["cell"] for c in detail["cells"]])]
+    profiles += [(r, r["cells"]) for r in data["rivals"]]
+    for profile, own in profiles:
         mine = np.isin(assigned, own)
         w = weights[mine]
         means = prepared.select(names.num).to_numpy()[mine]
-        assert data["means"][str(r)] == pytest.approx(
+        assert profile["means"] == pytest.approx(
             list((means * w[:, None]).sum(0) / w.sum())
         )
         for column in names.cat:
@@ -440,7 +459,7 @@ def test_quality_profile_means_a_region_and_the_regions_of_its_rivals(reported, 
                 .agg(pl.col("w").sum())
                 .sort(["w", "v"], descending=[True, False], nulls_last=True)
             )
-            assert data["top"][str(r)][column] == votes["v"][0]
+            assert profile["top"][column] == votes["v"][0]
 
 
 def test_quality_profile_of_an_unknown_region_is_404(reported, client):
@@ -452,10 +471,7 @@ def test_quality_map_shows_a_region_and_its_rivals(reported, client):
     region = quality["regions"][0]["region"]
     detail = _get(client, f"/api/toy/quality/region?region={region}")
     own = sorted(c["cell"] for c in detail["cells"])
-    paired = {p["cell_a"] for p in detail["pairs"]} | {
-        p["cell_b"] for p in detail["pairs"]
-    }
-    rivals = sorted(paired - set(own))
+    rivals = sorted({c for r in detail["rivals"] for c in r["rival_cells"]} - set(own))
     sizes = {c["cell"]: c["n_rows"] for c in _get(client, "/api/toy/cells")["cells"]}
     data = _get(client, f"/api/toy/quality/map?region={region}")
     assert data["region"] == region and data["cells"] == [*own, *rivals]

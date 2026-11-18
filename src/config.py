@@ -25,6 +25,7 @@ import yaml
 from src.data import DUPLICATES
 from src.prepare import MISSING
 from src.provenance import KEYS, TIME
+from src.quality import decisive_rows
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
 DATASET_DIR = CONFIG_DIR / "datasets"
@@ -53,17 +54,9 @@ class CellsConfig:
     Attributes:
         max_fit_samples: The most distinct rows of a class its Ward tree
             is built on; every other row joins its nearest sampled row.
-        max_rows: The most distinct rows of a cell, the same for every
-            class: the resolution of the report (a defect touching tau
-            of a cell's rows is seen), and what makes two cells compared
-            sampled alike.
-        min_rows: The fewest distinct rows of a cell: a smaller branch
-            of the tree joins the cells around it.
     """
 
     max_fit_samples: int
-    max_rows: int
-    min_rows: int
 
 
 @dataclass(frozen=True)
@@ -72,10 +65,11 @@ class QualityConfig:
 
     Attributes:
         tau: The share of a cell's rows that may be confused with a
-            rival's, in (0, 0.5]: the one threshold of class_overlap and
-            shortcut.
-        max_rows_per_cell: The distinct rows of a cell its pairs are
-            measured on, a uniform sample above this.
+            rival class, in (0, 0.5]: the one threshold of the report.
+        max_rows_per_cell: The most distinct rows of the rival side
+            when a cell is measured against a rival class (its rival
+            cells of that class pooled); the cell itself is always
+            measured whole.
         rival_rows: The distinct rows of a cell its rivals are searched
             from, a uniform sample above this: a budget, as the search
             compares every row with every other.
@@ -85,6 +79,11 @@ class QualityConfig:
             in (0, 1]: the window of the central rows, so that a few
             stray ones do not widen it. Description only, no defect
             depends on it.
+        confidence: The level of the interval around every measure of a
+            cell, in (0.5, 1): a cell has a defect when the measure is
+            past its threshold beyond the error of sampling, has none
+            when it is short of it beyond that error, and is undecided
+            otherwise.
     """
 
     tau: float
@@ -92,6 +91,7 @@ class QualityConfig:
     rival_rows: int
     max_group: int
     time_share: float
+    confidence: float
 
 
 @dataclass(frozen=True)
@@ -102,7 +102,7 @@ class MethodConfig:
         distance: One of DISTANCES: how the numeric columns are
             compared (graph.space_points).
         prepare: The prepared features.
-        cells: The cells of every class.
+        cells: How the cells of every class are built.
         quality: The quality report.
     """
 
@@ -110,6 +110,19 @@ class MethodConfig:
     prepare: PrepareConfig
     cells: CellsConfig
     quality: QualityConfig
+
+    @property
+    def min_rows(self) -> int:
+        """The fewest distinct rows of a cell, the one limit of the cut.
+
+        Twice the rows a share must be measured on to be able to fall
+        short of tau (`quality.decisive_rows`), since half of a cell's
+        rows choose and half are measured: under that a cell could
+        never be told to lack a rival defect, whatever it holds. It is
+        so no choice of its own, but what tau and the confidence ask
+        for (50 rows at tau 0.1 and 0.95).
+        """
+        return 2 * decisive_rows(self.quality.tau, self.quality.confidence)
 
 
 @dataclass(frozen=True)
@@ -223,24 +236,22 @@ def _validate_method(method: MethodConfig) -> None:
     cells, quality = method.cells, method.quality
     positive = {
         "cells.max_fit_samples": cells.max_fit_samples,
-        "cells.min_rows": cells.min_rows,
         "quality.max_rows_per_cell": quality.max_rows_per_cell,
         "quality.rival_rows": quality.rival_rows,
         "quality.max_group": quality.max_group,
     }
     for key, value in positive.items():
         _check(value >= 1, f"{key} must be >= 1, got {value}")
-    # A node over max_rows always has a child of min_rows or more.
-    _check(
-        cells.max_rows >= 2 * cells.min_rows,
-        f"cells.max_rows must be >= 2 * cells.min_rows, got {cells.max_rows}",
-    )
     _check(
         0 < quality.tau <= 0.5, f"quality.tau must be in (0, 0.5], got {quality.tau}"
     )
     _check(
         0 < quality.time_share <= 1,
         f"quality.time_share must be in (0, 1], got {quality.time_share}",
+    )
+    _check(
+        0.5 < quality.confidence < 1,
+        f"quality.confidence must be in (0.5, 1), got {quality.confidence}",
     )
     cat_cost = method.prepare.cat_cost
     _check(cat_cost > 0, f"prepare.cat_cost must be > 0, got {cat_cost}")
@@ -303,8 +314,8 @@ def load_config(dataset: str, method: str = "default") -> DatasetConfig:
 
     Raises:
         FileNotFoundError: When a yaml does not exist.
-        ValueError: When a key is unknown, or a value unknown or out of
-            its range.
+        ValueError: When a key is unknown, a value unknown or out of
+            its range, or a provenance column is also a feature.
     """
     path = _path(dataset, DATASET_DIR)
     raw = _yaml(path)
@@ -316,6 +327,11 @@ def load_config(dataset: str, method: str = "default") -> DatasetConfig:
             f"{added} is the column stage {stage} adds, not a configured one",
         )
     _check(raw["top_n"] >= 1, f"top_n must be >= 1, got {raw['top_n']}")
+    provenance = _provenance(raw.get("provenance"), path)
+    if provenance is not None:
+        features = {*(raw["num_cols"] or ()), *(raw["cat_cols"] or ())}
+        shared = sorted(set(provenance.columns().values()) & features)
+        _check(not shared, f"provenance columns are never features, got {shared}")
     return DatasetConfig(
         name=raw["name"],
         path=Path(raw["path"]),
@@ -327,6 +343,6 @@ def load_config(dataset: str, method: str = "default") -> DatasetConfig:
         seed=raw["seed"],
         output_dir=Path(raw["output_dir"]),
         db_path=Path(raw["db_path"]),
-        provenance=_provenance(raw.get("provenance"), path),
+        provenance=provenance,
         method=load_method_config(method),
     )
