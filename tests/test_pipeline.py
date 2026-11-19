@@ -60,11 +60,12 @@ def test_clean_drops_the_rare_class_and_the_constant_column_only(done):
     assert dropped == [("class_10",)]
     assert _rows(done, "SELECT column FROM dropped_columns") == [("flat",)]
     data = _read(done, "data.parquet")
-    n_raw, n_duplicate, n_rare, n_kept = _rows(
-        done, "SELECT n_raw, n_duplicate, n_rare, n_kept FROM clean_summary"
+    n_raw, n_duplicate, n_rare, n_capped, n_kept = _rows(
+        done,
+        "SELECT n_raw, n_duplicate, n_rare, n_capped, n_kept FROM clean_summary",
     )[0]
-    assert n_duplicate == N_DUPLICATES
-    assert data.height == n_kept == n_raw - n_duplicate - n_rare
+    assert n_duplicate == N_DUPLICATES and n_capped == 0
+    assert data.height == n_kept == n_raw - n_duplicate - n_rare - n_capped
     (n_unparsable,) = _rows(done, "SELECT n_unparsable FROM clean_summary")[0]
     assert n_unparsable == 1
     counts = dict(_rows(done, "SELECT label, n_rows FROM class_counts"))

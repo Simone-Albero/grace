@@ -8,7 +8,7 @@ included (the copies of a row may come from different hosts), and stage
 quality_report measures them per cell: how concentrated its values are
 (concentration, time_window), and how much more of one value it holds
 than the typical cell of its class (excess), the measure of the defect
-atypical_source (src.quality) on the source address.
+atypical_provenance (src.quality), judged on the keys of ORIGIN.
 """
 
 from __future__ import annotations

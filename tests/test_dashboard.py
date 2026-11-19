@@ -361,7 +361,10 @@ def test_every_tab_shows_the_hyperparameters_its_run_used(reported, client):
     dataset = yaml.safe_load(reported.dataset.read_text())
     method = yaml.safe_load(reported.method.read_text())
     expected = {
-        "clean": {"min_class_count": dataset["min_class_count"]},
+        "clean": {
+            "min_class_count": dataset["min_class_count"],
+            "max_class_rows": dataset.get("max_class_rows"),
+        },
         "prepare": {
             "top_n": dataset["top_n"],
             "cat_cost": method["prepare"]["cat_cost"],

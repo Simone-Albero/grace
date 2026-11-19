@@ -90,6 +90,7 @@ from statistics import NormalDist
 
 import numpy as np
 import polars as pl
+from sklearn.neighbors import NearestNeighbors
 
 from src.graph import sample_rows
 
@@ -495,8 +496,11 @@ def rival_pairs(
 ) -> list[tuple[int, int]]:
     """Return the pairs of a cell and the cells of its rows' nearest rivals.
 
-    For every row, its nearest row of another class (euclidean, ties
-    to the first); each cell is paired with the cells those rows lie in.
+    For every row, its nearest row of another class (euclidean, exact:
+    a kd-tree on the rows of the other classes, one per class, so the
+    memory is linear in the rows; of rows at the same distance, one,
+    the same on every run); each cell is paired with the cells those
+    rows lie in.
 
     Args:
         points: The rows, shape (n, d) (the sampled rows of every cell).
@@ -504,22 +508,22 @@ def rival_pairs(
         cell_class: The class of every cell.
 
     Returns:
-        The pairs (a, b), a < b, sorted.
+        The pairs (a, b), a < b, sorted; none when the rows are of one
+        class.
     """
     points = np.asarray(points, dtype=np.float64)
     cell = np.asarray(cell, dtype=np.int64)
     classes = np.asarray(cell_class)[cell]
     if len(np.unique(classes)) < 2:
         return []
-    norms = np.einsum("ij,ij->i", points, points)
     found: set[tuple[int, int]] = set()
-    for start in range(0, len(points), _RIVAL_ROWS):
-        part = slice(start, start + _RIVAL_ROWS)
-        sq = norms[part, None] + norms[None, :] - 2.0 * points[part] @ points.T
-        sq[classes[part, None] == classes[None, :]] = np.inf
-        rival = cell[np.argmin(sq, axis=1)]
-        for a, b in zip(cell[part].tolist(), rival.tolist()):
-            found.add((min(a, b), max(a, b)))
+    for k in np.unique(classes):
+        own = classes == k
+        search = NearestNeighbors(n_neighbors=1, algorithm="kd_tree", n_jobs=-1)
+        search.fit(points[~own])
+        nearest = search.kneighbors(points[own], return_distance=False)[:, 0]
+        a, b = cell[own], cell[~own][nearest]
+        found.update(zip(np.minimum(a, b).tolist(), np.maximum(a, b).tolist()))
     return sorted(found)
 
 
@@ -788,7 +792,6 @@ def defects_of(
 
 
 _TIE = 1e-9  # relative tolerance under which two distances tie
-_RIVAL_ROWS = 256  # rows whose nearest rival is searched at once
 
 
 def _rival_share(sq_dist: np.ndarray, side: np.ndarray) -> np.ndarray:

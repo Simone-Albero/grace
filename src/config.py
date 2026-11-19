@@ -167,6 +167,9 @@ class DatasetConfig:
         num_cols: The numeric columns.
         cat_cols: The categorical columns.
         min_class_count: Classes with fewer rows are dropped.
+        max_class_rows: The most distinct rows a class keeps, a uniform
+            sample of them past it (data.cap_classes); None keeps every
+            row.
         top_n: The most frequent values of a categorical column with
             their own one-hot slot; the others share one.
         seed: The seed of every stage.
@@ -183,6 +186,7 @@ class DatasetConfig:
     num_cols: tuple[str, ...]
     cat_cols: tuple[str, ...]
     min_class_count: int
+    max_class_rows: int | None
     top_n: int
     seed: int
     output_dir: Path
@@ -327,6 +331,14 @@ def load_config(dataset: str, method: str = "default") -> DatasetConfig:
             f"{added} is the column stage {stage} adds, not a configured one",
         )
     _check(raw["top_n"] >= 1, f"top_n must be >= 1, got {raw['top_n']}")
+    max_class_rows = raw.get("max_class_rows")
+    _check(
+        max_class_rows is None
+        or (
+            isinstance(max_class_rows, int) and max_class_rows >= raw["min_class_count"]
+        ),
+        f"max_class_rows must be null or >= min_class_count, got {max_class_rows}",
+    )
     provenance = _provenance(raw.get("provenance"), path)
     if provenance is not None:
         features = {*(raw["num_cols"] or ()), *(raw["cat_cols"] or ())}
@@ -339,6 +351,7 @@ def load_config(dataset: str, method: str = "default") -> DatasetConfig:
         num_cols=tuple(raw["num_cols"] or ()),
         cat_cols=tuple(raw["cat_cols"] or ()),
         min_class_count=raw["min_class_count"],
+        max_class_rows=max_class_rows,
         top_n=raw["top_n"],
         seed=raw["seed"],
         output_dir=Path(raw["output_dir"]),

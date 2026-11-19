@@ -29,13 +29,18 @@ Stages (each writes its files into the dataset's `output_dir` and its rows into 
   line a file repeats inside is dropped; the `sources` table logs each file's rows and dropped headers), keeps one copy of the rows equal on every column (the class
   included: equal features under different classes stay apart) and records their copies in `n_duplicates` (1 for a row
   without copies), the row's weight in stage cells and no feature, then drops the classes under `min_class_count`
-  distinct rows and the configured columns that hold a single value, and codes the class. A numeric cell whose text is
+  distinct rows, samples every class over `max_class_rows` distinct rows down to a uniform sample of that many (each
+  row kept with its copies counted; the shares of a sampled class are estimates on the sample) and drops the
+  configured columns that hold a single value, and codes the class. The rows are never held whole: the CSVs are read
+  twice in streaming, first for a key of each row (two 64-bit hashes of its columns, which stand for the row: two
+  distinct rows share one with a chance of about 1e-23 at 6e7 rows), from which the copies, the rare classes and the
+  sample are found, then for the rows kept only. A numeric cell whose text is
   not a number becomes null like an empty one, but is marked first, so the two stay apart (also as copies) and the
   quality report can tell them. No row is dropped for a missing or infinite value and nothing is scaled or encoded:
   stage prepare does it. Writes `data.parquet` (the kept columns as read, `n_duplicates`, the class as its code; a
   row's position is its id downstream), `classes.json` and `unparsable.parquet` (row and column of every cell that was
   not a number). When the dataset names its provenance columns, it also writes `provenance.parquet`: for every row of
-  the CSV of a kept class, in reading order, the row of `data.parquet` it is a copy of and its source and destination
+  the CSV that is a copy of a kept row, in reading order, the row of `data.parquet` it is a copy of and its source and destination
   address and port and its time, as read (a copy is equal on the features, not on where it comes from: each keeps its
   own); `provenance_columns` logs, per column, its empty values, the times `time_format` does not read and the
   distinct values.
@@ -167,7 +172,8 @@ Stages (each writes its files into the dataset's `output_dir` and its rows into 
 
 Configs:
 - `configs/datasets/`: one yaml per dataset: `name`, `path`, `label_col`, `num_cols`, `cat_cols`,
-  `min_class_count`, `top_n`, `seed`, `output_dir`, `db_path`, and optionally `provenance`: the columns of where each
+  `min_class_count`, `top_n`, `seed`, `output_dir`, `db_path`, optionally `max_class_rows` (the most distinct rows a
+  class keeps, null or absent for all; at least `min_class_count`), and optionally `provenance`: the columns of where each
   row comes from, never features (`src_ip`, `src_port`, `dst_ip`, `dst_port`, `time` with its `time_format`, the
   chrono format polars reads, e.g. `"%Y-%m-%d %H:%M:%S%.f"`; each optional, a missing one fails clean as a missing
   feature does; a column named both as provenance and as a feature fails the config). The destination port is no

@@ -8,26 +8,23 @@ import pytest
 
 from src.data import (
     DUPLICATES,
+    KEY,
     KINDS,
     UNPARSABLE,
+    Copies,
     Features,
+    cap_classes,
     constant_columns,
     count_kinds,
     csv_files,
-    drop_duplicates,
-    drop_rare_classes,
     feature_cols,
+    group_copies,
     header_rows,
+    rare_classes,
     read_numbers,
+    row_key,
     unparsable_cells,
 )
-
-
-def test_drop_rare_classes_keeps_order_and_the_class_at_the_floor():
-    df = pl.DataFrame({"y": ["a", "c", "b", "a", "b", "a"], "v": list(range(6))})
-    kept, dropped = drop_rare_classes(df, "y", 2)
-    assert kept["v"].to_list() == [0, 2, 3, 4, 5]
-    assert dropped == ["c"]
 
 
 def test_constant_columns_count_null_as_a_value():
@@ -51,23 +48,55 @@ def test_feature_cols_keep_the_present_ones_in_order():
     assert with_count == Features(num=("b",), cat=("c",))
 
 
-def test_drop_duplicates_counts_copies_within_a_label():
+def _copies(rows: pl.DataFrame) -> Copies:
+    keys = rows.select(row_key(rows.columns)).to_numpy()
+    return group_copies(keys)
+
+
+def test_row_keys_group_the_copies_within_a_label():
     nan = float("nan")
     rows = pl.DataFrame(
         {
-            "v": [1.0, nan, 1.0, nan, None, None, 1.0],
-            "c": ["x", "y", "x", "y", None, None, "x"],
-            "y": ["a", "a", "a", "a", "b", "b", "b"],
+            "v": [1.0, nan, 1.0, nan, None, None, 1.0, -0.0, 0.0, nan],
+            "c": ["x", "y", "x", "y", None, None, "x", "z", "z", None],
+            "y": ["a", "a", "a", "a", "b", "b", "b", "b", "b", "b"],
         }
     )
-    kept, copy_of = drop_duplicates(rows)
-    assert kept.columns == ["v", "c", "y", DUPLICATES]
-    assert kept["c"].to_list() == ["x", "y", None, "x"]
-    assert kept["y"].to_list() == ["a", "a", "b", "b"]
-    assert kept[DUPLICATES].to_list() == [2, 2, 2, 1]
-    # Every row read points at its kept copy.
-    assert copy_of.dtype == np.int64
-    assert copy_of.tolist() == [0, 1, 0, 1, 2, 2, 3]
+    copies = _copies(rows)
+    # Groups in order of first copy; null = null, NaN = NaN, -0.0 = 0.0,
+    # and the label keeps equal features apart.
+    assert copies.group.dtype == np.int64
+    assert copies.group.tolist() == [0, 1, 0, 1, 2, 2, 3, 4, 4, 5]
+    assert copies.first.tolist() == [0, 1, 4, 6, 7, 9]
+    assert copies.copies.tolist() == [2, 2, 2, 1, 2, 1]
+
+
+def test_row_key_names_two_unsigned_hashes():
+    keys = pl.DataFrame({"v": [1.0, 2.0]}).select(row_key(["v"]))
+    assert tuple(keys.columns) == KEY
+    assert keys.dtypes == [pl.UInt64, pl.UInt64]
+
+
+def test_group_copies_of_no_row_are_none():
+    copies = group_copies(np.empty((0, 2), dtype=np.uint64))
+    assert len(copies.group) == len(copies.first) == len(copies.copies) == 0
+
+
+def test_rare_classes_keep_the_class_at_the_floor():
+    labels = pl.Series(["a", "c", "b", "a", "b", "a", "d"])
+    assert rare_classes(labels, 2) == ["c", "d"]
+    assert rare_classes(labels, 1) == []
+
+
+def test_cap_classes_sample_only_the_classes_over_the_cap():
+    labels = np.array(["a"] * 10 + ["b"] * 3 + ["a"] * 5 + ["c"] * 4)
+    kept = cap_classes(labels, 4, seed=0)
+    assert kept.dtype == bool and kept.shape == labels.shape
+    counts = {k: int(kept[labels == k].sum()) for k in "abc"}
+    assert counts == {"a": 4, "b": 3, "c": 4}
+    assert np.array_equal(kept, cap_classes(labels, 4, seed=0))
+    assert not np.array_equal(kept, cap_classes(labels, 4, seed=1))
+    assert cap_classes(labels, None, seed=0).all()
 
 
 def _text() -> pl.DataFrame:
@@ -106,11 +135,18 @@ def test_unparsable_cells_list_the_kept_columns_row_by_row():
     assert unparsable_cells(pl.Series(UNPARSABLE, [None], pl.String), ["a"]).height == 0
 
 
-def test_drop_duplicates_keeps_an_unparsable_cell_apart_from_an_empty_one():
+def test_row_keys_keep_an_unparsable_cell_apart_from_an_empty_one():
     text = pl.DataFrame({"a": ["n/a", None, None], "y": ["k", "k", "k"]})
-    kept, _ = drop_duplicates(read_numbers(text, ["a"]))
-    assert kept[UNPARSABLE].to_list() == ["a", None]
-    assert kept[DUPLICATES].to_list() == [1, 2]
+    copies = _copies(read_numbers(text, ["a"]))
+    assert copies.group.tolist() == [0, 1, 1]
+    assert copies.copies.tolist() == [1, 2]
+
+
+def test_count_kinds_of_lazy_rows_as_of_rows_in_memory():
+    rows = read_numbers(_text(), ["a", "b"])
+    lazy = count_kinds(rows.lazy(), ["a", "b"], ["c"])
+    assert lazy == count_kinds(rows, ["a", "b"], ["c"])
+    assert count_kinds(rows.head(0), ["a", "b"], ["c"]) == dict.fromkeys(KINDS, 0)
 
 
 def test_csv_files_take_a_file_or_the_sorted_matches_of_a_glob(tmp_path):

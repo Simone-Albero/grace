@@ -62,7 +62,7 @@ MAP_MAX_POINTS = 20000  # most rows of a map
 CONFLICT_GROUPS = 10  # most label conflict groups in a region's detail
 # the settings each stage's tab shows, by stage, as its run's config set them
 HYPERPARAMETERS = {
-    "clean": ("min_class_count",),
+    "clean": ("min_class_count", "max_class_rows"),
     "prepare": ("top_n", "cat_cost"),
     "cells": ("distance", "min_rows", "max_fit_samples", "seed"),
     "quality_report": (
@@ -84,7 +84,9 @@ def clean(cfg: DatasetConfig) -> dict[str, Any]:
 
     Returns:
         run; params (_params); summary {n_raw, n_duplicate, n_rare,
-        n_kept, n_classes, n_constant}; classes [{label, n_read, n_rows}] sorted by label;
+        n_capped, n_kept, n_classes, n_constant} (n_capped absent from a
+        run before max_class_rows); classes [{label, n_read, n_distinct,
+        n_rows}] sorted by label (n_distinct absent likewise);
         dropped_classes [{label, n_rows}]; dropped_columns [column];
         features {num: [...], cat: [...]}; provenance [{key, column,
         n_read, n_empty, n_unparsable, n_values}] (the provenance_columns

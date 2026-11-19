@@ -24,6 +24,24 @@ def _method(tmp_path, **changes) -> str:
     return str(path)
 
 
+def _dataset(tmp_path, **changes) -> str:
+    dataset = yaml.safe_load((DATASET_DIR / "synthetic_test.yaml").read_text())
+    dataset.update(changes)
+    path = tmp_path / "dataset.yaml"
+    path.write_text(yaml.safe_dump(dataset))
+    return str(path)
+
+
+def test_max_class_rows_is_optional_and_not_under_min_class_count(tmp_path):
+    assert load_config(_dataset(tmp_path)).max_class_rows is None
+    assert load_config(_dataset(tmp_path, max_class_rows=None)).max_class_rows is None
+    capped = load_config(_dataset(tmp_path, min_class_count=50, max_class_rows=50))
+    assert capped.max_class_rows == 50
+    for bad in (49, 0, 1.5):
+        with pytest.raises(ValueError, match="max_class_rows"):
+            load_config(_dataset(tmp_path, min_class_count=50, max_class_rows=bad))
+
+
 def test_the_clustering_section_is_gone(tmp_path):
     method = yaml.safe_load((ROOT / "configs/method/default.yaml").read_text())
     method["clustering"] = {"split_separation": 4.0}

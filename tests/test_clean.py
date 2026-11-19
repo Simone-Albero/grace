@@ -4,7 +4,9 @@ import sqlite3
 
 import polars as pl
 import pytest
+import yaml
 
+from src.data import DUPLICATES, LABEL
 from tests.conftest import make_workspace
 
 
@@ -58,6 +60,45 @@ def test_clean_reads_a_glob_as_the_concatenation_of_its_files(
         ("part_2.csv", rows.height - 8000, 2),
     ]
     assert n_raw == rows.height
+
+
+def test_clean_samples_the_distinct_rows_of_a_class_over_max_class_rows(
+    tmp_path, synthetic_csv, done
+):
+    cap = 700  # every kept class of the synthetic CSV has more distinct rows
+    workspace = make_workspace(tmp_path, synthetic_csv)
+    dataset = yaml.safe_load(workspace.dataset.read_text())
+    workspace.dataset.write_text(yaml.safe_dump({**dataset, "max_class_rows": cap}))
+    workspace.run("clean")
+
+    capped = pl.read_parquet(workspace.output_dir / "data.parquet")
+    whole = pl.read_parquet(done.output_dir / "data.parquet")
+    assert capped.columns == whole.columns
+    assert capped[LABEL].value_counts()["count"].to_list() == [cap] * 9
+    # The rows kept are rows of the uncapped data, copies counted as there,
+    # in its order.
+    key = pl.struct(pl.all()).hash(0)
+    at = {h: i for i, h in enumerate(whole.select(key).to_series().to_list())}
+    positions = [at[h] for h in capped.select(key).to_series().to_list()]
+    assert positions == sorted(positions)
+    # Every CSV row of a kept row, and none other, has its provenance.
+    origin = pl.read_parquet(workspace.output_dir / "provenance.parquet")
+    copies = origin["row"].value_counts().sort("row")
+    assert copies["row"].to_list() == list(range(capped.height))
+    assert copies["count"].to_list() == capped[DUPLICATES].to_list()
+    with sqlite3.connect(workspace.db_path) as conn:
+        n_capped, n_kept = conn.execute(
+            "SELECT n_capped, n_kept FROM clean_summary"
+        ).fetchone()
+        counts = conn.execute(
+            "SELECT label, n_distinct, n_rows FROM class_counts ORDER BY label"
+        ).fetchall()
+    with sqlite3.connect(done.db_path) as conn:
+        distinct = conn.execute(
+            "SELECT label, n_rows FROM class_counts ORDER BY label"
+        ).fetchall()
+    assert n_kept == capped.height and n_capped == whole.height - capped.height
+    assert counts == [(label, n, cap) for label, n in distinct]
 
 
 def test_clean_names_the_file_that_lacks_a_column(tmp_path, synthetic_csv):

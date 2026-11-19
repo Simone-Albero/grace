@@ -18,8 +18,8 @@ quality:                 # the defects of every cell against its rivals, then of
                          #   over it the cell overlaps, and a shortcut is a removal of columns that brings it there
   max_rows_per_cell: 500 # most distinct rows of a side when a cell is measured against a rival class (its rival cells of
                          #   that class pooled): both sides sampled at one rate when the larger exceeds it
-  rival_rows: 100        # distinct rows of a cell its rivals are searched from (a budget: the search compares every row
-                         #   with every other)
+  rival_rows: 100        # distinct rows of a cell its rivals are searched from (a budget: an exact nearest-row search,
+                         #   a kd-tree per class over the rows of the others)
   max_group: 3           # most columns removed from a pair to find a shortcut
   time_share: 0.9        # the share of a cell's rows its time window holds (the central ones); description only
   confidence: 0.95       # level of the interval around every measure of a cell: a cell has a defect when the measure is

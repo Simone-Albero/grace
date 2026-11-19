@@ -1,21 +1,32 @@
-"""Clean the raw rows: polars frames in and out."""
+"""Clean the raw rows: polars frames in and out.
+
+A dataset may not fit in memory, so its rows are never held whole: a
+row is first known by its key (row_key), two 64-bit hashes of its
+columns, from which its copies are grouped (group_copies), the rare
+classes found (rare_classes) and the large ones sampled (cap_classes);
+only then are the rows kept read.
+"""
 
 from __future__ import annotations
 
 __all__ = [
     "DUPLICATES",
+    "KEY",
     "KINDS",
     "LABEL",
     "UNPARSABLE",
+    "Copies",
     "Features",
+    "cap_classes",
     "constant_columns",
     "count_kinds",
     "csv_files",
-    "drop_duplicates",
-    "drop_rare_classes",
     "feature_cols",
+    "group_copies",
     "header_rows",
+    "rare_classes",
     "read_numbers",
+    "row_key",
     "unparsable_cells",
 ]
 
@@ -28,6 +39,8 @@ from typing import TypeVar
 import numpy as np
 import polars as pl
 
+from src.graph import sample_rows
+
 Frame = TypeVar("Frame", pl.DataFrame, pl.LazyFrame)
 
 LABEL = "label"  # class code column of the data file
@@ -36,7 +49,7 @@ DUPLICATES = (
 )
 UNPARSABLE = "__unparsable__"  # clean's mark of the numeric cells that were not numbers
 KINDS = ("empty", "unparsable", "nan", "inf")  # the null and invalid values, by kind
-_READ = "__read__"  # the position of a row read, while its copies are grouped
+KEY = ("__key_0__", "__key_1__")  # the two hashes of row_key
 
 
 @dataclass(frozen=True)
@@ -182,79 +195,162 @@ def unparsable_cells(marks: pl.Series, columns: Sequence[str]) -> pl.DataFrame:
 
 
 def count_kinds(
-    rows: pl.DataFrame, num_cols: Sequence[str], cat_cols: Sequence[str]
+    rows: Frame, num_cols: Sequence[str], cat_cols: Sequence[str]
 ) -> dict[str, int]:
     """Count the null and invalid cells of the rows, by kind.
 
     Args:
-        rows: The output of read_numbers.
+        rows: The output of read_numbers; lazy rows are counted in
+            streaming, so they are never held whole.
         num_cols: The numeric columns.
         cat_cols: The categorical columns.
 
     Returns:
         By kind of KINDS, the cells: "empty" (null, in any column, but
-        unparsable), "unparsable", "nan", "inf" (either sign).
+        unparsable), "unparsable", "nan", "inf" (either sign); 0 for
+        no row.
     """
-    marks = rows[UNPARSABLE].drop_nulls().to_list()
-    unparsable = sum(len(mark.split(",")) for mark in marks)
-    nulls = sum(rows[c].null_count() for c in [*num_cols, *cat_cols])
-    numbers = rows.select(num_cols)
+
+    def total(exprs: list[pl.Expr]) -> pl.Expr:
+        return pl.sum_horizontal(exprs) if exprs else pl.lit(0, pl.Int64)
+
+    nums, every = list(num_cols), [*num_cols, *cat_cols]
+    marks = pl.col(UNPARSABLE).str.count_matches(",").cast(pl.Int64) + 1
+    counts = (
+        rows.lazy()
+        .select(
+            marks.sum().alias("unparsable"),
+            total([pl.col(c).null_count().cast(pl.Int64) for c in every]).alias(
+                "nulls"
+            ),
+            total([pl.col(c).is_nan().sum().cast(pl.Int64) for c in nums]).alias("nan"),
+            total([pl.col(c).is_infinite().sum().cast(pl.Int64) for c in nums]).alias(
+                "inf"
+            ),
+        )
+        .collect(engine="streaming")
+        .row(0, named=True)
+    )
+    unparsable = int(counts["unparsable"] or 0)
     return {
-        "empty": nulls - unparsable,
+        "empty": int(counts["nulls"] or 0) - unparsable,
         "unparsable": unparsable,
-        "nan": int(sum(numbers[c].is_nan().sum() for c in num_cols)),
-        "inf": int(sum(numbers[c].is_infinite().sum() for c in num_cols)),
+        "nan": int(counts["nan"] or 0),
+        "inf": int(counts["inf"] or 0),
     }
 
 
-def drop_duplicates(rows: pl.DataFrame) -> tuple[pl.DataFrame, np.ndarray]:
-    """Keep one copy of each distinct row and count its copies.
+def row_key(columns: Sequence[str]) -> list[pl.Expr]:
+    """Return the key of a row: two 64-bit hashes of its columns.
 
-    Two rows are copies when every column is equal, the label included,
-    so equal features under different labels stay apart; null equals
-    null and NaN equals NaN.
+    Two rows are copies when every column is equal; the key stands for
+    the row, so copies have one key, and two rows that differ share one
+    with a chance of about n^2 / 2^129 over n rows (1e-23 at 6e7 rows).
+    Equal as polars groups rows: null equals null, NaN equals NaN, -0.0
+    equals 0.0, and a null differs from NaN and from the text "".
 
     Args:
-        rows: The rows, without a DUPLICATES column.
+        columns: The columns compared, at least one (of the output of
+            read_numbers, so an unparsable cell differs from an empty one).
 
     Returns:
-        The first copy of each distinct row, in order of first
-        appearance, with DUPLICATES appended: its number of copies
-        (Int64), 1 for a row without duplicates; and, for every row of
-        rows, the position of its distinct row in that frame (Int64,
-        shape (rows.height,)).
+        Two UInt64 expressions, named KEY.
     """
-    groups = (
-        rows.with_row_index(_READ)
-        .group_by(rows.columns, maintain_order=True)
-        .agg(pl.len().cast(pl.Int64).alias(DUPLICATES), pl.col(_READ))
-    )
-    copy_of = np.empty(rows.height, dtype=np.int64)
-    copies = groups[DUPLICATES].to_numpy()
-    copy_of[groups[_READ].explode().to_numpy()] = np.repeat(
-        np.arange(groups.height), copies
-    )
-    return groups.drop(_READ), copy_of
+    row = pl.struct(list(columns))
+    return [row.hash(seed).alias(name) for seed, name in enumerate(KEY)]
 
 
-def drop_rare_classes(
-    rows: pl.DataFrame, label_col: str, min_count: int
-) -> tuple[pl.DataFrame, list[str]]:
-    """Drop every class with fewer than min_count rows.
+@dataclass(frozen=True)
+class Copies:
+    """The copies of the rows read, grouped by key.
+
+    A group is a distinct row; groups are numbered in the order of
+    their first copy among the rows read.
+
+    Attributes:
+        group: Per row read, its group, int64, shape (n,).
+        first: Per group, the position of its first copy among the
+            rows read, int64, ascending.
+        copies: Per group, its copies, int64, >= 1.
+    """
+
+    group: np.ndarray
+    first: np.ndarray
+    copies: np.ndarray
+
+
+def group_copies(keys: np.ndarray) -> Copies:
+    """Group the rows read that are copies of each other.
 
     Args:
-        rows: The rows.
-        label_col: The class column.
+        keys: The key of every row read, in reading order, uint64,
+            shape (n, 2) (the two columns of row_key).
+
+    Returns:
+        The groups; none when n is 0.
+    """
+    keys = np.asarray(keys, dtype=np.uint64)
+    n = len(keys)
+    if n == 0:
+        empty = np.empty(0, dtype=np.int64)
+        return Copies(group=empty, first=empty, copies=empty)
+    # Stable: the first row of each run of equal keys is its first copy.
+    order = np.lexsort((keys[:, 1], keys[:, 0]))
+    ordered = keys[order]
+    starts = np.ones(n, dtype=bool)
+    starts[1:] = (ordered[1:] != ordered[:-1]).any(axis=1)
+    del ordered
+    run = np.cumsum(starts, dtype=np.int64) - 1  # per sorted row, its run
+    first = order[starts].astype(np.int64)
+    copies = np.diff(np.r_[np.flatnonzero(starts), n]).astype(np.int64)
+    by_first = np.argsort(first, kind="stable")
+    number = np.empty(len(first), dtype=np.int64)
+    number[by_first] = np.arange(len(first), dtype=np.int64)
+    group = np.empty(n, dtype=np.int64)
+    group[order] = number[run]
+    return Copies(group=group, first=first[by_first], copies=copies[by_first])
+
+
+def rare_classes(labels: pl.Series, min_count: int) -> list[str]:
+    """Return the classes with fewer than min_count rows.
+
+    Args:
+        labels: The class of every distinct row.
         min_count: The fewest rows a class keeps (a class with exactly
             min_count rows stays).
 
     Returns:
-        The rows of the kept classes, in their original order, and the
-        dropped class names, sorted.
+        The rare classes, sorted.
     """
-    counts = rows[label_col].value_counts()
-    rare = counts.filter(pl.col("count") < min_count)[label_col].to_list()
-    return rows.filter(~pl.col(label_col).is_in(rare)), sorted(rare)
+    counts = labels.value_counts()
+    rare = counts.filter(pl.col("count") < min_count)[:, 0]
+    return sorted(str(label) for label in rare.to_list())
+
+
+def cap_classes(labels: np.ndarray, cap: int | None, seed: int) -> np.ndarray:
+    """Sample every class down to cap rows.
+
+    Each class over cap keeps a uniform sample of cap of its rows
+    (graph.sample_rows with seed); the others keep every row.
+
+    Args:
+        labels: The class of every distinct row, shape (n,).
+        cap: The most rows a class keeps; None keeps every row.
+        seed: The seed of the draw, the same for every class.
+
+    Returns:
+        Per row, whether it is kept, bool, shape (n,).
+    """
+    labels = np.asarray(labels)
+    kept = np.ones(len(labels), dtype=bool)
+    if cap is None:
+        return kept
+    for label in np.unique(labels):
+        rows = np.flatnonzero(labels == label)
+        if len(rows) > cap:
+            kept[rows] = False
+            kept[rows[sample_rows(len(rows), cap, seed)]] = True
+    return kept
 
 
 def constant_columns(rows: pl.DataFrame, columns: Sequence[str]) -> list[str]:

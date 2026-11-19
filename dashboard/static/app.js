@@ -285,18 +285,21 @@ function renderData(data) {
   fill("sp-tiles",
     tile("CSV rows read", num(s.n_raw)),
     tile("copies", num(s.n_duplicate), `${pct(s.n_duplicate / s.n_raw)} of the CSV rows`),
-    tile("distinct rows kept", num(s.n_kept), `${num(s.n_rare)} in rare classes`),
+    tile("distinct rows kept", num(s.n_kept),
+      `${num(s.n_rare)} in rare classes` + (s.n_capped ? `, ${num(s.n_capped)} past max_class_rows` : "")),
     tile("classes", num(s.n_classes), `${data.dropped_classes.length} dropped`),
     features);
   const top = Math.max(...data.classes.map((c) => c.n_rows), 1);
+  const capped = data.classes.some((c) => (c.n_distinct ?? c.n_rows) > c.n_rows);
   fill("sp-classes", table(
-    ["class", "distinct rows", "share", "CSV rows", "copies"],
+    ["class", "distinct rows", "share", "CSV rows", "copies", ...(capped ? ["sampled out"] : [])],
     data.classes.map((c) => [
       c.label,
       h("span", {}, h("i", { class: "bar", style: `width:${Math.round((c.n_rows / top) * 60)}px` }), num(c.n_rows)),
       pct(c.n_rows / s.n_kept),
       num(c.n_read),
-      num(c.n_read - c.n_rows),
+      num(c.n_read - (c.n_distinct ?? c.n_rows)),
+      ...(capped ? [num((c.n_distinct ?? c.n_rows) - c.n_rows)] : []),
     ])));
   fill("sp-dropped", data.dropped_classes.map((c) => h("span", { class: "chip" }, `${c.label} (${num(c.n_rows)})`)));
   fill("sp-constant", data.dropped_columns.map((c) => h("span", { class: "chip" }, c)));
