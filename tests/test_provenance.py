@@ -7,13 +7,14 @@ import numpy as np
 import polars as pl
 import pytest
 
+from src.config import AttackScenario, ScenarioConfig
 from src.provenance import (
+    SCENARIO_KEYS,
     TIME,
+    breach_shares,
     concentration,
-    excess,
     read_provenance,
-    time_parts,
-    time_window,
+    scenario_breaches,
 )
 
 FORMAT = "%Y-%m-%d %H:%M:%S%.f"
@@ -73,98 +74,68 @@ def test_concentration_of_each_group_by_hand():
     assert as_categories.equals(out)
 
 
-def test_excess_against_the_typical_group_of_its_class_by_hand():
-    # Class 0: groups 0-3; class 1: groups 4-7; class 2: groups 8-9.
-    rows = [
-        (0, "a"), (0, "a"), (0, "a"), (0, "b"),
-        (1, "a"), (1, "b"),
-        (2, "a"), (2, "a"), (2, "a"), (2, "a"),
-        (3, "a"), (3, "c"), (3, "c"), (3, "c"),
-        (4, "a"), (4, "a"), (4, "d"), (4, "d"),
-        (5, "d"), (5, "e"),
-        (6, "d"), (6, "e"), (6, None),
-        (7, None),
-        (8, "e"), (8, "f"), (8, "f"),
-    ]  # fmt: skip
-    order = np.random.default_rng(0).permutation(len(rows))  # in no order
-    group = np.array([rows[i][0] for i in order])
-    values = pl.Series([rows[i][1] for i in order])
-    group_class = np.array([0, 0, 0, 0, 1, 1, 1, 1, 2, 2])
-    out = excess(group, values, group_class, 10)
-    assert out.columns == ["excess_value", "excess", "excess_share", "n"]
-    assert out.schema == {
-        "excess_value": pl.String,
-        "excess": pl.Float64,
-        "excess_share": pl.Float64,
-        "n": pl.Int64,
-    }
-    # the share of the value of the excess, over the group's rows with one
-    assert out["excess_share"].to_list()[:4] == [0.75, 0.5, 1.0, 0.75]
-    assert out["n"].to_list() == [4, 2, 4, 4, 4, 2, 2, None, 3, None]
-    out = out.select("excess_value", "excess")
-    # Class 0, four groups with a value, the typical share the 2nd
-    # smallest: a is in all four (0.75, 0.5, 1, 0.25), typically 0.5; b
-    # in half of them and c in one, typically 0.
-    # Group 0: a 0.75 - 0.5 and b 0.25 - 0 tie, to the first in text order.
-    assert out.row(0) == ("a", 0.25)
-    assert out.row(1) == ("b", 0.5)
-    assert out.row(2) == ("a", 0.5)
-    # Its share of a is under the typical one, of c far over.
-    assert out.row(3) == ("c", 0.75)
-    # Class 1, three groups with a value (group 7 holds a null only), the
-    # 2nd smallest: d is in all three at 0.5, e in two of three (more
-    # than half: 0, 0.5, 0.5 gives 0.5), a in one (0); class 0's a,
-    # typically 0.5 there, is not class 1's.
-    assert out.row(4) == ("a", 0.5)
-    assert out.row(5) == out.row(6) == ("d", 0.0)
-    assert out.row(7) == (None, None)
-    # Class 2, one group with a value: it is its own typical group.
-    assert out.row(8) == ("e", 0.0)
-    assert out.row(9) == (None, None)
-    as_categories = excess(group, values.cast(pl.Categorical), group_class, 10)
-    assert as_categories.select("excess_value", "excess").equals(out)
+def _origin() -> tuple[pl.DataFrame, np.ndarray]:
+    """Six CSV rows: two benign, three of attack A, one of attack B."""
+    t = datetime(2018, 2, 20, 10, 0, 0)
+    origin = pl.DataFrame(
+        {
+            "row": [0, 1, 2, 3, 4, 5],
+            "src_ip": ["9.9.9.9", "1.1.1.1", "1.1.1.1", "2.2.2.2", None, "3.3.3.3"],
+            "dst_port": ["53", "443", "80", "53", "80", "123"],
+            TIME: [t, t, t, t + timedelta(hours=2), t, None],
+        }
+    ).with_columns(pl.col("src_ip", "dst_port").cast(pl.Categorical))
+    return origin, np.array([0, 0, 1, 1, 1, 2])
 
 
-def test_time_parts_cut_each_class_in_as_many_parts_as_cells():
-    # Class 0 has two cells (0, 1), class 1 one (2). Class 0's six times
-    # in order fall in two parts of three; two equal times share a part.
-    t = [datetime(2018, 2, 15, 10, m) for m in (0, 1, 2, 3, 4, 5, 9)]
-    times = pl.Series([t[3], t[0], t[1], None, t[5], t[2], t[4], t[6], t[6]])
-    group = np.array([1, 0, 0, 1, 1, 0, 1, 2, 2])
-    parts = time_parts(group, times, np.array([0, 0, 1]))
-    assert parts.dtype == pl.String and parts[3] is None
-    first, second = "2018-02-15 10:00:00 to 10:02:00", "2018-02-15 10:03:00 to 10:05:00"
-    assert parts.to_list() == [
-        second, first, first, None, second, first, second,
-        "2018-02-15 10:09:00 to 10:09:00", "2018-02-15 10:09:00 to 10:09:00",
-    ]  # fmt: skip
-    # a cell recorded at once holds one part: as a value, its excess is
-    # all its rows over the typical cell of the class
-    out = excess(group, parts, np.array([0, 0, 1]), 3)
-    assert out["excess_share"].to_list() == [1.0, 1.0, 1.0]
+def test_scenario_breaches_rule_on_the_attacks_only():
+    origin, row_class = _origin()
+    t = datetime(2018, 2, 20, 10, 0, 0)
+    scenario = ScenarioConfig(
+        benign="Benign",
+        background_ports=(53, 123),
+        attacks={
+            "A": AttackScenario(
+                src_ip=("1.1.1.1",), time=((t - timedelta(minutes=5), t),)
+            ),
+        },
+    )
+    got = scenario_breaches(origin, row_class, ["Benign", "A", "B"], scenario)
+    assert list(got) == ["dst_port", "src_ip", TIME]
+    nan = math.nan
+    # the benign rows break nothing; B has the ports only
+    np.testing.assert_array_equal(got["dst_port"], [nan, nan, 0, 1, 0, 1])
+    np.testing.assert_array_equal(got["src_ip"], [nan, nan, 0, 1, nan, nan])
+    # the window is closed at its end; B has no window
+    np.testing.assert_array_equal(got[TIME], [nan, nan, 0, 1, 0, nan])
 
 
-def test_time_window_holds_the_central_share_of_the_rows_by_hand():
-    start = datetime(2018, 2, 20, 8)
+def test_scenario_breaches_hold_the_keys_declared_only():
+    origin, row_class = _origin()
+    ports = ScenarioConfig(benign="Benign", background_ports=(53,))
+    got = scenario_breaches(origin, row_class, ["Benign", "A", "B"], ports)
+    assert list(got) == ["dst_port"]
+    # a key the provenance lacks is not judged
+    bare = scenario_breaches(
+        origin.drop("dst_port"), row_class, ["Benign", "A", "B"], ports
+    )
+    assert bare == {}
+    assert set(SCENARIO_KEYS) == {"dst_port", "src_ip", TIME}
 
-    def at(seconds):
-        return start + timedelta(seconds=seconds)
 
-    # Group 0: 21 times a second apart, the last a day later; 1: one
-    # time; 2: two; 3: a null only; 4: no row.
-    times = [at(s) for s in [*range(20), 86400]] + [at(0), at(0), at(30), None]
-    group = np.array([0] * 21 + [1, 2, 2, 3])
-    order = np.random.default_rng(0).permutation(len(group))  # in no order
-    series = pl.Series([times[i] for i in order], dtype=pl.Datetime("us"))
-    out = time_window(group[order], series, 5, share=0.9)
-    assert out.columns == ["time_from", "time_to", "time_window"]
-    # k = floor(20 * 0.1 / 2) = 1: the first and the last time are left
-    # out, the day-late one among them.
-    assert out.row(0) == (at(1), at(19), 18.0)
-    assert out.row(1) == (at(0), at(0), 0.0)
-    # k = floor(1 * 0.05) = 0: both times.
-    assert out.row(2) == (at(0), at(30), 30.0)
-    assert out.row(3) == out.row(4) == (None, None, None)
-    # k = floor(20 * 0.5 / 2) = 5.
-    wide = time_window(group[order], series, 5, share=0.5)
-    assert wide.row(0) == (at(5), at(15), 10.0)
+def test_scenario_breaches_refuse_a_class_they_do_not_know():
+    origin, row_class = _origin()
+    for scenario in (
+        ScenarioConfig(benign="Normal"),
+        ScenarioConfig(benign="Benign", attacks={"C": AttackScenario(("1.1.1.1",))}),
+    ):
+        with pytest.raises(ValueError, match="scenario"):
+            scenario_breaches(origin, row_class, ["Benign", "A", "B"], scenario)
+
+
+def test_breach_shares_per_group_over_its_judged_rows():
+    group = np.array([0, 0, 0, 1, 1, 2])
+    breach = np.array([1.0, 0.0, np.nan, np.nan, np.nan, 1.0])
+    share, n = breach_shares(group, breach, 4)
+    np.testing.assert_array_equal(share, [0.5, np.nan, 1.0, np.nan])
+    np.testing.assert_array_equal(n, [2, 0, 1, 0])

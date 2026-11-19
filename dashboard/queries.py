@@ -26,7 +26,6 @@ __all__ = [
 ]
 
 import dataclasses
-import datetime as dt
 import json
 import math
 import sqlite3
@@ -42,12 +41,11 @@ from sklearn.decomposition import PCA
 
 from src.config import DatasetConfig
 from src.data import feature_cols
-from src.provenance import KEYS, TIME, concentration, time_window
+from src.provenance import KEYS, TIME, concentration
 from src.quality import decisive_rows
 from src.report import Verdicts, judge
 from stages.paths import (
     assignments_file,
-    cell_tree_file,
     data_file,
     need,
     prepared_file,
@@ -69,8 +67,6 @@ HYPERPARAMETERS = {
         "tau",
         "rival_rows",
         "max_rows_per_cell",
-        "max_group",
-        "time_share",
         "confidence",
     ),
 }
@@ -232,8 +228,8 @@ def quality(cfg: DatasetConfig, tau: float | None = None) -> dict[str, Any]:
         run; params (_params: the run's own settings, its tau too);
         stats (the quality_stats row, its tau the one judged at, at the
         run's confidence; n_regions, regions_, undecided_ and share_
-        judged at it; those of atypical_provenance null when the dataset
-        names no provenance, and so the classes'); classes
+        judged at it; those of off_scenario null when the dataset
+        declares no scenario, and so the classes'); classes
         (quality_classes); regions (quality_regions, defects and the
         class and key lists as lists); missing
         (cell_missing summed by region, column and kind: [{region,
@@ -271,7 +267,7 @@ def quality_region(
         quality_cells rows, the lists as lists, with the provenance
         columns when the dataset names some); rivals (the quality_rivals
         rows of its cells, one per cell and rival class, rival_cells,
-        rival_regions and confusion_without as lists); missing (its
+        rival_regions and rules as lists); missing (its
         cell_missing rows summed by column and
         kind); n_groups (the label conflict groups with a row in it) and
         conflicts: the CONFLICT_GROUPS of them with the most CSV rows,
@@ -310,7 +306,6 @@ def quality_region(
         )
         where = {c["cell"]: c["region"] for c in judged.cells}
         groups = [{**g, "region": where[g["cell"]]} for g in groups]
-        share = _params(conn, run, "quality_report")["time_share"]
     by_group: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for row in groups:
         by_group[row["group"]].append(row)
@@ -320,7 +315,7 @@ def quality_region(
     values = _feature_values(cfg, [members[0]["row"] for _, members in heaviest])
     (own,) = _rows_of_cells(cfg, [[c["cell"] for c in cells]])
     return {
-        **_provenance_of(cfg, own, share),
+        **_provenance_of(cfg, own),
         "region": _listed(rows[0]),
         "cells": [_listed(c) for c in cells],
         "rivals": [_rival_row(r) for r in rivals],
@@ -527,9 +522,7 @@ def _rivals_of(judged: Verdicts, region: int) -> list[dict[str, Any]]:
     return [r for r in judged.rivals if r["region"] == region]
 
 
-def _provenance_of(
-    cfg: DatasetConfig, rows: np.ndarray, share: float
-) -> dict[str, Any]:
+def _provenance_of(cfg: DatasetConfig, rows: np.ndarray) -> dict[str, Any]:
     """Return where the CSV rows of some rows of the data file come from.
 
     Over the CSV rows that are copies of rows (provenance.parquet), an
@@ -538,17 +531,15 @@ def _provenance_of(
     Args:
         cfg: The dataset.
         rows: Rows of the data file.
-        share: quality.time_share, the share of the CSV rows the time
-            window holds (provenance.time_window).
 
     Returns:
         provenance: per key of provenance.KEYS the dataset names, in
         order, {key, n_values (the distinct values), top, top_share (its
         share of the rows with a value; provenance.concentration),
         repeat (the mean CSV rows of a value among those of more than
-        one, null when none is)}; time: {time_from, time_to,
-        time_window} when it names a time, else null. No key without a
-        provenance.parquet.
+        one, null when none is)}; time: {time_from, time_to} (the first
+        and the last time, ISO) when it names a time and a row has one,
+        else null. No key without a provenance.parquet.
     """
     path = provenance_file(cfg)
     if cfg.provenance is None or not path.exists():
@@ -578,11 +569,11 @@ def _provenance_of(
             }
         )
     time = None
-    if TIME in origin.columns:
-        window = time_window(group, origin[TIME], 1, share).row(0, named=True)
+    if TIME in origin.columns and origin[TIME].drop_nulls().len():
+        times = origin[TIME].drop_nulls()
         time = {
-            k: v.isoformat() if isinstance(v, dt.datetime) else _json_value(v)
-            for k, v in window.items()
+            "time_from": times.min().isoformat(),
+            "time_to": times.max().isoformat(),
         }
     return {"provenance": found, "time": time}
 
@@ -594,7 +585,7 @@ _LISTS = (
     "label_with",
     "overlap_with",
     "shortcut_with",
-    "provenance_with",
+    "scenario_with",
 )  # the comma lists of quality_cells and quality_regions
 
 
@@ -641,9 +632,9 @@ def _judged(
 ) -> Verdicts:
     """Return the verdicts of a quality_report run at tau (src.report.judge).
 
-    What the run measured is read from quality_cells and quality_rivals,
-    the cells' tree from cell_tree.parquet, as the stage did. Cached per
-    database, run, tau and tree file.
+    What the run measured is read from quality_cells, quality_rivals and
+    quality_branches (the cells' tree with the spread of every node), as
+    the stage passed them. Cached per database, run and tau.
 
     Args:
         cfg: The dataset.
@@ -652,10 +643,10 @@ def _judged(
         tau: The threshold, in (0, 0.5]; None: the run's own.
 
     Raises:
-        LookupError: When the cells tree is missing, the cells were cut
-            again after the run (its cells are not those of the tree),
-            or the run is of an older quality_report (no clear_rows,
-            pairs of cells instead of rival classes, or no confidence).
+        LookupError: When the cells were cut again after the run (its
+            cells are not those of the tree), or the run is of an older
+            quality_report (no clear_rows, pairs of cells instead of
+            rival classes, no confidence, or no branches).
     """
     if _latest_run(conn, "cells", cfg)["id"] > run["id"]:
         raise LookupError("run quality_report again: the cells were cut after it")
@@ -663,8 +654,7 @@ def _judged(
     if "confidence" not in params:
         raise LookupError("run quality_report again: it judged without intervals")
     tau = params["tau"] if tau is None else tau
-    path = need(cell_tree_file(cfg), "cells")
-    key = (str(cfg.db_path.resolve()), run["id"], tau, path.stat().st_mtime_ns)
+    key = (str(cfg.db_path.resolve()), run["id"], tau)
     if key not in _JUDGED:
         cells = sorted(
             _rows(conn, "quality_report", "quality_cells", run),
@@ -675,12 +665,17 @@ def _judged(
         if _where(conn, "quality_pairs", run, "1"):
             raise LookupError("run quality_report again: it measured pairs of cells")
         rivals = _where(conn, "quality_rivals", run, "1")
+        branches = _rows(
+            conn, "quality_report", "quality_branches", run, missing_ok=True
+        )
+        if not branches:
+            raise LookupError("run quality_report again: it did not log its branches")
         if len(_JUDGED) >= 8:
             _JUDGED.clear()
         _JUDGED[key] = judge(
             cells,
             rivals,
-            pl.read_parquet(path).sort("node"),
+            pl.DataFrame(branches).sort("node"),
             _classes(cfg),
             tau,
             params["confidence"],
@@ -708,7 +703,7 @@ def _missing_by_region(
 def _rival_row(row: dict[str, Any]) -> dict[str, Any]:
     """Return a quality_rivals row with its JSON lists as lists."""
     out = dict(row)
-    for key in ("rival_cells", "rival_regions", "confusion_without"):
+    for key in ("rival_cells", "rival_regions", "rules"):
         out[key] = json.loads(row[key]) if row[key] else []
     return out
 

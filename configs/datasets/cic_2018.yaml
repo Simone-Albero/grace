@@ -1,7 +1,8 @@
 # CSE-CIC-IDS2018, corrected release (flows extracted again, Attempted Category added), one CSV per capture day.
-# Not features, as in bruno: id (the raw row id), Flow ID, Src/Dst IP, Src/Dst Port, Timestamp (Src/Dst IP and Port and
-# Timestamp are read as provenance), Attempted Category (tied to the label), ICMP Code/Type and the columns that
-# repeat others (Packet Length Variance, Average Packet Size, Fwd/Bwd Segment Size Avg, Subflow *).
+# Not features, as in bruno: id (the raw row id), Flow ID, Src/Dst IP, Src Port, Timestamp (Src/Dst IP and Port and
+# Timestamp are read as provenance; Dst Port is a feature too, as in DataBadSmells), Attempted Category (tied to the
+# label), ICMP Code/Type and the columns that repeat others (Packet Length Variance, Average Packet Size, Fwd/Bwd
+# Segment Size Avg, Subflow *).
 name: cic_2018
 path: resources/raw_data/cic_2018/*.csv  # a glob: every day, read in sorted order
 label_col: Label
@@ -80,15 +81,21 @@ num_cols:
   - Total TCP Flow Time
 
 cat_cols:
+  - Dst Port  # the service a flow targets: as in DataBadSmells, a feature (and provenance)
   - Protocol
 
-provenance:  # where each CSV row comes from, never a feature: measured per cell
+provenance:  # where each CSV row comes from: the source and the time are never features
   src_ip: Src IP
   src_port: Src Port
   dst_ip: Dst IP
   dst_port: Dst Port
   time: Timestamp
   time_format: "%Y-%m-%d %H:%M:%S%.f"
+
+scenario:  # what the documentation of CSE-CIC-IDS2018 says of its classes, in the clock of Timestamp
+  benign: BENIGN
+  # the ports DataBadSmells ignores (metadata/cic2018): background services, no attack's target
+  background_ports: [0, 53, 67, 68, 111, 123, 161, 179, 389, 427, 520, 1723, 1900]
 
 min_class_count: 50  # classes with fewer rows are dropped
 max_class_rows: 10000000  # Benign has 42.2M distinct rows (45.7M in all): a 16 GB machine holds a uniform sample of

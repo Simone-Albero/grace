@@ -13,28 +13,33 @@ on the cells of `src.cells`, each by its relation to the other cells
   class, as rows under a wrong label would;
 - class_overlap: against a rival class, the share of its rows confused
   with that class's rows reaches tau, and it is no suspect_label;
-- shortcut: against a rival class that share is under tau, but
-  removing at most max_group columns, chosen on half of the rows and
-  measured on the other half (feature_dependence), brings it to tau:
-  the separation rests on those few columns;
+- shortcut: against a rival class it does not overlap, the best rule
+  on a single column between its class and the rival class, both
+  whole (class_rule), leaves under tau of its rows and under tau of
+  the rival class's rows on the wrong side (rule_errors): one column
+  alone tells the two classes apart where the cell lies;
 - redundancy: its rows lie at most tau times as far from their centre
   as those of the typical cell of its class (cell_variance): near
-  copies of one another, as one session repeated;
-- atypical_provenance: at least tau of its rows come from one value of
-  a provenance key (source or destination address or port, or part of
-  the time) more than in the typical cell of its class
-  (src.provenance.excess): one recording, which a classifier can learn
-  by heart.
+  copies of one another, against the rest of its class;
+- repetition: it lies in a branch of its class's tree that holds at
+  least tau of the class's CSV rows and is at most tau times as
+  dispersed as the dataset (branch_spread, dataset_variance,
+  repetition_verdicts): a large part of its class lies in little
+  space, the class or one of its modes repeated;
+- off_scenario: at least tau of its CSV rows break a rule of the
+  scenario the dataset declares for its class (src.provenance.
+  scenario_breaches): traffic the documentation does not describe
+  under that label.
 The first three are facts of single rows (ROW_DEFECTS): counted in any
 group of rows, they are never diluted. The next three are measured
 between a cell and a rival class (RIVAL_DEFECTS, rival_defects): its
-rival cells of that class pooled. The last two between a cell and the
-other cells of its class (CLASS_DEFECTS). The rows confused are those
-that the better of two simple classifiers gets wrong (pair_confusion):
-the leave-one-out 1-NN on every column (nearest_error; by Cover & Hart
-its error lies between the least error any classifier can reach and
-twice it, cover_hart_low) and the best rule on a single column
-(single_column, OneR of Holte 1993).
+rival cells of that class pooled for the confusion, the rival class
+whole for the shortcut. The last three between a cell and a reference
+of its own (CLASS_DEFECTS): its class, the dataset, the scenario. The
+rows confused are those that the better of two simple classifiers gets
+wrong (pair_confusion): the leave-one-out 1-NN on every column
+(nearest_error) and the best rule on a single column (single_column,
+OneR of Holte 1993).
 
 Every measure of a cell is an estimate on few rows, so it is read with
 an interval at a confidence level (share_bounds, mean_bounds), and a
@@ -48,8 +53,8 @@ them. A cell is measured on all its rows, so that min_rows holds what
 it promises; its rival cells of a class are pooled and sampled down to
 quality.max_rows_per_cell, which in many dimensions barely moves the
 nearest rival row (thinning by r multiplies its distance by r^(-1/d)).
-Every measure but the copies and the provenance is computed on
-distinct rows, unweighted, and read on the cell's side.
+Every measure but the copies, the size of a branch and the scenario
+is computed on distinct rows, unweighted, and read on the cell's side.
 """
 
 from __future__ import annotations
@@ -59,34 +64,39 @@ __all__ = [
     "DEFECTS",
     "RIVAL_DEFECTS",
     "ROW_DEFECTS",
-    "Dependence",
+    "Confusion",
+    "Rule",
     "SingleColumn",
     "cell_samples",
-    "cover_hart_low",
+    "cell_variance",
+    "class_rule",
+    "column_values",
+    "branch_spread",
+    "dataset_variance",
     "decisive_rows",
     "defects_of",
-    "feature_dependence",
     "invalid_values",
     "label_conflicts",
+    "mean_bounds",
     "nearest_error",
     "pair_confusion",
     "pair_conflicts",
-    "cell_variance",
-    "mean_bounds",
-    "provenance_verdict",
-    "redundancy_verdict",
+    "repetition_verdicts",
     "rival_defects",
     "rival_pairs",
+    "rule_errors",
     "share_bounds",
     "single_column",
+    "variance_verdict",
     "verdict",
 ]
 
 import math
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from statistics import NormalDist
+from typing import NamedTuple
 
 import numpy as np
 import polars as pl
@@ -96,7 +106,7 @@ from src.graph import sample_rows
 
 ROW_DEFECTS = ("invalid_values", "duplicates", "label_conflict")
 RIVAL_DEFECTS = ("suspect_label", "class_overlap", "shortcut")
-CLASS_DEFECTS = ("redundancy", "atypical_provenance")
+CLASS_DEFECTS = ("redundancy", "repetition", "off_scenario")
 DEFECTS = ROW_DEFECTS + RIVAL_DEFECTS + CLASS_DEFECTS
 
 
@@ -215,24 +225,85 @@ class SingleColumn:
 
 
 @dataclass(frozen=True)
-class Dependence:
-    """How a pair's 1-NN error grows as columns are removed.
+class Confusion:
+    """How the better of two classifiers confuses a cell with its rival cells of a class.
 
     Attributes:
-        group: The columns removed, in the order chosen (indices into
-            the column names), at most max_group.
-        errors: Shape (len(group) + 1, 2): the 1-NN error of each side
-            (nearest_error) on the measured half, with every column
-            (row 0) and after removing the first i columns of group
-            (row i).
-        measure: Whether each row of the two cells, the first's then
-            the second's, is in the measured half (the others are in
-            the half the columns are chosen on), shape (n_a + n_b,).
+        nn_error: The leave-one-out 1-NN error of each side, the cell's
+            then the rival's, on the measured half, shape (2,).
+        single: The best rule on a single column, chosen on the other
+            half and measured on the measured half.
+        confusion: The error of the better of the two on each side,
+            shape (2,): the one whose worse side errs less, ties to the
+            1-NN.
+        measure: Whether each row, the cell's then the rival's, is in
+            the measured half, shape (n_a + n_b,).
     """
 
-    group: tuple[int, ...]
-    errors: np.ndarray
+    nn_error: np.ndarray
+    single: SingleColumn
+    confusion: np.ndarray
     measure: np.ndarray
+
+
+@dataclass(frozen=True)
+class Rule:
+    """A rule on one column that sends each value to one of two sides.
+
+    Attributes:
+        kind: How a value goes to the first side: "le" (at most at),
+            "lt" (under at), "ge" (at least at), "gt" (over at), or
+            "values" (not among at; those go to the second side).
+        at: The threshold, a float; for "values", the values sent to
+            the second side, a sorted array.
+    """
+
+    kind: str
+    at: float | np.ndarray
+
+    def first(self, values: np.ndarray) -> np.ndarray:
+        """Return whether each value goes to the first side.
+
+        Args:
+            values: The values of the column, shape (n,).
+
+        Returns:
+            Bool, shape (n,).
+        """
+        v = np.asarray(values)
+        if self.kind == "le":
+            return v <= self.at
+        if self.kind == "lt":
+            return v < self.at
+        if self.kind == "ge":
+            return v >= self.at
+        if self.kind == "gt":
+            return v > self.at
+        return ~np.isin(v, self.at)
+
+
+class RivalMeasure(NamedTuple):
+    """What a cell was measured on against one rival class, tau-free.
+
+    Attributes:
+        rival_class: The code of the rival class.
+        confusion: The confusion of the cell's rows (Confusion), None
+            when a side had too few rows.
+        n_scored: The cell's rows it is a share of (its measured half).
+        rules: Per column whose rule leaves under half of each side on
+            the wrong side, the error of class_rule on the cell's rows
+            and on the rival class's, shape (c, 2); the other columns
+            can never be a shortcut.
+        n_cell: The cell's rows the first error is a share of.
+        n_rival: The rival class's rows the second is a share of.
+    """
+
+    rival_class: int
+    confusion: float | None
+    n_scored: int | None
+    rules: np.ndarray
+    n_cell: int
+    n_rival: int
 
 
 def invalid_values(features: pl.DataFrame, unparsable: pl.DataFrame) -> pl.DataFrame:
@@ -298,22 +369,6 @@ def nearest_error(sq_dist: np.ndarray, side: np.ndarray) -> tuple[float, float]:
     return float(rival[~side].mean()), float(rival[side].mean())
 
 
-def cover_hart_low(error: float) -> float:
-    """Return Cover & Hart's lower bound of the Bayes error under a 1-NN error.
-
-    With two classes, R* >= (1 - sqrt(1 - 2 R)) / 2 for the asymptotic
-    1-NN error R (R clipped to 0.5). On a finite sample it is a guide,
-    not a guarantee.
-
-    Args:
-        error: A 1-NN error in [0, 1].
-
-    Returns:
-        The bound, in [0, 0.5].
-    """
-    return (1 - math.sqrt(max(0.0, 1 - 2 * min(error, 0.5)))) / 2
-
-
 def single_column(
     Xa: np.ndarray,
     Xb: np.ndarray,
@@ -361,7 +416,9 @@ def single_column(
         slots = column_of == c
         if c in skip or not slots.any():
             continue
-        va, vb = _values(Xa[:, slots], numeric[c]), _values(Xb[:, slots], numeric[c])
+        va, vb = column_values(Xa[:, slots], numeric[c]), column_values(
+            Xb[:, slots], numeric[c]
+        )
         if len(np.unique(np.r_[va, vb])) < 2:
             continue
         rule = _stump(va, vb) if numeric[c] else _majority(va, vb)
@@ -371,39 +428,42 @@ def single_column(
     if chosen is None:
         return SingleColumn(0.5, 0.5, -1)
     slots = column_of == column
-    ya, yb = (_values(Y[:, slots], numeric[column]) for Y in (Ya, Yb))
+    ya, yb = (column_values(Y[:, slots], numeric[column]) for Y in (Ya, Yb))
     side_a, side_b = _accuracy(chosen, ya, yb)
     return SingleColumn(side_a, side_b, column)
 
 
-def feature_dependence(
+def pair_confusion(
     Xa: np.ndarray,
     Xb: np.ndarray,
     column_of: np.ndarray,
-    max_group: int,
+    numeric: np.ndarray,
     seed: int | tuple[int, ...],
-) -> Dependence | None:
-    """Find the columns whose removal raises a pair's 1-NN error the most.
+) -> Confusion | None:
+    """Return the share of each side's rows the better of two classifiers confuses.
 
-    Each side is split at random into halves: the columns are chosen
-    on the first, the errors measured on the second, so the search does
-    not inflate them. Greedy: max_group times, the column (all the
-    slots of an original column together) whose removal gives the
-    highest mean of the two sides' errors on the choosing half, ties
-    broken by the highest mean margin d_own / (d_own + d_other)
-    (nearest row of the same side, of the other). The squared distance
-    is the sum of the columns' parts, so a removal subtracts one part.
+    Each side is split at random into halves: the single column is
+    chosen on the first and both classifiers are measured on the
+    second, so choosing does not inflate them. The classifiers are the
+    leave-one-out 1-NN on every column (nearest_error) and the best rule
+    on a single column (single_column); the better is the one whose
+    worse side errs less (ties to the 1-NN). Each holds the error of the
+    best classifier above it: the 1-NN alone overstates it when columns
+    that do not separate swamp the distance, and a single column misses
+    a separation that needs several. The worse side, not the mean of
+    the two, so that a rule that sends nearly every row to one side,
+    right on it and wrong on the other, is no better than the 1-NN.
 
     Args:
-        Xa: The rows of the first cell, shape (n_a, d).
-        Xb: The rows of the second cell, shape (n_b, d).
-        column_of: The original column of each point column, shape (d,).
-        max_group: The most columns removed.
+        Xa: The rows of the cell, shape (n_a, d).
+        Xb: The rows of its rival cells of a class, shape (n_b, d).
+        column_of: The original column of each point column, as an
+            index into numeric, shape (d,).
+        numeric: Whether each original column is numeric.
         seed: The seed of the halves (np.random.default_rng's).
 
     Returns:
-        The group and the errors on the measured half; None when a
-        side has fewer than 4 rows.
+        The Confusion; None when a side has fewer than 4 rows.
     """
     n_a, n_b = len(Xa), len(Xb)
     if min(n_a, n_b) < 4:
@@ -412,83 +472,111 @@ def feature_dependence(
     measure = np.zeros(n_a + n_b, dtype=bool)
     for start, n in ((0, n_a), (n_a, n_b)):
         measure[start + rng.permutation(n)[: n // 2]] = True
-    X = np.vstack([Xa, Xb])
-    side = np.r_[np.zeros(n_a, dtype=bool), np.ones(n_b, dtype=bool)]
-    columns = np.unique(column_of)
-    choose_parts = _column_parts(X[~measure], column_of, columns)
-    measure_parts = _column_parts(X[measure], column_of, columns)
-    choose_side, measure_side = side[~measure], side[measure]
-    choose_total, measure_total = choose_parts.sum(0), measure_parts.sum(0)
-    group: list[int] = []
-    errors = [nearest_error(measure_total, measure_side)]
-    for _ in range(min(max_group, len(columns))):
-        best, best_score = -1, (-1.0, -1.0)
-        for i in range(len(columns)):
-            if i in group:
-                continue
-            sq = choose_total - choose_parts[i]
-            rival = _rival_share(sq, choose_side)
-            error = (rival[~choose_side].mean() + rival[choose_side].mean()) / 2
-            score = (error, _margin(sq, choose_side))
-            if score > best_score:
-                best, best_score = i, score
-        group.append(best)
-        choose_total = choose_total - choose_parts[best]
-        measure_total = measure_total - measure_parts[best]
-        errors.append(nearest_error(measure_total, measure_side))
-    return Dependence(tuple(int(columns[i]) for i in group), np.array(errors), measure)
+    on_a, on_b = measure[:n_a], measure[n_a:]
+    X = np.vstack([Xa[on_a], Xb[on_b]]).astype(np.float64)
+    side = np.r_[np.zeros(on_a.sum(), dtype=bool), np.ones(on_b.sum(), dtype=bool)]
+    norms = np.einsum("ij,ij->i", X, X)
+    sq = np.maximum(norms[:, None] + norms[None, :] - 2.0 * X @ X.T, 0.0)
+    nn_error = np.array(nearest_error(sq, side))
+    single = single_column(
+        Xa[~on_a], Xb[~on_b], column_of, numeric, Ya=Xa[on_a], Yb=Xb[on_b]
+    )
+    one = np.array([1 - single.side_a, 1 - single.side_b])
+    confusion = nn_error if nn_error.max() <= one.max() else one
+    return Confusion(nn_error, single, confusion, measure)
 
 
-def pair_confusion(
-    Xa: np.ndarray,
-    Xb: np.ndarray,
-    column_of: np.ndarray,
-    numeric: np.ndarray,
-    dependence: Dependence,
-) -> np.ndarray:
-    """Return the share of each side's rows the better of two classifiers confuses.
+def class_rule(va: np.ndarray, vb: np.ndarray, numeric: bool) -> Rule:
+    """Return the rule on one column of highest balanced accuracy between two samples.
 
-    The classifiers are the 1-NN on every column (dependence.errors)
-    and the best rule on a single column (single_column, chosen on the
-    half of the rows feature_dependence chose its columns on and
-    measured on the half it measured, as the 1-NN); the better is the
-    one whose worse side errs less (ties to the 1-NN). Each holds the
-    error of the best classifier above it: the 1-NN alone overstates it
-    when columns that do not separate swamp the distance, and a single
-    column misses a separation that needs several. The worse side, not
-    the mean of the two, so that a rule that sends nearly every row to
-    one side, right on it and wrong on the other, is no better than
-    the 1-NN: each side is read on its own. After removing the first i
-    columns of dependence.group, the single column is sought among the
-    others.
+    A numeric column gets a threshold, in either direction: the
+    balanced accuracy F_a(t) - F_b(t) + 1/2 (or the other way) changes
+    only at the values of either sample, and its extremes are reached at
+    a value of the smaller one or just under it, so the search is exact
+    over those. A categorical column sends each value to the side where
+    it is the larger share of the rows (a tie to the first). Ties to
+    the first threshold found.
 
     Args:
-        Xa: The rows of the first cell, shape (n_a, d).
-        Xb: The rows of the second cell, shape (n_b, d).
-        column_of: The original column of each point column.
-        numeric: Whether each original column is numeric.
-        dependence: feature_dependence of the two cells.
+        va: The values of the first sample, shape (n_a,), n_a >= 1.
+        vb: The values of the second, shape (n_b,), n_b >= 1.
+        numeric: Whether the column is numeric; else its values are the
+            codes of its categories.
 
     Returns:
-        Shape (len(dependence.group) + 1, 2): the confusion of each side
-        with every column (row 0) and after removing the first i
-        columns of the group (row i).
+        The Rule; Rule("values", empty) (every row to the first side)
+        when no rule beats chance.
     """
-    confusion = np.empty_like(dependence.errors)
-    on_a, on_b = dependence.measure[: len(Xa)], dependence.measure[len(Xa) :]
-    for i, nearest in enumerate(dependence.errors):
-        rule = single_column(
-            Xa[~on_a],
-            Xb[~on_b],
-            column_of,
-            numeric,
-            dependence.group[:i],
-            Ya=Xa[on_a],
-            Yb=Xb[on_b],
+    va, vb = np.asarray(va, dtype=np.float64), np.asarray(vb, dtype=np.float64)
+    if numeric:
+        return _threshold(np.sort(va), np.sort(vb))
+    return _split(*(_shares(v, np.unique(np.r_[va, vb])) for v in (va, vb)))
+
+
+def rule_errors(
+    values: np.ndarray,
+    labels: np.ndarray,
+    cell: np.ndarray,
+    pairs: Sequence[tuple[int, int]],
+    cell_class: np.ndarray,
+    numeric: bool,
+) -> np.ndarray:
+    """Return, per cell and rival class, the errors of their classes' rule on one column.
+
+    For every pair of the cell's class and the rival class, class_rule
+    on all the distinct rows of the two classes, chosen once; then the
+    share of the cell's rows it sends to the rival's side and the share
+    of the rival class's rows it sends to the cell's. The rule is that
+    of the two classes, not of the cell: a cell is small, and some
+    column puts it in a tail of any class, so a rule chosen for it alone
+    would nearly always separate it.
+
+    Args:
+        values: The column's value of every row, shape (n,).
+        labels: The class code of every row, shape (n,).
+        cell: The cell of every row, shape (n,).
+        pairs: The (cell, rival class) pairs.
+        cell_class: The class of every cell.
+        numeric: Whether the column is numeric.
+
+    Returns:
+        Shape (len(pairs), 2): the error on the cell's rows and on the
+        rival class's rows, each in [0, 1].
+    """
+    values = np.asarray(values, dtype=np.float64)
+    labels, cell = np.asarray(labels), np.asarray(cell)
+    cell_class = np.asarray(cell_class)
+    m = len(cell_class)
+    size = np.bincount(cell, minlength=m)
+    errors = np.zeros((len(pairs), 2))
+    by_classes = defaultdict(list)  # (class, rival class): the pairs' positions
+    for i, (c, k) in enumerate(pairs):
+        by_classes[(int(cell_class[c]), int(k))].append(i)
+    own = {
+        k: np.flatnonzero(labels == k) for k in {k for pair in by_classes for k in pair}
+    }
+    sorted_of, shares_of = {}, {}
+    categories = np.unique(values) if not numeric else None
+    for (a, k), positions in sorted(by_classes.items()):
+        for c in (a, k):
+            if c in sorted_of or c in shares_of:
+                continue
+            if numeric:
+                sorted_of[c] = np.sort(values[own[c]])
+            else:
+                shares_of[c] = _shares(values[own[c]], categories)
+        if numeric:
+            rule = _threshold(sorted_of[a], sorted_of[k])
+        else:
+            rule = _split(shares_of[a], shares_of[k])
+        rival = float(rule.first(values[own[k]]).mean())
+        wrong = np.bincount(
+            cell[own[a]], weights=~rule.first(values[own[a]]), minlength=m
         )
-        one = np.array([1 - rule.side_a, 1 - rule.side_b])
-        confusion[i] = nearest if nearest.max() <= one.max() else one
-    return confusion
+        for i in positions:
+            c = pairs[i][0]
+            errors[i] = (wrong[c] / size[c], rival)
+    return errors
 
 
 def rival_pairs(
@@ -617,29 +705,22 @@ def verdict(low: float, high: float, threshold: float) -> bool | None:
 
 
 def rival_defects(
-    rivals: Iterable[tuple[int, np.ndarray, int]], tau: float, confidence: float
+    rivals: Iterable[RivalMeasure], tau: float, confidence: float
 ) -> dict[tuple[str, int], bool | None]:
     """Return the verdict of every rival defect of a cell against each rival class.
 
-    Against a rival class, with c the confusion of the cell's rows with
-    every column and c_i after removing the first i key columns, each
-    read with its interval on the n rows of the cell it was measured on
-    (share_bounds, verdict): suspect_label is c against 1/2;
-    class_overlap is c against tau. A shortcut is read on the rise,
-    c_i - c, not on c_i: the share of the cell's rows that the key
-    columns alone keep apart from the rival class, a share of the same
-    n rows, read with its own interval against tau. It is True when the
-    cell is apart (class_overlap False) and some rise reaches tau,
-    False when it is not apart or every rise falls short, None
-    otherwise. The rise, not the value, so that a cell already near
-    the threshold is no shortcut for a hair of a rise, and a cell far
-    from its rival is one when those columns alone hold them apart.
+    Against a rival class, each measure read with its interval
+    (share_bounds, verdict): suspect_label is the confusion against
+    1/2, class_overlap against tau. A column is a shortcut when the
+    upper bounds of both errors of its rule (rule_errors) lie under
+    tau, none when the lower bound of either reaches it. shortcut is
+    True when the cell is apart (class_overlap False) and some column
+    is a shortcut, False when it is not apart or no column is, None
+    otherwise. Without a confusion (a side too small) the three are
+    None.
 
     Args:
-        rivals: Per rival class with a measure: its code, the confusion
-            of this cell's rows (with every column, then after removing
-            the first 1, 2, ... key columns), shape (k + 1,), and the
-            rows of the cell it was measured on.
+        rivals: Per rival class, what the cell was measured on.
         tau: The threshold of class_overlap and shortcut.
         confidence: The level of the intervals.
 
@@ -647,23 +728,30 @@ def rival_defects(
         By (defect, class), its verdict: True, False or None.
     """
     found: dict[tuple[str, int], bool | None] = {}
-    for rival_class, confusion, n in rivals:
-        k = int(rival_class)
-        overlap = verdict(*share_bounds(confusion[0], n, confidence), tau)
-        found[("suspect_label", k)] = verdict(
-            *share_bounds(confusion[0], n, confidence), 0.5
-        )
+    for measure in rivals:
+        k = int(measure.rival_class)
+        if measure.confusion is None:
+            found.update({(d, k): None for d in RIVAL_DEFECTS})
+            continue
+        bounds = share_bounds(measure.confusion, measure.n_scored, confidence)
+        overlap = verdict(*bounds, tau)
+        found[("suspect_label", k)] = verdict(*bounds, 0.5)
         found[("class_overlap", k)] = overlap
-        # the rows the key columns alone keep apart, a share of the same rows
-        rises = [
-            verdict(*share_bounds(max(c - confusion[0], 0.0), n, confidence), tau)
-            for c in confusion[1:]
-        ]
         if overlap is not False:  # overlapping, or maybe
             found[("shortcut", k)] = False if overlap else None
-        elif any(v is True for v in rises):
+            continue
+        columns = []
+        for cell_error, rival_error in measure.rules:
+            sides = (
+                share_bounds(cell_error, measure.n_cell, confidence),
+                share_bounds(rival_error, measure.n_rival, confidence),
+            )
+            low, high = max(b[0] for b in sides), max(b[1] for b in sides)
+            # the worse side of the rule against tau: True when it is over it
+            columns.append(verdict(low, high, tau))
+        if any(v is False for v in columns):
             found[("shortcut", k)] = True
-        elif all(v is False for v in rises):
+        elif all(v is True for v in columns):
             found[("shortcut", k)] = False
         else:
             found[("shortcut", k)] = None
@@ -697,7 +785,145 @@ def cell_variance(
     return mean, np.sqrt(np.maximum(second - mean * mean, 0.0))
 
 
-def redundancy_verdict(
+def dataset_variance(points: np.ndarray) -> float:
+    """Return the variance of the dataset: the mean squared distance of its rows to their centroid.
+
+    Args:
+        points: Every distinct row, shape (n, d), n >= 1.
+
+    Returns:
+        The variance, >= 0; about d for standardized columns.
+    """
+    points = np.asarray(points, dtype=np.float64)
+    centre = points.mean(axis=0)
+    total = 0.0
+    for start in range(0, len(points), _CHUNK):  # no copy of every row at once
+        part = points[start : start + _CHUNK] - centre
+        total += float(np.einsum("ij,ij->", part, part))
+    return total / len(points)
+
+
+def branch_spread(
+    points: np.ndarray, cell: np.ndarray, parent: np.ndarray, node_cell: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return how far the rows of every branch of a tree lie from their centre.
+
+    Exact, from the sums of every cell (its rows, their sum, the sum of
+    their squared norms, of their outer products, of their squared norm
+    times themselves, of their fourth powers), added up the tree: the
+    variance of a branch is the mean squared distance of its rows to its
+    centroid, as cell_variance's of a cell, and its standard deviation
+    that of those squared distances, what mean_bounds needs.
+
+    Args:
+        points: The rows, shape (n, d) (distinct, unweighted).
+        cell: The cell of every row.
+        parent: The parent of every node, -1 for a root; a parent comes
+            before its children.
+        node_cell: The cell of every node, -1 for a node that is not a
+            cell; the cells are the leaves.
+
+    Returns:
+        Per node, shape (k,): the variance of its rows, its standard
+        deviation, and its rows.
+    """
+    points = np.asarray(points, dtype=np.float64)
+    parent, node_cell = np.asarray(parent), np.asarray(node_cell)
+    centre = points.mean(axis=0)  # moments about it: no cancellation far away
+    order = np.argsort(np.asarray(cell), kind="stable")
+    ids, starts = np.unique(np.asarray(cell)[order], return_index=True)
+    rows_of = dict(zip(ids.tolist(), np.split(order, starts[1:])))
+    k = len(parent)
+    variance, sd, n_rows = np.zeros(k), np.zeros(k), np.zeros(k, dtype=np.int64)
+    pending: dict[int, list] = {}  # the sums of the children seen of a node
+    for v in range(k - 1, -1, -1):  # children after their parent
+        if node_cell[v] >= 0:
+            Z = points[rows_of.get(int(node_cell[v]), np.empty(0, int))] - centre
+            norm = np.einsum("ij,ij->i", Z, Z)
+            sums = [len(Z), Z.sum(0), norm.sum(), Z.T @ Z, norm @ Z, (norm**2).sum()]
+        else:
+            sums = pending.pop(v)
+        n, s1, s2, outer, t, q = sums
+        if n:
+            c = s1 / n
+            cc = c @ c
+            mean = s2 / n - cc
+            fourth = q - 4 * c @ t + 4 * c @ outer @ c + 2 * cc * s2 - 3 * n * cc * cc
+            variance[v] = max(mean, 0.0)
+            sd[v] = math.sqrt(max(fourth / n - mean * mean, 0.0))
+            n_rows[v] = n
+        if parent[v] >= 0:
+            if parent[v] in pending:
+                pending[parent[v]] = [a + b for a, b in zip(pending[parent[v]], sums)]
+            else:
+                pending[parent[v]] = list(sums)
+    return variance, sd, n_rows
+
+
+def repetition_verdicts(
+    parent: np.ndarray,
+    node_cell: np.ndarray,
+    n_read: np.ndarray,
+    spread: tuple[np.ndarray, np.ndarray, np.ndarray],
+    reference: float,
+    tau: float,
+    confidence: float,
+) -> tuple[list[bool | None], np.ndarray]:
+    """Return whether every cell lies in a large branch of its class as tight as tau of the dataset.
+
+    A branch is large when it holds at least tau of the CSV rows of its
+    root (its class); a large branch is tight when its variance is at
+    most tau times the dataset's (variance_verdict, with its interval).
+    A cell has repetition when a large branch above it (or itself) is
+    tight, has it not when every large branch above it is not, and is
+    undecided otherwise.
+
+    Args:
+        parent: The parent of every node, -1 for a root; a parent comes
+            before its children.
+        node_cell: The cell of every node, -1 for none.
+        n_read: The CSV rows of every node.
+        spread: The variance, its standard deviation and the rows of
+            every node (branch_spread).
+        reference: The variance of the dataset (dataset_variance).
+        tau: The threshold of both the size and the ratio.
+        confidence: The level of the interval.
+
+    Returns:
+        Per cell (indexed by cell, 0 to the most cell): its verdict, and
+        the node of the largest tight branch above it, -1 for none.
+    """
+    parent, node_cell = np.asarray(parent), np.asarray(node_cell)
+    n_read = np.asarray(n_read, dtype=np.float64)
+    variance, sd, n_rows = spread
+    k = len(parent)
+    root = np.arange(k)
+    top = np.full(k, -1)  # the highest tight large branch on the path
+    open_ = np.zeros(k, dtype=bool)  # an undecided large branch on the path
+    for v in range(k):  # a parent before its children
+        p = parent[v]
+        if p >= 0:
+            root[v], top[v], open_[v] = root[p], top[p], open_[p]
+        if n_read[v] < tau * n_read[root[v]]:  # too small a part of its class
+            continue
+        held = variance_verdict(
+            variance[v], sd[v], n_rows[v], reference, tau, confidence
+        )
+        if held is True and top[v] < 0:
+            top[v] = v
+        elif held is None:
+            open_[v] = True
+    m = int(node_cell.max()) + 1 if len(node_cell) else 0
+    found: list[bool | None] = [None] * m
+    of_cell = np.full(m, -1)
+    for v in np.flatnonzero(node_cell >= 0):
+        c = int(node_cell[v])
+        of_cell[c] = top[v]
+        found[c] = True if top[v] >= 0 else (None if open_[v] else False)
+    return found, of_cell
+
+
+def variance_verdict(
     variance: float,
     sd: float,
     n: int,
@@ -705,14 +931,15 @@ def redundancy_verdict(
     tau: float,
     confidence: float,
 ) -> bool | None:
-    """Return whether a cell's variance is at most tau times the typical one beyond the error of sampling.
+    """Return whether a variance is at most tau times a typical one beyond the error of sampling.
 
     Args:
         variance: The cell's variance (cell_variance).
         sd: The standard deviation of its rows' squared distances.
         n: Its rows.
-        typical: The typical variance of a cell of its class (the
-            median), > 0; None when it is 0.
+        typical: The variance it is compared with: of the typical cell
+            of its class (redundancy), or of the dataset for a branch
+            (repetition).
         tau: The threshold of the ratio.
         confidence: The level of the interval (mean_bounds).
 
@@ -729,30 +956,6 @@ def redundancy_verdict(
     if low > tau * typical:
         return False
     return None
-
-
-def provenance_verdict(
-    share: float, excess: float, n: float, tau: float, confidence: float
-) -> bool | None:
-    """Return whether a cell's excess of one provenance value reaches tau beyond the error of sampling.
-
-    The excess is the share of the value in the cell less its typical
-    share in the class (src.provenance.excess); the interval is the
-    share's (share_bounds), less the typical share.
-
-    Args:
-        share: The share of the value in the cell's CSV rows with one.
-        excess: The excess of the value.
-        n: The cell's CSV rows with a value.
-        tau: The threshold.
-        confidence: The level of the interval.
-
-    Returns:
-        verdict of the excess against tau.
-    """
-    low, high = share_bounds(share, n, confidence)
-    typical = share - excess
-    return verdict(low - typical, high - typical, tau)
 
 
 def defects_of(
@@ -792,6 +995,7 @@ def defects_of(
 
 
 _TIE = 1e-9  # relative tolerance under which two distances tie
+_CHUNK = 1 << 20  # rows taken at once from a large array
 
 
 def _rival_share(sq_dist: np.ndarray, side: np.ndarray) -> np.ndarray:
@@ -804,39 +1008,66 @@ def _rival_share(sq_dist: np.ndarray, side: np.ndarray) -> np.ndarray:
     return (near & other).sum(axis=1) / near.sum(axis=1)
 
 
-def _margin(sq_dist: np.ndarray, side: np.ndarray) -> float:
-    """Return the mean over the two sides of d_own / (d_own + d_other), 0.5 at d = 0.
+def column_values(Z: np.ndarray, numeric: bool) -> np.ndarray:
+    """Return the values of one original column from its point columns.
 
-    The squared distances may come from subtracted parts, a hair under 0.
+    Args:
+        Z: Its point columns, shape (n, s): one for a number, its
+            one-hot slots for a categorical.
+        numeric: Whether it is numeric.
+
+    Returns:
+        Shape (n,) float: the number, or the index of the active slot
+        (-1 for none).
     """
-    sq = np.maximum(sq_dist, 0.0)
-    np.fill_diagonal(sq, np.inf)
-    same = side[None, :] == side[:, None]
-    own = np.sqrt(np.where(same, sq, np.inf).min(axis=1))
-    other = np.sqrt(np.where(~same, sq, np.inf).min(axis=1))
-    both = own + other
-    ratio = np.full(len(own), 0.5)
-    np.divide(own, both, out=ratio, where=np.isfinite(both) & (both > 0))
-    return float((ratio[~side].mean() + ratio[side].mean()) / 2)
-
-
-def _column_parts(
-    X: np.ndarray, column_of: np.ndarray, columns: np.ndarray
-) -> np.ndarray:
-    """Return the squared distances each original column adds, shape (c, n, n)."""
-    parts = np.empty((len(columns), len(X), len(X)))
-    for i, c in enumerate(columns):
-        Z = X[:, column_of == c]
-        sq = (Z * Z).sum(axis=1)
-        parts[i] = np.maximum(sq[:, None] + sq[None, :] - 2 * Z @ Z.T, 0.0)
-    return parts
-
-
-def _values(Z: np.ndarray, numeric: bool) -> np.ndarray:
-    """Return a column's values: the number, or the active slot (-1 for none)."""
     if numeric:
         return Z[:, 0]
     return np.where(Z.max(axis=1) > 0, Z.argmax(axis=1), -1).astype(float)
+
+
+def _threshold(sa: np.ndarray, sb: np.ndarray) -> Rule:
+    """Return the threshold of highest balanced accuracy between two sorted samples (class_rule).
+
+    The difference of their distribution functions changes only at their
+    values; between two values of the smaller sample it is monotone, so
+    its extremes lie at a value of it or just under one: the search
+    reads both limits there, with "le"/"gt" at a value and "lt"/"ge"
+    just under it.
+    """
+    small = np.unique(sa if len(sa) <= len(sb) else sb)
+    na, nb = len(sa), len(sb)
+    fa_r, fb_r = (
+        np.searchsorted(x, small, side="right") / n for x, n in ((sa, na), (sb, nb))
+    )
+    fa_l, fb_l = (
+        np.searchsorted(x, small, side="left") / n for x, n in ((sa, na), (sb, nb))
+    )
+    candidates = (  # (kind, accuracy on a + accuracy on b)
+        ("le", fa_r + 1 - fb_r),
+        ("lt", fa_l + 1 - fb_l),
+        ("gt", 1 - fa_r + fb_r),
+        ("ge", 1 - fa_l + fb_l),
+    )
+    best = max(range(4), key=lambda i: candidates[i][1].max())
+    kind, score = candidates[best]
+    if score.max() <= 1.0:  # no rule beats chance
+        return Rule("values", np.empty(0))
+    return Rule(kind, float(small[np.argmax(score)]))
+
+
+def _shares(
+    values: np.ndarray, categories: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the categories and the share of a sample's rows at each, shape (len(categories),)."""
+    at = np.searchsorted(categories, values)
+    return categories, np.bincount(at, minlength=len(categories)) / max(len(values), 1)
+
+
+def _split(a: tuple, b: tuple) -> Rule:
+    """Return the rule that sends each category to the side where it is the larger share (a tie to a)."""
+    categories, share_a = a
+    _, share_b = b
+    return Rule("values", categories[share_b > share_a])
 
 
 def _stump(va: np.ndarray, vb: np.ndarray) -> tuple[str, float]:

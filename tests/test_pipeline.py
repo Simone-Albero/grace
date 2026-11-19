@@ -1,11 +1,9 @@
 """Every stage end to end on the small synthetic dataset."""
 
 import json
-import math
 import sqlite3
 from collections import Counter
 from datetime import datetime
-from fractions import Fraction
 
 import numpy as np
 import polars as pl
@@ -23,18 +21,19 @@ from conftest import (
 from src.config import load_config
 from src.data import DUPLICATES, KINDS, LABEL
 from src.prepare import MISSING, OTHER
-from src.provenance import KEYS, TIME
+from src.provenance import KEYS, SCENARIO_KEYS, TIME
 from src.quality import (
     CLASS_DEFECTS,
     DEFECTS,
     RIVAL_DEFECTS,
+    RivalMeasure,
     decisive_rows,
     defects_of,
-    provenance_verdict,
-    redundancy_verdict,
     rival_defects,
+    share_bounds,
+    variance_verdict,
+    verdict,
 )
-from src.report import PROVENANCE
 from stages.paths import read_points
 
 
@@ -157,7 +156,7 @@ def test_clean_writes_where_every_csv_row_comes_from(done, synthetic_csv):
 
 def test_clean_without_provenance_writes_none(copy_of_done):
     raw = yaml.safe_load(copy_of_done.dataset.read_text())
-    del raw["provenance"]
+    del raw["provenance"], raw["scenario"]  # a scenario reads the provenance
     copy_of_done.dataset.write_text(yaml.safe_dump(raw, sort_keys=False))
     assert (copy_of_done.output_dir / "provenance.parquet").exists()
     copy_of_done.run("clean")
@@ -472,15 +471,22 @@ def test_quality_cells_judge_every_cell(reported):
         rivals = []
         for p in own.iter_rows(named=True):
             assert p["region"] == r["region"]
-            if p["confusion"] is None:
-                continue
-            steps = [p["confusion"], *json.loads(p["confusion_without"])]
-            k = classes.index(p["rival_class"])
-            rivals.append((k, np.array(steps), p["n_scored"]))
+            rules = [e[1:] for e in json.loads(p["rules"])]
+            rivals.append(
+                RivalMeasure(
+                    classes.index(p["rival_class"]),
+                    p["confusion"],
+                    p["n_scored"],
+                    np.array(rules, dtype=float).reshape(-1, 2),
+                    p["n_measured"],
+                    p["n_rival_rows"],
+                )
+            )
             if p["rival_class"] == r["rival_class"]:
                 assert r["confusion"] == pytest.approx(p["confusion"])
                 assert r["confusion_low"] <= r["confusion"] <= r["confusion_high"]
-        assert r["confusion"] == pytest.approx(max(e[0] for _, e, _ in rivals))
+        confused = [m.confusion for m in rivals if m.confusion is not None]
+        assert r["confusion"] == pytest.approx(max(confused))
         # the classes of each rival defect: those of a True verdict, and
         # class_overlap only where it is no suspect_label
         found = rival_defects(rivals, tau, confidence)
@@ -490,33 +496,31 @@ def test_quality_cells_judge_every_cell(reported):
             "suspect_label"
         )
         assert set(_codes(r["shortcut_with"], classes)) == yes("shortcut")
-        redundant = redundancy_verdict(
-            r["variance"],
-            r["variance_sd"],
-            r["n_rows"],
-            r["variance_typical"],
-            tau,
-            confidence,
-        )
+        if r["shortcut_with"]:
+            assert r["shortcut_class"] in r["shortcut_with"].split(",")
+            assert 0 <= r["shortcut_error"] < tau and r["shortcut_columns"]
+        else:
+            assert r["shortcut_class"] is r["shortcut_columns"] is None
+        spread = (r["variance"], r["variance_sd"], r["n_rows"])
+        redundant = variance_verdict(*spread, r["variance_typical"], tau, confidence)
+        repeated = r["repetition_branch"] is not None
         keys = {
             key
-            for key in PROVENANCE
-            if r[f"{key}_excess"] is not None
-            and provenance_verdict(
-                r[f"{key}_excess_share"],
-                r[f"{key}_excess"],
-                r[f"{key}_n"],
+            for key in SCENARIO_KEYS
+            if r[f"scenario_{key}"] is not None
+            and verdict(
+                *share_bounds(r[f"scenario_{key}"], r[f"scenario_{key}_n"], confidence),
                 tau,
-                confidence,
             )
         }
-        assert set(_listed(r["provenance_with"])) == keys
+        assert set(_listed(r["scenario_with"])) == keys
         established = {
             "suspect_label": r["label_with"],
             "class_overlap": r["overlap_with"],
             "shortcut": r["shortcut_with"],
             "redundancy": redundant,
-            "atypical_provenance": keys,
+            "repetition": repeated,
+            "off_scenario": keys,
         }
         defects = defects_of(
             r["missing_rows"],
@@ -561,7 +565,7 @@ def test_quality_regions_are_branches_of_the_cut_with_the_defects_of_their_cells
         assert r["n_read"] == pytest.approx(own["n_read"].sum())
         assert r["confusion"] == pytest.approx(own["confusion"].max())
         # the defects its cells have, against the classes or keys they have them
-        for key in ("label_with", "overlap_with", "shortcut_with", "provenance_with"):
+        for key in ("label_with", "overlap_with", "shortcut_with", "scenario_with"):
             union = {n for v in own[key] for n in _listed(v)}
             assert set(_listed(r[key])) == union
         held = {d for v in own["defects"] for d in _listed(v)}
@@ -644,6 +648,9 @@ def test_quality_rivals_measure_every_cell_against_its_rival_classes(reported):
     assert rivals.select("cell", "rival_class").is_unique().all()
     assert set(rivals["cell"]) == set(cells["cell"])
     columns = set(cfg.num_cols + cfg.cat_cols)
+    n_class = Counter()  # the distinct rows of every class
+    for c, n in size.items():
+        n_class[classes[class_of[c]]] += n
     for r in rivals.iter_rows(named=True):
         # the cell whole, its rival cells of one class pooled and capped
         others = json.loads(r["rival_cells"])
@@ -654,13 +661,46 @@ def test_quality_rivals_measure_every_cell_against_its_rival_classes(reported):
         assert r["n_rival_measured"] == min(n_b, quality.max_rows_per_cell)
         # so a measure is decidable, as min_rows promises
         assert r["n_scored"] >= decisive_rows(quality.tau, quality.confidence)
-        assert 0 <= r["bayes_error_low"] <= r["nn_error"] <= 1
+        assert 0 <= r["nn_error"] <= 1
         assert 0 <= r["single_column_acc"] <= 1 and r["single_column"] in columns
-        removed = r["key_columns"].split(",")
-        assert set(removed) <= columns and len(removed) == quality.max_group
-        without = json.loads(r["confusion_without"])
-        assert len(without) == len(removed) and all(0 <= e <= 1 for e in without)
         assert 0 <= r["confusion"] <= 1
+        # the rules of the two classes on the columns under one half both
+        # ways, the lowest worse error first
+        assert r["n_rival_rows"] == n_class[r["rival_class"]]
+        rules = json.loads(r["rules"])
+        worse = [max(e[1:]) for e in rules]
+        assert worse == sorted(worse) and all(w < 0.5 for w in worse)
+        assert {e[0] for e in rules} <= columns
+
+
+def test_quality_branches_spread_every_node_of_the_cut(reported):
+    cfg = load_config(str(reported.dataset), method=str(reported.method))
+    branches = _table(reported, "quality_branches").sort("node")
+    tree = _read(reported, "cell_tree.parquet").sort("node")
+    assert branches.select("node", "class", "parent", "cell").equals(tree)
+    cells = _cells(reported).sort("cell")
+    points, _ = read_points(cfg)
+    cell = _read(reported, "assignments.parquet").sort("row")["cell"].to_numpy()
+    below = {}  # the cells under every node
+    parent = dict(zip(tree["node"].to_list(), tree["parent"].to_list()))
+    for c, node in zip(tree["cell"].to_list(), tree["node"].to_list()):
+        while c is not None and node >= 0:
+            below.setdefault(node, []).append(c)
+            node = parent[node]
+    for r in branches.iter_rows(named=True):
+        own = below[r["node"]]
+        assert r["n_rows"] == cells.filter(pl.col("cell").is_in(own))["n_rows"].sum()
+        assert r["n_read"] == pytest.approx(
+            cells.filter(pl.col("cell").is_in(own))["n_read"].sum()
+        )
+        if r["parent"] < 0:  # a class whole
+            rows = points[np.isin(cell, own)]
+            d = ((rows - rows.mean(axis=0)) ** 2).sum(axis=1)
+            assert r["variance"] == pytest.approx(d.mean(), rel=1e-6)
+            assert r["variance_sd"] == pytest.approx(d.std(), rel=1e-4)
+    d = ((points - points.mean(axis=0)) ** 2).sum(axis=1).mean()
+    q = _table(reported, "quality_cells")
+    assert q["variance_dataset"].to_list() == pytest.approx([d] * q.height, rel=1e-9)
 
 
 def test_quality_report_refuses_cells_of_other_data(copy_of_done):
@@ -672,21 +712,11 @@ def test_quality_report_refuses_cells_of_other_data(copy_of_done):
         copy_of_done.run("quality_report")
 
 
-def _central(times: list, share: Fraction) -> tuple:
-    """The first and last time left once k = floor((n - 1) (1 - share) / 2) are cut at each end."""
-    times = sorted(times)
-    k = int((len(times) - 1) * (1 - share) / 2)
-    return times[k], times[len(times) - 1 - k]
-
-
-def test_quality_cells_measure_where_their_csv_rows_come_from(reported):
-    cfg = load_config(str(reported.dataset), method=str(reported.method))
-    held = Fraction(str(cfg.method.quality.time_share))
+def test_quality_cells_describe_where_their_csv_rows_come_from(reported):
     cells = _table(reported, "quality_cells").sort("cell")
     provenance = _read(reported, "provenance.parquet")
     cell = _read(reported, "assignments.parquet").sort("row")["cell"].to_numpy()
     of = cell[provenance["row"].to_numpy()]
-    shares = {key: [] for key in KEYS}  # per key, per cell: {value: its share}
     for c, row in enumerate(cells.iter_rows(named=True)):
         assert row["cell"] == c
         mine = provenance.filter(pl.Series(of == c))
@@ -699,41 +729,41 @@ def test_quality_cells_measure_where_their_csv_rows_come_from(reported):
             assert row[f"{key}_top_share"] == pytest.approx(counts[top] / len(values))
             assert row[f"{key}_n_values"] == len(counts)
             assert row[f"{key}_eff_n"] == pytest.approx(np.exp(-(p * np.log(p)).sum()))
-            shares[key].append({v: Fraction(n, len(values)) for v, n in counts.items()})
-        first, last = _central(mine[TIME].drop_nulls().to_list(), held)
-        assert row["time_from"] == first.strftime("%Y-%m-%d %H:%M:%S")
-        assert row["time_to"] == last.strftime("%Y-%m-%d %H:%M:%S")
-        assert row["time_window"] == pytest.approx((last - first).total_seconds())
-    # The excess: a cell's share of one of its values less the typical
-    # share of that value in its class, the ceil(n / 2)-th smallest of its
-    # shares in the class's n cells (0 in a cell without it).
-    of_class = cells["class"].to_list()
-    for key in KEYS:
-        for c, row in enumerate(cells.iter_rows(named=True)):
-            mates = [
-                shares[key][o]
-                for o in range(cells.height)
-                if of_class[o] == of_class[c]
-            ]
-            over = {}
-            for v, share in shares[key][c].items():
-                typical = sorted(d.get(v, Fraction(0)) for d in mates)
-                over[v] = share - typical[math.ceil(len(mates) / 2) - 1]
-            best = max(over.values())
-            assert row[f"{key}_excess"] == pytest.approx(float(best))
-            assert over[row[f"{key}_excess_value"]] == best
-    # The time window as a share of the window of the class's CSV rows.
-    for name in set(of_class):
-        own = [c for c in range(cells.height) if of_class[c] == name]
-        times = provenance.filter(pl.Series(np.isin(of, own)))[TIME]
-        first, last = _central(times.drop_nulls().to_list(), held)
-        whole = (last - first).total_seconds()
-        for c in own:
-            share = cells["time_window_share"][c]
-            if whole > 0:
-                assert share == pytest.approx(cells["time_window"][c] / whole)
-            else:
-                assert share is None
+
+
+def test_quality_cells_count_the_csv_rows_that_break_the_scenario(reported):
+    cfg = load_config(str(reported.dataset), method=str(reported.method))
+    scenario = cfg.scenario
+    cells = _table(reported, "quality_cells").sort("cell")
+    provenance = _read(reported, "provenance.parquet")
+    cell = _read(reported, "assignments.parquet").sort("row")["cell"].to_numpy()
+    of = cell[provenance["row"].to_numpy()]
+    hosts = set(scenario.attacks["class_4"].src_ip)
+    ((start, end),) = scenario.attacks["class_4"].time
+    ports = {str(p) for p in scenario.background_ports}
+    for c, row in enumerate(cells.iter_rows(named=True)):
+        mine = provenance.filter(pl.Series(of == c))
+        if row["class"] == scenario.benign:
+            assert all(row[f"scenario_{k}"] is None for k in SCENARIO_KEYS)
+            assert all(row[f"scenario_{k}_n"] == 0 for k in SCENARIO_KEYS)
+            continue
+        port = mine["dst_port"].cast(pl.String).drop_nulls().to_list()
+        assert row["scenario_dst_port_n"] == len(port)
+        assert row["scenario_dst_port"] == pytest.approx(
+            sum(p in ports for p in port) / len(port)
+        )
+        if row["class"] != "class_4":  # no hosts nor windows declared
+            assert row["scenario_src_ip"] is None and row["scenario_time"] is None
+            continue
+        src = mine["src_ip"].cast(pl.String).drop_nulls().to_list()
+        assert row["scenario_src_ip_n"] == len(src)
+        assert row["scenario_src_ip"] == pytest.approx(
+            sum(s not in hosts for s in src) / len(src)
+        )
+        times = mine[TIME].drop_nulls().to_list()
+        assert row["scenario_time"] == pytest.approx(
+            sum(not start <= t <= end for t in times) / len(times)
+        )
 
 
 def test_the_planted_provenance_shows_in_its_cells(reported):
@@ -742,25 +772,23 @@ def test_the_planted_provenance_shows_in_its_cells(reported):
     single = cells.filter(pl.col("class") == "class_5")
     assert set(single["src_ip_top"]) == {"18.5.0.99"}
     assert (single["src_ip_top_share"] > 0.9).all()
-    # The canonical sub-group of class_4: one host, one port, 5 minutes.
+    # The canonical sub-group of class_4: one host, one port.
     planted = cells.filter(pl.col("class") == "class_4").sort(
         "src_ip_top_share", descending=True
     )
     first = planted.row(0, named=True)
     assert first["src_ip_top"] == "18.99.9.9" and first["src_port_top"] == "31337"
-    assert first["src_ip_top_share"] > 0.9 and first["time_window"] <= 300
+    assert first["src_ip_top_share"] > 0.9
     # The background has many hosts in every cell.
     background = cells.filter(pl.col("class") == "class_1")
     assert (background["src_ip_eff_n"] > 10).all()
 
 
-def test_the_planted_source_is_atypical_for_its_class(reported):
+def test_the_planted_host_is_off_the_scenario_of_its_class(reported):
     cells = _table(reported, "quality_cells")
-    by_host = cells.filter(
-        pl.col("provenance_with").fill_null("").str.contains("src_ip")
-    )
-    # The canonical sub-group of class_4 comes from a host the rest of
-    # its class never has: every cell of it, and only of it, in class_4.
+    by_host = cells.filter(pl.col("scenario_with").fill_null("").str.contains("src_ip"))
+    # The canonical sub-group of class_4 comes from a host the scenario
+    # does not declare: every cell of it, and only of it, in class_4.
     planted = cells.filter(
         (pl.col("class") == "class_4") & (pl.col("src_ip_top") == "18.99.9.9")
     )
@@ -768,28 +796,27 @@ def test_the_planted_source_is_atypical_for_its_class(reported):
     assert set(planted["cell"]) == set(
         by_host.filter(pl.col("class") == "class_4")["cell"]
     )
-    assert planted["defects"].str.contains("atypical_provenance").all()
-    assert set(planted["src_ip_excess_value"]) == {"18.99.9.9"}
-    assert (planted["src_ip_excess"] > 0.9).all()
-    # class_5 comes all from one host: typical of it, so no cell is
-    # atypical; nor is any of the background, of many hosts.
-    assert not by_host["class"].is_in(["class_1", "class_5"]).any()
+    assert planted["defects"].str.contains("off_scenario").all()
+    # No other class has a host rule, and no attack targets a background port.
+    assert set(by_host["class"]) == {"class_4"}
+    assert not cells["scenario_with"].fill_null("").str.contains("dst_port").any()
 
 
-def test_quality_without_a_provenance_does_not_measure_atypical_provenance(
-    copy_of_done,
-):
+def test_quality_without_a_scenario_does_not_measure_off_scenario(copy_of_done):
     raw = yaml.safe_load(copy_of_done.dataset.read_text())
-    del raw["provenance"]
+    del raw["scenario"]
     copy_of_done.dataset.write_text(yaml.safe_dump(raw, sort_keys=False))
     copy_of_done.run("quality_report")
     stats = _table(copy_of_done, "quality_stats").row(0, named=True)
-    assert stats["share_atypical_provenance"] is None
-    assert stats["regions_atypical_provenance"] is None
+    assert stats["share_off_scenario"] is None
+    assert stats["regions_off_scenario"] is None
     assert stats["share_no_defect"] is not None
     assert stats["share_redundancy"] is not None  # geometry alone
+    assert stats["share_repetition"] is not None
     classes = _table(copy_of_done, "quality_classes")
-    assert classes["share_atypical_provenance"].is_null().all()
+    assert classes["share_off_scenario"].is_null().all()
     for table in ("quality_cells", "quality_regions"):
         defects = _table(copy_of_done, table)["defects"].fill_null("")
-        assert not defects.str.contains("atypical_provenance").any()
+        assert not defects.str.contains("off_scenario").any()
+    # the provenance is still described
+    assert _table(copy_of_done, "quality_cells")["src_ip_top"].is_not_null().all()

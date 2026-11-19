@@ -29,17 +29,7 @@ const pctSmall = (v) => (v > 0 && v < 0.001 ? `${Number((v * 100).toPrecision(1)
 const num = (v) => (v == null ? "–" : Number(v).toLocaleString("en-US"));
 const dec = (v, d = 3) => (v == null ? "–" : Number(v).toFixed(d));
 const short = (v) => (v == null ? "–" : String(Number(Number(v).toPrecision(3))));
-// a difference of shares, with its sign: +12.5%, −3.0%
-const signed = (v) => (v == null ? "–" : `${v < 0 ? "−" : "+"}${pct(Math.abs(v))}`);
 const when = (iso) => (iso ? `${iso.replace("T", " ").slice(0, 16)} UTC` : "–");
-// a span of seconds in its largest unit: 45 s, 12 min, 3.2 h, 2.1 days
-const duration = (v) => {
-  if (v == null) return "–";
-  if (v < 60) return `${short(v)} s`;
-  if (v < 3600) return `${short(v / 60)} min`;
-  if (v < 86400) return `${short(v / 3600)} h`;
-  return `${short(v / 86400)} days`;
-};
 const plural = (n, one, many = `${one}s`) => `${num(n)} ${n === 1 ? one : many}`;
 // the first names of a list, then how many more
 const some = (names, k = 3) => names.slice(0, k).join(", ") + (names.length > k ? ` and ${names.length - k} more` : "");
@@ -997,12 +987,12 @@ function panZoom(svg, draw) {
 
 // the defects of a cell, in the order of src.quality.DEFECTS
 const DEFECTS = ["invalid_values", "duplicates", "label_conflict", "suspect_label", "class_overlap", "shortcut",
-  "redundancy", "atypical_provenance"];
+  "redundancy", "repetition", "off_scenario"];
 
-/** The defects the last quality run measured: atypical_provenance needs a provenance (share null without it). */
+/** The defects the last quality run measured: off_scenario needs a scenario (share null without it). */
 const measuredDefects = () => DEFECTS.filter((d) => last.quality.stats[`share_${d}`] != null);
 const RIVAL_COLUMNS = 6; // most rival classes compared feature by feature, the most confused first
-const RIVAL_BARS = 12; // most rival classes drawn as bars, the most confused first
+const RIVAL_SHORTCUTS = 12; // most rival classes listed in a shortcut's evidence, the most confused first
 
 /** What each defect means, one line: the glossary and the tooltip of its chips. */
 const DEFINITION = {
@@ -1015,14 +1005,17 @@ const DEFINITION = {
     "of sampling: the cell lies inside the other class, as rows under a wrong label would",
   class_overlap: "against a rival class, τ or more of the cell's rows are confused with its rows beyond the error of " +
     "sampling, and it is no suspect_label",
-  shortcut: "against a rival class the confusion is under τ, but removing at most max_group key columns adds τ of " +
-    "the cell's rows to it, both beyond the error of sampling: those columns alone hold the two apart",
+  shortcut: "against a rival class it does not overlap, the best rule on a single column between its class and the " +
+    "rival class leaves under τ of the cell's rows and under τ of the rival class's rows on the wrong side, beyond the " +
+    "error of sampling: one column alone tells the two classes apart where the cell lies",
   redundancy: "the cell's rows lie at most τ times as far from their centre as those of the typical cell of its class " +
-    "(the median), beyond the error of sampling: near copies of one another",
-  atypical_provenance: "for one key of where its rows come from (the source address or port, or the part of its " +
-    "class's time the row falls in), at least τ of the cell's CSV rows come from one value more than in the typical " +
-    "cell of its class, beyond the error of sampling (the destination and its port follow the service: measured, no " +
-    "defect)",
+    "(the median), beyond the error of sampling: near copies of one another, against the rest of its class",
+  repetition: "the cell lies in a branch of its class's tree that holds at least τ of the class's CSV rows and whose " +
+    "rows lie at most τ times as far from their centre as the dataset's, beyond the error of sampling: a large part " +
+    "of its class repeated in little space",
+  off_scenario: "at least τ of the cell's CSV rows break a rule of the scenario the dataset declares for its class " +
+    "(a background port as destination, a host or a time the documentation does not give the attack), beyond the " +
+    "error of sampling",
 };
 
 /** The other words of the quality tab, one line each. */
@@ -1048,7 +1041,8 @@ const ROWS_WITH = {
   class_overlap: "lie in a cell with class_overlap",
   shortcut: "lie in a cell with shortcut",
   redundancy: "lie in a cell with redundancy",
-  atypical_provenance: "lie in a cell with atypical_provenance",
+  repetition: "lie in a cell with repetition",
+  off_scenario: "lie in a cell with off_scenario",
 };
 
 /** One sentence per column of the quality tables, shown on hover of the header. */
@@ -1056,9 +1050,10 @@ const HELP = {
   read: "rows of the CSV, copies included (hover a number for the distinct rows)",
   why: "each defect of the cell with what was found",
   nn: "share of this cell's rows whose nearest row is of the rival class (0 apart, about 0.5 mixed)",
-  without: "this cell's confusion with the rival class with every column, then after removing the key columns one at " +
-    "a time; a shortcut is a rise of τ, not a value of τ",
-  key: "the columns removed one at a time, each the one whose removal raises the 1-NN error the most",
+  rule: "the column whose rule between the two classes errs least on its worse side, with its error on this cell's " +
+    "rows and on the rival class's",
+  cellError: "the share of this cell's rows the rule of the two classes sends to the rival's side",
+  rivalError: "the share of the rival class's rows the rule sends to this cell's side",
 };
 
 /** The hyperparameters, the matrix, the cells and the glossary. @param {object} data response of /quality */
@@ -1160,9 +1155,10 @@ function why(r, missingOf) {
     label_conflict: () => `${plural(r.conflict_read, "CSV row")} identical to rows of ${r.conflict_with.join(", ")}`,
     suspect_label: () => `inside ${r.label_with.join(", ")} (highest confusion ${interval(r)})`,
     class_overlap: () => `confused with ${r.overlap_with.join(", ")} (highest ${interval(r)})`,
-    shortcut: () => `apart from ${r.shortcut_with.join(", ")} on a few columns only`,
+    shortcut: () => `one column tells it from ${r.shortcut_with.join(", ")}`,
     redundancy: () => `spread ${dec(r.variance_ratio, 3)} times the typical cell of its class`,
-    atypical_provenance: () => `one value over the typical cell of its class on ${r.provenance_with.join(", ")}`,
+    repetition: () => `in ${pct(r.repetition_share)} of its class, spread ${dec(r.repetition_ratio, 3)} times the dataset`,
+    off_scenario: () => `off the scenario of its class on ${r.scenario_with.join(", ")}`,
   };
   return h("div", { class: "why" }, r.defects.map((d) => h("div", {}, diagnosisChip(d), " ", found[d]())));
 }
@@ -1217,14 +1213,14 @@ function scrollUnderHeader(el) {
  * the rival leaves of that class of every leaf kept; the most confused first.
  * @param {object} d the detail of the cell (/quality/region)
  * @param {(rival: object) => boolean} [keep] the measures to look at
- * @returns {{class: string, here: number|null, without: number[], nn: number|null, key: string|null,
- *   cells: number[]}[]}
+ * @returns {{class: string, here: number|null, nn: number|null, rules: Array<[string, number, number]>,
+ *   n: number, nRival: number, cells: number[]}[]}
  */
 function rivalClasses(d, keep = () => true) {
   const best = new Map(), cells = new Map();
   for (const r of d.rivals) {
-    const rival = { class: r.rival_class, here: r.confusion, without: r.confusion_without, nn: r.nn_error,
-      key: r.key_columns };
+    const rival = { class: r.rival_class, here: r.confusion, nn: r.nn_error, rules: r.rules, n: r.n_measured,
+      nRival: r.n_rival_rows };
     if (!keep(rival)) continue;
     cells.set(rival.class, new Set([...(cells.get(rival.class) ?? []), ...r.rival_cells]));
     const was = best.get(rival.class);
@@ -1261,7 +1257,7 @@ async function drawDetail() {
     row.defects.length ? chips(row.defects) : "no defect");
   $("qr-all").open = false;
   fill("qr-evidence", h("p", { class: "note" }, "loading…"));
-  for (const el of ["qr-map", "qr-rivals", "qr-provenance"]) fill(el);
+  for (const el of ["qr-map", "qr-rivals", "qr-provenance", "qr-provenance-time"]) fill(el);
   const ds = encodeURIComponent(state.dataset);
   let d, profile;
   try {
@@ -1287,18 +1283,19 @@ async function drawDetail() {
     label_conflict: () => evidence("label_conflict", conflicts(d, row)),
     suspect_label: () => evidence("suspect_label", featureDeltas(profile, label.slice(0, RIVAL_COLUMNS))),
     class_overlap: () => evidence("class_overlap", featureDeltas(profile, overlap.slice(0, RIVAL_COLUMNS))),
-    shortcut: () => evidence("shortcut", shortcutBars(shortcut.slice(0, RIVAL_BARS), tau)),
+    shortcut: () => evidence("shortcut", shortcutTable(shortcut.slice(0, RIVAL_SHORTCUTS), tau)),
     redundancy: () => evidence("redundancy", spreadTable(d, row, tau)),
-    atypical_provenance: () => evidence("atypical_provenance", sourceTable(d, row)),
+    repetition: () => evidence("repetition", branchTable(d, row, tau)),
+    off_scenario: () => evidence("off_scenario", scenarioTable(d, row)),
   };
   fill("qr-evidence", row.defects.map((x) => parts[x]()).filter(Boolean));
   const rivals = rivalClasses(d);
   sortable($("qr-rivals"), [
     { key: "class", label: "rival class", text: true, help: TERMS["rival class"] },
+    { key: "here", label: "confusion here", format: (v) => dec(v, 3), help: TERMS.confusion },
     { key: "nn", label: "nn_error here", format: (v) => dec(v, 3), help: HELP.nn },
-    { key: "without", label: "without key columns", wrap: true, help: HELP.without,
-      format: (v, r) => (r.here == null ? "–" : [r.here, ...v].map((e, i) => (i ? ` → ${dec(e, 2)}` : dec(e, 2))).join("")) },
-    { key: "key", label: "key columns", format: (v) => (v ? colNames(v) : "–"), help: HELP.key, wrap: true },
+    { key: "rules", label: "best one-column rule", wrap: true, help: HELP.rule,
+      format: (v) => (v.length ? [colName(v[0][0]), ` · ${dec(v[0][1], 3)} here, ${dec(v[0][2], 3)} of the rival`] : "–") },
   ], rivals, { empty: "No class was measured against it." });
   drawCellProvenance(d);
   const involved = new Set([...label, ...overlap, ...shortcut].map((r) => r.class));
@@ -1336,62 +1333,36 @@ function featureDeltas(profile, rivals) {
 }
 
 /**
- * One group of bars per rival class this cell is apart from on a few columns only: its confusion with every column,
- * then without its shortcut columns (the key columns up to the first whose removal brings the confusion to τ), named
- * at the end of the bar; one axis from 0, τ dashed.
+ * Per rival class this cell has a shortcut against, the columns whose rule between the two classes errs under τ on
+ * both sides here: its error on this cell's rows and on the rival class's, the best first.
  * @param {object[]} rivals from rivalClasses, the shortcut ones
  * @param {number} tau
  * @returns {HTMLElement}
  */
-function shortcutBars(rivals, tau) {
+function shortcutTable(rivals, tau) {
   if (!rivals.length) return h("p", { class: "note" }, "No rival class measured.");
-  const steps = rivals.map((r) => {
-    const k = r.without.findIndex((e) => e >= tau);
-    return [{ label: "every column", value: r.here },
-      { label: `without ${r.key.split(",").slice(0, k + 1).join(", ")}`, value: r.without[k] }];
-  });
-  const top = Math.min(1, niceMax(Math.max(tau * 2, ...steps.flat().map((s) => s.value))));
-  const bar = 10, gap = 4, rowH = 2 * (bar + gap) + 14;
-  const W = 1100, m = { l: 200, r: 260, t: 22, b: 26 }, H = m.t + m.b + rowH * rivals.length;
-  const x = (v) => m.l + (Math.min(v, top) / top) * (W - m.l - m.r);
-  const kids = [];
-  for (let t = 0; t <= 4; t++) {
-    const v = (top * t) / 4;
-    kids.push(sv("line", { class: t ? "grid" : "axis", x1: x(v), x2: x(v), y1: m.t - 4, y2: H - m.b }),
-      sv("text", { x: x(v), y: H - 8, "text-anchor": "middle" }, short(v)));
-  }
-  kids.push(sv("line", { x1: x(tau), x2: x(tau), y1: m.t - 10, y2: H - m.b, style: "stroke:var(--text-2);stroke-dasharray:4 4" }),
-    sv("text", { x: x(tau) + 4, y: m.t - 10 }, `τ = ${tau}`));
-  rivals.forEach((r, row) => {
-    const y0 = m.t + row * rowH;
-    kids.push(sv("text", { x: m.l - 8, y: y0 + bar, "text-anchor": "end" }, `vs ${r.class}`));
-    steps[row].forEach((s, i) => {
-      const y = y0 + i * (bar + gap), w = Math.max(0, x(s.value) - x(0)), rr = Math.min(3, w, bar / 2);
-      kids.push(sv("path", {
-        d: `M${x(0)},${y}h${w - rr}a${rr},${rr} 0 0 1 ${rr},${rr}v${bar - 2 * rr}a${rr},${rr} 0 0 1 ${-rr},${rr}h${-(w - rr)}z`,
-        style: `fill:var(--accent);fill-opacity:${i ? 1 : 0.4}`,
-      }), sv("text", { x: x(s.value) + 6, y: y + bar - 1 }, `${s.label} · ${dec(s.value, 2)}`));
-    });
-  });
-  return h("div", { class: "table-wrap" }, sv("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", style: "min-width:640px",
-    "aria-label": "confusion with every column and without the shortcut columns, per rival class" }, kids));
+  const lines = rivals.flatMap((r) => r.rules.filter(([, a, b]) => a < tau && b < tau)
+    .map(([column, a, b]) => [r.class, colName(column), dec(a, 3), dec(b, 3)]));
+  return h("div", { class: "table-wrap" }, table(
+    ["rival class", "column", h("span", { title: HELP.cellError }, "error here"),
+      h("span", { title: HELP.rivalError }, "error on the rival class")], lines));
 }
 
 /**
- * Per provenance key of the cell's atypical_provenance, the value of its highest excess among its leaves: the value,
- * its share of the leaf's CSV rows and the excess over the typical cell of its class; then the time window of the cell.
+ * Per key of the cell's off_scenario, the share of its CSV rows that break the scenario of its class, over its leaves.
  * @param {object} d the detail of the cell (/quality/region)
  * @param {object} row its quality_regions row
  */
-function sourceTable(d, row) {
-  const lines = row.provenance_with.map((key) => {
-    const top = d.cells.reduce((a, c) => ((c[`${key}_excess`] ?? -1) > (a?.[`${key}_excess`] ?? -1) ? c : a), null);
-    return [key, top?.[`${key}_excess_value`] ?? "–", pct(top?.[`${key}_excess_share`]), signed(top?.[`${key}_excess`])];
+function scenarioTable(d, row) {
+  const lines = row.scenario_with.map((key) => {
+    let broken = 0, judged = 0;
+    for (const c of d.cells) {
+      const n = c[`scenario_${key}_n`] ?? 0;
+      if (n && c[`scenario_${key}`] != null) { broken += c[`scenario_${key}`] * n; judged += n; }
+    }
+    return [key, judged ? pct(broken / judged) : "–", num(judged)];
   });
-  const timeNote = d.time?.time_window == null ? null : h("p", { class: "note" }, "time window ",
-    duration(d.time.time_window), ` · ${span(d.time.time_from.replace("T", " "), d.time.time_to.replace("T", " "))}`);
-  return h("div", {}, h("div", { class: "table-wrap" },
-    table(["key", "value", "its share", "excess over its class"], lines)), timeNote);
+  return h("div", { class: "table-wrap" }, table(["key", "CSV rows off the scenario", "CSV rows judged"], lines));
 }
 
 /**
@@ -1404,8 +1375,21 @@ function sourceTable(d, row) {
 function spreadTable(d, row, tau) {
   const typical = d.cells[0]?.variance_typical;
   return h("div", { class: "table-wrap" }, table(
-    ["variance over the typical cell", "typical variance of its class", "τ"],
+    ["variance over the typical cell of its class", "typical variance of its class", "τ"],
     [[flagged(dec(row.variance_ratio, 3), row.variance_ratio <= tau), dec(typical, 3), String(tau)]]));
+}
+
+/**
+ * The widest branch of its class the cell lies in that is a repetition: its share of the class's CSV rows and its
+ * variance over the dataset's, against τ.
+ * @param {object} d the detail of the cell (/quality/region)
+ * @param {object} row its quality_regions row
+ * @param {number} tau
+ */
+function branchTable(d, row, tau) {
+  return h("div", { class: "table-wrap" }, table(
+    ["share of its class in the branch", "variance of the branch over the dataset's", "dataset variance", "τ"],
+    [[pct(row.repetition_share), dec(row.repetition_ratio, 3), dec(d.cells[0]?.variance_dataset, 2), String(tau)]]));
 }
 
 /** "YYYY-MM-DD HH:MM:SS → HH:MM:SS", the day written once when both times fall on it. */
@@ -1413,6 +1397,9 @@ const span = (from, to) => `${from.slice(0, 19)} → ${to.slice(0, 10) === from.
 
 /** Per provenance column, over the cell's CSV rows: its distinct values, the most frequent, the rows per repeated value. */
 function drawCellProvenance(d) {
+  const time = d.time == null ? null
+    : h("p", { class: "note" }, `time ${span(d.time.time_from.replace("T", " "), d.time.time_to.replace("T", " "))}`);
+  fill("qr-provenance-time", time);
   sortable($("qr-provenance"), [
     { key: "key", label: "column", text: true },
     { key: "n_values", label: "distinct values", format: num },

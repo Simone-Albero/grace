@@ -1,42 +1,43 @@
-"""Provenance: where each row of the CSV comes from, and how concentrated it is per cell.
+"""Provenance: where each row of the CSV comes from, and the scenario it should fit.
 
 A dataset may name the columns of its rows' source and destination
-(address and port) and time (ProvenanceConfig): never features, they
-say whether a group of rows is many hosts at many times or one host in
-a few minutes. Stage clean reads them for every row of the CSV, copies
-included (the copies of a row may come from different hosts), and stage
-quality_report measures them per cell: how concentrated its values are
-(concentration, time_window), and how much more of one value it holds
-than the typical cell of its class (excess), the measure of the defect
-atypical_provenance (src.quality), judged on the keys of ORIGIN.
+(address and port) and time (ProvenanceConfig). Stage clean reads them
+for every row of the CSV, copies included (the copies of a row may come
+from different hosts), and stage quality_report describes them per
+cell (concentration). A dataset may also declare its scenario, what its
+documentation says of where and when each class was generated
+(ScenarioConfig): the ports of the background traffic, and per attack
+its hosts and time windows. A row of an attack class that falls outside
+them breaks the scenario (scenario_breaches), and a cell with tau of
+its CSV rows doing so has the defect off_scenario (src.quality).
 """
 
 from __future__ import annotations
 
 __all__ = [
     "KEYS",
-    "ORIGIN",
+    "SCENARIO_KEYS",
     "TIME",
+    "breach_shares",
     "concentration",
-    "excess",
     "read_provenance",
-    "time_parts",
-    "time_window",
+    "scenario_breaches",
 ]
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING
 
 import numpy as np
 import polars as pl
 
+if TYPE_CHECKING:
+    from src.config import ScenarioConfig
+
 KEYS = ("src_ip", "src_port", "dst_ip", "dst_port")  # measured as values, in this order
-TIME = (
-    "time"  # measured as a window, and as the part of its class's time a row falls in
-)
-# The keys atypical_provenance is judged on: where a group of rows comes from and when.
-# The destination follows the service, and a cell of one service is the rule, not a defect:
-# on the injection experiment nearly every clean BENIGN cell had one destination port.
-ORIGIN = ("src_ip", "src_port", TIME)
+TIME = "time"  # the time of the row
+# The keys a scenario rules on, in this order: a background port as the destination of an
+# attack, a source that is none of the attack's hosts, a time out of its windows.
+SCENARIO_KEYS = ("dst_port", "src_ip", TIME)
 
 
 def read_provenance(
@@ -108,178 +109,91 @@ def concentration(group: np.ndarray, values: pl.Series, m: int) -> pl.DataFrame:
     )
 
 
-def excess(
-    group: np.ndarray, values: pl.Series, group_class: np.ndarray, m: int
-) -> pl.DataFrame:
-    """Return, per group of rows, the value it holds most over the typical group of its class.
+def scenario_breaches(
+    origin: pl.DataFrame,
+    row_class: np.ndarray,
+    classes: Sequence[str],
+    scenario: "ScenarioConfig",
+) -> dict[str, np.ndarray]:
+    """Return, per key of the scenario, whether each CSV row breaks it.
 
-    The share of a value in a group is over the group's rows with a
-    value, as in concentration. Its typical share in a class is the
-    median of its shares in the n groups of the class with a value: the
-    ceil(n / 2)-th smallest, a group without it counting 0, every group
-    alike (the groups are the units, each a cell). It is so 0 for a
-    value in at most half of the groups, and a part of the class that
-    holds one value apart does not move the others' typical share, as
-    the mean would. The excess of a group is the most its share of one
-    of its values exceeds that value's typical share: 0 in a class of a
-    single group, near 1 for a group of one value its class seldom has.
+    A row of the benign class breaks no rule. A row of another class
+    breaks dst_port when its destination port is one of the background
+    ports, src_ip when its source is none of its class's hosts, time
+    when its time lies in none of its class's windows (each window
+    closed). A key the scenario does not rule on for the row's class,
+    or a value unknown (null), leaves the row unjudged on it.
 
     Args:
-        group: The group of every row (its cell), in [0, m).
-        values: The value of every row, text or Categorical; a null is
-            unknown and left out.
-        group_class: The class of every group, shape (m,).
+        origin: The provenance of the CSV rows (paths.read_provenance),
+            one row per CSV row, with the columns of the keys it names.
+        row_class: The class code of every CSV row, shape (n,).
+        classes: The class names, by code.
+        scenario: The dataset's scenario.
+
+    Returns:
+        By key of SCENARIO_KEYS the scenario rules on and origin holds,
+        in that order, per CSV row: 1.0 when it breaks the rule, 0.0
+        when it fits it, NaN when unjudged; shape (n,) float64.
+
+    Raises:
+        ValueError: When the scenario names a class that is not one of
+            classes.
+    """
+    named = [scenario.benign, *scenario.attacks]
+    unknown = [name for name in named if name not in classes]
+    if unknown:
+        raise ValueError(f"the scenario names classes the data lacks: {unknown}")
+    code = {name: k for k, name in enumerate(classes)}
+    row_class = np.asarray(row_class)
+    found = {}
+    if scenario.background_ports and "dst_port" in origin.columns:
+        port = origin["dst_port"].cast(pl.String)
+        ports = [str(p) for p in scenario.background_ports]
+        breaks = port.is_in(ports).cast(pl.Float64).fill_null(np.nan).to_numpy()
+        found["dst_port"] = np.where(row_class != code[scenario.benign], breaks, np.nan)
+    for key in ("src_ip", TIME):
+        declared = any(getattr(a, key) for a in scenario.attacks.values())
+        if not declared or key not in origin.columns:
+            continue
+        breaks = np.full(origin.height, np.nan)
+        for name, attack in scenario.attacks.items():
+            rule = getattr(attack, key)
+            if not rule:
+                continue
+            own = row_class == code[name]
+            if key == TIME:
+                t = origin[TIME].to_numpy()[own]
+                inside = np.zeros(len(t), dtype=bool)
+                for start, end in rule:
+                    start, end = np.datetime64(start, "us"), np.datetime64(end, "us")
+                    inside |= (t >= start) & (t <= end)
+                breaks[own] = np.where(np.isnat(t), np.nan, ~inside)
+            else:
+                hosts = origin[key].cast(pl.String).to_numpy()[own]
+                unknown = np.array([h is None for h in hosts], dtype=bool)
+                breaks[own] = np.where(unknown, np.nan, ~np.isin(hosts, list(rule)))
+        found[key] = breaks
+    return found
+
+
+def breach_shares(
+    group: np.ndarray, breach: np.ndarray, m: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return, per group of CSV rows, the share of its judged rows that break a rule.
+
+    Args:
+        group: The group of every CSV row (its cell), in [0, m).
+        breach: Per CSV row, 1.0, 0.0 or NaN (scenario_breaches).
         m: The number of groups.
 
     Returns:
-        One row per group, 0 to m - 1 in order: excess_value (String:
-        the value of the highest excess, ties to the first in text
-        order), excess (Float64: its share in the group less its
-        typical share in the class), excess_share (Float64: its share
-        in the group) and n (Int64: the group's rows with a value, what
-        the share is of); null for a group without a value.
+        Per group, shape (m,): the share of its judged rows that break
+        the rule (NaN for a group with none judged) and the judged rows.
     """
-    groups = pl.DataFrame(
-        {"group": np.arange(m, dtype=group.dtype), "cls": np.asarray(group_class)}
-    )
-    rows = pl.DataFrame({"group": group, "value": values}).drop_nulls("value")
-    shares = (
-        rows.group_by("group", "value")
-        .len()
-        .with_columns(pl.col("value").cast(pl.String))
-        .with_columns(
-            share=pl.col("len") / pl.col("len").sum().over("group"),
-            rows=pl.col("len").sum().over("group").cast(pl.Int64),
-        )
-        .join(groups, on="group")
-        .with_columns(
-            n=pl.col("group").n_unique().over("cls"),  # its class's groups with a value
-            held=pl.len().over("cls", "value"),  # those holding this value
-            rank=pl.col("share").rank("ordinal").over("cls", "value"),
-        )
-    )
-    # The ceil(n / 2)-th smallest share, after the n - held zeros: none
-    # of the held shares when the zeros reach it, and the typical share 0.
-    position = (pl.col("n") + 1) // 2 - (pl.col("n") - pl.col("held"))
-    typical = shares.filter(pl.col("rank") == position).select(
-        "cls", "value", typical="share"
-    )
-    best = (
-        shares.join(typical, on=["cls", "value"], how="left")
-        .select(
-            "group",
-            excess_value="value",
-            excess=pl.col("share") - pl.col("typical").fill_null(0.0),
-            excess_share="share",
-            n="rows",
-        )
-        .sort(["group", "excess", "excess_value"], descending=[False, True, False])
-        .group_by("group", maintain_order=True)
-        .first()
-    )
-    return (
-        groups.select("group")
-        .join(best, on="group", how="left")
-        .sort("group")
-        .drop("group")
-    )
-
-
-def time_parts(
-    group: np.ndarray, times: pl.Series, group_class: np.ndarray
-) -> pl.Series:
-    """Return the part of its class's time each row falls in, as a value.
-
-    The rows of a class with a time, in order of time, are cut into as
-    many parts of equal rows as the class has groups (its cells); rows
-    of one time share a part. A part is so a value of the time, as an
-    address is a value of the source: a group recorded at once lies in
-    one part, as the rows of one host share one address, and excess
-    measures the time as it measures the keys of KEYS.
-
-    Args:
-        group: The group of every row (its cell).
-        times: The time of every row, Datetime; a null is unknown.
-        group_class: The class of every group.
-
-    Returns:
-        Per row, String: its part, written "<first time> to <last time>"
-        ("%Y-%m-%d %H:%M:%S", the last without the day); null for a row
-        without a time.
-    """
-    group_class = np.asarray(group_class)
-    cells = np.bincount(group_class)
-    rows = pl.DataFrame(
-        {
-            "cls": group_class[np.asarray(group)],
-            "t": times,
-        }
-    ).with_row_index("i")
-    known = rows.drop_nulls("t").with_columns(
-        n=pl.len().over("cls"),
-        r=pl.col("t").rank("min").over("cls").cast(pl.Int64) - 1,
-        k=pl.col("cls").replace_strict(
-            dict(enumerate(cells.tolist())), return_dtype=pl.Int64
-        ),
-    )
-    known = known.with_columns(part=pl.col("r") * pl.col("k") // pl.col("n"))
-    spans = known.group_by("cls", "part").agg(
-        first=pl.col("t").min(), last=pl.col("t").max()
-    )
-    label = known.join(spans, on=["cls", "part"]).select(
-        "i",
-        value=pl.concat_str(
-            pl.col("first").dt.to_string("%Y-%m-%d %H:%M:%S"),
-            pl.lit(" to "),
-            pl.col("last").dt.to_string("%H:%M:%S"),
-        ),
-    )
-    return rows.join(label, on="i", how="left").sort("i")["value"]
-
-
-def time_window(
-    group: np.ndarray, times: pl.Series, m: int, share: float
-) -> pl.DataFrame:
-    """Return, per group of rows, the window of time that holds the central share of them.
-
-    With the n times of a group sorted, the window leaves out the k
-    first and the k last, k = floor((n - 1) * (1 - share) / 2): from the
-    (1 - share)/2 quantile (the lower of the two times around it) to
-    the (1 + share)/2 quantile (the higher). At most 1 - share of the
-    group's rows lie outside it, so a few stray rows (copies read on
-    another day, say) do not widen it.
-
-    Args:
-        group: The group of every row (its cell), in [0, m).
-        times: The time of every row, Datetime; a null is unknown and
-            left out.
-        m: The number of groups.
-        share: The share of a group's rows its window holds, in (0, 1],
-            quality.time_share.
-
-    Returns:
-        One row per group, 0 to m - 1 in order: time_from and time_to
-        (Datetime, as times) and time_window (Float64: the seconds from
-        time_from to time_to); null for a group without a time.
-    """
-    known = times.is_not_null().to_numpy()
-    at = times.dt.epoch("us").to_numpy()[known]
-    own = np.asarray(group)[known]
-    order = np.lexsort((at, own))
-    at, own = at[order], own[order]
-    n = np.bincount(own, minlength=m)
-    start = np.concatenate([[0], np.cumsum(n)[:-1]])
-    # floor((n - 1) * (1 - share) / 2), with a margin for rounding: 20 * 0.1 / 2 may land under 1
-    k = np.floor((np.maximum(n, 1) - 1) * (1 - share) / 2 + 1e-9).astype(np.int64)
-    has = n > 0
-    first = np.where(has, start + k, 0)
-    last = np.where(has, start + n - 1 - k, 0)
-    lo = pl.Series(np.where(has, at[first] if len(at) else 0, 0))
-    hi = pl.Series(np.where(has, at[last] if len(at) else 0, 0))
-    window = pl.DataFrame({"lo": lo, "hi": hi, "has": has})
-    time = times.dtype
-    return window.select(
-        time_from=pl.when("has").then(pl.col("lo").cast(pl.Datetime("us"))).cast(time),
-        time_to=pl.when("has").then(pl.col("hi").cast(pl.Datetime("us"))).cast(time),
-        time_window=pl.when("has").then((pl.col("hi") - pl.col("lo")) / 1e6),
-    )
+    known = ~np.isnan(breach)
+    n = np.bincount(group[known], minlength=m)
+    broken = np.bincount(group[known], weights=breach[known], minlength=m)
+    share = np.full(m, np.nan)
+    np.divide(broken, n, out=share, where=n > 0)
+    return share, n

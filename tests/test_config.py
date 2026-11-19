@@ -1,5 +1,7 @@
 """src.config: every shipped yaml loads, a bad value fails up front."""
 
+from datetime import datetime
+
 import pytest
 import yaml
 from conftest import ROOT
@@ -136,14 +138,6 @@ def test_tau_is_a_share_of_rows_under_one_half(tmp_path, value):
         load_config("synthetic_test", method=_method(tmp_path, quality__tau=value))
 
 
-@pytest.mark.parametrize("value", [0.0, 1.5])
-def test_time_share_is_a_share_of_rows(tmp_path, value):
-    with pytest.raises(ValueError, match="quality.time_share"):
-        load_config(
-            "synthetic_test", method=_method(tmp_path, quality__time_share=value)
-        )
-
-
 @pytest.mark.parametrize(
     "key",
     [
@@ -153,6 +147,8 @@ def test_time_share_is_a_share_of_rows(tmp_path, value):
         "candidate_separation",
         "diversity_pairs",
         "max_rows_per_region",
+        "max_group",
+        "time_share",
     ],
 )
 def test_the_dropped_quality_keys_are_unknown(tmp_path, key):
@@ -163,8 +159,8 @@ def test_the_dropped_quality_keys_are_unknown(tmp_path, key):
 
 
 def test_the_quality_group_is_checked(tmp_path):
-    with pytest.raises(ValueError, match="quality.max_group"):
-        load_config("synthetic_test", method=_method(tmp_path, quality__max_group=0))
+    with pytest.raises(ValueError, match="quality.rival_rows"):
+        load_config("synthetic_test", method=_method(tmp_path, quality__rival_rows=0))
 
 
 def test_the_default_method_loads():
@@ -172,7 +168,7 @@ def test_the_default_method_loads():
     # the fewest rows a cell can be measured on: 2 x 25 scored at tau 0.1, 95%
     assert method.min_rows == 50
     assert method.quality.tau == 0.1 and method.quality.rival_rows == 100
-    assert method.quality.time_share == 0.9 and method.quality.confidence == 0.95
+    assert method.quality.confidence == 0.95
 
 
 @pytest.mark.parametrize("value", [0.5, 1.0, 0.3])
@@ -224,9 +220,86 @@ def test_a_bad_provenance_block_fails(tmp_path, block, match):
 
 
 @pytest.mark.parametrize("kind", ["num_cols", "cat_cols"])
-def test_a_provenance_column_is_never_a_feature(tmp_path, kind):
+@pytest.mark.parametrize("column", ["src_ip", "src_port", "timestamp"])
+def test_the_source_and_the_time_are_never_features(tmp_path, kind, column):
     raw = yaml.safe_load((DATASET_DIR / "synthetic_test.yaml").read_text())
     path = tmp_path / "feature.yaml"
-    path.write_text(yaml.safe_dump({**raw, kind: [*(raw[kind] or []), "dst_port"]}))
-    with pytest.raises(ValueError, match="dst_port"):
+    path.write_text(yaml.safe_dump({**raw, kind: [*(raw[kind] or []), column]}))
+    with pytest.raises(ValueError, match=column):
         load_config(str(path))
+
+
+def test_the_destination_may_be_a_feature_too(tmp_path):
+    raw = yaml.safe_load((DATASET_DIR / "synthetic_test.yaml").read_text())
+    path = tmp_path / "feature.yaml"
+    path.write_text(yaml.safe_dump({**raw, "cat_cols": [*raw["cat_cols"], "dst_port"]}))
+    cfg = load_config(str(path))
+    assert "dst_port" in cfg.cat_cols and cfg.provenance.dst_port == "dst_port"
+
+
+def test_the_scenario_block_is_read_and_optional():
+    scenario = load_config("synthetic_test").scenario
+    assert scenario.benign == "class_1"
+    assert scenario.background_ports == (53, 123)
+    assert list(scenario.attacks) == ["class_4"]
+    attack = scenario.attacks["class_4"]
+    assert attack.src_ip[0] == "18.3.0.0" and len(attack.src_ip) == 20
+    assert attack.time == ((datetime(2018, 2, 20, 11), datetime(2018, 2, 20, 12)),)
+    assert load_config("letter_recognition").scenario is None
+    for name in ("cic_2018", "cic_2018_broken"):
+        assert 53 in load_config(name).scenario.background_ports
+
+
+def _with_scenario(tmp_path, scenario, provenance=...) -> str:
+    raw = yaml.safe_load((DATASET_DIR / "synthetic_test.yaml").read_text())
+    raw["scenario"] = scenario
+    if provenance is not ...:
+        raw["provenance"] = provenance
+    path = tmp_path / "scenario.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    return str(path)
+
+
+@pytest.mark.parametrize(
+    "scenario, provenance, match",
+    [
+        ({"background_ports": [53]}, ..., "benign"),
+        ({"benign": "class_1", "hosts": []}, ..., "scenario.hosts"),
+        ({"benign": "class_1", "attacks": {"x": {"port": 1}}}, ..., "attacks.x.port"),
+        ({"benign": "class_1", "background_ports": ["dns"]}, ..., "background_ports"),
+        (
+            {"benign": "class_1", "background_ports": [53]},
+            {"src_ip": "src_ip"},
+            "dst_port",
+        ),
+        (
+            {"benign": "class_1", "attacks": {"x": {"src_ip": ["1.1.1.1"]}}},
+            {"dst_port": "dst_port"},
+            "src_ip",
+        ),
+        (
+            {
+                "benign": "class_1",
+                "attacks": {
+                    "x": {"time": [["2018-02-20 11:00:00", "2018-02-20 12:00:00"]]}
+                },
+            },
+            {"src_ip": "src_ip"},
+            "time",
+        ),
+        (
+            {
+                "benign": "class_1",
+                "attacks": {
+                    "x": {"time": [["2018-02-20 12:00:00", "2018-02-20 11:00:00"]]}
+                },
+            },
+            ...,
+            "before",
+        ),
+        ({"benign": "class_1", "background_ports": [53]}, None, "provenance"),
+    ],
+)
+def test_a_bad_scenario_block_fails(tmp_path, scenario, provenance, match):
+    with pytest.raises(ValueError, match=match):
+        load_config(_with_scenario(tmp_path, scenario, provenance))

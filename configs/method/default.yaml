@@ -14,13 +14,13 @@ cells:                   # every class cut into compact cells of about the same 
                          #   (2 x quality.decisive_rows: 50 rows at tau 0.1 and 0.95). The regions set the granularity
 
 quality:                 # the defects of every cell against its rivals, then of the regions the cells are merged into
-  tau: 0.1               # the one threshold: the share of a cell's rows that may be confused with a rival class; at or
-                         #   over it the cell overlaps, and a shortcut is a removal of columns that brings it there
-  max_rows_per_cell: 500 # most distinct rows of a side when a cell is measured against a rival class (its rival cells of
-                         #   that class pooled): both sides sampled at one rate when the larger exceeds it
+  tau: 0.1               # the one threshold: the share of a cell's rows that may be confused with a rival class (at or
+                         #   over it the cell overlaps), that a one-column rule may leave on the wrong side (under it on
+                         #   both sides it is a shortcut), the ratio of a cell's variance to a typical one, the share of
+                         #   its CSV rows that may break the scenario
+  max_rows_per_cell: 500 # most distinct rows of the rival side when a cell is measured against a rival class (its rival
+                         #   cells of that class pooled, sampled down past it); the cell is always measured whole
   rival_rows: 100        # distinct rows of a cell its rivals are searched from (a budget: an exact nearest-row search,
                          #   a kd-tree per class over the rows of the others)
-  max_group: 3           # most columns removed from a pair to find a shortcut
-  time_share: 0.9        # the share of a cell's rows its time window holds (the central ones); description only
   confidence: 0.95       # level of the interval around every measure of a cell: a cell has a defect when the measure is
                          #   past its threshold beyond the error of sampling, none when short of it, else undecided

@@ -16,18 +16,25 @@ from src import db
 from src.config import DatasetConfig
 from src.data import DUPLICATES, KINDS, LABEL
 from src.graph import sample_rows
-from src.provenance import KEYS, TIME, concentration, excess, time_parts, time_window
+from src.provenance import (
+    KEYS,
+    breach_shares,
+    concentration,
+    scenario_breaches,
+)
 from src.quality import (
     DEFECTS,
+    branch_spread,
     cell_samples,
     cell_variance,
-    cover_hart_low,
-    feature_dependence,
+    column_values,
+    dataset_variance,
     invalid_values,
     label_conflicts,
     pair_conflicts,
     pair_confusion,
     rival_pairs,
+    rule_errors,
     single_column,
 )
 from src.report import COUNTS, judge
@@ -59,25 +66,24 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     its rival cells (a rival class), the cell's rows against the rows
     of those rival cells pooled, the cell whole and the rival side
     sampled to q.max_rows_per_cell (graph.sample_rows, seed):
-    quality.feature_dependence (q.max_group, seed (seed, cell, class)),
-    quality.single_column chosen on its choosing half and measured on
-    its measured half, and quality.pair_confusion ->
-    quality.cell_variance of every cell, and the median of its class's
-    -> quality.invalid_values -> quality.label_conflicts on every
-    feature -> quality.pair_conflicts; with cfg.provenance, on
-    provenance.parquet (paths.read_provenance: every row of the CSV,
-    with the row of the data file it is a copy of; "run clean again"
-    when they disagree), over the CSV rows of each cell,
-    provenance.concentration and provenance.excess (against the cells
-    of its class) of each of its keys of provenance.KEYS and of the
-    part of its class's time each row falls in (provenance.time_parts),
-    provenance.time_window (q.time_share) of its time and of its
-    class's -> src.report.judge at q.tau and q.confidence (the one
-    place they are applied, so the dashboard can apply any other tau):
-    the verdict of every defect of every cell, the cells merged into
-    regions where they do not contradict each other, the shares of the
-    CSV rows with each defect and with none, per class and over the
-    dataset.
+    quality.pair_confusion (seed (seed, cell, class)) -> per original
+    column (quality.column_values of its point columns),
+    quality.rule_errors of every cell and rival class ->
+    quality.cell_variance of every cell and the median of its class's,
+    quality.dataset_variance and quality.branch_spread of every node of
+    the cells' tree -> quality.invalid_values ->
+    quality.label_conflicts on every feature -> quality.pair_conflicts;
+    with cfg.provenance, on provenance.parquet (paths.read_provenance:
+    every row of the CSV, with the row of the data file it is a copy
+    of; "run clean again" when they disagree), over the CSV rows of each
+    cell, provenance.concentration of each of its keys of
+    provenance.KEYS, and with cfg.scenario provenance.scenario_breaches
+    and provenance.breach_shares -> src.report.judge at q.tau and
+    q.confidence (the one place they are applied, so the dashboard can
+    apply any other tau): the verdict of every defect of every cell, the
+    cells merged into regions where they do not contradict each other,
+    the shares of the CSV rows with each defect and with none, per class
+    and over the dataset.
 
     Logs: quality_rivals (one row per cell and rival class: cell,
     region, class, rival_class, rival_cells and rival_regions (JSON
@@ -85,64 +91,69 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     n_measured and n_rival_measured (the distinct rows of each side
     measured), then of the cell's side: n_scored (its rows in the
     measured half, what the confusion is a share of), nn_error,
-    bayes_error_low (quality.cover_hart_low of nn_error),
-    single_column_acc, single_column, key_columns (the columns
-    feature_dependence removed, in order, joined by ","), confusion
-    (pair_confusion with every column) and confusion_without (JSON
-    list: after removing the first 1, 2, ... key columns); n_scored,
-    the 1-NN, key column and confusion columns are null when a side
-    has fewer than 4 measured rows), quality_cells (cell, region,
-    class, n_rows, n_read, n_duplicates = n_read - n_rows, dup_share =
-    1 - n_rows / n_read, conflict_rows, conflict_read, conflict_with
-    (the classes its conflicting rows are shared with, joined by ","),
-    missing_rows and missing_read (rows with a null or invalid value),
-    then per kind of data.KINDS <kind>_rows, clear_rows (its distinct
-    rows with no null or invalid value and in no label conflict, which
-    the share of rows with no defect needs); n_rivals (its rival
-    cells); rival_class: the rival class its rows are most confused
-    with (ties to the lower code), its confusion with confusion_low and
-    confusion_high (its interval), n_scored, nn_error,
-    single_column_acc and single_column; label_with, overlap_with and
-    shortcut_with (the classes it has suspect_label, class_overlap and
-    shortcut against, joined by ","), provenance_with (the keys of its
-    atypical_provenance), variance_ratio (variance over
-    variance_typical); shortcut_class: among the rival classes it does
-    not overlap, the one whose removal of key columns raises the
-    confusion the most, shortcut_columns (the first key columns whose
-    removal adds tau of its rows, all of them otherwise) and
-    confusion_without (the confusion without them); defects and undecided (the defects it
-    neither has nor lacks against some target) joined by ","; null for
-    an empty list; variance, variance_sd (of its rows' squared
-    distances to its centre) and variance_typical (the median variance
-    of the cells of its class); with cfg.provenance, per configured key
-    of provenance.KEYS and for its time (key "time"): <key>_top,
-    <key>_top_share, <key>_n_values and <key>_eff_n, <key>_excess_value,
-    <key>_excess, <key>_excess_share and <key>_n, and with its time
-    time_from and time_to ("YYYY-MM-DD HH:MM:SS"), time_window (seconds)
-    and time_window_share (over its class's window, null when that is
-    0); what depends on tau, the region, the class and key lists,
-    shortcut_*, defects and undecided, is judged by src.report.judge,
-    the rest measured), quality_regions (region, class, n_cells, then
-    the counts of quality_cells summed over its cells, conflict_with,
-    label_with, overlap_with, shortcut_with and provenance_with: the
-    union of its cells', confusion with confusion_low, confusion_high
-    and rival_class: the highest of its cells', variance_ratio: the
-    lowest of its cells', and defects), quality_classes (class, n_rows,
+    single_column_acc, single_column, confusion (n_scored, nn_error and
+    confusion null when a side has fewer than 4 rows); n_rival_rows (the
+    distinct rows of the rival class) and rules (JSON list of [column,
+    error on the cell's rows, error on the rival class's rows] of the
+    rule of the two classes on each column whose errors are both under
+    one half, the lowest worse error first)), quality_cells (cell,
+    region, class, n_rows, n_read, n_duplicates = n_read - n_rows,
+    dup_share = 1 - n_rows / n_read, conflict_rows, conflict_read,
+    conflict_with (the classes its conflicting rows are shared with,
+    joined by ","), missing_rows and missing_read (rows with a null or
+    invalid value), then per kind of data.KINDS <kind>_rows, clear_rows
+    (its distinct rows with no null or invalid value and in no label
+    conflict, which the share of rows with no defect needs); n_rivals
+    (its rival cells); rival_class: the rival class its rows are most
+    confused with (ties to the lower code), its confusion with
+    confusion_low and confusion_high (its interval), n_scored,
+    nn_error, single_column_acc and single_column; label_with,
+    overlap_with and shortcut_with (the classes it has suspect_label,
+    class_overlap and shortcut against, joined by ","), scenario_with
+    (the keys of its off_scenario), variance_ratio (variance over
+    variance_typical), repetition_branch (the largest branch of its
+    class above it that is a repetition, null for none),
+    repetition_share (its share of the class's CSV rows) and
+    repetition_ratio (its variance over variance_dataset); shortcut_class (the rival class of its shortcut
+    whose best rule errs least), shortcut_columns (the columns whose
+    rule is a shortcut against it, the best first) and shortcut_error
+    (the worse error of the best); defects and undecided (the defects
+    it neither has nor lacks against some target) joined by ","; null
+    for an empty list; variance, variance_sd (of its rows' squared
+    distances to its centre), variance_typical (the median variance of
+    the cells of its class) and variance_dataset (of every distinct row
+    of the dataset, the same in every cell); with cfg.provenance,
+    per configured key of provenance.KEYS <key>_top, <key>_top_share,
+    <key>_n_values and <key>_eff_n; with cfg.scenario, per key of
+    provenance.SCENARIO_KEYS it rules on, scenario_<key> (the share of
+    its judged CSV rows that break it, null when none is judged) and
+    scenario_<key>_n (its judged CSV rows); what depends on tau, the
+    region, the class and key lists, shortcut_*, defects and undecided,
+    is judged by src.report.judge, the rest measured), quality_regions
+    (region, class, n_cells, then the counts of quality_cells summed
+    over its cells, conflict_with, label_with, overlap_with,
+    shortcut_with and scenario_with: the union of its cells', confusion
+    with confusion_low, confusion_high and rival_class: the highest of
+    its cells', variance_ratio: the lowest of its cells',
+    repetition_share and repetition_ratio: of its cell's widest branch
+    of repetition, and defects), quality_branches (node, class, parent,
+    cell as in cell_tree.parquet, then n_rows and n_read below the node,
+    variance and variance_sd of its rows), quality_classes (class, n_rows,
     n_read, n_cells, n_regions, share_<defect> and share_no_defect: the
     share of its CSV rows with that defect, a row defect of the row
     itself, a defect of its cell for the others, or with none;
-    share_atypical_provenance null when the dataset has no provenance),
+    share_off_scenario null when the dataset has no scenario),
     cell_missing (cell, region, column, kind, n_rows, n_read: the null
     and invalid cells; no row without one), label_conflict_groups
     (group, row, class, cell, region, n_read), quality_stats (one row:
-    tau, confidence, max_rows_per_cell, rival_rows, max_group, n_pairs
-    (the pairs of rival cells), n_rivals (the rows of quality_rivals),
-    n_reduced (of them, those measured on a sample of the cell's rows),
-    n_groups, n_cells, n_regions, regions_<defect>, regions_no_defect,
+    tau, confidence, max_rows_per_cell, rival_rows, n_pairs (the pairs
+    of rival cells), n_rivals (the rows of quality_rivals), n_reduced
+    (of them, those measured on a sample of the cell's rows), n_groups,
+    n_cells, n_regions, regions_<defect>, regions_no_defect,
     undecided_<defect> (the cells undecided on it), share_<defect> and
-    share_no_defect of all the CSV rows; those of atypical_provenance
-    null when the dataset has no provenance). n_rows counts distinct
-    rows, n_read rows of the CSV.
+    share_no_defect of all the CSV rows; those of off_scenario null when
+    the dataset has no scenario). n_rows counts distinct rows, n_read
+    rows of the CSV.
     """
     q = cfg.method.quality
     classes = read_classes(cfg)
@@ -179,13 +190,31 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     variance, variance_sd = cell_variance(points, cell, len(cell_class))
     median = {k: np.median(variance[cell_class == k]) for k in set(cell_class)}
     typical = np.array([median[k] for k in cell_class], dtype=np.float64)
+    n_read = np.bincount(cell, weights=weights, minlength=len(cell_class))
+    of_dataset = dataset_variance(points)
+    branches = _branches(tree, points, cell, n_read)
     measures = Parallel(n_jobs=-1, batch_size=8)(
-        delayed(_measure)(
-            points[a], points[b], column_of, numeric, q.max_group, (cfg.seed, own, k)
-        )
+        delayed(_measure)(points[a], points[b], column_of, numeric, (cfg.seed, own, k))
         for (own, k, _), (a, b) in zip(rivals, sides)
     )
+    pairs_of = [(own, k) for own, k, _ in rivals]
+    errors = np.stack(
+        [
+            rule_errors(
+                column_values(points[:, column_of == c], numeric[c]),
+                labels,
+                cell,
+                pairs_of,
+                cell_class,
+                bool(numeric[c]),
+            )
+            for c in range(len(columns))
+        ],
+        axis=1,
+    )  # (pairs, columns, 2)
+    print(f"[quality_report] rules of {len(columns)} columns measured", flush=True)
     del points
+    n_class = np.bincount(labels, minlength=len(classes))
 
     data = read_data(cfg)
     features = data.drop(DUPLICATES, LABEL)
@@ -199,7 +228,7 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
         conflict_with[b].add(int(cell_class[a]))
 
     origins = (
-        _provenance(cfg, cell, cell_class, weights, q.time_share)
+        _provenance(cfg, cell, cell_class, labels, weights, classes)
         if cfg.provenance is not None
         else [{} for _ in range(len(cell_class))]
     )
@@ -207,15 +236,29 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     flawed[invalid["row"].to_numpy()] = True
     clear = np.bincount(cell[~flawed], minlength=len(cell_class))
     rival_rows = [
-        _rival_row(rival, (len(a), len(b)), measure, cell_class, classes, columns)
-        for rival, (a, b), measure in zip(rivals, sides, measures)
+        _rival_row(
+            rival,
+            (len(a), len(b)),
+            measure,
+            rules,
+            n_class,
+            cell_class,
+            classes,
+            columns,
+        )
+        for rival, (a, b), measure, rules in zip(rivals, sides, measures, errors)
     ]
-    spread = {"variance": variance, "variance_sd": variance_sd, "typical": typical}
+    spread = {
+        "variance": variance,
+        "variance_sd": variance_sd,
+        "typical": typical,
+        "dataset": np.full(len(cell_class), of_dataset),
+    }
     cell_rows = [
         _cell_row(c, cell_class, classes, counts, conflict_with, clear, spread, origin)
         for c, origin in enumerate(origins)
     ]
-    judged = judge(cell_rows, rival_rows, tree, classes, q.tau, q.confidence)
+    judged = judge(cell_rows, rival_rows, branches, classes, q.tau, q.confidence)
     region = np.array([row["region"] for row in judged.cells], dtype=np.int64)
     found = {d: judged.stats[f"regions_{d}"] for d in DEFECTS}
     print(
@@ -226,6 +269,7 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
         flush=True,
     )
     db.log_table(conn, run_id, "quality_rivals", judged.rivals)
+    db.log_table(conn, run_id, "quality_branches", branches.to_dicts())
     db.log_table(conn, run_id, "quality_cells", judged.cells)
     db.log_table(conn, run_id, "quality_regions", judged.regions)
     db.log_table(conn, run_id, "quality_classes", judged.classes)
@@ -258,7 +302,6 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
                 "confidence": q.confidence,
                 "max_rows_per_cell": q.max_rows_per_cell,
                 "rival_rows": q.rival_rows,
-                "max_group": q.max_group,
                 "n_pairs": len(pairs),
                 "n_rivals": len(rivals),
                 "n_reduced": reduced,
@@ -267,6 +310,24 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
                 **{k: v for k, v in judged.stats.items() if k != "tau"},
             }
         ],
+    )
+
+
+def _branches(tree: pl.DataFrame, points, cell, n_read) -> pl.DataFrame:
+    """Return the quality_branches rows: the cells' tree with the rows and the spread of every node (quality.branch_spread)."""
+    at = {v: i for i, v in enumerate(tree["node"].to_list())}
+    parent = np.array([at.get(v, -1) for v in tree["parent"].to_list()])
+    node_cell = tree["cell"].fill_null(-1).to_numpy()
+    variance, sd, n_rows = branch_spread(points, cell, parent, node_cell)
+    read = np.where(node_cell >= 0, n_read[np.maximum(node_cell, 0)], 0.0)
+    for i in range(len(parent) - 1, -1, -1):  # children after their parent
+        if parent[i] >= 0:
+            read[parent[i]] += read[i]
+    return tree.select("node", "class", "parent", "cell").with_columns(
+        n_rows=pl.Series(n_rows.astype(np.int64)),
+        n_read=pl.Series(read),
+        variance=pl.Series(variance),
+        variance_sd=pl.Series(sd),
     )
 
 
@@ -294,21 +355,12 @@ def _sides(rows_of, own, others, cap, seed) -> tuple[np.ndarray, np.ndarray]:
     return mine, theirs[sample_rows(len(theirs), cap, seed)]
 
 
-def _measure(Xa, Xb, column_of, numeric, max_group, seed):
-    """The single column, dependence and confusion of a cell and a rival class; the last two None when a side is too small.
-
-    The single column is chosen on the half feature_dependence chooses
-    its columns on and measured on the other, as the 1-NN; on every row
-    when there are no halves.
-    """
-    dependence = feature_dependence(Xa, Xb, column_of, max_group, seed)
-    if dependence is None:
-        return single_column(Xa, Xb, column_of, numeric), None, None
-    on_a, on_b = dependence.measure[: len(Xa)], dependence.measure[len(Xa) :]
-    one = single_column(
-        Xa[~on_a], Xb[~on_b], column_of, numeric, Ya=Xa[on_a], Yb=Xb[on_b]
-    )
-    return one, dependence, pair_confusion(Xa, Xb, column_of, numeric, dependence)
+def _measure(Xa, Xb, column_of, numeric, seed):
+    """The confusion of a cell and a rival class, and its single column on every row when a side is too small."""
+    confusion = pair_confusion(Xa, Xb, column_of, numeric, seed)
+    if confusion is None:
+        return single_column(Xa, Xb, column_of, numeric), None
+    return confusion.single, confusion
 
 
 def _counts(cell, m, weights, groups, invalid) -> dict[str, np.ndarray]:
@@ -331,10 +383,14 @@ def _counts(cell, m, weights, groups, invalid) -> dict[str, np.ndarray]:
     return counts
 
 
-def _rival_row(rival, sizes, measure, cell_class, classes, columns) -> dict:
+def _rival_row(
+    rival, sizes, measure, rules, n_class, cell_class, classes, columns
+) -> dict:
     """Return the quality_rivals row of a cell and a rival class, without the regions (src.report.judge)."""
     (own, k, others), (n_a, n_b) = rival, sizes
-    one, dependence, confusion = measure
+    one, confusion = measure
+    worse = rules.max(axis=1)
+    kept = sorted((float(worse[c]), columns[c], c) for c in np.flatnonzero(worse < 0.5))
     row = {
         "cell": own,
         "class": classes[cell_class[own]],
@@ -342,20 +398,20 @@ def _rival_row(rival, sizes, measure, cell_class, classes, columns) -> dict:
         "rival_cells": json.dumps(others),
         "n_measured": n_a,
         "n_rival_measured": n_b,
-        **dict.fromkeys(("n_scored", "nn_error", "bayes_error_low")),
+        **dict.fromkeys(("n_scored", "nn_error")),
         "single_column_acc": one.side_a,
         "single_column": columns[one.column] if one.column >= 0 else None,
-        **dict.fromkeys(("key_columns", "confusion", "confusion_without")),
+        "confusion": None,
+        "n_rival_rows": int(n_class[k]),
+        "rules": json.dumps(
+            [[name, float(rules[c, 0]), float(rules[c, 1])] for _, name, c in kept]
+        ),
     }
-    if dependence is not None:
-        nn_error = float(dependence.errors[0, 0])
+    if confusion is not None:
         row.update(
-            n_scored=int(dependence.measure[:n_a].sum()),
-            nn_error=nn_error,
-            bayes_error_low=cover_hart_low(nn_error),
-            key_columns=",".join(columns[c] for c in dependence.group),
-            confusion=float(confusion[0, 0]),
-            confusion_without=json.dumps(confusion[1:, 0].tolist()),
+            n_scored=int(confusion.measure[:n_a].sum()),
+            nn_error=float(confusion.nn_error[0]),
+            confusion=float(confusion.confusion[0]),
         )
     return row
 
@@ -382,6 +438,7 @@ def _cell_row(
         "variance": float(spread["variance"][c]),
         "variance_sd": float(spread["variance_sd"][c]),
         "variance_typical": float(spread["typical"][c]),
+        "variance_dataset": float(spread["dataset"][c]),
         **origin,
     }
 
@@ -395,8 +452,9 @@ def _provenance(
     cfg: DatasetConfig,
     cell: np.ndarray,
     cell_class: np.ndarray,
+    labels: np.ndarray,
     weights: np.ndarray,
-    share: float,
+    classes: list[str],
 ) -> list[dict]:
     """Return, per cell, the provenance columns of its quality_cells row.
 
@@ -404,19 +462,17 @@ def _provenance(
         cfg: The dataset config, with a provenance.
         cell: The cell of every row of the data file.
         cell_class: The class of every cell.
+        labels: The class code of every row of the data file.
         weights: The copies of every row of the data file in the CSV.
-        share: quality.time_share, the share of a cell's rows its time
-            window holds.
+        classes: The class names, by code.
 
     Returns:
         One dict per cell, in cell order: per key of provenance.KEYS in
         the file, <key>_top, <key>_top_share, <key>_n_values and
-        <key>_eff_n (provenance.concentration), then <key>_excess_value
-        and <key>_excess (provenance.excess, against the cells of its
-        class); with its time, time_from, time_to and time_window
-        (provenance.time_window), and time_window_share: time_window
-        over the window of its class's CSV rows (time_window of them
-        all), null when that is 0.
+        <key>_eff_n (provenance.concentration); with cfg.scenario, per
+        key it rules on, scenario_<key> and scenario_<key>_n
+        (provenance.breach_shares, the share null for a cell with no
+        judged row).
 
     Raises:
         ValueError: When provenance.parquet is not of the rows of the
@@ -433,26 +489,21 @@ def _provenance(
             continue
         rename = lambda c, k=key: f"{k}_{c}"  # noqa: E731
         parts.append(concentration(group, origin[key], m).rename(rename))
-        parts.append(excess(group, origin[key], cell_class, m).rename(rename))
-    if TIME in origin.columns:
-        # the time as a value: the part of its class's time a row falls in
-        part = time_parts(group, origin[TIME], cell_class)
-        rename = lambda c: f"{TIME}_{c}"  # noqa: E731
-        parts.append(concentration(group, part, m).rename(rename))
-        parts.append(excess(group, part, cell_class, m).rename(rename))
-        window = time_window(group, origin[TIME], m, share)
-        n_classes = int(cell_class.max()) + 1
-        of_class = time_window(cell_class[group], origin[TIME], n_classes, share)
-        whole = of_class["time_window"].to_numpy()[cell_class]
-        share = window["time_window"] / pl.Series(whole)
-        text = pl.col("time_from", "time_to").dt.to_string("%Y-%m-%d %H:%M:%S")
-        parts.append(
-            window.with_columns(
-                text,
-                time_window_share=pl.when(pl.Series(whole) > 0).then(share),
+    if cfg.scenario is not None:
+        breaches = scenario_breaches(origin, labels[row], classes, cfg.scenario)
+        for key, breach in breaches.items():
+            share, n = breach_shares(group, breach, m)
+            parts.append(
+                pl.DataFrame(
+                    {
+                        f"scenario_{key}": pl.Series(share).fill_nan(None),
+                        f"scenario_{key}_n": n.astype(np.int64),
+                    }
+                )
             )
-        )
     print(f"[quality_report] provenance of {len(row)} CSV rows measured", flush=True)
+    if not parts:
+        return [{} for _ in range(m)]
     return pl.concat(parts, how="horizontal").to_dicts()
 
 

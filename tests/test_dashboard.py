@@ -13,7 +13,7 @@ from dashboard.app import create_app
 from dashboard.queries import CONFLICT_GROUPS, MAP_MAX_POINTS, MAP_PER_CELL
 from src.config import load_config
 from src.data import DUPLICATES, feature_cols
-from src.provenance import KEYS, TIME, time_window
+from src.provenance import KEYS, SCENARIO_KEYS, TIME
 from src.quality import DEFECTS
 from stages.paths import assignments_file, data_file, prepared_file, provenance_file
 
@@ -173,13 +173,13 @@ def test_quality(reported, client):
             "label_with",
             "overlap_with",
             "shortcut_with",
-            "provenance_with",
+            "scenario_with",
             "conflict_with",
         ):
             assert isinstance(region[key], list)
-        # the keys of its atypical_provenance
-        if "atypical_provenance" in region["defects"]:
-            assert set(region["provenance_with"]) <= {*KEYS, TIME}
+        # the keys of its off_scenario
+        if "off_scenario" in region["defects"]:
+            assert set(region["scenario_with"]) <= set(SCENARIO_KEYS)
     assert data["stats"]["confidence"] == 0.95
     assert any(r["defects"] for r in data["regions"])
 
@@ -193,8 +193,10 @@ def test_quality_judges_the_measures_at_any_tau(reported, client):
     assert high["stats"]["n_regions"] == len(high["regions"])
     for d in ("invalid_values", "duplicates", "label_conflict"):
         assert high["stats"][f"share_{d}"] == run["stats"][f"share_{d}"]
-    for d in ("class_overlap", "atypical_provenance"):
+    for d in ("class_overlap", "off_scenario"):
         assert high["stats"][f"share_{d}"] <= run["stats"][f"share_{d}"]
+    for d in ("shortcut", "redundancy"):
+        assert high["stats"][f"share_{d}"] >= run["stats"][f"share_{d}"]
     low = _get(client, "/api/toy/quality?tau=0.02")
     assert low["stats"]["share_class_overlap"] >= run["stats"]["share_class_overlap"]
     assert low["stats"]["share_class_overlap"] > high["stats"]["share_class_overlap"]
@@ -263,20 +265,19 @@ def test_quality_region_of_a_region_in_a_label_conflict(reported, client):
     assert len(cells) == data["region"]["n_cells"]
     assert all(c["region"] == region for c in data["cells"])
     measured = {
-        f"{k}_{m}"
-        for k in KEYS
-        for m in ("top", "top_share", "n_values", "eff_n", "excess_value", "excess")
+        f"{k}_{m}" for k in KEYS for m in ("top", "top_share", "n_values", "eff_n")
     }
-    timed = {"time_from", "time_to", "time_window", "time_window_share"}
+    judged = {f"scenario_{k}{m}" for k in SCENARIO_KEYS for m in ("", "_n")}
     for cell in data["cells"]:
-        assert measured | timed <= set(cell)
+        assert measured | judged <= set(cell)
         assert 0 < cell["src_ip_top_share"] <= 1 and cell["src_ip_n_values"] >= 1
     assert sum(c["n_rows"] for c in data["cells"]) == data["region"]["n_rows"]
     assert data["rivals"] and all(r["cell"] in cells for r in data["rivals"])
     for r in data["rivals"]:
         assert r["rival_class"] != data["region"]["class"]
-        for key in ("rival_cells", "rival_regions", "confusion_without"):
+        for key in ("rival_cells", "rival_regions", "rules"):
             assert isinstance(r[key], list)
+        assert all(len(rule) == 3 for rule in r["rules"])
     assert data["missing"] == [
         {k: m[k] for k in m if k != "region"}
         for m in quality["missing"]
@@ -381,8 +382,6 @@ def test_every_tab_shows_the_hyperparameters_its_run_used(reported, client):
                 "tau",
                 "rival_rows",
                 "max_rows_per_cell",
-                "max_group",
-                "time_share",
                 "confidence",
             )
         },
@@ -418,12 +417,11 @@ def test_quality_region_tells_where_its_csv_rows_come_from(reported, client):
         assert p["repeat"] == (
             pytest.approx(repeated.mean()) if len(repeated) else None
         )
-    times = origin[TIME]
-    window = time_window(np.zeros(len(times), dtype=np.int64), times, 1, 0.9)
-    assert detail["time"]["time_window"] == pytest.approx(window["time_window"][0])
-    assert detail["time"]["time_from"].startswith(
-        str(window["time_from"][0])[:19].replace(" ", "T")
-    )
+    times = origin[TIME].drop_nulls()
+    assert detail["time"] == {
+        "time_from": times.min().isoformat(),
+        "time_to": times.max().isoformat(),
+    }
 
 
 def test_quality_profile_means_a_region_and_each_of_its_rival_classes(reported, client):
