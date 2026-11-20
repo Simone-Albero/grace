@@ -1,8 +1,7 @@
 """The points of the space and uniform samples of rows.
 
-space_points turns the prepared rows into the points every distance is
-measured on; past it every distance is euclidean. sample_rows draws a
-uniform sample of rows.
+space_points turns the prepared rows into the points every distance,
+euclidean, is measured on. sample_rows draws a uniform sample of rows.
 """
 
 from __future__ import annotations
@@ -15,29 +14,23 @@ __all__ = [
 import numpy as np
 
 
-def space_points(numbers: np.ndarray, slots: np.ndarray, metric: str) -> np.ndarray:
+def space_points(numbers: np.ndarray, slots: np.ndarray) -> np.ndarray:
     """Return the points every distance of the method is measured on.
 
-    The metric applies to the numbers only: under "cosine" each row of
-    numbers is divided by max(its norm, 1e-8), so that the euclidean
-    distance of two rows is sqrt(2 (1 - cos)); under "euclidean" they
-    stay as they are. The categorical slots follow unchanged, so a
-    mismatch costs the same squared distance under either metric.
+    The prepared numbers, then the categorical slots, as they are: the
+    distance of two rows is the euclidean one of their points.
 
     Args:
         numbers: The prepared numeric columns, shape (n, d_num).
         slots: The prepared one-hot slots, shape (n, d_cat); may have
             no column.
-        metric: "euclidean" or "cosine".
 
     Returns:
         Float64 points, shape (n, d_num + d_cat).
     """
-    numbers = np.asarray(numbers, dtype=np.float64)
-    if metric == "cosine":
-        norms = np.linalg.norm(numbers, axis=1, keepdims=True)
-        numbers = numbers / np.maximum(norms, 1e-8)
-    return np.hstack([numbers, np.asarray(slots, dtype=np.float64)])
+    return np.hstack(
+        [np.asarray(numbers, dtype=np.float64), np.asarray(slots, dtype=np.float64)]
+    )
 
 
 def sample_rows(n: int, max_samples: int, seed: int) -> np.ndarray:

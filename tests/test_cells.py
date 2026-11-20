@@ -4,7 +4,13 @@ import numpy as np
 from scipy.cluster.hierarchy import fcluster, is_valid_linkage, ward
 from sklearn.metrics import adjusted_rand_score
 
-from src.cells import CellTree, class_cells, merge_cells, ward_tree
+from src.cells import (
+    CellTree,
+    _squared_distances,
+    class_cells,
+    merge_cells,
+    ward_tree,
+)
 from src.graph import sample_rows
 
 # --- ward_tree ---
@@ -26,9 +32,9 @@ def _cloud(n: int, seed: int) -> np.ndarray:
     )
 
 
-def test_ward_tree_with_unit_weights_is_scipy_ward():
+def test_ward_tree_is_scipy_ward():
     X = _cloud(90, 0)
-    tree = ward_tree(X, np.ones(len(X)))
+    tree = ward_tree(X)
     Z = _linkage(tree, len(X))
     assert is_valid_linkage(Z)
     reference = ward(X)
@@ -38,22 +44,9 @@ def test_ward_tree_with_unit_weights_is_scipy_ward():
         assert adjusted_rand_score(ours, fcluster(reference, k, "maxclust")) == 1.0
 
 
-def test_ward_tree_weights_are_copies_of_the_rows():
-    X = _cloud(60, 1)
-    w = np.random.default_rng(1).integers(1, 4, size=len(X))
-    tree = ward_tree(X, w.astype(float))
-    reference = ward(np.repeat(X, w, axis=0))
-    # The copies merge first, at height 0; the other merges are the tree's.
-    np.testing.assert_allclose(tree.heights, reference[-(len(X) - 1) :, 2], atol=1e-9)
-    Z = _linkage(tree, len(X))
-    for k in (2, 3, 6):
-        ours = np.repeat(fcluster(Z, k, "maxclust"), w)
-        assert adjusted_rand_score(ours, fcluster(reference, k, "maxclust")) == 1.0
-
-
 def test_ward_tree_orders_children_before_parents():
     X = _cloud(40, 2)
-    tree = ward_tree(X, np.ones(len(X)))
+    tree = ward_tree(X)
     n = len(X)
     assert tree.children.shape == (n - 1, 2) and tree.children.dtype == np.int64
     assert (tree.children < n + np.arange(n - 1)[:, None]).all()
@@ -62,8 +55,38 @@ def test_ward_tree_orders_children_before_parents():
 
 
 def test_ward_tree_of_one_row_has_no_merge():
-    tree = ward_tree(np.zeros((1, 3)), np.ones(1))
+    tree = ward_tree(np.zeros((1, 3)))
     assert tree.children.shape == (0, 2) and len(tree.heights) == 0
+
+
+def _hair_apart(n: int, seed: int) -> np.ndarray:
+    """Rows a hair apart (1e-8) around one point, as distinct CSV rows prepared."""
+    rng = np.random.default_rng(seed)
+    return rng.normal(0.0, 1.5, size=96) + rng.normal(0.0, 1e-8, size=(n, 96))
+
+
+def test_squared_distances_are_the_distances():
+    X = _cloud(30, 3)
+    for a in (0, 7, 29):
+        np.testing.assert_allclose(
+            _squared_distances(X, a), ((X - X[a]) ** 2).sum(axis=1), rtol=1e-12
+        )
+    assert _squared_distances(X, 7)[7] == 0.0
+
+
+def test_squared_distances_are_exactly_symmetric_for_rows_a_hair_apart():
+    # ||x||² + ||y||² - 2 x·y rounds a to b and b to a differently here, and the
+    # nearest-neighbour chain of ward_tree then went round three rows forever.
+    X = _hair_apart(600, 4)
+    D = np.stack([_squared_distances(X, a) for a in range(40)])
+    assert (D[:, :40] == D[:, :40].T).all()
+
+
+def test_ward_tree_of_rows_a_hair_apart_ends():
+    far = np.random.default_rng(5).normal(50.0, 3.0, size=(510, 96))
+    X = np.vstack([_hair_apart(30, 5), far])
+    tree = ward_tree(X)
+    assert tree.children.shape == (len(X) - 1, 2)
 
 
 # --- cells of a class ---
@@ -81,9 +104,8 @@ def _blobs(sizes, d=3, gap=12.0, seed=0) -> tuple[np.ndarray, np.ndarray]:
     return X, np.repeat(np.arange(len(sizes)), sizes)
 
 
-def _cells(X, weights=None, min_rows=20, max_fit_samples=20_000, seed=0):
-    weights = np.ones(len(X)) if weights is None else weights
-    return class_cells(X, weights, min_rows, max_fit_samples, seed)
+def _cells(X, min_rows=20, max_fit_samples=20_000, seed=0):
+    return class_cells(X, min_rows, max_fit_samples, seed)
 
 
 def _tree_is_valid(tree: CellTree, labels: np.ndarray) -> None:
@@ -145,15 +167,6 @@ def test_class_cells_give_every_row_the_cell_of_its_nearest_sampled_row():
     A = sample_rows(len(X), 300, 7)
     nearest = np.argmin(((X[:, None, :] - X[A][None, :, :]) ** 2).sum(2), axis=1)
     assert (labels == labels[A][nearest]).all()
-
-
-def test_class_cells_count_distinct_rows_not_copies():
-    # A row of many copies weighs in the tree but counts once in a cell.
-    X, blob = _blobs([300, 300], seed=5)
-    weights = np.ones(600)
-    weights[0] = 10_000.0
-    labels, _ = _cells(X, weights, min_rows=200)
-    assert adjusted_rand_score(blob, labels) == 1.0
 
 
 # --- merge into regions ---

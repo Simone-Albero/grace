@@ -3,9 +3,8 @@
 Data quality through the geometry of the data, independent of any model: each class is cut into the smallest cells a
 measure makes sense on, every cell is checked for the defects of a dataset after the data design smells of Flood et
 al. (EuroS&P 2024) and diagnosed by its relation to other cells (against another class: a suspect label, class
-overlap or a shortcut; against the typical cell of its class: redundancy; within a large and tight branch of its
-class: repetition; against the
-scenario the dataset's documentation declares: off_scenario), and the cells
+overlap or a shortcut; within a large and tight branch of its class: repetition; against the scenario the dataset's
+documentation declares: off_scenario), and the cells
 of a class merge into regions where they do not contradict each other, the units the report is read in. Each defect
 has a one-line definition, the report has a single threshold, tau, and every measure is read with its error of
 sampling at one confidence.
@@ -50,25 +49,26 @@ Stages (each writes its files into the dataset's `output_dir` and its rows into 
   then is standardized (mean 0, standard deviation 1; a missing or infinite one lands on the mean, and the column
   `n_missing`, always present and unscaled, counts how many numbers of the row did; it is a diagnostic, no distance
   sees it). Each categorical column gets an integer code, its `top_n` most frequent values (a missing value counts as
-  one) their own and the rest a shared "other", then a one-hot slot per code. Its active slot weighs
-  sqrt(`prepare.cat_cost` / g), g = 1 - Σ p² over the shares of its slots (the chance two rows differ on it): on
-  average over pairs of rows a categorical column then adds `cat_cost` times what a standardized number adds, and a
-  mismatch on a concentrated column costs more. Writes `prepared.parquet` (the prepared columns, Float64, then the
+  one) their own and the rest a shared "other", then a one-hot slot per code. Its active slot weighs sqrt(1 / g),
+  g = 1 - Σ p² over the shares of its slots (the chance two rows differ on it): on average over pairs of rows a
+  categorical column then adds what a standardized number adds, and a mismatch on a concentrated column costs more. Writes `prepared.parquet` (the prepared columns, Float64, then the
   class code; same rows as `data.parquet`).
-- `cells`: builds the points of the space (`graph.space_points`): the prepared numbers, at unit length under
-  `cosine`, then the categorical slots unchanged, `n_missing` left out. Every distance from there on, here and in
-  `quality_report`, is euclidean on them. Then cuts each class on its own, by geometry alone, into cells
+- `cells`: builds the points of the space (`graph.space_points`): the prepared numbers, then the categorical slots,
+  `n_missing` left out. Every distance from there on, here and in `quality_report`, is euclidean on them. Then cuts each class on its own, by geometry alone, into cells
   (`src/cells.py`):
-  - a Ward tree of a uniform sample of its distinct rows (at most `cells.max_fit_samples`), each row weighted by
-    `n_duplicates` (so it is the Ward tree of the rows as read); every row of the class joins its nearest sampled row,
-    so each node of the tree holds a known number of the class's rows;
+  - a Ward tree of a uniform sample of its distinct rows (at most `cells.max_fit_samples`), each counted once whatever
+    its copies (they are a defect of their own, `duplicates`, and no measure of a cell weighs them); every row of the
+    class joins its nearest sampled row, so each node of the tree holds a known number of the class's rows;
   - from the root, a node is split into its two children while it holds at least 2 · `min_rows` rows, until every
     node left is a cell; a child under `min_rows` rows is no cell of its own, its rows join the nearest cell. A cell
     so holds from `min_rows` to under twice it, but for the small branches it gathers. `min_rows` is no key of the
-    method: it is what `quality.tau` and `quality.confidence` ask for, twice the rows a share must be measured on to
-    be able to fall short of tau (`quality.decisive_rows`, z² (1 - tau) / tau rows; half of a cell's rows choose the
-    rule and half are measured, and a cell is never sampled down). Under it a cell could never be told to lack a defect, whatever it holds: 50 rows at
-    tau 0.1 and 0.95, 32 at tau 0.15. A smaller tau or a higher confidence so asks for larger cells;
+    method: it is what `quality.tau` and `quality.confidence` ask for, the rows on which a share tau away from a
+    threshold of the report, tau or one half, is decided against it (`quality.resolution_rows`): a cell is then
+    undecided only within tau of a threshold. With the normal interval that is z² s (1 - s) / tau² for a share s,
+    at most z² / (4 tau²) near one half, where a share is the least certain: 68 rows at tau 0.1 and 0.95, 31 at
+    tau 0.15, 271 at tau 0.05. A smaller tau or a higher confidence so asks for larger cells. On the cells of
+    cic_2018_broken_poc read against the labels of the corrected release, 68 rows find the relabelled rows of
+    Infilteration as well as 50 and better than 25, whose cells leave more of them undecided;
   - the cells are the units every defect is measured on, as small as the measures allow, so a defect touching a share
     of a cell's rows is not diluted in a larger group. The regions they merge into (below) set the granularity of the
     report: large where a class is uniform, small where it is not;
@@ -81,26 +81,20 @@ Stages (each writes its files into the dataset's `output_dir` and its rows into 
   Writes `cells.parquet` (with `n_read`, the rows of the CSV), `assignments.parquet` (the cell of every row) and
   `cell_tree.parquet` (the cut of every class).
 - `quality_report`: the defects of every cell (`src/quality.py`), after the smells of Flood et al. but per cell, then
-  of the regions the cells are merged into. The rival cells of a cell are the cells of other classes that hold the
-  nearest row of another class to one of its rows (searched from at most `quality.rival_rows` rows per cell): no
-  threshold picks them. A rival class is the class of some of them. A cell is measured once against each rival class:
-  its rows against the rows of its rival cells of that class pooled, so that rows confused with a class spread over
-  several of its cells are counted together (against each cell alone, a cell of rows relabelled from a class cut into
-  nine cells was confused at most 0.19 on the injection experiment). The cell is measured on all its rows,
-  so that `min_rows` holds what it promises (half of them are scored, enough to decide a defect); the rival side is
-  sampled down to `quality.max_rows_per_cell`, which in many dimensions barely moves the nearest rival row (thinning
-  it by r multiplies that distance by r^(-1/d), 0.97 at r = 0.1 and d = 70). Distinct rows, unweighted; each side is
-  split into halves, one to choose on and one to measure on, so that choosing does not inflate what is measured. Read
-  on the cell's side:
-  - `nn_error`: the 1-NN error, the share of the cell's measured rows whose nearest row (leave-one-out) is of the rival
-    class; rows tied at the least distance share the vote;
-  - `single_column_acc`: the accuracy on the cell's measured rows of the best rule on a single column, `single_column`
-    (OneR, Holte 1993), chosen on the other half: a threshold on a number, each value to its side on a categorical
-    (its slots read back as one value; a value not seen when choosing goes to the cell's side);
-  - `confusion`: the error of the better of the two, the one whose worse side errs less (a rule that sends nearly
-    every row to the cell's side, right on it and wrong on the rival's, is so no better than the 1-NN). Any classifier
-    errs at least as much as the best one can; the 1-NN alone overstates the error when columns that do not separate
-    swamp the distance, and a single column misses a separation that needs several;
+  of the regions the cells are merged into. Every distinct row is looked at once against the whole dataset
+  (`quality.nearest_rivals`, euclidean and exact, a kd-tree per class): its nearest row of another class, and its
+  nearest row of its own class, itself left out. The row is confused with the class of its nearest rival row when that
+  row is nearer than its nearest own row, the leave-one-out 1-NN on every column and every row; at the same distance
+  it counts one half. The rival classes of a cell are the classes of its rows' nearest rival rows, its rival cells the
+  cells those rows lie in: no threshold picks them. Against each rival class (`quality.rival_shares`), read on the
+  cell's side:
+  - `rival_share`: the share of the cell's distinct rows confused with that class. The rival class is whole, so rows
+    confused with a class spread over several of its cells are counted together, and no row is sampled away on
+    either side. The shares of a cell over its rival classes sum to at most one. (It replaces the confusion of the
+    earlier runs, the better of the 1-NN and of a one-column rule chosen on the cell, on a sample of 500 rows of its
+    rival cells: on cic_2018_broken_poc, Infilteration against Benign, the rule chosen on a compact cell of about 90
+    rows separated it in 73 cells of 102, and the confusion read 0.21 where the 1-NN on the two classes whole reads 0.72
+    and the nearest neighbours test of Flood et al. 0.78.)
   - `rules`: per column, the rule of the two classes (`quality.class_rule`, on all the distinct rows of the cell's class
     and of the rival class: a threshold either way of highest balanced accuracy, exact, or each categorical value to
     the side where it is the larger share), read on the cell (`quality.rule_errors`): the share of the cell's rows it
@@ -111,10 +105,10 @@ Stages (each writes its files into the dataset's `output_dir` and its rows into 
     one, 50% ten). This is the single-feature efficacy of Flood et al., per cell and against every rival class,
     without a model.
 
-  Every measure of a cell is an estimate on few rows, so it is read with its interval at `quality.confidence` (0.95,
-  each bound one-sided): Wilson's for a share of rows, the normal one for a mean. Against a threshold a cell has the
-  defect when the interval lies at or past it, has it not when the interval lies short of it, and is undecided
-  otherwise (`undecided`). A small cell is so judged only on strong evidence, at any granularity.
+  Every share of a cell's rows is an estimate on few rows, so it is read with its interval at `quality.confidence`
+  (0.95, each bound one-sided, Wilson's). Against a threshold a cell has the defect when the interval lies at or past
+  it, has it not when the interval lies short of it, and is undecided otherwise (`undecided`). A small cell is so
+  judged only on strong evidence, at any granularity.
 
   A cell has a defect when (`quality.tau` = 0.1, the threshold the run logs its verdicts at; see "tau, after the run"
   below):
@@ -124,44 +118,37 @@ Stages (each writes its files into the dataset's `output_dir` and its rows into 
   | `invalid_values` | the row | a row holds an empty, unparsable, NaN or infinite cell | by definition |
   | `duplicates` | the row | a row comes more than once in the CSV | copies can fall on both sides of a train/test split |
   | `label_conflict` | the row | a row equals a row of another class on every feature | no classifier can tell them apart |
-  | `suspect_label` | cell and rival class | its confusion is at least one half | the cell lies inside the other class, as rows under a wrong label would |
-  | `class_overlap` | cell and rival class | its confusion is tau or more, and it is no `suspect_label` | even the better classifier mixes the two |
-  | `shortcut` | cell and rival class | it is no `class_overlap`, and the rule of its class and the rival class on one column leaves under tau of its rows and under tau of the rival class's rows on the wrong side | one column alone tells the two classes apart where the cell lies, an artefact of the capture rather than of the attack |
-  | `redundancy` | cell and its class | its variance (the mean squared distance of its rows to their centre) is at most tau times the typical one of a cell of its class (the median) | near copies of one another, against the rest of its class: one session repeated |
+  | `suspect_label` | cell and rival class | its `rival_share` is at least one half | the cell lies inside the other class, as rows under a wrong label would |
+  | `class_overlap` | cell and rival class | its `rival_share` is tau or more, and it is no `suspect_label` | the nearest row of a share of its rows is of the other class |
+  | `shortcut` | cell and rival class | the rule of its class and the rival class on one column leaves under tau of its rows and under tau of the rival class's rows on the wrong side | one column alone tells the two classes apart where the cell lies, an artefact of the capture rather than of the attack |
   | `repetition` | cell and its class's tree | it lies in a branch of its class's tree that holds at least tau of the class's CSV rows and whose variance is at most tau times the dataset's (`quality.dataset_variance`, the mean squared distance of every distinct row to their centroid; `quality.branch_spread`, `quality.repetition_verdicts`) | a large part of its class, the class or one of its modes, repeated in little space: the repetitiveness of Flood et al. |
-  | `off_scenario` | cell and the scenario | for one key of the scenario (`dst_port`, `src_ip`, `time`), at least tau of its judged CSV rows break the rule of its class | traffic the documentation does not describe under that label |
+  | `off_scenario` | cell and the scenario | at least tau of its judged CSV rows break the rule of its class on some key of the scenario (`dst_port`, `src_ip`, `time`) | traffic the documentation does not describe under that label |
 
   The first three are facts of single rows: counted in a group of any size, they are never diluted, and need no
   interval. The next three compare a cell with a rival class (a rule is a shortcut when the upper bounds of both its
-  errors lie under tau, none when the lower bound of either reaches it); the last three with a reference of its own:
-  its class, the dataset, the scenario. A dataset without a scenario does not measure `off_scenario` (its shares are
+  errors lie under tau, none when the lower bound of either reaches it, whatever the rival share: a cell may overlap
+  a class and still lie where one column tells the two apart); the last two with a reference of its own: the
+  dataset, the scenario. A dataset without a scenario does not measure `off_scenario` (its shares are
   null). One half, the majority, is the other threshold of the report: it is no choice.
 
-  Repetitiveness depends on the scale it is looked at: at the scale of a cell, of 50 to 100 rows, every cell is a
-  dense spot (the typical cell holds 0.0001 to 0.003 of its class's variance), so a cell's variance measures the
-  density of its neighbourhood, not whether its class repeats itself; at the scale of a class, a class of two tight
-  modes far apart (HOIC in cic_2018_broken) looks spread around a centre between them. The tree of a class holds
-  every scale in between, so `repetition` reads its branches: a branch is large when it holds at least tau of its
-  class's CSV rows, and tight when its variance, read with the interval of the mean on its distinct rows, is at most
-  tau times the dataset's; a cell has repetition when a large branch above it is tight (`repetition_branch`, the
-  largest), none when every large branch above it is not, and is undecided otherwise. `redundancy` stays the local
-  question, a cell of near copies within a class whose other cells are not: the two meet on the attack classes, and
-  `redundancy` alone finds the small groups of near copies within the large and varied ones (on cic_2018_broken,
-  15% of Benign's and 7% of Infilteration's CSV rows). The variance of a branch, and its standard deviation, are
-  exact, from the sums of its cells (rows, sum, squared norms, outer products, squared norm times the row, fourth
-  powers) added up the tree.
+  Repetitiveness depends on the scale it is looked at: at the scale of a cell every cell is a dense spot, so a cell's
+  variance measures the density of its neighbourhood, not whether its class repeats itself; at the scale of a class,
+  a class of two tight modes far apart (HOIC in cic_2018_broken) looks spread around a centre between them. The tree
+  of a class holds every scale in between, so `repetition` reads its branches: a branch is large when it holds at
+  least tau of its class's CSV rows, and tight when its variance is at most tau times the dataset's; a cell has
+  repetition when a large branch above it is tight (`repetition_branch`, the largest). It is the one verdict read
+  without an interval: a large branch holds many rows, and its variance, a mean of squared distances, is no share.
+  The variance of a branch is exact, from the sums of its cells (rows, sum, squared norms) added up the tree.
 
   The cells of a class are then merged into regions up their tree: a region is the largest branch whose cells do not
-  contradict each other, no defect against one target (a class, a key) being established in one cell and ruled out in
+  contradict each other, no defect against one target (a class, or the cell's own reference) being established in one cell and ruled out in
   another (a cell with no rival cell of a class rules out the rival defects against it); an undecided cell never
   splits a branch. A region is named by the node of the tree at its top (so the same branch has the same name at any
   tau), has the defects its cells have, and its row defects are counted over its rows. Measuring the merged regions
   instead would dilute again, so the regions only gather what the cells found. Per cell (`quality_cells`) and per
   region (`quality_regions`): the copies, the rows in a label conflict and the classes they conflict with, the rows
-  with a null or invalid value by kind, the classes of `suspect_label` (`label_with`), `class_overlap` and `shortcut`
-  and the keys of `off_scenario` (`scenario_with`), the highest confusion with a rival class, its interval and that
-  class, the variance over the typical one of its class (`variance_ratio`; per region the lowest), and the
-  `defects`; per cell also its rival cells (`n_rivals`), the
+  with a null or invalid value by kind, the classes of `suspect_label` (`label_with`), `class_overlap` and `shortcut`,
+  the highest `rival_share`, its interval and that rival class, and the `defects`; per cell also its rival cells (`n_rivals`), the
   widest branch of repetition it lies in, its share of its class and its variance over the dataset's
   (`repetition_branch`, `repetition_share`, `repetition_ratio`; per region its widest cell's), the rival class of its
   shortcut whose best rule errs least (`shortcut_class`), the columns whose rule is a shortcut
@@ -177,7 +164,9 @@ Stages (each writes its files into the dataset's `output_dir` and its rows into 
   its share (`<key>_top`, `<key>_top_share`), the distinct values (`<key>_n_values`) and the effective number
   (`<key>_eff_n`, exp of the Shannon entropy of their shares, Hill's number of order 1), a description. With a
   scenario, per key it rules on, the share of the cell's judged CSV rows that break it (`scenario_<key>`, null with
-  none judged) and those rows (`scenario_<key>_n`), `provenance.scenario_breaches`: a row of the benign class breaks
+  none judged) and those rows (`scenario_<key>_n`), and the same on any key (`scenario`, `scenario_n`,
+  `provenance.any_breach`: a row breaks the scenario when it breaks a key, and is judged when a key judges it), the
+  one `off_scenario` reads; `provenance.scenario_breaches`: a row of the benign class breaks
   nothing; a row of another class breaks `dst_port` when its destination is a background port, `src_ip` when its
   source is none of its class's hosts, `time` when its time lies in none of its class's windows (closed). A key the
   scenario does not rule on for a class, or a value unknown, leaves the row unjudged.
@@ -199,8 +188,8 @@ Configs:
   `cic_2018_v2`, `ton_iot_v2`, `bot_iot_v2`), five general benchmarks (`bank_marketing`, `covertype`,
   `letter_recognition`, `statlog_landsat_satellite`, `thyroid_disease`) and `synthetic_test`; their CSVs are not in
   the repo.
-- `configs/method/default.yaml`: the method, shared by every dataset: `distance` (`euclidean` or `cosine`), `prepare`,
-  `cells` and `quality` (the report), each key commented. The size of a cell is no key of it: `quality.tau` and
+- `configs/method/default.yaml`: the method, shared by every dataset: `cells` (`max_fit_samples`, a bound of
+  computation) and `quality` (`tau` and `confidence`), each key commented. The size of a cell is no key of it: `quality.tau` and
   `quality.confidence` set it.
   Another method is a copy of it passed as `--method <path>`.
 
@@ -213,22 +202,19 @@ run that wrote it and is created by its first insert: `clean_summary` (with the 
 kind), `dropped_classes`, `dropped_columns`,
 `class_counts`, `features`, `sources`, `provenance_columns` (clean); `prepare_summary`, `prepared_columns` (prepare); `cells`, `cell_tree` (the cut of
 each class, each node with the distinct and CSV rows below it), `class_cells`, `cell_stats` (cells); `quality_branches`
-(the cut of each class again, each node with its distinct and CSV rows and the variance of its rows and its standard
-deviation), `quality_rivals`
-(every cell against each rival class: its rival cells of that class, the rows measured on each side, the measures of
-the cell's side), `quality_cells`, `quality_regions`, `quality_classes`, `cell_missing` (the null and
+(the cut of each class again, each node with its distinct and CSV rows and the variance of its rows), `quality_rivals`
+(every cell against each rival class: its rival cells of that class, its `rival_share`, the distinct rows of the rival
+class and the rules of the two classes), `quality_cells`, `quality_regions`, `quality_classes`, `cell_missing` (the null and
 invalid cells by cell, column and kind), `label_conflict_groups` (every row in a label conflict, with its group),
-`quality_stats` (with tau and the confidence, the pairs of rival cells, the measures against a rival class and those
-taken on a sample of the cell's rows, the cells undecided on each defect, and the share of the CSV rows with each
+`quality_stats` (with tau and the confidence, the measures against a rival class, the cells undecided on each defect, and the share of the CSV rows with each
 defect and with none; `off_scenario` null without a scenario)
 (quality_report). There are no migrations: a new column is added to its table, an old one stays, empty for the new
 runs; to drop the old ones, delete the DB.
 
-**tau, after the run.** What the run measures does not depend on tau: the confusion of each cell with each rival
-class, with the rows it is a share of, and the errors of the rules of the two classes on every column
-(`quality_rivals`), the variance of each cell and of the typical cell of its class, of each branch of the tree of
-each class (`quality_branches`, which `judge` takes for the tree) and of the dataset, the share of
-its CSV rows that break each key of the scenario, the counts, and
+**tau, after the run.** What the run measures does not depend on tau: the `rival_share` of each cell against each
+rival class, and the errors of the rules of the two classes on every column
+(`quality_rivals`), the variance of each branch of the tree of each class (`quality_branches`, which `judge` takes for the tree) and of the dataset, the share of
+its CSV rows that break the scenario on any key, the counts, and
 `clear_rows` per cell (its distinct rows with no null or invalid value and in no label conflict, which the share with
 no defect needs). tau and the confidence only compare them. `src/report.py` (`judge`) turns these measures into the
 verdicts at any tau: the defects of the cells, the regions they merge into, the shares per class and over the dataset.
@@ -258,13 +244,12 @@ as a classifier is trained on them); the distinct rows are on hover.
   `class_overlap`, feature by feature, the difference of the mean numeric features from the rows near it of each class
   it has the defect against (its rival leaves of that class; logged and standardized, so in standard deviations of the
   dataset; `/quality/profile`) and the most frequent categorical values; for `shortcut`, per class, the columns whose
-  rule is under τ on both sides, with their error on the cell and on the rival class; for `redundancy` and
-  `repetition`, the widest branch it lies in, its share of the class and its variance over the dataset's; for
-  `off_scenario`, per key the
-  share of its CSV rows off the scenario. A confusion is shown with its interval. Then a map of the cell and the rival
-  leaves of the classes picked (`/quality/map`), and, closed, its rival classes (the confusion, nn_error and the best
+  rule is under τ on both sides, with their error on the cell and on the rival class; for `repetition`, the widest
+  branch it lies in, its share of the class and its variance over the dataset's; for `off_scenario`, the share of its
+  CSV rows off the scenario, on any key and per key. A rival share is shown with its interval. Then a map of the cell and the rival
+  leaves of the classes picked (`/quality/map`), and, closed, its rival classes (the rival share and the best
   one-column rule) and its provenance (per column its distinct values, the most frequent and the CSV rows per
-  repeated value; the first and last time). A rival class is measured by its most confused leaf
+  repeated value; the first and last time). A rival class is measured by its leaf of highest rival share
   of the cell. A glossary closes the tab.
 - cells (cells) calls the cells of the stage *leaves*: per class its leaves and how many distinct rows they hold
   (median, least and most), then the cut of a class, at most 63 nodes at a time: from the top, the node with the most
@@ -308,9 +293,9 @@ Known limits: every rerun of a stage overwrites its files, so the files hold onl
 nothing records which run wrote a stage's inputs: after changing the method or rerunning a stage, rerun everything
 after it (`make run`). Two method yamls on one dataset share its `output_dir`. A failed rerun can leave files that
 disagree with the latest `ok` run the dashboard shows. A run killed by anything but Ctrl-C stays `running`. The k-NN
-searches use every core. Under `distance: cosine` the numbers are scaled to unit length on every row, and the rules
-of a shortcut are read on those numbers. A run logged before cells were measured against rival classes (a
-`quality_pairs` table), without a confidence or without the rules of a shortcut must be run again for the dashboard.
+searches use every core. A run logged before cells were measured against rival classes (a
+`quality_pairs` table), without a confidence, without the rules of a shortcut or before `off_scenario` was read on
+any key (the `scenario` column) must be run again for the dashboard.
 The rule of two classes is chosen on all their rows, the cell's among them: for a class of a single cell it is chosen
 on the cell, and its error there is optimistic. A cell has a shortcut when some column passes, read with its own
 interval: over many columns a few pass by chance. The scenario is only as good as the documentation it is copied

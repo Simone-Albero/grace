@@ -6,10 +6,11 @@ on, so that a defect touching a share of a cell's rows is not diluted in
 a larger group; the regions the report merges them into set its
 granularity, large where a class is uniform, small where it is not.
 
-The rows of a class are deduplicated, each weighted by its copies in the
-CSV, so the weighted Ward tree of the distinct rows is the Ward tree of
-the rows as read. The tree is built on a uniform sample of the class,
-and every row joins its nearest sampled row, so each node of the tree
+The rows of a class are its distinct rows, each counted once whatever
+its copies in the CSV: the copies are a defect of their own
+(duplicates), and no measure of a cell weighs them. The Ward tree is
+built on a uniform sample of the class, and every row joins its nearest
+sampled row, so each node of the tree
 holds the rows of the sampled rows below it. The tree is cut from the
 root: a node is split into its two children while it holds rows enough
 for two cells, until every node left is a cell; a branch with too few
@@ -51,7 +52,7 @@ class WardTree:
         children: The two nodes each merge joins, shape (n - 1, 2),
             int64; a merge comes after the merges of its children.
         heights: The height of each merge, sqrt(2 Δ) with Δ the
-            increase of the weighted within-cluster sum of squares
+            increase of the within-cluster sum of squares
             (scipy's convention), shape (n - 1,), ascending.
     """
 
@@ -78,30 +79,27 @@ class CellTree:
     cell: np.ndarray
 
 
-def ward_tree(X: np.ndarray, weights: np.ndarray) -> WardTree:
-    """Build the weighted Ward tree of the rows.
+def ward_tree(X: np.ndarray) -> WardTree:
+    """Build the Ward tree of the rows.
 
-    Merging clusters a and b costs Δ = w_a w_b / (w_a + w_b) ·
-    ||c_a - c_b||², with w the summed weight and c the weighted centroid
-    of a cluster: with integer weights, the tree of the rows repeated
-    as many times. Built by the nearest-neighbour chain on the centroids
+    Merging clusters a and b costs Δ = n_a n_b / (n_a + n_b) ·
+    ||c_a - c_b||², with n the rows and c the centroid of a cluster.
+    Built by the nearest-neighbour chain on the centroids
     (memory O(n d)); Ward is reducible, so sorting the merges by height
     (stably: the chain keeps a child's merge before its parent's) gives
     a valid order.
 
     Args:
         X: The points, shape (n, d), n >= 1.
-        weights: The weight of every row, > 0.
 
     Returns:
         The tree; no merge when n = 1.
     """
     centers = np.array(X, dtype=np.float64)
-    mass = np.array(weights, dtype=np.float64)
     n = len(centers)
+    mass = np.ones(n)  # the rows of each cluster
     if n < 2:
         return WardTree(np.empty((0, 2), dtype=np.int64), np.empty(0))
-    norms = np.einsum("ij,ij->i", centers, centers)
     slot = np.arange(n)  # the row whose position a cluster holds
     alive = np.ones(n, dtype=bool)
     made = np.zeros(n)  # the height of the merge that made each row's cluster
@@ -113,19 +111,13 @@ def ward_tree(X: np.ndarray, weights: np.ndarray) -> WardTree:
             keep = np.flatnonzero(alive)
             position = np.full(len(centers), -1)
             position[keep] = np.arange(len(keep))
-            centers, mass, norms, slot = (
-                centers[keep],
-                mass[keep],
-                norms[keep],
-                slot[keep],
-            )
+            centers, mass, slot = centers[keep], mass[keep], slot[keep]
             alive = np.ones(len(keep), dtype=bool)
             chain = [int(position[c]) for c in chain]
         if not chain:
             chain.append(int(np.flatnonzero(alive)[0]))
         a = chain[-1]
-        squared = np.maximum(norms + norms[a] - 2.0 * (centers @ centers[a]), 0.0)
-        cost = squared * (mass * mass[a] / (mass + mass[a]))
+        cost = _squared_distances(centers, a) * (mass * mass[a] / (mass + mass[a]))
         cost[~alive] = np.inf
         cost[a] = np.inf
         b = int(np.argmin(cost))
@@ -139,7 +131,6 @@ def ward_tree(X: np.ndarray, weights: np.ndarray) -> WardTree:
         total = mass[a] + mass[b]
         centers[a] = (mass[a] * centers[a] + mass[b] * centers[b]) / total
         mass[a] = total
-        norms[a] = centers[a] @ centers[a]
         alive[b] = False
         # Rounding can put a merge a hair under its children's.
         height = max(np.sqrt(2.0 * cost[b]), made[slot[a]], made[slot[b]])
@@ -159,14 +150,13 @@ def ward_tree(X: np.ndarray, weights: np.ndarray) -> WardTree:
 
 def class_cells(
     X: np.ndarray,
-    weights: np.ndarray,
     min_rows: int,
     max_fit_samples: int,
     seed: int,
 ) -> tuple[np.ndarray, CellTree]:
     """Cut one class into cells of min_rows to 2 · min_rows - 1 distinct rows.
 
-    A weighted Ward tree (ward_tree) is built on a uniform sample of at
+    A Ward tree (ward_tree) is built on a uniform sample of at
     most max_fit_samples rows (graph.sample_rows); every row joins its
     nearest sampled row (euclidean), so a node holds the rows of its
     sampled rows. From the root, a node of at least 2 · min_rows rows is
@@ -180,8 +170,8 @@ def class_cells(
     class is cut at most into its sampled rows.
 
     Args:
-        X: The points of the class, shape (n, d), n >= 1.
-        weights: The weight of every row (its copies in the CSV), > 0.
+        X: The points of the class (its distinct rows), shape (n, d),
+            n >= 1.
         min_rows: The fewest distinct rows of a cell, >= 1.
         max_fit_samples: The most rows the tree is built on.
         seed: The seed of the sample.
@@ -193,7 +183,7 @@ def class_cells(
     n = len(X)
     sampled = sample_rows(n, max_fit_samples, seed)
     m = len(sampled)
-    tree = ward_tree(X[sampled], weights[sampled])
+    tree = ward_tree(X[sampled])
     nearest = _nearest(X, X[sampled])
     leaves, start, stop = _leaf_ranges(tree.children, m)
     held = np.r_[0, np.cumsum(np.bincount(nearest, minlength=m)[leaves])]
@@ -279,6 +269,26 @@ def merge_cells(
     region = np.empty(int(leaf.sum()), dtype=np.int64)
     region[tree.cell[leaf]] = region_of_node[leaf]
     return region
+
+
+def _squared_distances(X: np.ndarray, a: int) -> np.ndarray:
+    """Squared euclidean distance of every row of X to row a, exactly symmetric.
+
+    Summed over the differences, not as ||x||² + ||y||² - 2 x·y: the
+    distance of row a to row b is then the same float as that of b to a,
+    which the nearest-neighbour chain of ward_tree needs to end (with
+    rows a hair apart, the rounding of the dot product made a to b
+    differ from b to a, and the chain went round three rows forever).
+
+    Args:
+        X: The points, shape (n, d), float64.
+        a: The row the distances are to, 0 <= a < n.
+
+    Returns:
+        The squared distances, shape (n,), 0 at row a.
+    """
+    diff = X - X[a]
+    return np.einsum("ij,ij->i", diff, diff)
 
 
 def _nearest(X: np.ndarray, Y: np.ndarray) -> np.ndarray:

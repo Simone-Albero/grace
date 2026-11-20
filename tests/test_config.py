@@ -77,10 +77,11 @@ def test_the_kdn_reference_is_gone(tmp_path):
         load_config("synthetic_test", method=str(path))
 
 
-@pytest.mark.parametrize("key", ["cells__max_fit_samples", "quality__rival_rows"])
-def test_degenerate_counts_fail(tmp_path, key):
-    with pytest.raises(ValueError, match=key.replace("__", ".")):
-        load_config("synthetic_test", method=_method(tmp_path, **{key: 0}))
+def test_degenerate_counts_fail(tmp_path):
+    with pytest.raises(ValueError, match="cells.max_fit_samples"):
+        load_config(
+            "synthetic_test", method=_method(tmp_path, cells__max_fit_samples=0)
+        )
 
 
 @pytest.mark.parametrize("key", ["max_rows", "min_rows"])
@@ -91,8 +92,6 @@ def test_the_cell_sizes_are_gone(tmp_path, key):
 
 
 def test_degenerate_preparation_fails(tmp_path):
-    with pytest.raises(ValueError, match="cat_cost"):
-        load_config("synthetic_test", method=_method(tmp_path, prepare__cat_cost=0))
     raw = yaml.safe_load((DATASET_DIR / "synthetic_test.yaml").read_text())
     path = tmp_path / "top_n.yaml"
     path.write_text(yaml.safe_dump({**raw, "top_n": 0}))
@@ -158,16 +157,25 @@ def test_the_dropped_quality_keys_are_unknown(tmp_path, key):
         )
 
 
+@pytest.mark.parametrize("key", ["max_rows_per_cell", "rival_rows"])
+def test_the_rival_samples_are_gone(tmp_path, key):
+    # every row of a cell is measured against the whole dataset
+    with pytest.raises(ValueError, match=f"quality.{key}"):
+        load_config(
+            "synthetic_test", method=_method(tmp_path, **{f"quality__{key}": 100})
+        )
+
+
 def test_the_quality_group_is_checked(tmp_path):
-    with pytest.raises(ValueError, match="quality.rival_rows"):
-        load_config("synthetic_test", method=_method(tmp_path, quality__rival_rows=0))
+    with pytest.raises(ValueError, match="quality.tau"):
+        load_config("synthetic_test", method=_method(tmp_path, quality__tau=0.7))
 
 
 def test_the_default_method_loads():
     method = load_config("synthetic_test").method
-    # the fewest rows a cell can be measured on: 2 x 25 scored at tau 0.1, 95%
-    assert method.min_rows == 50
-    assert method.quality.tau == 0.1 and method.quality.rival_rows == 100
+    # the fewest rows of a cell: z^2 / (4 tau^2) at tau 0.1, 95%
+    assert method.min_rows == 68
+    assert method.quality.tau == 0.1
     assert method.quality.confidence == 0.95
 
 

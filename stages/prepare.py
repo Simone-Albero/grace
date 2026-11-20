@@ -27,7 +27,7 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     Reads the data file. Order: data.feature_cols of its columns (the
     kept num_cols numeric, the kept cat_cols categorical; DUPLICATES is
     a weight, read by stage regions) -> prepare.fit_preparation on
-    every row (top_n, method.prepare.cat_cost) -> prepare.transform.
+    every row (top_n) -> prepare.transform.
 
     Writes to output_dir: prepared.parquet (the columns of
     prepare.column_names, Float64, MISSING included, then LABEL as in
@@ -52,7 +52,6 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
         features.num,
         features.cat,
         top_n=cfg.top_n,
-        cat_cost=cfg.method.prepare.cat_cost,
     )
     prepared = transform(preparation, data)
     names = column_names(preparation)

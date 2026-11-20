@@ -15,7 +15,6 @@ from src.quality import (
     RivalMeasure,
     repetition_verdicts,
     rival_defects,
-    variance_verdict,
 )
 from src.report import judge
 
@@ -72,15 +71,15 @@ def test_judge_at_the_logged_tau_gives_the_logged_tables(reported):
 def test_judge_applies_tau_to_the_logged_rivals(reported):
     cells, rivals, tree, classes = _measures(reported)
     sides = {c["cell"]: [] for c in cells}
+    n_rows = {c["cell"]: c["n_rows"] for c in cells}
     for r in rivals:
         rules = [e[1:] for e in json.loads(r["rules"])]
         sides[r["cell"]].append(
             RivalMeasure(
                 classes.index(r["rival_class"]),
-                r["confusion"],
-                r["n_scored"],
+                r["rival_share"],
+                n_rows[r["cell"]],
                 np.array(rules, dtype=float).reshape(-1, 2),
-                r["n_measured"],
                 r["n_rival_rows"],
             )
         )
@@ -99,29 +98,22 @@ def test_judge_applies_tau_to_the_logged_rivals(reported):
             assert set((row["label_with"] or "").split(",")) - {""} == set(
                 names("suspect_label").split(",")
             ) - {""}
-            spread = (row["variance"], row["variance_sd"], row["n_rows"])
-            held = variance_verdict(*spread, row["variance_typical"], tau, CONFIDENCE)
-            assert ("redundancy" in (row["defects"] or "").split(",")) == (held is True)
+            assert "redundancy" not in (row["defects"] or "").split(",")
         # repetition: a large branch above the cell, as tight as tau of the dataset
         at = {v: i for i, v in enumerate(tree["node"].to_list())}
         found, top = repetition_verdicts(
             np.array([at.get(v, -1) for v in tree["parent"].to_list()]),
             tree["cell"].fill_null(-1).to_numpy(),
             tree["n_read"].to_numpy().astype(float),
-            tuple(
-                tree[c].to_numpy().astype(float)
-                for c in ("variance", "variance_sd", "n_rows")
-            ),
+            tree["variance"].to_numpy().astype(float),
             cells[0]["variance_dataset"],
             tau,
-            CONFIDENCE,
         )
         for row in got.cells:
             c = row["cell"]
-            assert ("repetition" in (row["defects"] or "").split(",")) == (
-                found[c] is True
-            )
-            if found[c] is True:
+            assert ("repetition" in (row["defects"] or "").split(",")) == found[c]
+            assert "repetition" not in (row["undecided"] or "").split(",")
+            if found[c]:
                 assert row["repetition_branch"] == tree["node"][int(top[c])]
                 assert tau <= row["repetition_share"] <= 1
                 assert row["repetition_ratio"] <= tau
@@ -129,7 +121,7 @@ def test_judge_applies_tau_to_the_logged_rivals(reported):
                 assert row["repetition_branch"] is None
 
 
-def test_a_higher_tau_finds_fewer_overlaps_and_more_redundancy_and_shortcuts(
+def test_a_higher_tau_finds_fewer_overlaps_and_more_shortcuts(
     reported,
 ):
     cells, rivals, tree, classes = _measures(reported)
@@ -144,12 +136,10 @@ def test_a_higher_tau_finds_fewer_overlaps_and_more_redundancy_and_shortcuts(
     for defect in ("class_overlap", "off_scenario"):
         sets = [found(tau, defect) for tau in TAUS]
         assert all(b <= a for a, b in zip(sets, sets[1:]))
-    # a variance at most tau times a typical one, a rule wrong on under tau
-    # of the rows of a cell apart: more at a higher tau (not repetition, whose
-    # branch must also hold more of its class)
-    for defect in ("redundancy", "shortcut"):
-        sets = [found(tau, defect) for tau in TAUS]
-        assert all(a <= b for a, b in zip(sets, sets[1:])), defect
+    # a rule wrong on under tau of the rows of a cell: more at a higher tau
+    # (not repetition, whose branch must also hold more of its class)
+    sets = [found(tau, "shortcut") for tau in TAUS]
+    assert all(a <= b for a, b in zip(sets, sets[1:]))
     # the synthetic classes overlap, and the tau range shows it
     assert found(TAUS[0], "class_overlap") != found(TAUS[-1], "class_overlap")
 
@@ -216,6 +206,7 @@ def test_a_dataset_without_a_scenario_does_not_measure_off_scenario(reported):
     # one: the columns are there, null
     cells, rivals, tree, classes = _measures(reported)
     gone = {f"scenario_{key}{m}": None for key in SCENARIO_KEYS for m in ("", "_n")}
+    gone |= {"scenario": None, "scenario_n": None}
     cells = [{**c, **gone} for c in cells]
     got = judge(cells, rivals, tree, classes, 0.1, CONFIDENCE)
     assert got.stats["share_off_scenario"] is None
@@ -229,9 +220,18 @@ def test_a_dataset_without_a_scenario_does_not_measure_off_scenario(reported):
 def test_a_higher_confidence_decides_fewer_cells(reported):
     cells, rivals, tree, classes = _measures(reported)
     tau = _tau(reported)
-    loose, strict = (
-        judge(cells, rivals, tree, classes, tau, c).stats for c in (0.6, 0.999)
-    )
+    loose, strict = (judge(cells, rivals, tree, classes, tau, c) for c in (0.6, 0.999))
     for d in ("class_overlap", "shortcut"):
-        assert strict[f"share_{d}"] <= loose[f"share_{d}"]
-        assert strict[f"undecided_{d}"] >= loose[f"undecided_{d}"]
+        assert strict.stats[f"undecided_{d}"] >= loose.stats[f"undecided_{d}"]
+    assert strict.stats["share_shortcut"] <= loose.stats["share_shortcut"]
+
+    # a cell no longer suspect_label may be class_overlap against the same
+    # class: the two together never grow
+    def mixed(verdicts) -> float:
+        return sum(
+            r["n_read"]
+            for r in verdicts.cells
+            if {"suspect_label", "class_overlap"} & set((r["defects"] or "").split(","))
+        )
+
+    assert mixed(strict) <= mixed(loose)

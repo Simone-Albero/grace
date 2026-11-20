@@ -8,14 +8,13 @@ how many numbers of the row did, unscaled. A categorical column
 becomes an integer code (TopNEncoder: its top_n most frequent values
 their own code, every other one a shared "other" code), then a one-hot
 block of one slot per code. The active slot of column c is worth
-w_c = sqrt(cat_cost / g_c), with g_c = 1 - Σ p_s² over the shares p_s
-of its slots in the fitted rows (the chance two random rows differ on
-it): a mismatch costs 2 · cat_cost / g_c in squared distance, so on
-average, g_c times that, the column adds 2 · cat_cost, as much as one
-standardized number adds at cat_cost = 1. A rare slot is far from the
-others, as a rare value of a standardized number is. Nothing here
-depends on the metric: graph.space_points applies it to the numbers
-only, and leaves MISSING out of every distance.
+w_c = sqrt(1 / g_c), with g_c = 1 - Σ p_s² over the shares p_s of its
+slots in the fitted rows (the chance two random rows differ on it): a
+mismatch costs 2 / g_c in squared distance, so on average, g_c times
+that, the column adds 2, as much as one standardized number adds. A
+rare slot is far from the others, as a rare value of a standardized
+number is. MISSING is left out of every distance (graph.space_points
+takes the numbers and the slots).
 """
 
 from __future__ import annotations
@@ -134,7 +133,7 @@ class Preparation:
         encoders: The TopNEncoder of each categorical column, in column
             order after num_cols.
         weights: The value of an active slot of each encoder,
-            sqrt(cat_cost / g_c); 0 for a column whose fitted rows all
+            sqrt(1 / g_c); 0 for a column whose fitted rows all
             share one slot (g_c = 0).
     """
 
@@ -150,7 +149,6 @@ def fit_preparation(
     cat_cols: Sequence[str],
     *,
     top_n: int,
-    cat_cost: float,
 ) -> Preparation:
     """Fit the preparation on the rows.
 
@@ -159,9 +157,6 @@ def fit_preparation(
         num_cols: The numeric columns, at least one.
         cat_cols: The categorical columns, as text; may be empty.
         top_n: The values of a categorical column with their own code.
-        cat_cost: The average squared distance a categorical column adds
-            between two random rows, in units of a standardized
-            number's (2), > 0.
 
     Returns:
         The fitted preparation.
@@ -173,7 +168,7 @@ def fit_preparation(
         slots = _slots(encoder, encoder.transform(rows[encoder.column]))
         shares = np.bincount(slots, minlength=_n_slots(encoder)) / max(len(slots), 1)
         differ = 1.0 - float(np.sum(shares**2))
-        weights.append(math.sqrt(cat_cost / differ) if differ > 1e-12 else 0.0)
+        weights.append(math.sqrt(1.0 / differ) if differ > 1e-12 else 0.0)
     return Preparation(
         num_cols=tuple(num_cols),
         scaler=scaler,

@@ -85,9 +85,7 @@ def write_method_yaml(folder: Path) -> Path:
     method = yaml.safe_load((ROOT / "configs/method/default.yaml").read_text())
     method["quality"][
         "tau"
-    ] = 0.1  # min_rows = 50: cells of 50 to 99 rows, few enough to be fast
-    method["quality"]["max_rows_per_cell"] = 100
-    method["quality"]["rival_rows"] = 50
+    ] = 0.1  # min_rows = 68: cells of 68 to 135 rows, few enough to be fast
     path = folder / "method.yaml"
     path.write_text(yaml.safe_dump(method, sort_keys=False))
     return path

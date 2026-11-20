@@ -59,7 +59,7 @@ def test_top_n_encoder_has_no_other_slot_when_every_value_fits():
 
 def test_numbers_are_standardized_and_missing_ones_sit_on_the_mean():
     rows = pl.DataFrame({"n": [0.0, 1.0, 2.0, 3.0, 4.0, None, float("inf")]})
-    preparation = fit_preparation(rows, ["n"], [], top_n=4, cat_cost=1.0)
+    preparation = fit_preparation(rows, ["n"], [], top_n=4)
     logged = np.log1p(np.arange(5.0))
     prepared = transform(preparation, rows)
     assert prepared.columns == ["n", MISSING]
@@ -74,20 +74,20 @@ def test_missing_counts_the_numbers_of_a_row_set_to_0():
     rows = pl.DataFrame(
         {"m": [1.0, None, nan, 2.0], "n": [-inf, None, 3.0, 4.0], "c": ["x"] * 4}
     )
-    preparation = fit_preparation(rows, ["m", "n"], ["c"], top_n=1, cat_cost=1.0)
+    preparation = fit_preparation(rows, ["m", "n"], ["c"], top_n=1)
     prepared = transform(preparation, rows)
     assert prepared[MISSING].to_list() == [1.0, 2.0, 1.0, 0.0]
     finite = pl.DataFrame({"m": [1.0, 2.0], "n": [3.0, 5.0]})
-    preparation = fit_preparation(finite, ["m", "n"], [], top_n=1, cat_cost=1.0)
+    preparation = fit_preparation(finite, ["m", "n"], [], top_n=1)
     assert transform(preparation, finite)[MISSING].to_list() == [0.0, 0.0]
 
 
-def test_a_categorical_mismatch_costs_cat_cost_over_the_chance_of_one():
+def test_a_categorical_mismatch_costs_two_over_the_chance_of_one():
     rows = pl.DataFrame({"n": [0.0] * 4, "c": ["a", "a", "b", "c"]})
-    preparation = fit_preparation(rows, ["n"], ["c"], top_n=1, cat_cost=3.0)
+    preparation = fit_preparation(rows, ["n"], ["c"], top_n=1)
     # Slots a and <other>, half the rows each: two rows differ with 1/2.
     (weight,) = preparation.weights
-    assert weight == pytest.approx(math.sqrt(3.0 / 0.5))
+    assert weight == pytest.approx(math.sqrt(1.0 / 0.5))
     prepared = transform(preparation, rows)
     names = ["n", MISSING, "c=a", f"c={OTHER}"]
     assert prepared.columns == column_names(preparation) == names
@@ -95,7 +95,7 @@ def test_a_categorical_mismatch_costs_cat_cost_over_the_chance_of_one():
     points = prepared.to_numpy()
     np.testing.assert_allclose(points[0], [0.0, 0.0, weight, 0.0])
     np.testing.assert_allclose(points[2], [0.0, 0.0, 0.0, weight])
-    assert np.sum((points[0] - points[2]) ** 2) == pytest.approx(2 * 3.0 / 0.5)
+    assert np.sum((points[0] - points[2]) ** 2) == pytest.approx(2 / 0.5)
     assert np.sum((points[2] - points[3]) ** 2) == 0.0
 
 
@@ -103,7 +103,7 @@ def test_a_categorical_column_adds_on_average_what_a_number_adds():
     rng = np.random.default_rng(0)
     values = rng.choice(["a", "b", "c", "d"], size=4000, p=[0.7, 0.2, 0.06, 0.04])
     rows = pl.DataFrame({"n": rng.normal(size=4000), "c": values})
-    preparation = fit_preparation(rows, ["n"], ["c"], top_n=2, cat_cost=1.0)
+    preparation = fit_preparation(rows, ["n"], ["c"], top_n=2)
     prepared = transform(preparation, rows)
     pairs = rng.integers(0, 4000, size=(20000, 2))
     slots = prepared.select(pl.selectors.starts_with("c=")).to_numpy()
@@ -118,7 +118,7 @@ def test_a_categorical_column_adds_on_average_what_a_number_adds():
 
 def test_a_column_with_a_single_slot_weighs_nothing():
     rows = pl.DataFrame({"n": [1.0, 2.0], "c": ["a", "a"]})
-    preparation = fit_preparation(rows, ["n"], ["c"], top_n=1, cat_cost=1.0)
+    preparation = fit_preparation(rows, ["n"], ["c"], top_n=1)
     assert preparation.weights == (0.0,)
     assert transform(preparation, rows)["c=a"].to_list() == [0.0, 0.0]
 
@@ -127,6 +127,6 @@ def test_columns_follow_the_column_order():
     rows = pl.DataFrame(
         {"m": [1.0, 2.0], "n": [3.0, 5.0], "c": ["x", "y"], "d": ["u", "u"]}
     )
-    preparation = fit_preparation(rows, ["n", "m"], ["d", "c"], top_n=2, cat_cost=1.0)
+    preparation = fit_preparation(rows, ["n", "m"], ["d", "c"], top_n=2)
     assert column_names(preparation) == ["n", "m", MISSING, "d=u", "c=x", "c=y"]
     assert transform(preparation, rows).height == 2

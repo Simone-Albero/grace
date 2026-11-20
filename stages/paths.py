@@ -174,8 +174,7 @@ def read_points(cfg: DatasetConfig) -> tuple[np.ndarray, np.ndarray]:
 
     The numeric columns of the prepared file (data.feature_cols) and its
     one-hot slots (every other column but MISSING and LABEL) go through
-    graph.space_points with method.distance. MISSING is a diagnostic:
-    no distance sees it.
+    graph.space_points. MISSING is a diagnostic: no distance sees it.
 
     Args:
         cfg: The dataset config.
@@ -193,7 +192,6 @@ def read_points(cfg: DatasetConfig) -> tuple[np.ndarray, np.ndarray]:
     points = space_points(
         prepared.select(numeric).to_numpy(),
         prepared.select(slots).to_numpy(),
-        cfg.method.distance,
     )
     return points, prepared[LABEL].to_numpy()
 

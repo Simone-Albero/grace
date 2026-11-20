@@ -1,13 +1,12 @@
 """The verdicts of quality_report at a value of tau.
 
-What quality_report measures does not depend on tau: the confusion of
-every cell with each rival class, with the rows it was measured on, the
-errors of the one-column rules between its class and each rival class,
-the variance of every cell and of the typical cell of its class, the
-variance of every branch of every class's tree and of the dataset, the
-share of its CSV rows that break the scenario, the counts of rows. tau and the confidence only compare them: every measure is
-read with its interval (src.quality), and a cell has a defect, has
-none, or is undecided. judge turns these measures into the verdicts
+What quality_report measures does not depend on tau: the share of the
+rows of every cell confused with each rival class, the errors of the
+one-column rules between its class and each rival class, the variance
+of every branch of every class's tree and of the dataset, the share of
+its CSV rows that break the scenario, the counts of rows. tau and the
+confidence only compare them: every share is read with its interval
+(src.quality), and a cell has a defect, has none, or is undecided. judge turns these measures into the verdicts
 (the defects of the cells, the regions they merge into, the shares of
 rows), so that the stage, at quality.tau, and the dashboard, at any
 tau, run the same code.
@@ -27,7 +26,6 @@ import polars as pl
 
 from src.cells import CellTree, merge_cells
 from src.data import KINDS
-from src.provenance import SCENARIO_KEYS
 from src.quality import (
     CLASS_DEFECTS,
     DEFECTS,
@@ -37,7 +35,6 @@ from src.quality import (
     repetition_verdicts,
     rival_defects,
     share_bounds,
-    variance_verdict,
     verdict,
 )
 
@@ -64,8 +61,8 @@ class Verdicts:
     Attributes:
         rivals: The quality_rivals rows, with region and rival_regions.
         cells: The quality_cells rows, with region, n_rivals, the rival
-            columns, the classes and keys of each defect, the shortcut
-            columns, the variance ratios, defects and undecided.
+            columns, the classes of each rival defect, the shortcut
+            columns, the branch of repetition, defects and undecided.
         regions: The quality_regions rows.
         classes: The quality_classes rows.
         stats: tau, confidence, n_regions, regions_<defect>,
@@ -94,10 +91,9 @@ def judge(
     (True: it has it beyond the error of sampling, False: it has it not,
     None: undecided): src.quality.rival_defects against each rival class
     it was measured against (no rival defect against a class it has no
-    rival cell of), variance_verdict of its variance against the typical
-    one of its class (redundancy), src.quality.repetition_verdicts of
-    the branches above it (repetition), and
-    the share of its CSV rows that break each key of the scenario
+    rival cell of), src.quality.repetition_verdicts of the branches
+    above it (repetition, which is never undecided), and
+    the share of its CSV rows that break the scenario, on any key,
     against tau (off_scenario). A cell has a defect when an entry of it
     is True; class_overlap only against a class it is no suspect_label
     of. Then the cells merge into regions (src.cells.merge_cells, class
@@ -117,24 +113,21 @@ def judge(
             sorted by cell, one per cell 0 to m - 1: cell, class,
             COUNTS, n_duplicates, dup_share, conflict_with, clear_rows
             (its distinct rows without a null or invalid value and in no
-            label conflict), variance, variance_sd, variance_typical,
-            variance_dataset (of the dataset, the same in every cell),
-            and with a scenario scenario_<key> and
-            scenario_<key>_n per key of provenance.SCENARIO_KEYS;
-            off_scenario is not measured when no cell has one.
+            label conflict), variance_dataset (the variance of the
+            dataset, the same in every cell),
+            and with a scenario scenario and scenario_n (the share of
+            its judged CSV rows that break it on any key, and those
+            rows); off_scenario is not measured when no cell has one.
         rivals: The tau-free quality_rivals rows, one per cell and
             rival class: cell, class, rival_class, rival_cells (JSON
-            list), n_measured, n_rival_measured, n_scored, nn_error,
-            single_column_acc, single_column, confusion (all of the
-            cell's side; n_scored and on None when a side had too few
-            rows), n_rival_rows and rules (JSON list of [column, error
-            on the cell, error on the rival class]); region and
-            rival_regions are ignored.
+            list), rival_share (of the cell's rows, over its n_rows),
+            n_rival_rows and rules (JSON list of [column, error on the
+            cell, error on the rival class]); region and rival_regions
+            are ignored.
         branches: The quality_branches rows, the cells' tree with the
             spread of every node: node, class (the code), parent (-1 for
             a root), cell (null for a node that is not a cell), n_rows,
-            n_read, variance, variance_sd, sorted by node, in pre-order
-            per class.
+            n_read, variance, sorted by node, in pre-order per class.
         classes: The class names, by code.
         tau: The threshold, in (0, 0.5].
         confidence: The level of the intervals, in (0.5, 1).
@@ -154,34 +147,29 @@ def judge(
         rules = json.loads(rival["rules"]) if rival["rules"] else []
         measure = RivalMeasure(
             rival_class=k,
-            confusion=rival["confusion"],
-            n_scored=rival["n_scored"],
+            share=rival["rival_share"],
+            n_rows=cells[c]["n_rows"],
             rules=np.array([r[1:] for r in rules], dtype=np.float64).reshape(-1, 2),
-            n_cell=rival["n_measured"],
             n_rival=rival["n_rival_rows"],
         )
         sides[c].append((measure, [r[0] for r in rules], i))
-    keys = [
-        key
-        for key in SCENARIO_KEYS
-        if any(c.get(f"scenario_{key}") is not None for c in cells)
-    ]
     # The defects the dataset cannot measure: off_scenario without a
-    # scenario (a table shared with other datasets may hold its columns,
+    # scenario (a table shared with other datasets may hold its column,
     # null).
-    unmeasured = () if keys else ("off_scenario",)
+    scenario = any(c.get("scenario") is not None for c in cells)
+    unmeasured = () if scenario else ("off_scenario",)
     entries = [
-        _entries(cells[c], sides[c], rival_of[c], classes, keys, tau, confidence)
+        _entries(cells[c], sides[c], rival_of[c], classes, tau, confidence)
         for c in range(m)
     ]
-    repeated, branch = _repetition(branches, cells, tau, confidence)
+    repeated, branch = _repetition(branches, cells, tau)
     for c in range(m):
         entries[c][("repetition", None)] = repeated[c]
     yes = [{e for e, v in found.items() if v is True} for found in entries]
     no = [{e for e, v in found.items() if v is False} for found in entries]
     region = _merge(branches, yes, no)
     rival_rows = [_rival_row(r, region) for r in rivals]
-    judged = (region, classes, n_rivals, sides, entries, rivals, tau, confidence)
+    judged = (region, classes, n_rivals, sides, entries, tau, confidence)
     judged += (_branch_of(branches, branch),)
     cell_rows = [_cell_row(c, cells[c], *judged) for c in range(m)]
     region_rows = _region_rows(cell_rows, region, classes)
@@ -212,45 +200,35 @@ def judge(
     return Verdicts(rival_rows, cell_rows, region_rows, class_rows, stats)
 
 
-def _entries(row, sides, rival_of, classes, keys, tau, confidence) -> dict:
-    """Return the verdict of every entry of a cell: (defect, class code, key or None) to True, False or None."""
+def _entries(row, sides, rival_of, classes, tau, confidence) -> dict:
+    """Return the verdict of every entry of a cell: (defect, class code or None) to True, False or None."""
     found = dict(rival_defects([s[0] for s in sides], tau, confidence))
     own = classes.index(row["class"])
     for k in range(len(classes)):
         if k != own and k not in rival_of:  # no rival cell: none of them
             found.update({(d, k): False for d in RIVAL_DEFECTS})
-    spread = (row["variance"], row["variance_sd"], row["n_rows"])
-    found[("redundancy", None)] = variance_verdict(
-        *spread, row["variance_typical"], tau, confidence
-    )
-    for key in keys:
-        share, n = row.get(f"scenario_{key}"), row.get(f"scenario_{key}_n")
-        if share is not None and n:
-            bounds = share_bounds(share, n, confidence)
-            found[("off_scenario", key)] = verdict(*bounds, tau)
+    share, n = row.get("scenario"), row.get("scenario_n")
+    if share is not None and n:
+        found[("off_scenario", None)] = verdict(
+            *share_bounds(share, n, confidence), tau
+        )
     return found
 
 
-def _repetition(branches: pl.DataFrame, cells, tau, confidence):
+def _repetition(branches: pl.DataFrame, cells, tau):
     """Return repetition_verdicts over every class's tree, positions in place of node ids."""
     at = {v: i for i, v in enumerate(branches["node"].to_list())}
     parent = np.array([at.get(p, -1) for p in branches["parent"].to_list()])
     node_cell = branches["cell"].fill_null(-1).to_numpy()
-    spread = tuple(
-        branches[c].to_numpy().astype(np.float64)
-        for c in ("variance", "variance_sd", "n_rows")
-    )
     reference = cells[0]["variance_dataset"] if cells else 0.0
-    found, top = repetition_verdicts(
+    return repetition_verdicts(
         parent,
         node_cell,
         branches["n_read"].to_numpy().astype(np.float64),
-        spread,
+        branches["variance"].to_numpy().astype(np.float64),
         reference,
         tau,
-        confidence,
     )
-    return found, top
 
 
 def _branch_of(branches: pl.DataFrame, top: np.ndarray) -> list[dict]:
@@ -280,6 +258,7 @@ def _branch_of(branches: pl.DataFrame, top: np.ndarray) -> list[dict]:
 
 
 _BRANCH = ("repetition_branch", "repetition_share", "repetition_variance")
+_RIVAL = ("rival_class", "rival_share", "rival_share_low", "rival_share_high")
 
 
 def _established(found: dict) -> dict[str, set]:
@@ -315,11 +294,6 @@ def _names(codes, classes: list[str]) -> str | None:
     return ",".join(classes[c] for c in sorted(codes)) or None
 
 
-def _keys(keys) -> str | None:
-    """Return scenario keys in SCENARIO_KEYS order joined by ",", None for none."""
-    return ",".join(k for k in SCENARIO_KEYS if k in keys) or None
-
-
 def _listed(value: str | None) -> list[str]:
     return value.split(",") if value else []
 
@@ -340,27 +314,22 @@ def _rival_row(rival: dict, region: np.ndarray) -> dict:
 
 
 def _cell_row(
-    c, base, region, classes, n_rivals, sides, entries, rivals, tau, confidence, branch
+    c, base, region, classes, n_rivals, sides, entries, tau, confidence, branch
 ) -> dict:
     """Return the quality_cells row of a cell: the tau-free columns of base, then what tau decides."""
     found = entries[c]
     held = _established(found)
-    mine = [s for s in sides[c] if s[0].confusion is not None]
-    rival = max(mine, key=lambda s: (s[0].confusion, -s[0].rival_class), default=None)
+    rival = max(sides[c], key=lambda s: (s[0].share, -s[0].rival_class), default=None)
     row = {k: base[k] for k in _OWN}
     row = {"cell": row.pop("cell"), "region": int(region[c]), **row}
-    typical, dataset = base["variance_typical"], base["variance_dataset"]
+    dataset = base["variance_dataset"]
     top = branch[c]
     row.update(
         n_rivals=int(n_rivals[c]),
-        **dict.fromkeys(("rival_class", "confusion", "confusion_low")),
-        **dict.fromkeys(("confusion_high", "n_scored", "nn_error")),
-        **dict.fromkeys(("single_column_acc", "single_column")),
+        **dict.fromkeys(_RIVAL),
         label_with=_names(held["suspect_label"], classes),
         overlap_with=_names(held["class_overlap"], classes),
         shortcut_with=_names(held["shortcut"], classes),
-        scenario_with=_keys(held["off_scenario"]),
-        variance_ratio=base["variance"] / typical if typical else None,
         repetition_branch=top["repetition_branch"],
         repetition_share=top["repetition_share"],
         repetition_ratio=(
@@ -371,17 +340,13 @@ def _cell_row(
         **_shortcut(sides[c], held["shortcut"], classes, tau, confidence),
     )
     if rival is not None:
-        measure, _, i = rival
-        low, high = share_bounds(measure.confusion, measure.n_scored, confidence)
+        measure = rival[0]
+        low, high = share_bounds(measure.share, measure.n_rows, confidence)
         row.update(
             rival_class=classes[measure.rival_class],
-            confusion=measure.confusion,
-            confusion_low=low,
-            confusion_high=high,
-            n_scored=int(measure.n_scored),
-            nn_error=rivals[i]["nn_error"],
-            single_column_acc=rivals[i]["single_column_acc"],
-            single_column=rivals[i]["single_column"],
+            rival_share=measure.share,
+            rival_share_low=low,
+            rival_share_high=high,
         )
     established = {d for d, targets in held.items() if targets}
     row["defects"] = (
@@ -414,7 +379,7 @@ def _shortcut(sides, against, classes, tau, confidence) -> dict:
     for measure, columns, _ in sides:
         if measure.rival_class not in against:
             continue
-        n = (measure.n_cell, measure.n_rival)
+        n = (measure.n_rows, measure.n_rival)
         cut = [
             (float(max(errors)), name)
             for name, errors in zip(columns, measure.rules)
@@ -442,8 +407,8 @@ def _region_rows(
         first = own[0]
         summed = {key: sum(row[key] for row in own) for key in COUNTS}
         worst = max(
-            (row for row in own if row["confusion"] is not None),
-            key=lambda row: row["confusion"],
+            (row for row in own if row["rival_share"] is not None),
+            key=lambda row: row["rival_share"],
             default=None,
         )
 
@@ -460,9 +425,8 @@ def _region_rows(
                     if any(d in _listed(row["defects"]) for row in own)
                     else set()
                 )
-                for d in ("redundancy", "repetition")
+                for d in ("repetition", "off_scenario")
             },
-            "off_scenario": union("scenario_with"),
         }
         defects = defects_of(
             summed["missing_rows"],
@@ -472,9 +436,6 @@ def _region_rows(
             {d for d, targets in held.items() if targets},
         )
         codes = lambda names: {classes.index(n) for n in names}  # noqa: E731
-
-        def lowest(key: str) -> float | None:
-            return min((row[key] for row in own if row[key] is not None), default=None)
 
         rows.append(
             {
@@ -494,17 +455,7 @@ def _region_rows(
                 "label_with": _names(codes(held["suspect_label"]), classes),
                 "overlap_with": _names(codes(held["class_overlap"]), classes),
                 "shortcut_with": _names(codes(held["shortcut"]), classes),
-                "scenario_with": _keys(held["off_scenario"]),
-                **{
-                    key: None if worst is None else worst[key]
-                    for key in (
-                        "confusion",
-                        "confusion_low",
-                        "confusion_high",
-                        "rival_class",
-                    )
-                },
-                "variance_ratio": lowest("variance_ratio"),
+                **{key: None if worst is None else worst[key] for key in _RIVAL},
                 **_widest(own),
                 "defects": ",".join(defects) or None,
             }

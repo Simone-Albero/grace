@@ -28,26 +28,11 @@ import yaml
 from src.data import DUPLICATES
 from src.prepare import MISSING
 from src.provenance import KEYS, TIME
-from src.quality import decisive_rows
+from src.quality import resolution_rows
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs"
 DATASET_DIR = CONFIG_DIR / "datasets"
 METHOD_DIR = CONFIG_DIR / "method"
-
-DISTANCES = ("euclidean", "cosine")
-
-
-@dataclass(frozen=True)
-class PrepareConfig:
-    """The prepared features distances are measured on (`src.prepare`).
-
-    Attributes:
-        cat_cost: The average squared distance a categorical column
-            adds between two random rows, in units of a standardized
-            number's.
-    """
-
-    cat_cost: float
 
 
 @dataclass(frozen=True)
@@ -69,13 +54,6 @@ class QualityConfig:
     Attributes:
         tau: The share of a cell's rows that may be confused with a
             rival class, in (0, 0.5]: the one threshold of the report.
-        max_rows_per_cell: The most distinct rows of the rival side
-            when a cell is measured against a rival class (its rival
-            cells of that class pooled); the cell itself is always
-            measured whole.
-        rival_rows: The distinct rows of a cell its rivals are searched
-            from, a uniform sample above this: a budget for the nearest
-            row search.
         confidence: The level of the interval around every measure of a
             cell, in (0.5, 1): a cell has a defect when the measure is
             past its threshold beyond the error of sampling, has none
@@ -84,8 +62,6 @@ class QualityConfig:
     """
 
     tau: float
-    max_rows_per_cell: int
-    rival_rows: int
     confidence: float
 
 
@@ -94,15 +70,10 @@ class MethodConfig:
     """Parameters of the method, shared by every dataset.
 
     Attributes:
-        distance: One of DISTANCES: how the numeric columns are
-            compared (graph.space_points).
-        prepare: The prepared features.
         cells: How the cells of every class are built.
         quality: The quality report.
     """
 
-    distance: str
-    prepare: PrepareConfig
     cells: CellsConfig
     quality: QualityConfig
 
@@ -110,14 +81,14 @@ class MethodConfig:
     def min_rows(self) -> int:
         """The fewest distinct rows of a cell, the one limit of the cut.
 
-        Twice the rows a share must be measured on to be able to fall
-        short of tau (`quality.decisive_rows`), since half of a cell's
-        rows choose and half are measured: under that a cell could
-        never be told to lack a rival defect, whatever it holds. It is
-        so no choice of its own, but what tau and the confidence ask
-        for (50 rows at tau 0.1 and 0.95).
+        The rows on which a share tau away from a threshold of the
+        report, tau or one half, is decided against it
+        (`quality.resolution_rows`): a cell is then undecided only
+        within tau of a threshold. It is so no choice of its own, but
+        what tau and the confidence ask for, about z² / (4 tau²) (68
+        rows at tau 0.1 and 0.95).
         """
-        return 2 * decisive_rows(self.quality.tau, self.quality.confidence)
+        return resolution_rows(self.quality.tau, self.quality.confidence)
 
 
 @dataclass(frozen=True)
@@ -274,15 +245,9 @@ def _check_keys(
 
 
 def _validate_method(method: MethodConfig) -> None:
-    _check(
-        method.distance in DISTANCES,
-        f"distance must be one of {DISTANCES}, got {method.distance!r}",
-    )
     cells, quality = method.cells, method.quality
     positive = {
         "cells.max_fit_samples": cells.max_fit_samples,
-        "quality.max_rows_per_cell": quality.max_rows_per_cell,
-        "quality.rival_rows": quality.rival_rows,
     }
     for key, value in positive.items():
         _check(value >= 1, f"{key} must be >= 1, got {value}")
@@ -293,8 +258,6 @@ def _validate_method(method: MethodConfig) -> None:
         0.5 < quality.confidence < 1,
         f"quality.confidence must be in (0.5, 1), got {quality.confidence}",
     )
-    cat_cost = method.prepare.cat_cost
-    _check(cat_cost > 0, f"prepare.cat_cost must be > 0, got {cat_cost}")
 
 
 def load_method_config(name_or_path: str = "default") -> MethodConfig:
@@ -314,15 +277,13 @@ def load_method_config(name_or_path: str = "default") -> MethodConfig:
     raw = _yaml(path)
     _check_keys(raw, MethodConfig, path)
     sections = {
-        "prepare": PrepareConfig,
         "cells": CellsConfig,
         "quality": QualityConfig,
     }
     for key, section in sections.items():
         _check_keys(raw[key], section, path, prefix=f"{key}.")
     method = MethodConfig(
-        distance=raw["distance"],
-        **{key: section(**raw[key]) for key, section in sections.items()},
+        **{key: section(**raw[key]) for key, section in sections.items()}
     )
     _validate_method(method)
     return method

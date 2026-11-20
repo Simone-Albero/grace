@@ -26,12 +26,13 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     """Cut each class into cells.
 
     Reads the points of the prepared file (paths.read_points: the
-    numbers scaled for distance, the categorical slots, not MISSING;
-    every distance from here on is euclidean on them) and the weight of
-    every row (paths.read_weights: its copies in the CSV). Per class,
-    ascending: cells.class_cells with method.min_rows (what tau and
-    the confidence ask for) and method.cells (max_fit_samples) and seed -> cell id = cell + offset, offset += the
-    class's cells; node id = node + node offset.
+    numbers, the categorical slots, not MISSING; every distance from
+    here on is euclidean on them) and the copies of every row in the CSV
+    (paths.read_weights), only to count n_read: no row weighs more than
+    another in the cut. Per class, ascending: cells.class_cells with
+    method.min_rows (what tau and the confidence ask for),
+    method.cells.max_fit_samples and seed -> cell id = cell + offset,
+    offset += the class's cells; node id = node + node offset.
 
     Writes to output_dir: cells.parquet (cell, class code, n_rows,
     n_read), assignments.parquet (row, cell for every row),
@@ -41,9 +42,8 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     Logs: cells (cell, class name, n_rows, n_read), cell_tree (node,
     class name, parent, depth (0 at a root), cell, n_rows and n_read of
     the cells below), class_cells (class, n_rows, n_read, n_cells),
-    cell_stats (one row: n_cells, distance, min_rows,
-    max_fit_samples). n_rows counts distinct rows, n_read rows of the
-    CSV (the summed weights).
+    cell_stats (one row: n_cells, min_rows, max_fit_samples). n_rows
+    counts distinct rows, n_read rows of the CSV (the summed copies).
     """
     limits = cfg.method.cells
     points, labels = read_points(cfg)
@@ -56,7 +56,6 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
         rows = np.flatnonzero(labels == code)
         own, tree = class_cells(
             points[rows],
-            weights[rows],
             cfg.method.min_rows,
             limits.max_fit_samples,
             cfg.seed,
@@ -128,7 +127,6 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
         [
             {
                 "n_cells": offset,
-                "distance": cfg.method.distance,
                 "min_rows": cfg.method.min_rows,
                 "max_fit_samples": limits.max_fit_samples,
             }

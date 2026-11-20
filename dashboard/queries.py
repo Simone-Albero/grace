@@ -25,7 +25,6 @@ __all__ = [
     "quality_region",
 ]
 
-import dataclasses
 import json
 import math
 import sqlite3
@@ -42,7 +41,7 @@ from sklearn.decomposition import PCA
 from src.config import DatasetConfig
 from src.data import feature_cols
 from src.provenance import KEYS, TIME, concentration
-from src.quality import decisive_rows
+from src.quality import resolution_rows
 from src.report import Verdicts, judge
 from stages.paths import (
     assignments_file,
@@ -61,12 +60,10 @@ CONFLICT_GROUPS = 10  # most label conflict groups in a region's detail
 # the settings each stage's tab shows, by stage, as its run's config set them
 HYPERPARAMETERS = {
     "clean": ("min_class_count", "max_class_rows"),
-    "prepare": ("top_n", "cat_cost"),
-    "cells": ("distance", "min_rows", "max_fit_samples", "seed"),
+    "prepare": ("top_n",),
+    "cells": ("min_rows", "max_fit_samples", "seed"),
     "quality_report": (
         "tau",
-        "rival_rows",
-        "max_rows_per_cell",
         "confidence",
     ),
 }
@@ -149,7 +146,7 @@ def cells(cfg: DatasetConfig, tau: float | None = None) -> dict[str, Any]:
 
     Returns:
         run; params (_params); stats (the cell_stats row: n_cells,
-        distance, min_rows, max_fit_samples); classes [{class, n_rows, n_read,
+        min_rows, max_fit_samples); classes [{class, n_rows, n_read,
         n_cells}]; cells [{cell, class, n_rows, n_read, region,
         defects}], region and defects (a list) those of the last
         quality_report run after this cells run, judged at tau (_judged),
@@ -179,8 +176,8 @@ def cell_map(cfg: DatasetConfig, node: int) -> dict[str, Any]:
     cells run) are sampled at random (seed cfg.seed): at most per_cell
     = min(MAP_PER_CELL, max(1, MAP_MAX_POINTS // cells)) of each cell.
     A PCA fitted on the sample, in the space the cells were cut in
-    (graph.space_points of the prepared file with the distance of that
-    run's method, not of cfg's), gives their first two components. The
+    (graph.space_points of the prepared file), gives their first two
+    components. The
     prepared points are cached per file and mtime.
 
     Args:
@@ -481,7 +478,7 @@ def _params(
     """Return HYPERPARAMETERS[stage] as the config of run set them.
 
     A name is looked up in the dataset (min_class_count), then in the
-    method (distance), then in its groups (method.quality.tau); one the
+    method, then in its groups (method.quality.tau); one the
     config lacks is left out. min_rows is no key of the config: it is
     what the run's tau and confidence ask for (src.config.MethodConfig).
     """
@@ -493,7 +490,7 @@ def _params(
     places = [config, method, *(v for v in method.values() if isinstance(v, dict))]
     quality = method.get("quality", {})
     if {"tau", "confidence"} <= set(quality):
-        rows = 2 * decisive_rows(quality["tau"], quality["confidence"])
+        rows = resolution_rows(quality["tau"], quality["confidence"])
         places.insert(0, {"min_rows": rows})
     found = {}
     for name in HYPERPARAMETERS[stage]:
@@ -585,7 +582,6 @@ _LISTS = (
     "label_with",
     "overlap_with",
     "shortcut_with",
-    "scenario_with",
 )  # the comma lists of quality_cells and quality_regions
 
 
@@ -734,10 +730,7 @@ def _summed_missing(
 def _map_cells(cfg: DatasetConfig, shown: list[int]) -> dict[str, Any]:
     """Return shares, points and sampled of cell_map for the rows of the cells shown."""
     with closing(_connect(cfg)) as conn:
-        run = _latest_run(conn, "cells", cfg)
-        (config,) = conn.execute(
-            "SELECT config FROM runs WHERE id = ?", (run["id"],)
-        ).fetchone()
+        _latest_run(conn, "cells", cfg)  # a run to map: LookupError without one
     cell = pl.read_parquet(need(assignments_file(cfg), "cells"))
     cell = cell.sort("row")["cell"].to_numpy()
     rows = np.flatnonzero(np.isin(cell, shown))
@@ -751,8 +744,7 @@ def _map_cells(cfg: DatasetConfig, shown: list[int]) -> dict[str, Any]:
             [rng.permutation(group)[:per_cell] for group in groups] or [rows]
         )
     )
-    distance = json.loads(config)["method"]["distance"]
-    points = _space(cfg, distance)[take]
+    points = _space(cfg)[take]
     plane = np.zeros((len(points), 2))
     shares = [0.0, 0.0]
     if len(points) >= 2:
@@ -885,13 +877,12 @@ def _classes(cfg: DatasetConfig) -> list[str]:
 _SPACE: dict[tuple, np.ndarray] = {}  # the points of the last prepared files read
 
 
-def _space(cfg: DatasetConfig, distance: str) -> np.ndarray:
-    """Return paths.read_points under distance, cached per file and mtime."""
+def _space(cfg: DatasetConfig) -> np.ndarray:
+    """Return paths.read_points, cached per file and mtime."""
     path = need(prepared_file(cfg), "prepare")
-    key = (str(path), path.stat().st_mtime_ns, distance)
+    key = (str(path), path.stat().st_mtime_ns)
     if key not in _SPACE:
-        method = dataclasses.replace(cfg.method, distance=distance)
-        points, _ = read_points(dataclasses.replace(cfg, method=method))
+        points, _ = read_points(cfg)
         if len(_SPACE) >= 2:
             _SPACE.clear()
         _SPACE[key] = points

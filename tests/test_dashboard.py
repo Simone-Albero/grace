@@ -98,7 +98,7 @@ def test_cells(client):
     assert set(data) == {"run", "params", "stats", "classes", "cells", "tree"}
     assert {"region", "defects"} <= set(data["cells"][0])
     assert data["stats"]["n_cells"] == len(data["cells"])
-    assert {"min_rows", "distance"} <= set(data["stats"])
+    assert {"min_rows", "max_fit_samples"} <= set(data["stats"])
     assert sum(c["n_cells"] for c in data["classes"]) == len(data["cells"])
     leaves = [n for n in data["tree"] if n["cell"] is not None]
     assert sorted(n["cell"] for n in leaves) == [c["cell"] for c in data["cells"]]
@@ -173,13 +173,10 @@ def test_quality(reported, client):
             "label_with",
             "overlap_with",
             "shortcut_with",
-            "scenario_with",
             "conflict_with",
         ):
             assert isinstance(region[key], list)
-        # the keys of its off_scenario
-        if "off_scenario" in region["defects"]:
-            assert set(region["scenario_with"]) <= set(SCENARIO_KEYS)
+        assert "scenario_with" not in region  # off_scenario is on any key
     assert data["stats"]["confidence"] == 0.95
     assert any(r["defects"] for r in data["regions"])
 
@@ -195,8 +192,8 @@ def test_quality_judges_the_measures_at_any_tau(reported, client):
         assert high["stats"][f"share_{d}"] == run["stats"][f"share_{d}"]
     for d in ("class_overlap", "off_scenario"):
         assert high["stats"][f"share_{d}"] <= run["stats"][f"share_{d}"]
-    for d in ("shortcut", "redundancy"):
-        assert high["stats"][f"share_{d}"] >= run["stats"][f"share_{d}"]
+    assert high["stats"]["share_shortcut"] >= run["stats"]["share_shortcut"]
+    assert "share_redundancy" not in run["stats"]
     low = _get(client, "/api/toy/quality?tau=0.02")
     assert low["stats"]["share_class_overlap"] >= run["stats"]["share_class_overlap"]
     assert low["stats"]["share_class_overlap"] > high["stats"]["share_class_overlap"]
@@ -268,6 +265,7 @@ def test_quality_region_of_a_region_in_a_label_conflict(reported, client):
         f"{k}_{m}" for k in KEYS for m in ("top", "top_share", "n_values", "eff_n")
     }
     judged = {f"scenario_{k}{m}" for k in SCENARIO_KEYS for m in ("", "_n")}
+    judged |= {"scenario", "scenario_n"}
     for cell in data["cells"]:
         assert measured | judged <= set(cell)
         assert 0 < cell["src_ip_top_share"] <= 1 and cell["src_ip_n_values"] >= 1
@@ -368,11 +366,9 @@ def test_every_tab_shows_the_hyperparameters_its_run_used(reported, client):
         },
         "prepare": {
             "top_n": dataset["top_n"],
-            "cat_cost": method["prepare"]["cat_cost"],
         },
         "cells": {
-            "distance": method["distance"],
-            "min_rows": 50,  # 2 x decisive_rows at tau 0.1 and 0.95
+            "min_rows": 68,  # resolution_rows at tau 0.1 and 0.95
             "max_fit_samples": method["cells"]["max_fit_samples"],
             "seed": dataset["seed"],
         },
@@ -380,8 +376,6 @@ def test_every_tab_shows_the_hyperparameters_its_run_used(reported, client):
             k: method["quality"][k]
             for k in (
                 "tau",
-                "rival_rows",
-                "max_rows_per_cell",
                 "confidence",
             )
         },

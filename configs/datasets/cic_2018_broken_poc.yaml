@@ -1,0 +1,89 @@
+# cic_2018_broken sampled into one CSV to compare grace and DataBadSmells (experiments/poc/generate.py, seed 42):
+# Benign 100k lines, every attack whole up to 10k but FTP-BruteForce and SlowHTTPTest whole (nearly all copies:
+# 10k lines would leave them under min_class_count distinct rows), raw lines byte for byte, one header, LF ends,
+# and the four columns only Thuesday-20-02 has dropped. Counts per class and per file of the source in its .manifest.json.
+name: cic_2018_broken_poc
+path: resources/raw_data/cic_2018_broken_poc/cic_2018_broken_poc.csv
+label_col: Label
+
+num_cols:
+  - Flow Duration
+  - Tot Fwd Pkts
+  - Tot Bwd Pkts
+  - TotLen Fwd Pkts
+  - TotLen Bwd Pkts
+  - Fwd Pkt Len Max
+  - Fwd Pkt Len Min
+  - Fwd Pkt Len Mean
+  - Fwd Pkt Len Std
+  - Bwd Pkt Len Max
+  - Bwd Pkt Len Min
+  - Bwd Pkt Len Mean
+  - Bwd Pkt Len Std
+  - Flow Byts/s
+  - Flow Pkts/s
+  - Flow IAT Mean
+  - Flow IAT Std
+  - Flow IAT Max
+  - Flow IAT Min
+  - Fwd IAT Tot
+  - Fwd IAT Mean
+  - Fwd IAT Std
+  - Fwd IAT Max
+  - Fwd IAT Min
+  - Bwd IAT Tot
+  - Bwd IAT Mean
+  - Bwd IAT Std
+  - Bwd IAT Max
+  - Bwd IAT Min
+  - Fwd PSH Flags
+  - Fwd URG Flags
+  - Fwd Header Len
+  - Bwd Header Len
+  - Fwd Pkts/s
+  - Bwd Pkts/s
+  - Pkt Len Min
+  - Pkt Len Max
+  - Pkt Len Mean
+  - Pkt Len Std
+  - FIN Flag Cnt
+  - SYN Flag Cnt
+  - RST Flag Cnt
+  - PSH Flag Cnt
+  - ACK Flag Cnt
+  - URG Flag Cnt
+  - CWE Flag Count
+  - ECE Flag Cnt
+  - Down/Up Ratio
+  - Init Fwd Win Byts
+  - Init Bwd Win Byts
+  - Fwd Act Data Pkts
+  - Fwd Seg Size Min
+  - Active Mean
+  - Active Std
+  - Active Max
+  - Active Min
+  - Idle Mean
+  - Idle Std
+  - Idle Max
+  - Idle Min
+
+cat_cols:
+  - Dst Port  # the service a flow targets: as in DataBadSmells, a feature
+  - Protocol
+
+# The destination port only: Src IP and Src Port are in Thuesday-20-02 only, and the times are written on 12 hours
+# without AM/PM (an attack of 17:14 in cic_2018 reads 01:14 here), so no rule of the scenario reads them.
+provenance:
+  dst_port: Dst Port
+
+scenario:  # what the documentation of CSE-CIC-IDS2018 says of its classes
+  benign: Benign
+  # the ports DataBadSmells ignores (metadata/cic2018): background services, no attack's target
+  background_ports: [0, 53, 67, 68, 111, 123, 161, 179, 389, 427, 520, 1723, 1900]
+
+min_class_count: 50  # classes with fewer rows are dropped
+top_n: 32  # most frequent values of a categorical column with their own one-hot slot; the others share one
+seed: 42
+output_dir: resources/processed/cic_2018_broken_poc
+db_path: resources/processed/grace.db

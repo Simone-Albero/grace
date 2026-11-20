@@ -8,14 +8,16 @@ cell (concentration). A dataset may also declare its scenario, what its
 documentation says of where and when each class was generated
 (ScenarioConfig): the ports of the background traffic, and per attack
 its hosts and time windows. A row of an attack class that falls outside
-them breaks the scenario (scenario_breaches), and a cell with tau of
-its CSV rows doing so has the defect off_scenario (src.quality).
+them breaks the scenario (scenario_breaches); a row breaks it when it
+breaks any of its keys (any_breach), and a cell with tau of its CSV rows
+doing so has the defect off_scenario (src.quality).
 """
 
 from __future__ import annotations
 
 __all__ = [
     "KEYS",
+    "any_breach",
     "SCENARIO_KEYS",
     "TIME",
     "breach_shares",
@@ -175,6 +177,20 @@ def scenario_breaches(
                 breaks[own] = np.where(unknown, np.nan, ~np.isin(hosts, list(rule)))
         found[key] = breaks
     return found
+
+
+def any_breach(breaches: Mapping[str, np.ndarray]) -> np.ndarray:
+    """Return, per CSV row, whether it breaks any key of the scenario.
+
+    Args:
+        breaches: By key, per CSV row, 1.0, 0.0 or NaN
+            (scenario_breaches); at least one key.
+
+    Returns:
+        Per CSV row, shape (n,): 1.0 when it breaks a key, 0.0 when it
+        is judged on a key and breaks none, NaN when no key judges it.
+    """
+    return np.fmax.reduce(np.vstack(list(breaches.values())), axis=0)
 
 
 def breach_shares(
