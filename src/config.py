@@ -13,7 +13,6 @@ __all__ = [
     "AttackScenario",
     "ProvenanceConfig",
     "ScenarioConfig",
-    "dataset_names",
     "load_config",
 ]
 
@@ -220,15 +219,6 @@ def _path(name_or_path: str, directory: Path) -> Path:
     if path.is_file() or path.suffix == ".yaml":
         return path
     return directory / f"{name_or_path}.yaml"
-
-
-def _names(directory: Path) -> list[str]:
-    return sorted(p.stem for p in directory.glob("*.yaml"))
-
-
-def dataset_names() -> list[str]:
-    """Return the names of the dataset configs, sorted."""
-    return _names(DATASET_DIR)
 
 
 def _check(condition: bool, message: str) -> None:

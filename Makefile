@@ -2,31 +2,23 @@
 # these targets are shortcuts.
 .DEFAULT_GOAL := help
 PYTHON ?= $(if $(wildcard venv/bin/python),venv/bin/python,python)
-DATA ?= synthetic_test
 METHOD ?= default
 PORT ?= 8000
 
-.PHONY: help test format generate run dashboard
+.PHONY: help format run dashboard
 
 ## help: this list
 help:
 	@grep -hE '^## ' $(MAKEFILE_LIST) | sed 's/^## //'
-
-## test: the pytest suite
-test:
-	$(PYTHON) -m pytest -q tests
 
 ## format: black and isort over the repo
 format:
 	$(PYTHON) -m black .
 	$(PYTHON) -m isort --profile black .
 
-## generate: the synthetic dataset (ROWS=<n> for a smaller one)
-generate:
-	$(PYTHON) generate_synthetic.py $(if $(ROWS),--rows $(ROWS),)
-
-## run: every stage in order on DATA (default synthetic_test) with METHOD (default default)
+## run: every stage in order on DATA (a name of configs/datasets/ or a yaml) with METHOD (default default)
 run:
+	$(if $(DATA),,$(error DATA=<name|yaml> is required))
 	$(PYTHON) main.py --stage clean --dataset $(DATA) --method $(METHOD)
 	$(PYTHON) main.py --stage prepare --dataset $(DATA) --method $(METHOD)
 	$(PYTHON) main.py --stage cells --dataset $(DATA) --method $(METHOD)

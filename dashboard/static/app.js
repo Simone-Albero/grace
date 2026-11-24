@@ -123,7 +123,7 @@ const tauQuery = (first = "?") => (state.tau == null ? "" : `${first}tau=${state
 
 /**
  * GET a JSON endpoint under /api.
- * @param {string} path e.g. "/synthetic_test/clean"
+ * @param {string} path e.g. "/cic_2018/clean"
  * @returns {Promise<object>} parsed body; rejects with the server "detail" on 404 (shown as the empty state)
  */
 async function api(path) {

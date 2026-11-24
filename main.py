@@ -1,4 +1,4 @@
-"""Run a stage: python main.py --stage clean --dataset synthetic_test"""
+"""Run a stage: python main.py --stage clean --dataset cic_2018"""
 
 from __future__ import annotations
 

@@ -9,17 +9,11 @@ annotated-doc==0.0.5
 annotated-types==0.8.0
     # via pydantic
 anyio==4.16.0
-    # via
-    #   httpx
-    #   starlette
+    # via starlette
 black==26.10.1
     # via -r requirements.in
 build==1.6.1
     # via pip-tools
-certifi==2026.10.23
-    # via
-    #   httpcore
-    #   httpx
 click==8.5.1
     # via
     #   black
@@ -30,19 +24,9 @@ cloudpickle==3.1.2
 fastapi==0.162.2
     # via -r requirements.in
 h11==0.16.0
-    # via
-    #   httpcore
-    #   uvicorn
-httpcore==1.0.9
-    # via httpx
-httpx==0.28.1
-    # via -r requirements.in
+    # via uvicorn
 idna==3.20
-    # via
-    #   anyio
-    #   httpx
-iniconfig==2.3.1
-    # via pytest
+    # via anyio
 isort==9.0.2
     # via -r requirements.in
 joblib==1.6.0
@@ -67,7 +51,6 @@ packaging==26.3
     # via
     #   black
     #   build
-    #   pytest
     #   wheel
 pandas==3.1.1
     # via -r requirements.in
@@ -77,8 +60,6 @@ pip-tools==7.6.2
     # via -r requirements.in
 platformdirs==4.14.5
     # via black
-pluggy==1.7.0
-    # via pytest
 polars==2.1.0
     # via -r requirements.in
 polars-runtime-32==2.1.0
@@ -91,14 +72,10 @@ pydantic-core==2.50.4
     # via pydantic
 pyflakes==4.1.0
     # via -r requirements.in
-pygments==2.21.0
-    # via pytest
 pyproject-hooks==1.3.3
     # via
     #   build
     #   pip-tools
-pytest==9.2.0
-    # via -r requirements.in
 python-dateutil==4.0.0
     # via pandas
 pytokens==0.4.1

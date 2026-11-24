@@ -8,8 +8,6 @@ joblib
 pyyaml
 fastapi
 uvicorn
-httpx
-pytest
 black
 isort
 pyflakes

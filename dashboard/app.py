@@ -30,12 +30,8 @@ def _query(query: Callable[..., Any], *args: Any) -> Any:
         raise HTTPException(404, str(e)) from e
 
 
-def create_app(dataset_dir: Path = DATASET_DIR) -> FastAPI:
-    """Build the app over the dataset configs of dataset_dir.
-
-    Args:
-        dataset_dir: The folder of the dataset yamls the dashboard
-            offers.
+def create_app() -> FastAPI:
+    """Build the app over the dataset configs of configs/datasets/.
 
     Returns:
         The app: "/" (the page), "/api/options" and one JSON route per
@@ -54,14 +50,14 @@ def create_app(dataset_dir: Path = DATASET_DIR) -> FastAPI:
         return response
 
     def offered_datasets() -> list[str]:
-        return sorted(path.stem for path in dataset_dir.glob("*.yaml"))
+        return sorted(path.stem for path in DATASET_DIR.glob("*.yaml"))
 
     def load_dataset(dataset: str) -> DatasetConfig:
         # The name is checked first: load_config also takes arbitrary
         # paths.
         if dataset not in offered_datasets():
             raise HTTPException(404, f"unknown dataset: {dataset}")
-        return load_config(str(dataset_dir / f"{dataset}.yaml"))
+        return load_config(str(DATASET_DIR / f"{dataset}.yaml"))
 
     @app.get("/")
     def index() -> HTMLResponse:
