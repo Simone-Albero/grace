@@ -42,7 +42,7 @@ from src.config import DatasetConfig
 from src.data import feature_cols
 from src.provenance import KEYS, TIME, concentration
 from src.quality import resolution_rows
-from src.report import Verdicts, judge
+from src.report import Verdicts
 from stages.paths import (
     assignments_file,
     data_file,
@@ -59,7 +59,7 @@ MAP_MAX_POINTS = 20000  # most rows of a map
 CONFLICT_GROUPS = 10  # most label conflict groups in a region's detail
 # the settings each stage's tab shows, by stage, as its run's config set them
 HYPERPARAMETERS = {
-    "clean": ("min_class_count", "max_class_rows"),
+    "clean": ("min_class_count", "max_class_rows", "significant_digits"),
     "prepare": ("top_n",),
     "cells": ("min_rows", "max_fit_samples", "seed"),
     "quality_report": (
@@ -136,26 +136,24 @@ def prepare(cfg: DatasetConfig) -> dict[str, Any]:
         }
 
 
-def cells(cfg: DatasetConfig, tau: float | None = None) -> dict[str, Any]:
+def cells(cfg: DatasetConfig) -> dict[str, Any]:
     """Return the last cells run.
 
     Args:
         cfg: The dataset.
-        tau: The threshold the defects of the cells are judged at, in
-            (0, 0.5]; None: the last quality_report run's own.
 
     Returns:
         run; params (_params); stats (the cell_stats row: n_cells,
         min_rows, max_fit_samples); classes [{class, n_rows, n_read,
         n_cells}]; cells [{cell, class, n_rows, n_read, region,
         defects}], region and defects (a list) those of the last
-        quality_report run after this cells run, judged at tau (_judged),
-        null without one; tree [{node, class, parent, depth, cell, n_rows, n_read}] in
+        quality_report run after this cells run (the defects of its
+        region), null without one; tree [{node, class, parent, depth, cell, n_rows, n_read}] in
         pre-order per class.
     """
     with closing(_connect(cfg)) as conn:
         run = _latest_run(conn, "cells", cfg)
-        judged = _cell_defects(conn, cfg, run, tau)
+        judged = _cell_defects(conn, cfg, run)
         return {
             "run": _public(run),
             "params": _params(conn, run, "cells"),
@@ -213,20 +211,15 @@ def cell_map(cfg: DatasetConfig, node: int) -> dict[str, Any]:
     return {"node": node, **_map_cells(cfg, sorted(below))}
 
 
-def quality(cfg: DatasetConfig, tau: float | None = None) -> dict[str, Any]:
-    """Return the last quality_report run, judged at tau.
+def quality(cfg: DatasetConfig) -> dict[str, Any]:
+    """Return the last quality_report run, as the stage judged it at its tau.
 
     Args:
         cfg: The dataset.
-        tau: The threshold, in (0, 0.5]; None: the run's own. What the
-            run measured does not depend on it (src.report.judge).
 
     Returns:
         run; params (_params: the run's own settings, its tau too);
-        stats (the quality_stats row, its tau the one judged at, at the
-        run's confidence; n_regions, regions_, undecided_ and share_
-        judged at it; those of off_scenario null when the dataset
-        declares no scenario, and so the classes'); classes
+        stats (the quality_stats row); classes
         (quality_classes); regions (quality_regions, defects and the
         class and key lists as lists); missing
         (cell_missing summed by region, column and kind: [{region,
@@ -235,36 +228,30 @@ def quality(cfg: DatasetConfig, tau: float | None = None) -> dict[str, Any]:
     """
     with closing(_connect(cfg)) as conn:
         run = _latest_run(conn, "quality_report", cfg)
-        judged = _judged(cfg, conn, run, tau)
+        judged = _logged(cfg, conn, run)
         return {
             "run": _public(run),
             "params": _params(conn, run, "quality_report"),
-            "stats": {
-                **_rows(conn, "quality_report", "quality_stats", run)[0],
-                **judged.stats,
-            },
+            "stats": judged.stats,
             "classes": judged.classes,
             "regions": [_listed(r) for r in judged.regions],
             "missing": _missing_by_region(conn, run, judged),
         }
 
 
-def quality_region(
-    cfg: DatasetConfig, region: int, tau: float | None = None
-) -> dict[str, Any]:
-    """Return the detail of one region in the last quality_report run, judged at tau.
+def quality_region(cfg: DatasetConfig, region: int) -> dict[str, Any]:
+    """Return the detail of one region in the last quality_report run.
 
     Args:
         cfg: The dataset.
-        region: A region id of quality_regions, at tau.
-        tau: The threshold, in (0, 0.5]; None: the run's own.
+        region: A region id of quality_regions.
 
     Returns:
         region (its quality_regions row, as quality's); cells (its
         quality_cells rows, the lists as lists, with the provenance
         columns when the dataset names some); rivals (the quality_rivals
         rows of its cells, one per cell and rival class, rival_cells,
-        rival_regions and rules as lists); missing (its
+        rival_regions as lists); missing (its
         cell_missing rows summed by column and
         kind); n_groups (the label conflict groups with a row in it) and
         conflicts: the CONFLICT_GROUPS of them with the most CSV rows,
@@ -276,11 +263,11 @@ def quality_region(
 
     Raises:
         LookupError: When quality_report has not run or region is not
-            one of its regions at tau.
+            one of its regions.
     """
     with closing(_connect(cfg)) as conn:
         run = _latest_run(conn, "quality_report", cfg)
-        judged = _judged(cfg, conn, run, tau)
+        judged = _logged(cfg, conn, run)
         rows = [r for r in judged.regions if r["region"] == region]
         if not rows:
             raise LookupError(f"no region {region} in quality_regions")
@@ -333,19 +320,15 @@ def quality_region(
     }
 
 
-def quality_map(
-    cfg: DatasetConfig, region: int, tau: float | None = None
-) -> dict[str, Any]:
+def quality_map(cfg: DatasetConfig, region: int) -> dict[str, Any]:
     """Return the rows of a region and of its rival cells in their own plane.
 
     As cell_map, with the cells of the region and every rival cell of
-    them in the last quality_report run (quality_rivals), judged at
-    tau.
+    them in the last quality_report run (quality_rivals).
 
     Args:
         cfg: The dataset.
-        region: A region id of quality_regions, at tau.
-        tau: The threshold, in (0, 0.5]; None: the run's own.
+        region: A region id of quality_regions.
 
     Returns:
         region; cells (its cells, then the rival cells, each by id);
@@ -357,7 +340,7 @@ def quality_map(
             region is not one of its regions.
     """
     with closing(_connect(cfg)) as conn:
-        judged = _judged(cfg, conn, _latest_run(conn, "quality_report", cfg), tau)
+        judged = _logged(cfg, conn, _latest_run(conn, "quality_report", cfg))
     own = _cells_of(judged, region)
     if not own:
         raise LookupError(f"no region {region} in quality_regions")
@@ -369,13 +352,11 @@ def quality_map(
     return {"region": region, "cells": shown, **_map_cells(cfg, shown)}
 
 
-def quality_profile(
-    cfg: DatasetConfig, region: int, tau: float | None = None
-) -> dict[str, Any]:
+def quality_profile(cfg: DatasetConfig, region: int) -> dict[str, Any]:
     """Return the mean features of a region and of each of its rival classes.
 
     Over the rows of the region (its cells in the last quality_report
-    run judged at tau, assignments.parquet) and, per rival class, of
+    run, assignments.parquet) and, per rival class, of
     the rival cells of that class of its cells (quality_rivals), each
     row weighted by its copies in the CSV: the mean of every numeric
     column of the prepared file (logged and standardized: a difference
@@ -385,8 +366,7 @@ def quality_profile(
 
     Args:
         cfg: The dataset.
-        region: A region id of quality_regions, at tau.
-        tau: The threshold, in (0, 0.5]; None: the run's own.
+        region: A region id of quality_regions.
 
     Returns:
         region; columns (the numeric columns, in data file order); own
@@ -399,7 +379,7 @@ def quality_profile(
             one of its regions.
     """
     with closing(_connect(cfg)) as conn:
-        judged = _judged(cfg, conn, _latest_run(conn, "quality_report", cfg), tau)
+        judged = _logged(cfg, conn, _latest_run(conn, "quality_report", cfg))
     if not any(r["region"] == region for r in judged.regions):
         raise LookupError(f"no region {region} in quality_regions")
     by_class: dict[str, set[int]] = defaultdict(set)
@@ -579,18 +559,21 @@ _LISTS = (
     "defects",
     "undecided",
     "conflict_with",
-    "label_with",
-    "overlap_with",
-    "shortcut_with",
+    "minority_overlap_with",
+    "majority_overlap_with",
 )  # the comma lists of quality_cells and quality_regions
 
 
 def _listed(row: dict[str, Any]) -> dict[str, Any]:
-    """Return a quality_regions or quality_cells row with its comma lists as lists."""
+    """Return a quality_regions or quality_cells row with its comma lists as lists and cut_columns as [[column, share]]."""
     out = dict(row)
     for key in _LISTS:
         if key in row:
             out[key] = row[key].split(",") if row[key] else []
+    if "cut_columns" in row:
+        out["cut_columns"] = (
+            json.loads(row["cut_columns"]) if row["cut_columns"] else []
+        )
     return out
 
 
@@ -598,9 +581,8 @@ def _cell_defects(
     conn: sqlite3.Connection,
     cfg: DatasetConfig,
     cells_run: Mapping[str, Any],
-    tau: float | None,
 ) -> dict[int, dict[str, Any]]:
-    """Return the region and defects of every cell, by cell, as quality_report judges them at tau.
+    """Return the region and defects of every cell, by cell: the defects of its region.
 
     From the last ok quality_report run, when it ran after cells_run (an
     older one judged other cells); none otherwise.
@@ -611,72 +593,61 @@ def _cell_defects(
         return {}
     if run["id"] < cells_run["id"]:
         return {}
+    logged = _logged(cfg, conn, run)
+    defects = {r["region"]: _listed(r)["defects"] for r in logged.regions}
     return {
-        row["cell"]: {"region": row["region"], "defects": row["defects"]}
-        for row in map(_listed, _judged(cfg, conn, run, tau).cells)
+        row["cell"]: {"region": row["region"], "defects": defects[row["region"]]}
+        for row in logged.cells
     }
 
 
-_JUDGED: dict[tuple, Verdicts] = {}  # the last verdicts judged, per run, tau and tree
-
-
-def _judged(
-    cfg: DatasetConfig,
-    conn: sqlite3.Connection,
-    run: Mapping[str, Any],
-    tau: float | None,
+def _logged(
+    cfg: DatasetConfig, conn: sqlite3.Connection, run: Mapping[str, Any]
 ) -> Verdicts:
-    """Return the verdicts of a quality_report run at tau (src.report.judge).
+    """Return the verdicts a quality_report run logged, as src.report.judge returned them.
 
-    What the run measured is read from quality_cells, quality_rivals and
-    quality_branches (the cells' tree with the spread of every node), as
-    the stage passed them. Cached per database, run and tau.
+    Read from quality_rivals, quality_cells, quality_regions,
+    quality_classes and quality_stats of the run: the stage judged once,
+    at its quality.tau.
 
     Args:
         cfg: The dataset.
         conn: The database, of the run.
         run: The quality_report run.
-        tau: The threshold, in (0, 0.5]; None: the run's own.
 
     Raises:
-        LookupError: When the cells were cut again after the run (its
-            cells are not those of the tree), or the run is of an older
-            quality_report (no clear_rows, pairs of cells instead of
-            rival classes, no confidence, or no branches).
+        LookupError: When the cells were cut again after the run, or the
+            run is of an older quality_report (no cut_share in
+            quality_branches).
     """
     if _latest_run(conn, "cells", cfg)["id"] > run["id"]:
         raise LookupError("run quality_report again: the cells were cut after it")
-    params = _params(conn, run, "quality_report")
-    if "confidence" not in params:
-        raise LookupError("run quality_report again: it judged without intervals")
-    tau = params["tau"] if tau is None else tau
-    key = (str(cfg.db_path.resolve()), run["id"], tau)
-    if key not in _JUDGED:
-        cells = sorted(
-            _rows(conn, "quality_report", "quality_cells", run),
-            key=lambda c: c["cell"],
-        )
-        if cells and "clear_rows" not in cells[0]:
-            raise LookupError("run quality_report again: it did not log clear_rows")
-        if _where(conn, "quality_pairs", run, "1"):
-            raise LookupError("run quality_report again: it measured pairs of cells")
-        rivals = _where(conn, "quality_rivals", run, "1")
+    key = (str(cfg.db_path.resolve()), run["id"])
+    if key not in _LOGGED:
         branches = _rows(
             conn, "quality_report", "quality_branches", run, missing_ok=True
         )
-        if not branches:
-            raise LookupError("run quality_report again: it did not log its branches")
-        if len(_JUDGED) >= 8:
-            _JUDGED.clear()
-        _JUDGED[key] = judge(
-            cells,
-            rivals,
-            pl.DataFrame(branches).sort("node"),
-            _classes(cfg),
-            tau,
-            params["confidence"],
+        if not branches or "cut_share" not in branches[0]:
+            raise LookupError("run quality_report again: it is of an older version")
+        if len(_LOGGED) >= 8:
+            _LOGGED.clear()
+        _LOGGED[key] = Verdicts(
+            rivals=_where(conn, "quality_rivals", run, "1"),
+            cells=sorted(
+                _rows(conn, "quality_report", "quality_cells", run),
+                key=lambda c: c["cell"],
+            ),
+            regions=sorted(
+                _rows(conn, "quality_report", "quality_regions", run),
+                key=lambda r: r["region"],
+            ),
+            classes=_rows(conn, "quality_report", "quality_classes", run),
+            stats=_rows(conn, "quality_report", "quality_stats", run)[0],
         )
-    return _JUDGED[key]
+    return _LOGGED[key]
+
+
+_LOGGED: dict[tuple, Verdicts] = {}  # the verdicts last read, per database and run
 
 
 def _missing_by_region(
@@ -699,7 +670,7 @@ def _missing_by_region(
 def _rival_row(row: dict[str, Any]) -> dict[str, Any]:
     """Return a quality_rivals row with its JSON lists as lists."""
     out = dict(row)
-    for key in ("rival_cells", "rival_regions", "rules"):
+    for key in ("rival_cells", "rival_regions"):
         out[key] = json.loads(row[key]) if row[key] else []
     return out
 

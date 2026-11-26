@@ -17,8 +17,8 @@ for two cells, until every node left is a cell; a branch with too few
 rows to be measured is left out, its rows joining the nearest cell.
 
 The cut is the tree of the cells (CellTree): sibling cells are the most
-alike, so the report merges cells up this tree where their defects do
-not contradict each other (merge_cells).
+alike, so the report merges cells up this tree where no verdict they
+decide changes on the rows merged (merge_nodes).
 """
 
 from __future__ import annotations
@@ -27,11 +27,11 @@ __all__ = [
     "CellTree",
     "WardTree",
     "class_cells",
-    "merge_cells",
+    "merge_nodes",
     "ward_tree",
 ]
 
-from collections.abc import Hashable, Sequence, Set
+from collections.abc import Hashable, Mapping, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -221,53 +221,58 @@ def class_cells(
     )
 
 
-def merge_cells(
-    tree: CellTree, yes: Sequence[Set[Hashable]], no: Sequence[Set[Hashable]]
+def merge_nodes(
+    tree: CellTree, entries: Sequence[Mapping[Hashable, bool | None]]
 ) -> np.ndarray:
-    """Merge the cells of a class into regions up its cut, where they do not contradict each other.
+    """Merge the cells of a class into regions up its cut, where no decided verdict changes.
 
-    Every cell has a verdict on some entries (a defect, against a class
-    or on a key): the entries it has (yes) and those it has not (no);
-    on the others it is undecided. A node is uniform when no entry is
-    in the yes of one of its cells and in the no of another; a region
-    is a uniform node whose parent is not uniform, or the root when it
-    is uniform. A region is so the largest branch of the cut whose
-    cells do not contradict each other (an undecided cell never splits
-    a branch), and it is named by its top node: the same branch has the
-    same name whatever the cells outside it.
+    Every node of the cut has a verdict on each entry (a defect against
+    a target): True, False or None (undecided), read on its own rows.
+    A cell is merged. An internal node is merged when its two children
+    are, and every verdict a child decides (True or False) is the same
+    on the node: a decided verdict that the node's rows turn undecided
+    or opposite stops the merge, for merging would dilute the very
+    share the child measures. A region is a merged node whose parent is
+    not merged (or the root, when merged): the largest branch whose
+    rows keep every verdict of its parts, named by its top node, and
+    its verdicts are the node's.
 
     Args:
         tree: The cut of the class (class_cells).
-        yes: Per cell, indexed by cell, the entries it has.
-        no: Per cell, the entries it has not; disjoint from its yes.
+        entries: Per node of the cut, in its order, the verdict of every
+            entry (the raw ones: no defect hides another).
 
     Returns:
-        The region of every cell: the index in the cut of the top node
-        of its region (so not numbered from 0, nor without gaps).
+        The region of every cell, indexed by cell: the index in the cut
+        of the top node of its region (so not numbered from 0, nor
+        without gaps).
     """
     parent = np.asarray(tree.parent, dtype=np.int64)
+    node_cell = np.asarray(tree.cell, dtype=np.int64)
     k = len(parent)
-    # The entries a node's cells have and have not; children come after
-    # their parent, so walking back adds each into its parent.
-    has: list[set] = [set() for _ in range(k)]
-    lacks: list[set] = [set() for _ in range(k)]
-    for v in range(k - 1, -1, -1):
-        if tree.cell[v] >= 0:
-            has[v] |= yes[tree.cell[v]]
-            lacks[v] |= no[tree.cell[v]]
-        if parent[v] >= 0:
-            has[parent[v]] |= has[v]
-            lacks[parent[v]] |= lacks[v]
-    uniform = [not (has[v] & lacks[v]) for v in range(k)]
-    region_of_node = np.full(k, -1, dtype=np.int64)
+    children: list[list[int]] = [[] for _ in range(k)]
     for v in range(k):
-        if not uniform[v]:
+        if parent[v] >= 0:
+            children[parent[v]].append(v)
+    merged = np.zeros(k, dtype=bool)
+    for v in range(k - 1, -1, -1):  # children after their parent
+        if node_cell[v] >= 0:
+            merged[v] = True
             continue
-        up = parent[v]
-        region_of_node[v] = region_of_node[up] if up >= 0 and uniform[up] else v
-    leaf = tree.cell >= 0
+        merged[v] = all(merged[c] for c in children[v]) and all(
+            entries[v].get(entry) == value
+            for c in children[v]
+            for entry, value in entries[c].items()
+            if value is not None
+        )
+    region_of_node = np.full(k, -1, dtype=np.int64)
+    for v in range(k):  # a parent before its children
+        if merged[v]:
+            up = parent[v]
+            region_of_node[v] = region_of_node[up] if up >= 0 and merged[up] else v
+    leaf = node_cell >= 0
     region = np.empty(int(leaf.sum()), dtype=np.int64)
-    region[tree.cell[leaf]] = region_of_node[leaf]
+    region[node_cell[leaf]] = region_of_node[leaf]
     return region
 
 

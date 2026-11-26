@@ -3,16 +3,15 @@
 /**
  * UI state.
  * @type {{dataset: string|null, tab: "quality"|"cells"|"data", cls: string|null, node: number|null,
- *   colorBy: string|null, qclass: string|null, qfilter: string|null, region: number|null, tau: number|null}}
+ *   colorBy: string|null, qclass: string|null, qfilter: string|null, region: number|null}}
  *   cls, node: the class whose tree is drawn and the node whose map is shown (null: its root), the tree drawn from the
  *   level that shows it (treeLevels); colorBy: what colours the tree and the map, null their subtrees, "any" any
  *   defect, else one of DEFECTS; qclass, qfilter: the regions listed, picked in the matrix (null: all), qfilter "none"
- *   or one of DEFECTS; region: the region whose detail is shown (null: none); tau: the threshold the defects of the
- *   quality and cells tabs are judged at (null: the run's own)
+ *   or one of DEFECTS; region: the region whose detail is shown (null: none)
  */
 const state = {
   dataset: null, tab: "quality", cls: null, node: null, colorBy: null,
-  qclass: null, qfilter: null, region: null, tau: null,
+  qclass: null, qfilter: null, region: null,
 };
 
 const last = { cells: null, cellInfo: null, quality: null }; // last responses, for the controls that only redraw
@@ -118,9 +117,6 @@ function fill(id, ...kids) {
 
 // --- data ---
 
-/** The tau of the request, as a query string part (null tau: none). @param {"?"|"&"} [first] */
-const tauQuery = (first = "?") => (state.tau == null ? "" : `${first}tau=${state.tau}`);
-
 /**
  * GET a JSON endpoint under /api.
  * @param {string} path e.g. "/cic_2018/clean"
@@ -150,38 +146,25 @@ async function init() {
   };
   $("dataset").onchange = (e) => {
     state.dataset = e.target.value;
-    state.cls = state.node = state.colorBy = state.qclass = state.qfilter = state.region = state.tau = null;
+    state.cls = state.node = state.colorBy = state.qclass = state.qfilter = state.region = null;
     load();
   };
-  $("qr-tau").oninput = (e) => { $("qr-tau-value").textContent = e.target.value; };
-  $("qr-tau").onchange = (e) => setTau(Number(e.target.value));
-  $("qr-tau-reset").onclick = () => setTau(null);
   $("rg-class").onchange = (e) => selectClass(e.target.value);
   $("rg-color").onchange = (e) => { state.colorBy = e.target.value || null; drawClass(); };
   for (const b of document.querySelectorAll(".tabs button")) b.onclick = () => showTab(b.dataset.tab);
   showTab(state.tab);
 }
 
-/**
- * Judge the defects at another tau and draw the tab again; the run's own tau is null, never a number.
- * @param {number|null} tau
- */
-function setTau(tau) {
-  state.tau = tau === last.quality.params.tau ? null : tau;
-  load();
-}
-
 let shownHash = ""; // the hash last written by saveHash: a hashchange to it is our own
 
 /**
- * Set state from the URL hash: tab, dataset, the quality tab's region or the cells tab's class and node, and tau
- * ("?tau=0.15" after them).
+ * Set state from the URL hash: tab, dataset, the quality tab's region or the cells tab's class and node (a query
+ * after them, as the "?tau=" of older links, is ignored).
  * @param {string[]} datasets the known datasets; an unknown one falls back to the first
  */
 function readHash(datasets) {
-  const [path, query] = location.hash.slice(1).split("?");
+  const [path] = location.hash.slice(1).split("?");
   const [named, dataset, a, b] = path.split("/").map(decodeURIComponent);
-  state.tau = Number(new URLSearchParams(query).get("tau")) || null;
   const tab = OLD_TABS[named] ?? named;
   if (TABS.includes(tab)) state.tab = tab;
   const next = datasets.includes(dataset) ? dataset : datasets[0];
@@ -207,14 +190,14 @@ function showTab(tab) {
 }
 
 /**
- * Keep tab, dataset and, on the quality tab the region, on the cells tab class and node, and tau, in the URL hash.
+ * Keep tab, dataset and, on the quality tab the region, on the cells tab class and node, in the URL hash.
  * @param {boolean} [push] a step the back button returns from (opening a region or a node); else the entry is replaced
  */
 function saveHash(push = false) {
   const parts = [state.tab, state.dataset];
   if (state.tab === "quality" && state.region != null) parts.push(state.region);
   if (state.tab === "cells" && state.cls != null) parts.push(state.cls, ...(state.node != null ? [state.node] : []));
-  shownHash = `#${parts.map((p) => encodeURIComponent(p)).join("/")}${tauQuery()}`;
+  shownHash = `#${parts.map((p) => encodeURIComponent(p)).join("/")}`;
   if (shownHash === location.hash) return;
   if (push) history.pushState(null, "", shownHash);
   else history.replaceState(null, "", shownHash);
@@ -226,7 +209,7 @@ function saveHash(push = false) {
  * @param {string} d the dataset's path, "/<dataset>"
  */
 async function fetchTab(tab, d) {
-  if (tab !== "data") return api(`${d}/${tab}${tauQuery()}`);
+  if (tab !== "data") return api(`${d}/${tab}`);
   const [clean, prepare] = await Promise.all([
     api(`${d}/clean`), api(`${d}/prepare`).catch((e) => ({ error: e.message }))]);
   return { ...clean, prepare };
@@ -409,7 +392,7 @@ function drawRegionLink(n) {
   const open = h("button", { class: "chip", type: "button" }, `open cell ${info.region} in quality`);
   open.onclick = () => {
     state.qclass = state.qfilter = null;
-    location.hash = `#quality/${encodeURIComponent(state.dataset)}/${info.region}${tauQuery()}`;
+    location.hash = `#quality/${encodeURIComponent(state.dataset)}/${info.region}`;
   };
   fill("rg-region", `Leaf ${n.cell} is part of cell ${info.region}.`, open);
 }
@@ -983,44 +966,40 @@ function panZoom(svg, draw) {
 }
 
 // The quality tab calls cell what quality_report calls a region (its id the region's): the leaves of a class's tree
-// merged where their defects agree. It never shows the leaves.
+// merged where no verdict they decide changes. It never shows the leaves.
 
-// the defects of a cell, in the order of src.quality.DEFECTS
-const DEFECTS = ["invalid_values", "duplicates", "label_conflict", "suspect_label", "class_overlap", "shortcut",
-  "repetition", "off_scenario"];
+// the defects of a cell, in the order of src.quality.DEFECTS: structural, overlap, generalization
+const DEFECTS = ["invalid_values", "duplicates", "label_conflict", "minority_overlap", "majority_overlap",
+  "single_feature_cut", "low_variability"];
 
-/** The defects the last quality run measured: off_scenario needs a scenario (share null without it). */
+/** The defects the last quality run measured: every one of DEFECTS. */
 const measuredDefects = () => DEFECTS.filter((d) => last.quality.stats[`share_${d}`] != null);
 const RIVAL_COLUMNS = 6; // most rival classes compared feature by feature, the highest rival share first
-const RIVAL_SHORTCUTS = 12; // most rival classes listed in a shortcut's evidence, the highest rival share first
 
 /** What each defect means, one line: the glossary and the tooltip of its chips. */
 const DEFINITION = {
-  invalid_values: "at least one row holds an empty, unparsable, NaN or infinite value",
-  duplicates: "at least one row comes more than once in the CSV, label included: copies can fall on both sides of a " +
-    "train/test split",
-  label_conflict: "at least one row is identical on every feature to a row of another class: no classifier can tell " +
-    "them apart",
-  suspect_label: "against a rival class, its rival share is at least one half beyond the error of sampling: the cell " +
-    "lies inside the other class, as rows under a wrong label would",
-  class_overlap: "against a rival class, its rival share is τ or more beyond the error of sampling, and it is no " +
-    "suspect_label",
-  shortcut: "against a rival class, the best rule on a single column between its class and the " +
-    "rival class leaves under τ of the cell's rows and under τ of the rival class's rows on the wrong side, beyond the " +
-    "error of sampling: one column alone tells the two classes apart where the cell lies",
-  repetition: "the cell lies in a branch of its class's tree that holds at least τ of the class's CSV rows and whose " +
-    "rows lie at most τ times as far from their centre as the dataset's: a large part of its class repeated in " +
-    "little space",
-  off_scenario: "at least τ of the cell's CSV rows break a rule of the scenario the dataset declares for its class " +
-    "(a background port as destination, a host or a time the documentation does not give the attack), beyond the " +
-    "error of sampling",
+  invalid_values: "τ or more of its distinct rows hold an empty, unparsable, NaN or infinite value, beyond the error " +
+    "of sampling",
+  duplicates: "τ or more of its CSV rows repeat a row, label included, beyond the error of sampling (on its distinct " +
+    "rows): copies can fall on both sides of a train/test split",
+  label_conflict: "τ or more of its distinct rows are identical on every feature to a row of another class, beyond " +
+    "the error of sampling: no classifier can tell them apart",
+  minority_overlap: "against a rival class, its rival share is at least one half beyond the error of sampling: its " +
+    "class is the minority where it lies, as rows under a wrong label, or a true minority, would be",
+  majority_overlap: "against a rival class, its rival share is τ or more beyond the error of sampling, and it has no " +
+    "minority_overlap against it: its class is the majority where it lies, but the rival is no stray",
+  single_feature_cut: "one column alone separates it from its rival class (the most frequent class of its rows' " +
+    "nearest rival rows): under τ of that class's rows fall inside its values on the column, beyond the error of " +
+    "sampling",
+  low_variability: "it lies in a branch of its class's tree that holds at least τ of the class's CSV rows and is no " +
+    "more spread than the median leaf of the dataset: many rows in the room of a few, near copies of one flow",
 };
 
 /** The other words of the quality tab, one line each. */
 const TERMS = {
   "CSV rows": "the rows of the CSV, copies included, as a classifier is trained on them; every share is of them",
-  cell: "a compact group of rows of one class, the unit every defect is measured on: neighbouring leaves of the " +
-    "class's tree (the cells tab) with the same defects against the same classes and the same host",
+  cell: "a branch of a class's tree (the cells tab), its leaves merged where no verdict they decide changes on " +
+    "their rows together; every verdict is read on all its rows",
   "rival class": "another class holding the nearest row of another class to one of the cell's rows; the leaves " +
     "that hold those rows are its rival leaves",
   "rival share": "the share of a cell's rows whose nearest row in the whole dataset (itself left out) is of a " +
@@ -1030,34 +1009,19 @@ const TERMS = {
   "clear ratio": "the share of the CSV rows with none of the defects",
 };
 
-/** Which rows of the CSV have each defect: the row itself for the first three, its cell for the others. */
-const ROWS_WITH = {
-  invalid_values: "hold a null or invalid value",
-  duplicates: "repeat a row read before them (the first copy of a row does not)",
-  label_conflict: "are identical to a row of another class",
-  suspect_label: "lie in a cell with suspect_label",
-  class_overlap: "lie in a cell with class_overlap",
-  shortcut: "lie in a cell with shortcut",
-  repetition: "lie in a cell with repetition",
-  off_scenario: "lie in a cell with off_scenario",
-};
+/** Which rows of the CSV have each defect: those of the cells with it. */
+const ROWS_WITH = Object.fromEntries(DEFECTS.map((d) => [d, `lie in a cell with ${d}`]));
 
 /** One sentence per column of the quality tables, shown on hover of the header. */
 const HELP = {
   read: "rows of the CSV, copies included (hover a number for the distinct rows)",
   why: "each defect of the cell with what was found",
-  rule: "the column whose rule between the two classes errs least on its worse side, with its error on this cell's " +
-    "rows and on the rival class's",
-  cellError: "the share of this cell's rows the rule of the two classes sends to the rival's side",
-  rivalError: "the share of the rival class's rows the rule sends to this cell's side",
 };
 
 /** The hyperparameters, the matrix, the cells and the glossary. @param {object} data response of /quality */
 function renderQuality(data) {
   last.quality = data;
   fill("qr-params", paramTable(data.params));
-  $("qr-tau").value = $("qr-tau-value").textContent = data.stats.tau;
-  $("qr-tau-reset").hidden = state.tau == null;
   const term = (name, text) => [h("dt", {}, name), h("dd", {}, text)];
   fill("qr-glossary",
     Object.entries(TERMS).map(([k, v]) => term(k, v)),
@@ -1147,13 +1111,14 @@ function why(r, missingOf) {
   const found = {
     invalid_values: () => `${plural(r.missing_read, "CSV row")} with a null or invalid value, in ` +
       some([...new Set((missingOf.get(r.region) ?? []).map((m) => m.column))]),
-    duplicates: () => `${pct(r.dup_share)} of its CSV rows are copies`,
+    duplicates: () => `${pct(r.duplicates_share)} of its CSV rows are copies`,
     label_conflict: () => `${plural(r.conflict_read, "CSV row")} identical to rows of ${r.conflict_with.join(", ")}`,
-    suspect_label: () => `inside ${r.label_with.join(", ")} (highest rival share ${interval(r)})`,
-    class_overlap: () => `confused with ${r.overlap_with.join(", ")} (highest ${interval(r)})`,
-    shortcut: () => `one column tells it from ${r.shortcut_with.join(", ")}`,
-    repetition: () => `in ${pct(r.repetition_share)} of its class, spread ${dec(r.repetition_ratio, 3)} times the dataset`,
-    off_scenario: () => "off the scenario of its class",
+    minority_overlap: () => `inside ${r.minority_overlap_with.join(", ")} (highest rival share ${interval(r)})`,
+    majority_overlap: () => `confused with ${r.majority_overlap_with.join(", ")} (highest ${interval(r)})`,
+    single_feature_cut: () => [colName(r.cut_columns[0]?.[0] ?? "?"),
+      ` alone separates it from ${r.cut_class} (${pct(r.cut_share)} of its rows inside)`],
+    low_variability: () => `in ${pct(r.low_variability_share)} of its class, spread ` +
+      `${dec(r.low_variability_ratio, 2)} times the median leaf`,
   };
   return h("div", { class: "why" }, r.defects.map((d) => h("div", {}, diagnosisChip(d), " ", found[d]())));
 }
@@ -1208,12 +1173,12 @@ function scrollUnderHeader(el) {
  * the rival leaves of that class of every leaf kept; the highest rival share first.
  * @param {object} d the detail of the cell (/quality/region)
  * @param {(rival: object) => boolean} [keep] the measures to look at
- * @returns {{class: string, here: number, rules: Array<[string, number, number]>, cells: number[]}[]}
+ * @returns {{class: string, here: number, cells: number[]}[]}
  */
 function rivalClasses(d, keep = () => true) {
   const best = new Map(), cells = new Map();
   for (const r of d.rivals) {
-    const rival = { class: r.rival_class, here: r.rival_share, rules: r.rules };
+    const rival = { class: r.rival_class, here: r.rival_share };
     if (!keep(rival)) continue;
     cells.set(rival.class, new Set([...(cells.get(rival.class) ?? []), ...r.rival_cells]));
     const was = best.get(rival.class);
@@ -1246,7 +1211,7 @@ async function drawDetail() {
   fill("qr-detail-title", `Cell ${row.region} · ${row.class}`, close);
   fill("qr-detail-head",
     `${num(row.n_read)} CSV rows (${num(row.n_rows)} distinct) · `,
-    flagged(`${pct(row.dup_share)} copies`, row.defects.includes("duplicates")), " · ",
+    flagged(`${pct(row.duplicates_share)} copies`, row.defects.includes("duplicates")), " · ",
     row.defects.length ? chips(row.defects) : "no defect");
   $("qr-all").open = false;
   fill("qr-evidence", h("p", { class: "note" }, "loading…"));
@@ -1255,8 +1220,8 @@ async function drawDetail() {
   let d, profile;
   try {
     [d, profile] = await Promise.all([
-      api(`/${ds}/quality/region?region=${row.region}${tauQuery("&")}`),
-      api(`/${ds}/quality/profile?region=${row.region}${tauQuery("&")}`).catch((e) => ({ error: e.message })),
+      api(`/${ds}/quality/region?region=${row.region}`),
+      api(`/${ds}/quality/profile?region=${row.region}`).catch((e) => ({ error: e.message })),
     ]);
   } catch (e) {
     if (id === detailId) fill("qr-evidence", h("p", { class: "note" }, e.message));
@@ -1265,7 +1230,7 @@ async function drawDetail() {
   if (id !== detailId) return;
   // the rival classes of each defect, as the run judged them (beyond the error of sampling)
   const against = (names) => rivalClasses(d, (s) => names.includes(s.class));
-  const label = against(row.label_with), overlap = against(row.overlap_with), shortcut = against(row.shortcut_with);
+  const label = against(row.minority_overlap_with), overlap = against(row.majority_overlap_with);
   const parts = {
     invalid_values: () => evidence("invalid_values", sortableIn([
       { key: "column", label: "column", text: true },
@@ -1274,22 +1239,19 @@ async function drawDetail() {
     ], d.missing, { by: "n_read" })),
     duplicates: () => null, // its copies are in the head
     label_conflict: () => evidence("label_conflict", conflicts(d, row)),
-    suspect_label: () => evidence("suspect_label", featureDeltas(profile, label.slice(0, RIVAL_COLUMNS))),
-    class_overlap: () => evidence("class_overlap", featureDeltas(profile, overlap.slice(0, RIVAL_COLUMNS))),
-    shortcut: () => evidence("shortcut", shortcutTable(shortcut.slice(0, RIVAL_SHORTCUTS), tau)),
-    repetition: () => evidence("repetition", branchTable(d, row, tau)),
-    off_scenario: () => evidence("off_scenario", scenarioTable(d)),
+    minority_overlap: () => evidence("minority_overlap", featureDeltas(profile, label.slice(0, RIVAL_COLUMNS))),
+    majority_overlap: () => evidence("majority_overlap", featureDeltas(profile, overlap.slice(0, RIVAL_COLUMNS))),
+    single_feature_cut: () => evidence("single_feature_cut", cutTable(row, tau)),
+    low_variability: () => evidence("low_variability", branchTable(row, last.quality.stats, tau)),
   };
   fill("qr-evidence", row.defects.map((x) => parts[x]()).filter(Boolean));
   const rivals = rivalClasses(d);
   sortable($("qr-rivals"), [
     { key: "class", label: "rival class", text: true, help: TERMS["rival class"] },
     { key: "here", label: "rival share here", format: (v) => dec(v, 3), help: TERMS["rival share"] },
-    { key: "rules", label: "best one-column rule", wrap: true, help: HELP.rule,
-      format: (v) => (v.length ? [colName(v[0][0]), ` · ${dec(v[0][1], 3)} here, ${dec(v[0][2], 3)} of the rival`] : "–") },
   ], rivals, { empty: "No class was measured against it." });
-  drawCellProvenance(d);
-  const involved = new Set([...label, ...overlap, ...shortcut].map((r) => r.class));
+  drawCellProvenance(d, row);
+  const involved = new Set([...label, ...overlap].map((r) => r.class));
   drawCellMap(row, d, rivals, involved.size ? involved : new Set(rivals.slice(0, 1).map((r) => r.class)), id);
 }
 
@@ -1324,61 +1286,47 @@ function featureDeltas(profile, rivals) {
 }
 
 /**
- * Per rival class this cell has a shortcut against, the columns whose rule between the two classes errs under τ on
- * both sides here: its error on this cell's rows and on the rival class's, the best first.
- * @param {object[]} rivals from rivalClasses, the shortcut ones
+ * The widest branch of its class the cell lies in that has low_variability: its share of the class's CSV rows, and its
+ * variance over the reference, the variance of the median leaf of the dataset.
+ * @param {object} row its quality_regions row
+ * @param {object} stats the quality_stats row
  * @param {number} tau
- * @returns {HTMLElement}
  */
-function shortcutTable(rivals, tau) {
-  if (!rivals.length) return h("p", { class: "note" }, "No rival class measured.");
-  const lines = rivals.flatMap((r) => r.rules.filter(([, a, b]) => a < tau && b < tau)
-    .map(([column, a, b]) => [r.class, colName(column), dec(a, 3), dec(b, 3)]));
+function branchTable(row, stats, tau) {
   return h("div", { class: "table-wrap" }, table(
-    ["rival class", "column", h("span", { title: HELP.cellError }, "error here"),
-      h("span", { title: HELP.rivalError }, "error on the rival class")], lines));
+    ["share of its class in the branch", "variance of the branch over the reference", "reference", "τ"],
+    [[pct(row.low_variability_share), dec(row.low_variability_ratio, 3), dec(stats.low_variability_reference, 4),
+      String(tau)]]));
 }
 
 /**
- * The share of the cell's CSV rows that break the scenario of its class, over its leaves: on any key, the one
- * off_scenario reads, then per key.
- * @param {object} d the detail of the cell (/quality/region)
- */
-function scenarioTable(d) {
-  const line = (name, prefix) => {
-    let broken = 0, judged = 0;
-    for (const c of d.cells) {
-      const n = c[`${prefix}_n`] ?? 0;
-      if (n && c[prefix] != null) { broken += c[prefix] * n; judged += n; }
-    }
-    return judged ? [name, pct(broken / judged), num(judged)] : null;
-  };
-  const lines = [line("any key", "scenario"),
-    ...["dst_port", "src_ip", "time"].map((key) => line(key, `scenario_${key}`))].filter(Boolean);
-  return h("div", { class: "table-wrap" }, table(["key", "CSV rows off the scenario", "CSV rows judged"], lines));
-}
-
-/**
- * The widest branch of its class the cell lies in that is a repetition: its share of the class's CSV rows and its
- * variance over the dataset's, against τ.
- * @param {object} d the detail of the cell (/quality/region)
+ * The columns that alone separate the cell from its rival class: the share of that class's rows inside the cell's
+ * values on each, the lowest first (those under one half), the lowest with its interval.
  * @param {object} row its quality_regions row
  * @param {number} tau
  */
-function branchTable(d, row, tau) {
-  return h("div", { class: "table-wrap" }, table(
-    ["share of its class in the branch", "variance of the branch over the dataset's", "dataset variance", "τ"],
-    [[pct(row.repetition_share), dec(row.repetition_ratio, 3), dec(d.cells[0]?.variance_dataset, 2), String(tau)]]));
+function cutTable(row, tau) {
+  const lines = row.cut_columns.map(([column, share], i) => [colName(column), i === 0
+    ? `${dec(share, 3)} (${dec(row.cut_low, 3)}–${dec(row.cut_high, 3)})` : dec(share, 3)]);
+  return h("div", {},
+    h("p", { class: "note" }, `against ${row.cut_class}: the share of its rows inside this cell's values, under τ = ${tau}`),
+    h("div", { class: "table-wrap" }, table(["column", `rows of ${row.cut_class} inside`], lines)));
 }
 
 /** "YYYY-MM-DD HH:MM:SS → HH:MM:SS", the day written once when both times fall on it. */
 const span = (from, to) => `${from.slice(0, 19)} → ${to.slice(0, 10) === from.slice(0, 10) ? to.slice(11, 19) : to.slice(0, 19)}`;
 
-/** Per provenance column, over the cell's CSV rows: its distinct values, the most frequent, the rows per repeated value. */
-function drawCellProvenance(d) {
+/**
+ * Per provenance column, over the cell's CSV rows: its distinct values, the most frequent, the rows per repeated value;
+ * then how its rows share each key and the time with their nearest rival row, against the control (their nearest row of
+ * their own class) and chance.
+ * @param {object} d the detail of the cell (/quality/region)
+ * @param {object} row its quality_regions row
+ */
+function drawCellProvenance(d, row) {
   const time = d.time == null ? null
     : h("p", { class: "note" }, `time ${span(d.time.time_from.replace("T", " "), d.time.time_to.replace("T", " "))}`);
-  fill("qr-provenance-time", time);
+  fill("qr-provenance-time", time, neighbourTable(row));
   sortable($("qr-provenance"), [
     { key: "key", label: "column", text: true },
     { key: "n_values", label: "distinct values", format: num },
@@ -1386,6 +1334,28 @@ function drawCellProvenance(d) {
     { key: "repeat", label: "CSV rows per repeated value", format: (v) => (v == null ? "–" : short(v)),
       help: "the mean CSV rows of a value, over the values of more than one" },
   ], d.provenance, { empty: "The dataset names no provenance columns (a provenance block in its yaml)." });
+}
+
+/**
+ * How the cell's rows share each key and the time with their nearest rival row, their nearest own row (the control)
+ * and by chance: for a key, the share of pairs of copies with the same value; for the time, the mean chance that the
+ * neighbour's copies drawn at random lie as near (one half: no tie to the time; lower: nearer than chance). Only the
+ * excess of the rival over the control speaks of the labels.
+ * @param {object} row its quality_regions row
+ * @returns {HTMLElement|null}
+ */
+function neighbourTable(row) {
+  const lines = ["src_ip", "src_port", "dst_ip", "dst_port"].filter((k) => row[`${k}_n`] > 0).map((k) => {
+    const n = row[`${k}_n`];
+    return [k, dec(row[`${k}_same`] / n, 3), dec(row[`${k}_own`] / n, 3), dec(row[`${k}_chance`] / n, 3), num(n)];
+  });
+  if (row.time_n > 0) {
+    lines.push(["time", dec(row.time_near / row.time_n, 3), dec(row.time_near_own / row.time_n, 3), "0.5",
+      num(row.time_n)]);
+  }
+  if (!lines.length) return null;
+  return h("div", { class: "table-wrap" }, table(
+    ["with its nearest", "rival row", "own row (control)", "chance", "rows"], lines));
 }
 
 /**
@@ -1425,7 +1395,7 @@ async function drawCellMap(row, d, rivals, picked, detail) {
   el.replaceChildren(h("p", { class: "note" }, "loading…"));
   let data;
   try {
-    data = await api(`/${encodeURIComponent(state.dataset)}/quality/map?region=${row.region}${tauQuery("&")}`);
+    data = await api(`/${encodeURIComponent(state.dataset)}/quality/map?region=${row.region}`);
   } catch (e) {
     if (id === qualityMapId) el.replaceChildren(h("p", { class: "note" }, e.message));
     return;

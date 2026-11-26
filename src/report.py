@@ -1,15 +1,16 @@
-"""The verdicts of quality_report at a value of tau.
+"""The verdicts of quality_report, at the dataset's tau.
 
-What quality_report measures does not depend on tau: the share of the
-rows of every cell confused with each rival class, the errors of the
-one-column rules between its class and each rival class, the variance
-of every branch of every class's tree and of the dataset, the share of
-its CSV rows that break the scenario, the counts of rows. tau and the
-confidence only compare them: every share is read with its interval
-(src.quality), and a cell has a defect, has none, or is undecided. judge turns these measures into the verdicts
-(the defects of the cells, the regions they merge into, the shares of
-rows), so that the stage, at quality.tau, and the dashboard, at any
-tau, run the same code.
+What quality_report measures does not depend on tau: per cell its rows,
+its CSV rows, its rows with a null or invalid value or in a label
+conflict, and the share of its rows confused with each rival class; per
+node of each class's cut, the variance of its rows and, on each column,
+the share of its rival class's rows inside its values. judge reads them
+at tau and the confidence, once, in the stage: it sums the measures of
+the cells up the cut, gives every node a verdict on every entry
+(src.quality.node_verdicts), merges the cells into regions where no
+verdict a part decides changes (src.cells.merge_nodes), and writes the
+rows of the regions, of the classes and of the dataset. A region is a
+node of the cut, and its verdicts are read on its own rows.
 """
 
 from __future__ import annotations
@@ -17,41 +18,26 @@ from __future__ import annotations
 __all__ = ["COUNTS", "Verdicts", "judge"]
 
 import json
-from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import polars as pl
 
-from src.cells import CellTree, merge_cells
+from src.cells import CellTree, merge_nodes
 from src.data import KINDS
 from src.quality import (
-    CLASS_DEFECTS,
     DEFECTS,
-    RIVAL_DEFECTS,
-    RivalMeasure,
-    defects_of,
-    repetition_verdicts,
-    rival_defects,
+    STRUCTURAL,
+    low_variability_reference,
+    low_variability_verdicts,
+    node_sums,
+    node_verdicts,
     share_bounds,
-    verdict,
 )
 
 COUNTS = ("n_rows", "n_read", "conflict_rows", "conflict_read", "missing_rows")
 COUNTS += ("missing_read",) + tuple(f"{kind}_rows" for kind in KINDS)
-_OWN = (
-    "cell",
-    "class",
-    "n_rows",
-    "n_read",
-    "n_duplicates",
-    "dup_share",
-)  # the tau-free
-_OWN += ("conflict_rows", "conflict_read", "conflict_with")  # columns of a cell
-_OWN += ("missing_rows", "missing_read")
-_OWN += tuple(f"{kind}_rows" for kind in KINDS) + ("clear_rows",)
-_JUDGED = RIVAL_DEFECTS + CLASS_DEFECTS  # the defects of a cell, not of its rows
 
 
 @dataclass(frozen=True)
@@ -60,14 +46,13 @@ class Verdicts:
 
     Attributes:
         rivals: The quality_rivals rows, with region and rival_regions.
-        cells: The quality_cells rows, with region, n_rivals, the rival
-            columns, the classes of each rival defect, the shortcut
-            columns, the branch of repetition, defects and undecided.
+        cells: The quality_cells rows, with region.
         regions: The quality_regions rows.
         classes: The quality_classes rows.
         stats: tau, confidence, n_regions, regions_<defect>,
-            regions_no_defect, undecided_<defect>, share_<defect> and
-            share_no_defect of quality_stats.
+            regions_no_defect, undecided_<defect>, share_<defect>,
+            share_no_defect and low_variability_reference of
+            quality_stats.
     """
 
     rivals: list[dict[str, Any]]
@@ -87,218 +72,321 @@ def judge(
 ) -> Verdicts:
     """Return the verdicts of quality_report at tau.
 
-    Per cell, the verdict of every entry, a defect against a target
-    (True: it has it beyond the error of sampling, False: it has it not,
-    None: undecided): src.quality.rival_defects against each rival class
-    it was measured against (no rival defect against a class it has no
-    rival cell of), src.quality.repetition_verdicts of the branches
-    above it (repetition, which is never undecided), and
-    the share of its CSV rows that break the scenario, on any key,
-    against tau (off_scenario). A cell has a defect when an entry of it
-    is True; class_overlap only against a class it is no suspect_label
-    of. Then the cells merge into regions (src.cells.merge_cells, class
-    by class: the largest branches whose cells do not contradict each
-    other, each named by the node of the cell tree at its top), which
-    have the defects their cells have; then the shares of the CSV rows
-    with each defect and with none, per class and over the dataset: a
-    row has invalid_values when its data row holds a null or invalid
-    value, duplicates when it repeats a row read before it,
-    label_conflict when it is identical to a row of another class, the
-    others when its cell has them, and none when it has none (its first
-    copy: clear_rows of the cells without a defect of cell).
+    Per node of every class's cut, the measures of its cells summed
+    (COUNTS, the rows confused with each rival class as the sum of the
+    rival share times the rows, the provenance sums) and those the
+    stage measured on the node (variance, cut_*); then the verdict of
+    every entry (src.quality.node_verdicts, low_variability from
+    src.quality.low_variability_verdicts against the median cell);
+    then the regions (src.cells.merge_nodes on the raw verdicts). A
+    region has a defect when an entry of it is True; majority_overlap
+    only against a class it has no minority_overlap against. The share
+    of the CSV rows with a defect is that of the rows of the regions
+    with it, per class and over the dataset.
 
     Args:
-        cells: The tau-free quality_cells rows (those the stage logs
-            are the judged ones too: what depends on tau is ignored),
-            sorted by cell, one per cell 0 to m - 1: cell, class,
-            COUNTS, n_duplicates, dup_share, conflict_with, clear_rows
-            (its distinct rows without a null or invalid value and in no
-            label conflict), variance_dataset (the variance of the
-            dataset, the same in every cell),
-            and with a scenario scenario and scenario_n (the share of
-            its judged CSV rows that break it on any key, and those
-            rows); off_scenario is not measured when no cell has one.
+        cells: The tau-free quality_cells rows, sorted by cell, one per
+            cell 0 to m - 1: cell, class, COUNTS, n_duplicates,
+            conflict_with and the provenance columns of the cell
+            (<key>_same, <key>_own, <key>_chance, <key>_n, time_near,
+            time_near_own, time_n; none without a provenance).
         rivals: The tau-free quality_rivals rows, one per cell and
             rival class: cell, class, rival_class, rival_cells (JSON
-            list), rival_share (of the cell's rows, over its n_rows),
-            n_rival_rows and rules (JSON list of [column, error on the
-            cell, error on the rival class]); region and rival_regions
-            are ignored.
+            list) and rival_share (of the cell's distinct rows).
         branches: The quality_branches rows, the cells' tree with the
-            spread of every node: node, class (the code), parent (-1 for
-            a root), cell (null for a node that is not a cell), n_rows,
-            n_read, variance, sorted by node, in pre-order per class.
+            measures of every node: node, class (the code), parent (-1
+            for a root), cell (null for a node that is not a cell),
+            n_rows, n_read, variance, cut_class (null for none),
+            cut_share, n_cut_rows, cut_columns (JSON list of [column,
+            share]), sorted by node, in pre-order per class.
         classes: The class names, by code.
         tau: The threshold, in (0, 0.5].
         confidence: The level of the intervals, in (0.5, 1).
 
     Returns:
-        The Verdicts. Same rows in the same order as the stage logs
-        them, in the columns of quality_report's docstring.
+        The Verdicts: rivals and cells as given, with region and
+        rival_regions; regions (one row per region: region, class,
+        n_cells, the sums of its cells, conflict_with,
+        <defect>_share/_low/_high of the three structural defects,
+        rival_class with rival_share/_low/_high (its highest),
+        minority_overlap_with and majority_overlap_with, cut_class,
+        cut_share/_low/_high and cut_columns, low_variability_branch,
+        low_variability_share and low_variability_ratio, defects and
+        undecided joined by ",", the provenance sums); classes (class,
+        n_rows, n_read, n_cells, n_regions, share_<defect>,
+        share_no_defect); stats.
     """
-    m = len(cells)
-    sides = defaultdict(list)  # per cell: (its RivalMeasure, the column names, row)
-    rival_of = defaultdict(set)  # per cell: the classes of its rival cells
-    n_rivals = np.zeros(m, dtype=np.int64)
-    for i, rival in enumerate(rivals):
-        c, k = rival["cell"], classes.index(rival["rival_class"])
-        n_rivals[c] += len(json.loads(rival["rival_cells"]))
-        rival_of[c].add(k)
-        rules = json.loads(rival["rules"]) if rival["rules"] else []
-        measure = RivalMeasure(
-            rival_class=k,
-            share=rival["rival_share"],
-            n_rows=cells[c]["n_rows"],
-            rules=np.array([r[1:] for r in rules], dtype=np.float64).reshape(-1, 2),
-            n_rival=rival["n_rival_rows"],
-        )
-        sides[c].append((measure, [r[0] for r in rules], i))
-    # The defects the dataset cannot measure: off_scenario without a
-    # scenario (a table shared with other datasets may hold its column,
-    # null).
-    scenario = any(c.get("scenario") is not None for c in cells)
-    unmeasured = () if scenario else ("off_scenario",)
+    code = {name: k for k, name in enumerate(classes)}
+    nodes = branches["node"].to_list()
+    at = {v: i for i, v in enumerate(nodes)}
+    parent = np.array([at.get(p, -1) for p in branches["parent"].to_list()])
+    node_cell = branches["cell"].fill_null(-1).to_numpy().astype(np.int64)
+    node_class = branches["class"].to_numpy().astype(np.int64)
+    m, k = len(cells), len(nodes)
+
+    def summed(key: str) -> np.ndarray:
+        values = np.array([c.get(key) or 0 for c in cells], dtype=np.float64)
+        return node_sums(parent, node_cell, values)
+
+    count = {key: summed(key) for key in COUNTS}
+    extra = [key for key in (cells[0] if cells else {}) if key not in _MEASURED]
+    origin = {key: summed(key) for key in extra}  # the provenance sums
+    confused_cell = np.zeros((m, len(classes)))
+    present_cell = np.zeros((m, len(classes)))
+    for r in rivals:
+        c, j = r["cell"], code[r["rival_class"]]
+        confused_cell[c, j] += r["rival_share"] * cells[c]["n_rows"]
+        present_cell[c, j] = 1.0
+    confused = node_sums(parent, node_cell, confused_cell)
+    present = node_sums(parent, node_cell, present_cell) > 0
+    conflict = _node_sets(
+        parent, node_cell, [set(_listed(c["conflict_with"])) for c in cells]
+    )
+    n_rows, n_read = count["n_rows"], count["n_read"]
+    variance = branches["variance"].to_numpy().astype(np.float64)
+    reference = low_variability_reference(variance, node_cell)
+    compact, top = low_variability_verdicts(parent, n_read, variance, reference, tau)
+    root = np.arange(k)
+    for v in range(k):  # a parent before its children
+        if parent[v] >= 0:
+            root[v] = root[parent[v]]
+    cut_share = branches["cut_share"].to_list()
+    n_cut = branches["n_cut_rows"].to_list()
     entries = [
-        _entries(cells[c], sides[c], rival_of[c], classes, tau, confidence)
-        for c in range(m)
+        node_verdicts(
+            own=int(node_class[v]),
+            n_classes=len(classes),
+            n_rows=float(n_rows[v]),
+            n_read=float(n_read[v]),
+            missing_rows=float(count["missing_rows"][v]),
+            conflict_rows=float(count["conflict_rows"][v]),
+            confused={j: float(x) for j, x in enumerate(confused[v]) if x > 0},
+            cut_share=cut_share[v],
+            n_cut_rows=int(n_cut[v] or 0),
+            low_variability=bool(compact[v]),
+            tau=tau,
+            confidence=confidence,
+        )
+        for v in range(k)
     ]
-    repeated, branch = _repetition(branches, cells, tau)
-    for c in range(m):
-        entries[c][("repetition", None)] = repeated[c]
-    yes = [{e for e, v in found.items() if v is True} for found in entries]
-    no = [{e for e, v in found.items() if v is False} for found in entries]
-    region = _merge(branches, yes, no)
-    rival_rows = [_rival_row(r, region) for r in rivals]
-    judged = (region, classes, n_rivals, sides, entries, tau, confidence)
-    judged += (_branch_of(branches, branch),)
-    cell_rows = [_cell_row(c, cells[c], *judged) for c in range(m)]
-    region_rows = _region_rows(cell_rows, region, classes)
-    class_rows = _class_rows(cell_rows, region_rows, classes, unmeasured)
+    region = _merge(parent, node_cell, node_class, entries)  # its top node, per cell
+    held = [_held(found) for found in entries]
+    regions = []
+    for t in sorted(set(region.tolist())):
+        found, own = entries[t], held[t]
+        rows = float(n_rows[t])
+        shares = {
+            "invalid_values": count["missing_rows"][t] / rows,
+            "duplicates": 1 - rows / n_read[t] if n_read[t] > 0 else 0.0,
+            "label_conflict": count["conflict_rows"][t] / rows,
+        }
+        row: dict[str, Any] = {
+            "region": int(nodes[t]),
+            "class": classes[node_class[t]],
+            "n_cells": int((region == t).sum()),
+            **{
+                key: (
+                    float(count[key][t])
+                    if key.endswith("_read")
+                    else int(count[key][t])
+                )
+                for key in COUNTS
+            },
+            "n_duplicates": float(n_read[t] - n_rows[t]),
+            "conflict_with": _names(conflict[t], classes),
+        }
+        for d in STRUCTURAL:
+            low, high = share_bounds(shares[d], rows, confidence)
+            row.update(
+                {f"{d}_share": float(shares[d]), f"{d}_low": low, f"{d}_high": high}
+            )
+        row.update(_worst_rival(confused[t], present[t], rows, classes, confidence))
+        row.update(
+            minority_overlap_with=_names(own["minority_overlap"], classes),
+            majority_overlap_with=_names(own["majority_overlap"], classes),
+            **_cut(branches, t, confidence),
+        )
+        if compact[t]:
+            b = top[t]
+            row.update(
+                low_variability_branch=int(nodes[b]),
+                low_variability_share=float(n_read[b] / n_read[root[b]]),
+                low_variability_ratio=(
+                    float(variance[b] / reference) if reference else None
+                ),
+            )
+        else:
+            row.update(
+                low_variability_branch=None,
+                low_variability_share=None,
+                low_variability_ratio=None,
+            )
+        defects = [d for d in DEFECTS if own[d]]
+        undecided = [
+            d
+            for d in DEFECTS
+            if d not in defects
+            and any(v is None for (e, _), v in found.items() if e == d)
+        ]
+        row["defects"] = ",".join(defects) or None
+        row["undecided"] = ",".join(undecided) or None
+        for key in extra:
+            value = origin[key][t]
+            row[key] = int(value) if key.endswith("_n") else float(value)
+        regions.append(row)
+    cell_rows = [
+        {"cell": c["cell"], "region": int(nodes[region[c["cell"]]]), **_without(c)}
+        for c in cells
+    ]
+    rival_rows = [_rival_row(r, region, nodes) for r in rivals]
+    class_rows = _class_rows(cell_rows, regions, classes)
     stats = {
         "tau": tau,
         "confidence": confidence,
-        "n_regions": len(region_rows),
+        "n_regions": len(regions),
         **{
-            f"regions_{d}": (
-                None
-                if d in unmeasured
-                else sum(d in _listed(r["defects"]) for r in region_rows)
-            )
+            f"regions_{d}": sum(d in _listed(r["defects"]) for r in regions)
             for d in DEFECTS
         },
-        "regions_no_defect": sum(not r["defects"] for r in region_rows),
+        "regions_no_defect": sum(not r["defects"] for r in regions),
         **{
-            f"undecided_{d}": (
-                None
-                if d in unmeasured
-                else sum(d in _listed(r["undecided"]) for r in cell_rows)
-            )
-            for d in _JUDGED
+            f"undecided_{d}": sum(d in _listed(r["undecided"]) for r in regions)
+            for d in DEFECTS
         },
-        **_shares(cell_rows, unmeasured),
+        **_shares(regions),
+        "low_variability_reference": reference,
     }
-    return Verdicts(rival_rows, cell_rows, region_rows, class_rows, stats)
+    return Verdicts(rival_rows, cell_rows, regions, class_rows, stats)
 
 
-def _entries(row, sides, rival_of, classes, tau, confidence) -> dict:
-    """Return the verdict of every entry of a cell: (defect, class code or None) to True, False or None."""
-    found = dict(rival_defects([s[0] for s in sides], tau, confidence))
-    own = classes.index(row["class"])
-    for k in range(len(classes)):
-        if k != own and k not in rival_of:  # no rival cell: none of them
-            found.update({(d, k): False for d in RIVAL_DEFECTS})
-    share, n = row.get("scenario"), row.get("scenario_n")
-    if share is not None and n:
-        found[("off_scenario", None)] = verdict(
-            *share_bounds(share, n, confidence), tau
-        )
-    return found
+_MEASURED = ("cell", "region", "class", *COUNTS, "n_duplicates", "conflict_with")
+# the columns of a quality_cells row that are no provenance sum
 
 
-def _repetition(branches: pl.DataFrame, cells, tau):
-    """Return repetition_verdicts over every class's tree, positions in place of node ids."""
-    at = {v: i for i, v in enumerate(branches["node"].to_list())}
-    parent = np.array([at.get(p, -1) for p in branches["parent"].to_list()])
-    node_cell = branches["cell"].fill_null(-1).to_numpy()
-    reference = cells[0]["variance_dataset"] if cells else 0.0
-    return repetition_verdicts(
-        parent,
-        node_cell,
-        branches["n_read"].to_numpy().astype(np.float64),
-        branches["variance"].to_numpy().astype(np.float64),
-        reference,
-        tau,
-    )
-
-
-def _branch_of(branches: pl.DataFrame, top: np.ndarray) -> list[dict]:
-    """Per cell, repetition_branch, repetition_share and repetition_ratio of the branch top (nulls for -1)."""
-    node = branches["node"].to_numpy()
-    n_read = branches["n_read"].to_numpy().astype(np.float64)
-    variance = branches["variance"].to_numpy().astype(np.float64)
-    root = np.arange(len(node))
-    parent = branches["parent"].to_numpy()
-    at = {v: i for i, v in enumerate(node.tolist())}
-    for i in range(len(node)):  # a parent before its children: its root is set
-        if parent[i] >= 0:
-            root[i] = root[at[parent[i]]]
-    rows = []
-    for t in top.tolist():
-        if t < 0:
-            rows.append(dict.fromkeys(_BRANCH))
+def _held(found: dict) -> dict[str, set]:
+    """Return, per defect, the targets an entry has it against: majority_overlap not where minority_overlap."""
+    held: dict[str, set] = {d: set() for d in DEFECTS}
+    for (d, target), value in found.items():
+        if value is not True:
             continue
-        rows.append(
-            {
-                "repetition_branch": int(node[t]),
-                "repetition_share": float(n_read[t] / n_read[root[t]]),
-                "repetition_variance": float(variance[t]),
-            }
-        )
-    return rows
-
-
-_BRANCH = ("repetition_branch", "repetition_share", "repetition_variance")
-_RIVAL = ("rival_class", "rival_share", "rival_share_low", "rival_share_high")
-
-
-def _established(found: dict) -> dict[str, set]:
-    """Return, per defect of _JUDGED, the targets a cell has it against: class_overlap not where suspect_label."""
-    held = {d: set() for d in _JUDGED}
-    for (d, target), v in found.items():
-        if v is not True:
-            continue
-        if d == "class_overlap" and found.get(("suspect_label", target)) is True:
+        if d == "majority_overlap" and found.get(("minority_overlap", target)) is True:
             continue
         held[d].add(target)
     return held
 
 
-def _merge(tree: pl.DataFrame, yes: list[set], no: list[set]) -> np.ndarray:
-    """Return the region of every cell: cells.merge_cells class by class, the node at the top of its branch."""
-    region = np.empty(len(yes), dtype=np.int64)
-    for _, part in tree.group_by("class", maintain_order=True):
-        first = int(part["node"][0])
-        own = part["cell"].drop_nulls().to_numpy()
-        base = int(own.min())
+def _merge(
+    parent: np.ndarray, node_cell: np.ndarray, node_class: np.ndarray, entries: list
+) -> np.ndarray:
+    """Return the top node of the region of every cell: src.cells.merge_nodes, class by class."""
+    region = np.empty(int((node_cell >= 0).sum()), dtype=np.int64)
+    for c in dict.fromkeys(
+        node_class.tolist()
+    ):  # the classes in the order of their trees
+        span = np.flatnonzero(node_class == c)
+        first = int(span[0])
+        own = node_cell[span]
+        base = int(own[own >= 0].min())
         cut = CellTree(
-            parent=np.where(part["parent"] >= 0, part["parent"] - first, -1),
-            cell=np.where(part["cell"].is_null(), -1, part["cell"].fill_null(0) - base),
+            parent=np.where(parent[span] >= 0, parent[span] - first, -1),
+            cell=np.where(own >= 0, own - base, -1),
         )
-        span = slice(base, base + len(own))
-        region[span] = merge_cells(cut, yes[span], no[span]) + first
+        found = merge_nodes(cut, [entries[i] for i in span])
+        region[base : base + len(found)] = found + first
     return region
 
 
-def _names(codes, classes: list[str]) -> str | None:
-    """Return the names of class codes in code order joined by ",", None for none."""
-    return ",".join(classes[c] for c in sorted(codes)) or None
+def _node_sets(
+    parent: np.ndarray, node_cell: np.ndarray, per_cell: list[set]
+) -> list[set]:
+    """Return, per node, the union of the sets of the cells below it."""
+    out: list[set] = [set() for _ in range(len(parent))]
+    for v in range(len(parent) - 1, -1, -1):  # children after their parent
+        if node_cell[v] >= 0:
+            out[v] |= per_cell[node_cell[v]]
+        if parent[v] >= 0:
+            out[parent[v]] |= out[v]
+    return out
 
 
-def _listed(value: str | None) -> list[str]:
-    return value.split(",") if value else []
+def _worst_rival(
+    confused: np.ndarray,
+    present: np.ndarray,
+    rows: float,
+    classes: list[str],
+    confidence: float,
+) -> dict[str, Any]:
+    """Return rival_class, rival_share, rival_share_low and rival_share_high: the highest of a node's rival classes (ties to the lower code), nulls without one."""
+    if not present.any():
+        return dict.fromkeys(_RIVAL)
+    share = np.where(present, confused / rows, -1.0)
+    j = int(np.argmax(share))
+    low, high = share_bounds(float(share[j]), rows, confidence)
+    return dict(zip(_RIVAL, (classes[j], float(share[j]), low, high)))
 
 
-def _rival_row(rival: dict, region: np.ndarray) -> dict:
+_RIVAL = ("rival_class", "rival_share", "rival_share_low", "rival_share_high")
+
+
+def _cut(branches: pl.DataFrame, t: int, confidence: float) -> dict[str, Any]:
+    """Return cut_class, cut_share, cut_low, cut_high and cut_columns of a node (nulls without a rival class)."""
+    node = branches.row(t, named=True)
+    if node["cut_share"] is None:
+        return dict.fromkeys(
+            ("cut_class", "cut_share", "cut_low", "cut_high", "cut_columns")
+        )
+    low, high = share_bounds(node["cut_share"], node["n_cut_rows"], confidence)
+    return {
+        "cut_class": node["cut_class"],
+        "cut_share": float(node["cut_share"]),
+        "cut_low": low,
+        "cut_high": high,
+        "cut_columns": node["cut_columns"],
+    }
+
+
+def _class_rows(
+    cell_rows: list[dict], regions: list[dict], classes: list[str]
+) -> list[dict]:
+    """Return the quality_classes rows: per class its counts and _shares over its regions."""
+    rows = []
+    for name in classes:
+        own = [r for r in cell_rows if r["class"] == name]
+        if not own:
+            continue
+        mine = [r for r in regions if r["class"] == name]
+        rows.append(
+            {
+                "class": name,
+                "n_rows": sum(r["n_rows"] for r in own),
+                "n_read": sum(r["n_read"] for r in own),
+                "n_cells": len(own),
+                "n_regions": len(mine),
+                **_shares(mine),
+            }
+        )
+    return rows
+
+
+def _shares(regions: list[dict]) -> dict[str, float]:
+    """Return share_<defect> and share_no_defect: the share of the CSV rows of these regions in regions with it, or with none."""
+    total = sum(r["n_read"] for r in regions)
+
+    def share(rows: float) -> float:
+        return rows / total if total else 0.0
+
+    return {
+        **{
+            f"share_{d}": share(
+                sum(r["n_read"] for r in regions if d in _listed(r["defects"]))
+            )
+            for d in DEFECTS
+        },
+        "share_no_defect": share(sum(r["n_read"] for r in regions if not r["defects"])),
+    }
+
+
+def _rival_row(rival: dict, region: np.ndarray, nodes: list) -> dict:
     """Return a quality_rivals row with the region of its cell, after the cell, and of its rival cells, after them."""
     row: dict[str, Any] = {}
     for key, value in rival.items():
@@ -306,224 +394,25 @@ def _rival_row(rival: dict, region: np.ndarray) -> dict:
             continue
         row[key] = value
         if key == "cell":
-            row["region"] = int(region[value])
+            row["region"] = int(nodes[region[value]])
         if key == "rival_cells":
             others = json.loads(value)
-            row["rival_regions"] = json.dumps(sorted({int(region[o]) for o in others}))
-    return row
-
-
-def _cell_row(
-    c, base, region, classes, n_rivals, sides, entries, tau, confidence, branch
-) -> dict:
-    """Return the quality_cells row of a cell: the tau-free columns of base, then what tau decides."""
-    found = entries[c]
-    held = _established(found)
-    rival = max(sides[c], key=lambda s: (s[0].share, -s[0].rival_class), default=None)
-    row = {k: base[k] for k in _OWN}
-    row = {"cell": row.pop("cell"), "region": int(region[c]), **row}
-    dataset = base["variance_dataset"]
-    top = branch[c]
-    row.update(
-        n_rivals=int(n_rivals[c]),
-        **dict.fromkeys(_RIVAL),
-        label_with=_names(held["suspect_label"], classes),
-        overlap_with=_names(held["class_overlap"], classes),
-        shortcut_with=_names(held["shortcut"], classes),
-        repetition_branch=top["repetition_branch"],
-        repetition_share=top["repetition_share"],
-        repetition_ratio=(
-            top["repetition_variance"] / dataset
-            if dataset and top["repetition_variance"] is not None
-            else None
-        ),
-        **_shortcut(sides[c], held["shortcut"], classes, tau, confidence),
-    )
-    if rival is not None:
-        measure = rival[0]
-        low, high = share_bounds(measure.share, measure.n_rows, confidence)
-        row.update(
-            rival_class=classes[measure.rival_class],
-            rival_share=measure.share,
-            rival_share_low=low,
-            rival_share_high=high,
-        )
-    established = {d for d, targets in held.items() if targets}
-    row["defects"] = (
-        ",".join(
-            defects_of(
-                row["missing_rows"],
-                row["n_rows"],
-                row["n_read"],
-                row["conflict_rows"],
-                established,
+            row["rival_regions"] = json.dumps(
+                sorted({int(nodes[region[o]]) for o in others})
             )
-        )
-        or None
-    )
-    maybe = {d for (d, _), v in found.items() if v is None} - established
-    row["undecided"] = ",".join(d for d in _JUDGED if d in maybe) or None
-    row.update({k: v for k, v in base.items() if k not in row and k != "region"})
     return row
 
 
-def _shortcut(sides, against, classes, tau, confidence) -> dict:
-    """Return shortcut_class, shortcut_columns and shortcut_error of a cell.
-
-    Among the rival classes it has shortcut against, the one whose best
-    rule errs least on its worse side; its columns that are a shortcut
-    (both upper bounds under tau), the best first, and that error. None
-    without a shortcut.
-    """
-    best = None
-    for measure, columns, _ in sides:
-        if measure.rival_class not in against:
-            continue
-        n = (measure.n_rows, measure.n_rival)
-        cut = [
-            (float(max(errors)), name)
-            for name, errors in zip(columns, measure.rules)
-            if all(share_bounds(e, k, confidence)[1] < tau for e, k in zip(errors, n))
-        ]
-        if cut and (best is None or min(cut)[0] < best[0][0][0]):
-            best = (sorted(cut), measure.rival_class)
-    if best is None:
-        return dict.fromkeys(("shortcut_class", "shortcut_columns", "shortcut_error"))
-    cut, k = best
-    return {
-        "shortcut_class": classes[k],
-        "shortcut_columns": ",".join(name for _, name in cut),
-        "shortcut_error": cut[0][0],
-    }
+def _without(row: dict) -> dict:
+    """Return a quality_cells row without cell and region (they come first)."""
+    return {k: v for k, v in row.items() if k not in ("cell", "region")}
 
 
-def _region_rows(
-    cell_rows: list[dict], region: np.ndarray, classes: list[str]
-) -> list[dict]:
-    """Return the quality_regions rows: the counts of their cells summed, the defects they have."""
-    rows = []
-    for r in np.unique(region):
-        own = [cell_rows[c] for c in np.flatnonzero(region == r)]
-        first = own[0]
-        summed = {key: sum(row[key] for row in own) for key in COUNTS}
-        worst = max(
-            (row for row in own if row["rival_share"] is not None),
-            key=lambda row: row["rival_share"],
-            default=None,
-        )
-
-        def union(key: str) -> set[str]:
-            return {n for row in own for n in _listed(row[key])}
-
-        held = {
-            "suspect_label": union("label_with"),
-            "class_overlap": union("overlap_with"),
-            "shortcut": union("shortcut_with"),
-            **{
-                d: (
-                    {"cell"}
-                    if any(d in _listed(row["defects"]) for row in own)
-                    else set()
-                )
-                for d in ("repetition", "off_scenario")
-            },
-        }
-        defects = defects_of(
-            summed["missing_rows"],
-            summed["n_rows"],
-            summed["n_read"],
-            summed["conflict_rows"],
-            {d for d, targets in held.items() if targets},
-        )
-        codes = lambda names: {classes.index(n) for n in names}  # noqa: E731
-
-        rows.append(
-            {
-                "region": int(r),
-                "class": first["class"],
-                "n_cells": len(own),
-                "n_rows": int(summed["n_rows"]),
-                "n_read": float(summed["n_read"]),
-                "n_duplicates": float(summed["n_read"] - summed["n_rows"]),
-                "dup_share": float(1 - summed["n_rows"] / summed["n_read"]),
-                "conflict_rows": int(summed["conflict_rows"]),
-                "conflict_read": float(summed["conflict_read"]),
-                "conflict_with": _names(codes(union("conflict_with")), classes),
-                "missing_rows": int(summed["missing_rows"]),
-                "missing_read": float(summed["missing_read"]),
-                **{f"{kind}_rows": int(summed[f"{kind}_rows"]) for kind in KINDS},
-                "label_with": _names(codes(held["suspect_label"]), classes),
-                "overlap_with": _names(codes(held["class_overlap"]), classes),
-                "shortcut_with": _names(codes(held["shortcut"]), classes),
-                **{key: None if worst is None else worst[key] for key in _RIVAL},
-                **_widest(own),
-                "defects": ",".join(defects) or None,
-            }
-        )
-    return rows
+def _names(codes, classes: list[str]) -> str | None:
+    """Return the names of class codes (or names) in code order joined by ",", None for none."""
+    ks = sorted(c if isinstance(c, int) else classes.index(c) for c in codes)
+    return ",".join(classes[c] for c in ks) or None
 
 
-def _widest(own: list[dict]) -> dict:
-    """The repetition_share and repetition_ratio of the widest branch of repetition among some cells, nulls without one."""
-    held = [row for row in own if row["repetition_share"] is not None]
-    if not held:
-        return {"repetition_share": None, "repetition_ratio": None}
-    top = max(held, key=lambda row: (row["repetition_share"], -row["repetition_ratio"]))
-    return {k: top[k] for k in ("repetition_share", "repetition_ratio")}
-
-
-def _class_rows(
-    cell_rows: list[dict],
-    region_rows: list[dict],
-    classes: list[str],
-    unmeasured: tuple[str, ...],
-) -> list[dict]:
-    """Return the quality_classes rows: per class its counts and _shares."""
-    rows = []
-    for name in classes:
-        own = [r for r in cell_rows if r["class"] == name]
-        if not own:
-            continue
-        rows.append(
-            {
-                "class": name,
-                "n_rows": sum(r["n_rows"] for r in own),
-                "n_read": sum(r["n_read"] for r in own),
-                "n_cells": len(own),
-                "n_regions": sum(r["class"] == name for r in region_rows),
-                **_shares(own, unmeasured),
-            }
-        )
-    return rows
-
-
-def _shares(
-    cell_rows: list[dict], unmeasured: tuple[str, ...]
-) -> dict[str, float | None]:
-    """Return share_<defect> and share_no_defect over the CSV rows of these cells.
-
-    Args:
-        cell_rows: quality_cells rows, judged.
-        unmeasured: The defects the dataset cannot measure: their
-            share is None.
-    """
-    n_read = sum(r["n_read"] for r in cell_rows)
-    found = {
-        "invalid_values": sum(r["missing_read"] for r in cell_rows),
-        "duplicates": sum(r["n_duplicates"] for r in cell_rows),
-        "label_conflict": sum(r["conflict_read"] for r in cell_rows),
-    }
-    for d in _JUDGED:
-        found[d] = sum(r["n_read"] for r in cell_rows if d in _listed(r["defects"]))
-    clear = sum(
-        r["clear_rows"]
-        for r in cell_rows
-        if not set(_JUDGED) & set(_listed(r["defects"]))
-    )
-    return {
-        **{
-            f"share_{d}": None if d in unmeasured else found[d] / n_read
-            for d in DEFECTS
-        },
-        "share_no_defect": clear / n_read,
-    }
+def _listed(value: str | None) -> list[str]:
+    return value.split(",") if value else []

@@ -1,49 +1,39 @@
-"""Provenance: where each row of the CSV comes from, and the scenario it should fit.
+"""Provenance: where each row of the CSV comes from, as support of the verdicts.
 
 A dataset may name the columns of its rows' source and destination
 (address and port) and time (ProvenanceConfig). Stage clean reads them
 for every row of the CSV, copies included (the copies of a row may come
-from different hosts), and stage quality_report describes them per
-cell (concentration). A dataset may also declare its scenario, what its
-documentation says of where and when each class was generated
-(ScenarioConfig): the ports of the background traffic, and per attack
-its hosts and time windows. A row of an attack class that falls outside
-them breaks the scenario (scenario_breaches); a row breaks it when it
-breaks any of its keys (any_breach), and a cell with tau of its CSV rows
-doing so has the defect off_scenario (src.quality).
+from different hosts). Stage quality_report measures them between each
+distinct row and its nearest rival row (key_coincidence,
+time_nearness), with its nearest row of its own class as the control,
+and describes the hosts of each region (concentration). They never
+decide a verdict: they support one.
 """
 
 from __future__ import annotations
 
 __all__ = [
     "KEYS",
-    "any_breach",
-    "SCENARIO_KEYS",
     "TIME",
-    "breach_shares",
     "concentration",
+    "key_coincidence",
     "read_provenance",
-    "scenario_breaches",
+    "time_nearness",
 ]
 
-from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING
+from collections.abc import Mapping
 
 import numpy as np
 import polars as pl
 
-if TYPE_CHECKING:
-    from src.config import ScenarioConfig
-
 KEYS = ("src_ip", "src_port", "dst_ip", "dst_port")  # measured as values, in this order
 TIME = "time"  # the time of the row
-# The keys a scenario rules on, in this order: a background port as the destination of an
-# attack, a source that is none of the attack's hosts, a time out of its windows.
-SCENARIO_KEYS = ("dst_port", "src_ip", TIME)
 
 
 def read_provenance(
-    columns: Mapping[str, str], time_format: str | None
+    columns: Mapping[str, str],
+    time_format: str | None,
+    afternoon_before: int | None = None,
 ) -> dict[str, pl.Expr]:
     """Return the expressions that read the provenance of rows read as text.
 
@@ -53,6 +43,10 @@ def read_provenance(
         time_format: The format of the TIME column's text (chrono's
             strftime, as polars reads it, e.g. "%Y-%m-%d %H:%M:%S%.f");
             None without TIME.
+        afternoon_before: For a clock of 12 hours written without AM or
+            PM, the first hour of the morning the capture holds: a time
+            whose hour is under it is of the afternoon, and gets 12
+            hours. None reads the hours as written.
 
     Returns:
         By key, in the order of columns, the expression of its value: a
@@ -62,9 +56,13 @@ def read_provenance(
     exprs = {}
     for key, column in columns.items():
         if key == TIME:
-            exprs[key] = pl.col(column).str.to_datetime(
+            time = pl.col(column).str.to_datetime(
                 time_format, time_unit="us", strict=False
             )
+            if afternoon_before is not None:
+                late = time.dt.hour() < afternoon_before
+                time = pl.when(late).then(time + pl.duration(hours=12)).otherwise(time)
+            exprs[key] = time
         else:
             exprs[key] = pl.col(column).cast(pl.Categorical)
     return exprs
@@ -82,12 +80,9 @@ def concentration(group: np.ndarray, values: pl.Series, m: int) -> pl.DataFrame:
     Returns:
         One row per group, 0 to m - 1 in order: top (String: the most
         frequent value, ties to the first in text order), top_share
-        (Float64: its share of the group's rows with a value), n_values
-        (Int64: the distinct values) and eff_n (Float64: exp of the
-        Shannon entropy of the values' shares, Hill's number of order 1:
-        as many equally frequent values have the same entropy; 1 for a
-        single value, n_values when all are equally frequent). A group
-        without a value has n_values 0 and the others null.
+        (Float64: its share of the group's rows with a value) and
+        n_values (Int64: the distinct values). A group without a value
+        has n_values 0 and the others null.
     """
     rows = pl.DataFrame({"group": group, "value": values}).drop_nulls("value")
     counts = (
@@ -100,7 +95,6 @@ def concentration(group: np.ndarray, values: pl.Series, m: int) -> pl.DataFrame:
         top=pl.col("value").sort_by(["len", "value"], descending=[True, False]).first(),
         top_share=pl.col("share").max(),
         n_values=pl.len().cast(pl.Int64),
-        eff_n=(-(pl.col("share") * pl.col("share").log()).sum()).exp(),
     )
     every = pl.DataFrame({"group": np.arange(m, dtype=group.dtype)})
     return (
@@ -111,105 +105,195 @@ def concentration(group: np.ndarray, values: pl.Series, m: int) -> pl.DataFrame:
     )
 
 
-def scenario_breaches(
-    origin: pl.DataFrame,
-    row_class: np.ndarray,
-    classes: Sequence[str],
-    scenario: "ScenarioConfig",
-) -> dict[str, np.ndarray]:
-    """Return, per key of the scenario, whether each CSV row breaks it.
+def key_coincidence(
+    row: np.ndarray,
+    values: pl.Series,
+    labels: np.ndarray,
+    rival_row: np.ndarray,
+    own_row: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return, per distinct row, how often it shares a key's value with its nearest rival and own rows.
 
-    A row of the benign class breaks no rule. A row of another class
-    breaks dst_port when its destination port is one of the background
-    ports, src_ip when its source is none of its class's hosts, time
-    when its time lies in none of its class's windows (each window
-    closed). A key the scenario does not rule on for the row's class,
-    or a value unknown (null), leaves the row unjudged on it.
-
-    Args:
-        origin: The provenance of the CSV rows (paths.read_provenance),
-            one row per CSV row, with the columns of the keys it names.
-        row_class: The class code of every CSV row, shape (n,).
-        classes: The class names, by code.
-        scenario: The dataset's scenario.
-
-    Returns:
-        By key of SCENARIO_KEYS the scenario rules on and origin holds,
-        in that order, per CSV row: 1.0 when it breaks the rule, 0.0
-        when it fits it, NaN when unjudged; shape (n,) float64.
-
-    Raises:
-        ValueError: When the scenario names a class that is not one of
-            classes.
-    """
-    named = [scenario.benign, *scenario.attacks]
-    unknown = [name for name in named if name not in classes]
-    if unknown:
-        raise ValueError(f"the scenario names classes the data lacks: {unknown}")
-    code = {name: k for k, name in enumerate(classes)}
-    row_class = np.asarray(row_class)
-    found = {}
-    if scenario.background_ports and "dst_port" in origin.columns:
-        port = origin["dst_port"].cast(pl.String)
-        ports = [str(p) for p in scenario.background_ports]
-        breaks = port.is_in(ports).cast(pl.Float64).fill_null(np.nan).to_numpy()
-        found["dst_port"] = np.where(row_class != code[scenario.benign], breaks, np.nan)
-    for key in ("src_ip", TIME):
-        declared = any(getattr(a, key) for a in scenario.attacks.values())
-        if not declared or key not in origin.columns:
-            continue
-        breaks = np.full(origin.height, np.nan)
-        for name, attack in scenario.attacks.items():
-            rule = getattr(attack, key)
-            if not rule:
-                continue
-            own = row_class == code[name]
-            if key == TIME:
-                t = origin[TIME].to_numpy()[own]
-                inside = np.zeros(len(t), dtype=bool)
-                for start, end in rule:
-                    start, end = np.datetime64(start, "us"), np.datetime64(end, "us")
-                    inside |= (t >= start) & (t <= end)
-                breaks[own] = np.where(np.isnat(t), np.nan, ~inside)
-            else:
-                hosts = origin[key].cast(pl.String).to_numpy()[own]
-                unknown = np.array([h is None for h in hosts], dtype=bool)
-                breaks[own] = np.where(unknown, np.nan, ~np.isin(hosts, list(rule)))
-        found[key] = breaks
-    return found
-
-
-def any_breach(breaches: Mapping[str, np.ndarray]) -> np.ndarray:
-    """Return, per CSV row, whether it breaks any key of the scenario.
+    For a distinct row i and a neighbour u, the chance that a copy of
+    each, drawn at random, have the same value: the sum over the values
+    of p_i · p_u, p the share of a row's CSV rows with the value (nulls
+    left out), 1 or 0 for rows of one copy. Chance: the same between a
+    row drawn at random from i's class and one from its rival's class,
+    the sum of q_a · q_k with q the mean of p over the distinct rows of
+    a class (with a known value), exact. The own row is the control:
+    neighbours in the features share values for reasons that are no
+    labels' (the traffic of a day, a capture's artifacts, a key that is
+    also a feature).
 
     Args:
-        breaches: By key, per CSV row, 1.0, 0.0 or NaN
-            (scenario_breaches); at least one key.
+        row: The row of the data file every CSV row is a copy of, shape
+            (n_csv,).
+        values: The key's value of every CSV row, text or Categorical,
+            null when unknown.
+        labels: The class code of every row of the data file, shape (n,).
+        rival_row: The nearest row of another class of every row
+            (quality.nearest_rivals), -1 for none.
+        own_row: Its nearest other row of its class, -1 for none.
 
     Returns:
-        Per CSV row, shape (n,): 1.0 when it breaks a key, 0.0 when it
-        is judged on a key and breaks none, NaN when no key judges it.
+        Per row of the data file, shape (n,) float: the coincidence with
+        its rival row, with its own row, and the chance between its
+        class and its rival's; NaN where the row or either neighbour has
+        no known value.
     """
-    return np.fmax.reduce(np.vstack(list(breaches.values())), axis=0)
+    labels = np.asarray(labels)
+    n = len(labels)
+    known = (
+        pl.DataFrame({"row": np.asarray(row, dtype=np.int64), "value": values})
+        .with_columns(pl.col("value").cast(pl.String))
+        .drop_nulls("value")
+    )
+    p = (
+        known.group_by("row", "value")
+        .len()
+        .with_columns(p=pl.col("len") / pl.col("len").sum().over("row"))
+        .select("row", "value", "p")
+    )
+    has = np.zeros(n, dtype=bool)
+    has[p["row"].unique().to_numpy()] = True
+
+    def coincidence(neighbour: np.ndarray) -> np.ndarray:
+        pairs = pl.DataFrame({"row": np.arange(n), "other": neighbour}).filter(
+            pl.col("other") >= 0
+        )
+        other = p.rename({"row": "other", "p": "q"})
+        shared = (
+            pairs.join(p, on="row")
+            .join(other, on=["other", "value"])
+            .group_by("row")
+            .agg((pl.col("p") * pl.col("q")).sum().alias("sum"))
+        )
+        out = np.zeros(n)
+        out[shared["row"].to_numpy()] = shared["sum"].to_numpy()
+        return out
+
+    rival_row, own_row = np.asarray(rival_row), np.asarray(own_row)
+    every = (
+        has
+        & (rival_row >= 0)
+        & (own_row >= 0)
+        & has[np.maximum(rival_row, 0)]
+        & has[np.maximum(own_row, 0)]
+    )
+    of_class = (
+        p.with_columns(cls=pl.Series(labels)[p["row"].to_numpy()].alias("cls"))
+        .group_by("cls", "value")
+        .agg(pl.col("p").sum())
+    )
+    rows_of = np.bincount(labels[has], minlength=int(labels.max()) + 1)
+    q = of_class.with_columns(
+        q=pl.col("p") / pl.Series(rows_of)[of_class["cls"].to_numpy()]
+    ).select("cls", "value", "q")
+    chance_of = (
+        q.join(q.rename({"cls": "rival", "q": "q_rival"}), on="value")
+        .group_by("cls", "rival")
+        .agg((pl.col("q") * pl.col("q_rival")).sum().alias("chance"))
+    )
+    table = np.zeros((len(rows_of), len(rows_of)))
+    table[chance_of["cls"].to_numpy(), chance_of["rival"].to_numpy()] = chance_of[
+        "chance"
+    ].to_numpy()
+    same, own = coincidence(rival_row), coincidence(own_row)
+    chance = table[labels, labels[np.maximum(rival_row, 0)]]
+    return tuple(np.where(every, x, np.nan) for x in (same, own, chance))
 
 
-def breach_shares(
-    group: np.ndarray, breach: np.ndarray, m: int
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return, per group of CSV rows, the share of its judged rows that break a rule.
+def time_nearness(
+    row: np.ndarray,
+    times: np.ndarray,
+    labels: np.ndarray,
+    neighbour: np.ndarray,
+    own: bool,
+) -> np.ndarray:
+    """Return, per distinct row, how near in time it lies to a neighbour, against chance.
+
+    The copies of a row count as different times, and one is enough.
+    For a row i and its neighbour u: g, the least distance between a
+    copy of i and a copy of u; s, the share of the CSV rows of u's
+    class (with a known time) inside the union of [t - g, t + g] around
+    the copies of i, the bounds closed (a tie counts as near); m, the
+    copies of u with a known time. The measure is 1 - (1 - s)^m: the
+    chance that m copies drawn at random from u's class put one as
+    near. With no tie to the time it is uniform, of mean one half; near
+    0, the row and its neighbour are nearer in time than chance. For
+    the own row (own True) the copies of i leave the count and the
+    total.
 
     Args:
-        group: The group of every CSV row (its cell), in [0, m).
-        breach: Per CSV row, 1.0, 0.0 or NaN (scenario_breaches).
-        m: The number of groups.
+        row: The row of the data file every CSV row is a copy of, shape
+            (n_csv,).
+        times: The time of every CSV row, datetime64[us], NaT when
+            unknown.
+        labels: The class code of every row of the data file, shape (n,).
+        neighbour: The neighbour of every row of the data file (its
+            nearest rival or own row), -1 for none.
+        own: Whether the neighbour is of the row's own class.
 
     Returns:
-        Per group, shape (m,): the share of its judged rows that break
-        the rule (NaN for a group with none judged) and the judged rows.
+        Per row of the data file, shape (n,) float in [0, 1]; NaN where
+        the row or its neighbour has no known time, or it has no
+        neighbour.
     """
-    known = ~np.isnan(breach)
-    n = np.bincount(group[known], minlength=m)
-    broken = np.bincount(group[known], weights=breach[known], minlength=m)
-    share = np.full(m, np.nan)
-    np.divide(broken, n, out=share, where=n > 0)
-    return share, n
+    row, labels = np.asarray(row, dtype=np.int64), np.asarray(labels)
+    neighbour = np.asarray(neighbour, dtype=np.int64)
+    n = len(labels)
+    stamp = np.asarray(times, dtype="datetime64[us]")
+    known = ~np.isnat(stamp)
+    at, t = row[known], stamp[known].astype(np.int64)
+    order = np.lexsort((t, at))
+    at, t = at[order], t[order]
+    start = np.searchsorted(at, np.arange(n), side="left")
+    stop = np.searchsorted(at, np.arange(n), side="right")
+    copies = stop - start
+    of_class = {
+        k: np.sort(t[labels[at] == k]) for k in np.unique(labels[at])
+    }  # the known times of each class's CSV rows
+    out = np.full(n, np.nan)
+    judged = np.flatnonzero((neighbour >= 0) & (copies > 0))
+    judged = judged[copies[neighbour[judged]] > 0]
+    single = judged[(copies[judged] == 1) & (copies[neighbour[judged]] == 1)]
+    for k in np.unique(labels[neighbour[single]]):  # one copy on each side: vectorized
+        rows = single[labels[neighbour[single]] == k]
+        mine, theirs = t[start[rows]], t[start[neighbour[rows]]]
+        gap = np.abs(mine - theirs)
+        times_k = of_class[k]
+        inside = np.searchsorted(times_k, mine + gap, side="right") - np.searchsorted(
+            times_k, mine - gap, side="left"
+        )
+        total = np.full(len(rows), len(times_k), dtype=np.float64)
+        if own:  # the row itself leaves the count and the total
+            inside, total = inside - 1, total - 1
+        with np.errstate(divide="ignore", invalid="ignore"):
+            out[rows] = np.where(total > 0, inside / total, np.nan)
+    for i in np.setdiff1d(judged, single):  # copies on some side: one at a time
+        u = neighbour[i]
+        mine, theirs = t[start[i] : stop[i]], t[start[u] : stop[u]]
+        near = np.clip(np.searchsorted(theirs, mine), 1, len(theirs)) - 1
+        gap = min(
+            np.abs(mine - theirs[near]).min(),
+            np.abs(mine - theirs[np.minimum(near + 1, len(theirs) - 1)]).min(),
+        )
+        times_k = of_class[labels[u]]
+        inside, end = 0, None
+        for low, high in zip(
+            mine - gap, mine + gap
+        ):  # mine is sorted: merge as it goes
+            if end is not None and low <= end:
+                low = end + 1
+            if low <= high:
+                inside += np.searchsorted(
+                    times_k, high, side="right"
+                ) - np.searchsorted(times_k, low, side="left")
+            end = high if end is None else max(end, high)
+        total = len(times_k)
+        if own:
+            inside, total = inside - len(mine), total - len(mine)
+        if total > 0:
+            s = inside / total
+            out[i] = 1 - (1 - s) ** len(theirs)
+    return out

@@ -10,15 +10,12 @@ from __future__ import annotations
 __all__ = [
     "DATASET_DIR",
     "DatasetConfig",
-    "AttackScenario",
     "ProvenanceConfig",
-    "ScenarioConfig",
     "load_config",
 ]
 
-import datetime as dt
 from collections.abc import Mapping
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
 
@@ -95,8 +92,8 @@ class ProvenanceConfig:
     """The columns that say where each row of the CSV comes from (`src.provenance`).
 
     Stage clean reads them for every row of the CSV and stage
-    quality_report describes them per cell, and judges them against the
-    scenario when the dataset declares one. Each is optional. The
+    quality_report measures them per cell, as support of the verdicts:
+    they never decide one. Each is optional. The
     source and the time (ORIGIN) are never features: a classifier that
     learned them would learn the capture. The destination may be one
     too: its port names the service, which the flows of an attack target.
@@ -110,6 +107,11 @@ class ProvenanceConfig:
         time_format: The format of time's text (chrono's strftime, as
             polars reads it, e.g. "%Y-%m-%d %H:%M:%S%.f"), set with time
             and only with it.
+        time_afternoon_before: For a time written on 12 hours without AM
+            or PM, the first hour of the morning the capture holds, in
+            [1, 12]: an hour under it is of the afternoon and gets 12
+            hours (provenance.read_provenance). None, the default, reads
+            the hours as written; set only with time.
     """
 
     src_ip: str | None = None
@@ -118,6 +120,7 @@ class ProvenanceConfig:
     dst_port: str | None = None
     time: str | None = None
     time_format: str | None = None
+    time_afternoon_before: int | None = None
 
     def columns(self) -> dict[str, str]:
         """Return the configured keys, in the order of KEYS then TIME, with their columns."""
@@ -127,41 +130,6 @@ class ProvenanceConfig:
 
 # the provenance keys that are never features: where and when the capture happened
 ORIGIN = ("src_ip", "src_port", TIME)
-
-
-@dataclass(frozen=True)
-class AttackScenario:
-    """Where and when the documentation says an attack class was generated.
-
-    Attributes:
-        src_ip: The addresses of its attacking hosts; empty when not
-            declared.
-        time: Its windows of time, each (start, end), closed, in the
-            clock of the CSV's time column; empty when not declared.
-    """
-
-    src_ip: tuple[str, ...] = ()
-    time: tuple[tuple[dt.datetime, dt.datetime], ...] = ()
-
-
-@dataclass(frozen=True)
-class ScenarioConfig:
-    """What the dataset's documentation says of where and when its classes were generated (`src.provenance`).
-
-    Optional: a dataset without it does not measure off_scenario.
-
-    Attributes:
-        benign: The class of the background traffic, bound by no rule.
-        background_ports: The destination ports of background services
-            (DNS, NTP, DHCP and the like): a row of another class sent
-            to one of them is no attack traffic. Empty when not
-            declared.
-        attacks: Per attack class, its hosts and windows.
-    """
-
-    benign: str
-    background_ports: tuple[int, ...] = ()
-    attacks: Mapping[str, AttackScenario] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -180,13 +148,15 @@ class DatasetConfig:
             row.
         top_n: The most frequent values of a categorical column with
             their own one-hot slot; the others share one.
+        significant_digits: The significant digits every number is
+            rounded to as it is read (data.round_significant), so that
+            files writing the same value with more or fewer digits give
+            the same row; None, the default, keeps every digit.
         seed: The seed of every stage.
         output_dir: The folder of every file of every stage.
         db_path: The SQLite file.
         provenance: The columns of where each row comes from, or None
             when the dataset names none.
-        scenario: What the documentation says of the classes, or None
-            when the dataset declares none.
         method: The method.
     """
 
@@ -198,11 +168,11 @@ class DatasetConfig:
     min_class_count: int
     max_class_rows: int | None
     top_n: int
+    significant_digits: int | None
     seed: int
     output_dir: Path
     db_path: Path
     provenance: ProvenanceConfig | None
-    scenario: ScenarioConfig | None
     method: MethodConfig
 
 
@@ -289,79 +259,14 @@ def _provenance(raw: Mapping[str, Any] | None, path: Path) -> ProvenanceConfig |
         bool(provenance.time) == bool(provenance.time_format),
         f"provenance.time and provenance.time_format go together in {path}",
     )
+    hour = provenance.time_afternoon_before
+    _check(
+        hour is None
+        or (bool(provenance.time) and isinstance(hour, int) and 1 <= hour <= 12),
+        f"provenance.time_afternoon_before must be an hour in [1, 12], with time, in {path}",
+    )
     _check(bool(provenance.columns()), f"provenance names no column in {path}: {raw}")
     return provenance
-
-
-def _scenario(
-    raw: Mapping[str, Any] | None,
-    provenance: ProvenanceConfig | None,
-    path: Path,
-) -> ScenarioConfig | None:
-    """Return the scenario block of a dataset yaml, None when absent or empty.
-
-    The keys are benign (required), background_ports and attacks, each
-    attack with src_ip and time (a list of [start, end], ISO
-    "YYYY-MM-DD HH:MM:SS", in the clock of the CSV's time column). A
-    rule needs the provenance column it reads: background_ports
-    dst_port, src_ip src_ip, time time.
-
-    Raises:
-        ValueError: When a key is unknown, benign is missing, a rule
-            lacks its provenance column, a port is no integer, or a
-            window does not start before it ends.
-    """
-    if not raw:
-        return None
-    _check_keys(raw, ScenarioConfig, path, prefix="scenario.")
-    _check(bool(raw.get("benign")), f"scenario.benign is missing in {path}")
-    named = provenance.columns() if provenance is not None else {}
-
-    def needs(key: str, rule: str) -> None:
-        _check(
-            key in named,
-            f"scenario {rule} reads provenance.{key}, which {path} does not name",
-        )
-
-    ports = tuple(raw.get("background_ports") or ())
-    _check(
-        all(isinstance(port, int) and not isinstance(port, bool) for port in ports),
-        f"scenario.background_ports must be integers, got {list(ports)}",
-    )
-    if ports:
-        needs("dst_port", "background_ports")
-    attacks = {}
-    for name, attack in (raw.get("attacks") or {}).items():
-        attack = attack or {}
-        _check_keys(attack, AttackScenario, path, prefix=f"scenario.attacks.{name}.")
-        hosts = tuple(str(host) for host in attack.get("src_ip") or ())
-        windows = tuple(
-            (_time(start, path), _time(end, path))
-            for start, end in attack.get("time") or ()
-        )
-        for start, end in windows:
-            _check(
-                start < end,
-                f"scenario.attacks.{name}.time: {start} must be before {end}",
-            )
-        if hosts:
-            needs("src_ip", f"attacks.{name}.src_ip")
-        if windows:
-            needs(TIME, f"attacks.{name}.time")
-        attacks[str(name)] = AttackScenario(src_ip=hosts, time=windows)
-    return ScenarioConfig(
-        benign=str(raw["benign"]), background_ports=ports, attacks=attacks
-    )
-
-
-def _time(value: Any, path: Path) -> dt.datetime:
-    """Return a time of a scenario window: a yaml timestamp, or ISO text."""
-    if isinstance(value, dt.datetime):
-        return value.replace(tzinfo=None)
-    try:
-        return dt.datetime.fromisoformat(str(value))
-    except ValueError:
-        raise ValueError(f"scenario window time {value!r} in {path} is no ISO time")
 
 
 def load_config(dataset: str, method: str = "default") -> DatasetConfig:
@@ -377,8 +282,8 @@ def load_config(dataset: str, method: str = "default") -> DatasetConfig:
     Raises:
         FileNotFoundError: When a yaml does not exist.
         ValueError: When a key is unknown, a value unknown or out of
-            its range, a column of the source or the time is also a
-            feature, or the scenario is invalid (_scenario).
+            its range, or a column of the source or the time is also a
+            feature.
     """
     path = _path(dataset, DATASET_DIR)
     raw = _yaml(path)
@@ -398,13 +303,17 @@ def load_config(dataset: str, method: str = "default") -> DatasetConfig:
         ),
         f"max_class_rows must be null or >= min_class_count, got {max_class_rows}",
     )
+    digits = raw.get("significant_digits")
+    _check(
+        digits is None or (isinstance(digits, int) and 1 <= digits <= 17),
+        f"significant_digits must be null or in [1, 17], got {digits}",
+    )
     provenance = _provenance(raw.get("provenance"), path)
     if provenance is not None:
         features = {*(raw["num_cols"] or ()), *(raw["cat_cols"] or ())}
         origin = {c for k, c in provenance.columns().items() if k in ORIGIN}
         shared = sorted(origin & features)
         _check(not shared, f"the source and the time are never features, got {shared}")
-    scenario = _scenario(raw.get("scenario"), provenance, path)
     return DatasetConfig(
         name=raw["name"],
         path=Path(raw["path"]),
@@ -414,10 +323,10 @@ def load_config(dataset: str, method: str = "default") -> DatasetConfig:
         min_class_count=raw["min_class_count"],
         max_class_rows=max_class_rows,
         top_n=raw["top_n"],
+        significant_digits=digits,
         seed=raw["seed"],
         output_dir=Path(raw["output_dir"]),
         db_path=Path(raw["db_path"]),
         provenance=provenance,
-        scenario=scenario,
         method=load_method_config(method),
     )

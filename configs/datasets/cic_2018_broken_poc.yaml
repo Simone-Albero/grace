@@ -72,15 +72,19 @@ cat_cols:
   - Dst Port  # the service a flow targets: as in DataBadSmells, a feature
   - Protocol
 
-# The destination port only: Src IP and Src Port are in Thuesday-20-02 only, and the times are written on 12 hours
-# without AM/PM (an attack of 17:14 in cic_2018 reads 01:14 here), so no rule of the scenario reads them.
+# Where each CSV row comes from: the destination port and the time. The four columns only Thuesday-20-02 has (Src IP
+# and Src Port among them) are dropped from this CSV. The times are written on 12 hours without AM/PM, in local time
+# (an attack of 17:14 in cic_2018 reads 01:14 here): the corrected release (cic_2018) is in UTC, 4 hours ahead on every
+# day (experiments/relabel), and covers 12-23 UTC, so 08-19 local; an hour 1-7 is of the afternoon. Rows at 20:xx
+# local (00 UTC, about 1k a day) read as 08.
 provenance:
   dst_port: Dst Port
+  time: Timestamp
+  time_format: "%d/%m/%Y %H:%M:%S"
+  time_afternoon_before: 8
 
-scenario:  # what the documentation of CSE-CIC-IDS2018 says of its classes
-  benign: Benign
-  # the ports DataBadSmells ignores (metadata/cic2018): background services, no attack's target
-  background_ports: [0, 53, 67, 68, 111, 123, 161, 179, 389, 427, 520, 1723, 1900]
+significant_digits: 10  # half of the days write the decimals with 10 significant digits, half with about 15: rounded
+                        #   to 10, the same flow written on two days is the same row
 
 min_class_count: 50  # classes with fewer rows are dropped
 top_n: 32  # most frequent values of a categorical column with their own one-hot slot; the others share one

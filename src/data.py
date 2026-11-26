@@ -26,6 +26,7 @@ __all__ = [
     "header_rows",
     "rare_classes",
     "read_numbers",
+    "round_significant",
     "row_key",
     "unparsable_cells",
 ]
@@ -132,18 +133,24 @@ def header_rows(columns: Sequence[str]) -> pl.Expr:
     return pl.all_horizontal(pl.col(c) == c for c in columns).fill_null(False)
 
 
-def read_numbers(rows: Frame, num_cols: Sequence[str]) -> Frame:
+def read_numbers(
+    rows: Frame, num_cols: Sequence[str], significant_digits: int | None = None
+) -> Frame:
     """Turn the numeric columns from text into numbers, marking the bad text.
 
     A cell that is null stays null ("empty"); a cell whose text is not
     a number becomes null too, and its column is named in UNPARSABLE,
     so the two stay apart (also for drop_duplicates, which compares
-    UNPARSABLE as any column). "nan" and "inf" texts are numbers.
+    UNPARSABLE as any column). "nan" and "inf" texts are numbers. With
+    significant_digits, every number is rounded to them
+    (round_significant), before any copy is found.
 
     Args:
         rows: The rows as read, every column text; lazy rows stay lazy,
             so a large CSV is never held as text.
         num_cols: The numeric columns.
+        significant_digits: The significant digits every number keeps,
+            None for all.
 
     Returns:
         rows with num_cols as Float64 and UNPARSABLE appended: the
@@ -161,10 +168,30 @@ def read_numbers(rows: Frame, num_cols: Sequence[str]) -> Frame:
         if bad
         else pl.lit(None, pl.String)
     )
+    numbers = pl.col(num_cols).cast(pl.Float64, strict=False)
+    if significant_digits is not None:
+        numbers = round_significant(numbers, significant_digits)
     return rows.with_columns(
-        pl.col(num_cols).cast(pl.Float64, strict=False),
+        numbers,
         pl.when(marks != "").then(marks).alias(UNPARSABLE),
     )
+
+
+def round_significant(expr: pl.Expr, digits: int) -> pl.Expr:
+    """Round numbers to significant digits, the same way whatever digits they were written with.
+
+    The same expression for every value, so that a number written with
+    10 significant digits and the same number written with 15 give the
+    same float. 0, NaN and infinities are kept, a null stays null.
+
+    Args:
+        expr: The Float64 numbers.
+        digits: The significant digits kept, >= 1.
+
+    Returns:
+        The rounded numbers, Float64.
+    """
+    return expr.round_sig_figs(digits)
 
 
 def unparsable_cells(marks: pl.Series, columns: Sequence[str]) -> pl.DataFrame:

@@ -66,7 +66,11 @@ def _origin_exprs(cfg: DatasetConfig) -> list[pl.Expr]:
     _ORIGIN + key, and _UNREAD_TIME True on a time that time_format does not
     read); none without cfg.provenance."""
     origin = cfg.provenance.columns() if cfg.provenance else {}
-    reads = read_provenance(origin, cfg.provenance and cfg.provenance.time_format)
+    reads = read_provenance(
+        origin,
+        cfg.provenance and cfg.provenance.time_format,
+        cfg.provenance and cfg.provenance.time_afternoon_before,
+    )
     extra = [expr.alias(f"{_ORIGIN}{key}") for key, expr in reads.items()]
     if TIME in origin:
         unread = pl.col(origin[TIME]).is_not_null() & reads[TIME].is_null()
@@ -83,19 +87,27 @@ def _scans(cfg: DatasetConfig) -> Iterator[tuple[Path, pl.LazyFrame]]:
     provenance (_origin_exprs) and _HEADER, True on a header line the
     file repeats inside (data.header_rows).
 
+    A provenance column missing from a file is read as null in it (its
+    rows' provenance is unknown), and named on the console.
+
     Raises:
-        ValueError: When a configured column is missing from a file.
+        ValueError: When a feature or the label is missing from a file.
     """
     columns = [*cfg.num_cols, *cfg.cat_cols, cfg.label_col]
     origin = cfg.provenance.columns() if cfg.provenance else {}
     extra = _origin_exprs(cfg)
     for file in csv_files(cfg.path):
         scan = pl.scan_csv(file, infer_schema=False)
-        missing = sorted({*columns, *origin.values()} - set(scan.collect_schema()))
+        header = set(scan.collect_schema())
+        missing = sorted(set(columns) - header)
         if missing:
             raise ValueError(f"columns missing from {file}: {missing}")
+        absent = sorted(set(origin.values()) - header)
+        if absent:  # a file without them: its rows' provenance is unknown
+            print(f"[clean] {file.name}: provenance read as null: {absent}", flush=True)
+            scan = scan.with_columns(pl.lit(None, pl.String).alias(c) for c in absent)
         flagged = scan.select(*columns, *extra, header_rows(columns).alias(_HEADER))
-        yield file, read_numbers(flagged, cfg.num_cols)
+        yield file, read_numbers(flagged, cfg.num_cols, cfg.significant_digits)
 
 
 def _compared(cfg: DatasetConfig) -> list[str]:

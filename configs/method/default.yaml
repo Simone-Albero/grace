@@ -7,11 +7,11 @@ cells:                   # every class cut into compact cells of about the same 
                          #   (quality.resolution_rows, the rows that decide a share tau away from tau or one half:
                          #   z^2 / (4 tau^2), 68 rows at tau 0.1 and 0.95). The regions set the granularity
 
-quality:                 # the defects of every cell against its rivals, then of the regions the cells are merged into
-  tau: 0.1               # the one threshold: the share of a cell's rows whose nearest row is of a rival class (at or
-                         #   over it the cell overlaps), that a one-column rule may leave on the wrong side (under it on
-                         #   both sides it is a shortcut), the share of its CSV rows that may break the scenario; and,
-                         #   for repetition, the share of its class a branch holds and its variance over the dataset's
+quality:                 # the defects of the regions: the cells merged up their class's tree where no verdict changes
+  tau: 0.1               # the one threshold, the smallest share of a region worth reporting: of its rows whose
+                         #   nearest row is of a rival class (majority_overlap; minority_overlap reads one half), of its
+                         #   invalid, duplicated or conflicting rows, of a rival class's rows inside its range on one
+                         #   column (single_feature_cut, under it), of its class in a compact branch (low_variability)
   confidence: 0.95       # level of the Wilson interval around every share of a cell: a cell has a defect when the
                          #   share is past its threshold beyond the error of sampling, none when short of it, else
                          #   undecided

@@ -92,10 +92,6 @@ provenance:  # where each CSV row comes from: the source and the time are never 
   time: Timestamp
   time_format: "%Y-%m-%d %H:%M:%S%.f"
 
-scenario:  # what the documentation of CSE-CIC-IDS2018 says of its classes, in the clock of Timestamp
-  benign: BENIGN
-  # the ports DataBadSmells ignores (metadata/cic2018): background services, no attack's target
-  background_ports: [0, 53, 67, 68, 111, 123, 161, 179, 389, 427, 520, 1723, 1900]
 
 min_class_count: 50  # classes with fewer rows are dropped
 max_class_rows: 10000000  # Benign has 42.2M distinct rows (45.7M in all): a 16 GB machine holds a uniform sample of
