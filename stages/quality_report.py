@@ -21,11 +21,9 @@ from src.quality import (
     column_values,
     cut_shares,
     invalid_values,
-    label_conflicts,
     nearest_rivals,
-    node_ranges,
+    node_intervals,
     node_sums,
-    pair_conflicts,
     rival_shares,
 )
 from src.report import COUNTS, judge
@@ -35,114 +33,142 @@ from stages.paths import (
     cells_file,
     need,
     prepared_columns,
+    provenance_file,
     read_classes,
-    read_data,
+    read_conflicts,
     read_points,
-    read_provenance,
+    read_rows,
     read_unparsable,
     read_weights,
+    rivals_file,
 )
 
 
 def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
-    """Measure every cell and every node of the cut, and judge the regions at quality.tau.
+    """Measure every cell and every node of the cut on the rows read, and judge the regions at quality.tau.
 
-    Reads the data file (the features as read, DUPLICATES), the cells
-    stage clean could not read as numbers (paths.read_unparsable), the
+    The rows read are the uniform sample of each class stage cells drew
+    (assignments.parquet, sampled): every share is read on them, and
+    every property of a row read is searched among all the rows (its
+    nearest rows, its rows equal on the features, its copies). Reads the
     points (paths.read_points, as stage cells), cells.parquet,
     assignments.parquet and cell_tree.parquet, which must be of the same
-    rows ("run cells again" otherwise). With q = method.quality. Order:
-    quality.nearest_rivals on every row -> quality.rival_shares: per
-    cell and class of its rows' nearest rival rows (a rival class), its
-    rival cells and the share of its rows confused with it -> per node
-    of the cut, quality.branch_spread, its rival class (the most
-    frequent class of its rows' nearest rival rows, ties to the lower
-    code) and, per original column (quality.column_values of its point
-    columns), quality.cut_shares on quality.node_ranges ->
-    quality.invalid_values -> quality.label_conflicts on every feature
-    -> quality.pair_conflicts; with cfg.provenance, on provenance.parquet
-    (paths.read_provenance: every row of the CSV, with the row of the
-    data file it is a copy of; "run clean again" when they disagree),
-    per key provenance.key_coincidence and, with a time,
-    provenance.time_nearness, each with the nearest rival row and, the
-    control, the nearest own row -> src.report.judge at q.tau and
-    q.confidence, the one place they are applied -> with
-    cfg.provenance, provenance.concentration of each key over the CSV
-    rows of each region.
+    rows ("run cells again" otherwise), the rows read of the data file
+    (the features as read, paths.read_rows), the cells stage clean could
+    not read as numbers (paths.read_unparsable) and the conflict groups
+    of clean (paths.read_conflicts). With q = method.quality. Order:
+    quality.nearest_rivals of the rows read against every row, written
+    to rivals.parquet (paths.rivals_file: the costliest measure, kept so
+    that nothing downstream searches it again) -> quality.rival_shares: per cell and class of the nearest rival rows
+    of its rows read (a rival class), its rival cells and the share of
+    its rows read confused with it -> per node of the cut, on its rows
+    read, quality.branch_spread, its rival class (the most frequent
+    class of their nearest rival rows, ties to the lower code) and, per
+    original column (quality.column_values of its point columns),
+    quality.cut_shares on quality.node_intervals at q.tau (its central
+    values, all its rows read but tau) against the rows read of the
+    rival class -> quality.invalid_values of the rows read -> the
+    rows read in a conflict group, and the classes of their groups;
+    with cfg.provenance, on provenance.parquet (every row of the CSV,
+    with the row of the data file it is a copy of; "run clean again"
+    when they disagree), per key provenance.key_coincidence and, with a
+    time, provenance.time_nearness, each with the nearest rival row and,
+    the control, the nearest own row of the rows read -> src.report.judge
+    at q.tau and q.confidence, where every verdict is read (tau enters
+    the measures only through the cells, sized on it, and the central
+    values of the cut) -> with
+    cfg.provenance, provenance.concentration of each key over all the
+    CSV rows of each region.
 
     Logs:
     - quality_rivals: one row per cell and rival class: cell, region,
       class, rival_class, rival_cells and rival_regions (JSON lists: its
       rival cells of that class and their regions), rival_share (the
-      share of the cell's distinct rows whose nearest row in the dataset
-      is of the rival class, a tie one half).
+      share of the cell's rows read whose nearest row in the dataset is
+      of the rival class, a tie one half).
     - quality_branches: node, class, parent, cell as in
-      cell_tree.parquet, then n_rows and n_read below the node, variance
-      of its rows, cut_class (its rival class, null for none), cut_share
-      (the least share over the columns of the cut class's distinct
-      rows inside the node's values), n_cut_rows (the distinct rows of
-      the cut class) and cut_columns (JSON list of [column, share] of
-      the columns under one half, the lowest first).
-    - quality_cells: cell, region, class, n_rows, n_read, n_duplicates
-      (n_read - n_rows), conflict_rows, conflict_read, conflict_with
-      (the classes its conflicting rows are shared with, joined by
-      ","), missing_rows and missing_read (rows with a null or invalid
-      value), per kind of data.KINDS <kind>_rows; with cfg.provenance,
-      per configured key of provenance.KEYS <key>_same, <key>_own and
-      <key>_chance (the sums over its rows of
-      provenance.key_coincidence) and <key>_n (its rows summed, known
-      for the row and both neighbours), and with a time time_near,
+      cell_tree.parquet, then n_rows and n_read of the rows read below
+      the node, variance of them, cut_class (its rival class, null for
+      none), cut_share (the least share over the columns of the rows
+      read of the cut class inside the node's central values), n_cut_rows (the
+      rows read of the cut class) and cut_columns (JSON list of [column,
+      share] of the columns under one half, the lowest first).
+    - quality_cells: cell, region, class, then of its rows read n_rows,
+      n_read, n_duplicates (n_read - n_rows), conflict_rows,
+      conflict_read, conflict_with (the classes of the groups of its
+      conflicting rows, joined by ","), missing_rows and missing_read
+      (rows with a null or invalid value), per kind of data.KINDS
+      <kind>_rows; all_rows and all_read (every row of the cell); with
+      cfg.provenance, per configured key of provenance.KEYS <key>_same,
+      <key>_own and <key>_chance (the sums over its rows read of
+      provenance.key_coincidence) and <key>_n (its rows read summed,
+      known for the row and both neighbours), and with a time time_near,
       time_near_own and time_n (the same of provenance.time_nearness).
       Measures only: the verdicts are the regions'.
     - quality_regions: src.report.judge's, and with cfg.provenance per
       key <key>_n_values, <key>_top and <key>_top_share
-      (provenance.concentration over its CSV rows).
+      (provenance.concentration over all its CSV rows).
     - quality_classes, cell_missing (cell, region, column, kind,
-      n_rows, n_read: the null and invalid cells; no row without one),
-      label_conflict_groups (group, row, class, cell, region, n_read),
-      quality_stats (one row: tau, confidence, n_rivals (the rows of
-      quality_rivals), n_groups, n_cells, then src.report.judge's).
+      n_rows, n_read: the null and invalid cells of the rows read; no
+      row without one), label_conflict_groups (group, row, class, cell,
+      region, n_read: the rows read in a group), quality_stats (one row:
+      tau, confidence, n_rivals (the rows of quality_rivals), n_groups
+      (of the dataset), n_cells, n_sampled (the rows read), then
+      src.report.judge's).
 
     n_rows counts distinct rows, n_read rows of the CSV.
     """
     q = cfg.method.quality
     classes = read_classes(cfg)
     cells = pl.read_parquet(need(cells_file(cfg), "cells")).sort("cell")
-    assignments = pl.read_parquet(need(assignments_file(cfg), "cells"))
+    assignments = pl.read_parquet(need(assignments_file(cfg), "cells")).sort("row")
     tree = pl.read_parquet(need(cell_tree_file(cfg), "cells")).sort("node")
-    cell = assignments.sort("row")["cell"].to_numpy()
+    cell = assignments["cell"].to_numpy()
+    read = np.flatnonzero(assignments["sampled"].to_numpy())
     cell_class = cells["class"].to_numpy()
     m = len(cell_class)
     weights = read_weights(cfg)
     points, labels = read_points(cfg)
     if len(cell) != len(labels) or not np.array_equal(cell_class[cell], labels):
         raise ValueError("the cells were cut on other data: run cells again")
-    rival_row, confused, own_row = nearest_rivals(points, labels)
-    rivals = rival_shares(cell, rival_row, confused, cell_class)
+    rival_row, confused, own_row = nearest_rivals(points, labels, read)
+    pl.DataFrame(
+        {"row": read, "rival_row": rival_row, "confused": confused, "own_row": own_row}
+    ).write_parquet(rivals_file(cfg))
+    rivals = rival_shares(cell, read, rival_row, confused, cell_class)
     print(
-        f"[quality_report] nearest rival rows of {len(cell)} rows found: "
-        f"{len(rivals)} cells against a rival class",
+        f"[quality_report] nearest rows of {len(read)} rows read among "
+        f"{len(cell)} found: {len(rivals)} cells against a rival class",
         flush=True,
     )
-    n_read = np.bincount(cell, weights=weights, minlength=m)
-    branches = _branches(cfg, tree, points, labels, cell, n_read, rival_row, classes)
-    del points
+    n_read = np.bincount(cell[read], weights=weights[read], minlength=m)
+    X = np.asarray(points[read], dtype=np.float64)
+    branches = _branches(
+        cfg, tree, X, labels, read, cell, n_read, rival_row, classes, q.tau
+    )
+    del X
 
-    data = read_data(cfg)
-    features = data.drop(DUPLICATES, LABEL)
-    invalid = invalid_values(features, read_unparsable(cfg))
-    groups = label_conflicts(features, labels)
-    conflicts = pair_conflicts(groups, labels, cell, weights)
-    counts = _counts(cell, m, weights, groups, invalid)
-    conflict_with = defaultdict(set)
-    for a, b in conflicts:
-        conflict_with[a].add(int(cell_class[b]))
-        conflict_with[b].add(int(cell_class[a]))
+    features = read_rows(cfg, read).drop(DUPLICATES, LABEL)
+    unparsable = read_unparsable(cfg)
+    marked = unparsable["row"].to_numpy()
+    at = np.searchsorted(read, marked)
+    found = (at < len(read)) & (read[np.minimum(at, len(read) - 1)] == marked)
+    unparsable = unparsable.filter(pl.Series(found)).with_columns(
+        row=pl.Series(at[found], dtype=pl.Int64)
+    )
+    invalid = invalid_values(features, unparsable)
+    invalid = invalid.with_columns(row=pl.Series(read[invalid["row"].to_numpy()]))
+    del features
+    groups = read_conflicts(cfg, len(labels))
+    counts = _counts(cell, read, m, weights, groups, invalid)
+    conflict_with = _conflict_with(cell, read, labels, groups)
 
-    origin = None
+    has_provenance = False
     measured = [{} for _ in range(m)]
     if cfg.provenance is not None:
-        origin, measured = _provenance(cfg, cell, labels, weights, rival_row, own_row)
+        has_provenance, measured = _provenance(
+            cfg, cell, labels, weights, read, rival_row, own_row
+        )
     rival_rows = [_rival_row(rival, cell_class, classes) for rival in rivals]
     cell_rows = [
         _cell_row(c, cell_class, classes, counts, conflict_with, measured[c])
@@ -151,14 +177,14 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     judged = judge(cell_rows, rival_rows, branches, classes, q.tau, q.confidence)
     region = np.array([row["region"] for row in judged.cells], dtype=np.int64)
     regions = judged.regions
-    if origin is not None:
-        regions = _hosts(origin, cell, region, regions)
-    found = {d: judged.stats[f"regions_{d}"] for d in DEFECTS}
+    if has_provenance:
+        regions = _hosts(cfg, cell, region, regions)
+    found_defects = {d: judged.stats[f"regions_{d}"] for d in DEFECTS}
     print(
         f"[quality_report] {len(rivals)} cells against a rival class, "
         f"{int(groups.max()) + 1} label conflicts; "
         f"{len(judged.cells)} cells merged into {len(regions)} regions; "
-        f"regions by defect: {found}",
+        f"regions by defect: {found_defects}",
         flush=True,
     )
     db.log_table(conn, run_id, "quality_rivals", judged.rivals)
@@ -169,6 +195,7 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
     db.log_table(
         conn, run_id, "cell_missing", _missing_rows(invalid, cell, region, weights)
     )
+    in_group = read[groups[read] >= 0]
     db.log_table(
         conn,
         run_id,
@@ -182,7 +209,7 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
                 "region": int(region[cell[row]]),
                 "n_read": float(weights[row]),
             }
-            for row in np.flatnonzero(groups >= 0)
+            for row in in_group
         ],
     )
     stats = {k: v for k, v in judged.stats.items() if k not in ("tau", "confidence")}
@@ -197,6 +224,7 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
                 "n_rivals": len(rivals),
                 "n_groups": int(groups.max()) + 1,
                 "n_cells": len(judged.cells),
+                "n_sampled": len(read),
                 **stats,
             }
         ],
@@ -206,28 +234,41 @@ def run(cfg: DatasetConfig, conn: sqlite3.Connection, run_id: int) -> None:
 def _branches(
     cfg: DatasetConfig,
     tree: pl.DataFrame,
-    points: np.ndarray,
+    X: np.ndarray,
     labels: np.ndarray,
+    rows: np.ndarray,
     cell: np.ndarray,
     n_read: np.ndarray,
     rival_row: np.ndarray,
     classes: list[str],
+    tau: float,
 ) -> pl.DataFrame:
-    """Return the quality_branches rows: the cells' tree with the rows, the spread and the cut of every node.
+    """Return the quality_branches rows: the cells' tree with the rows read, their spread and the cut of every node.
 
-    The rival class of a node is the most frequent class of its rows'
-    nearest rival rows (ties to the lower code); its cut, per original
-    column, quality.cut_shares against it.
+    Args:
+        X: The points of the rows read, float64, shape (q, d).
+        labels: The class code of every row of the dataset.
+        rows: The rows read, shape (q,).
+        cell: The cell of every row of the dataset.
+        n_read: Per cell, the CSV rows of its rows read.
+        rival_row: The nearest rival row of every row read, -1 for none.
+        tau: The share of a node's rows its central values leave out.
+
+    The rival class of a node is the most frequent class of the nearest
+    rival rows of its rows read (ties to the lower code); its cut, per
+    original column, quality.cut_shares on its central values
+    (quality.node_intervals at tau) against the rows read of it.
     """
     at = {v: i for i, v in enumerate(tree["node"].to_list())}
     parent = np.array([at.get(v, -1) for v in tree["parent"].to_list()])
     node_cell = tree["cell"].fill_null(-1).to_numpy()
-    variance, n_rows = branch_spread(points, cell, parent, node_cell)
+    own_cell, own_class = cell[rows], labels[rows]
+    variance, n_rows = branch_spread(X, own_cell, parent, node_cell)
     m = int(node_cell.max()) + 1
     read = node_sums(parent, node_cell, n_read)
     has_rival = rival_row >= 0
     by_class = np.zeros((m, len(classes)), dtype=np.int64)
-    np.add.at(by_class, (cell[has_rival], labels[rival_row[has_rival]]), 1)
+    np.add.at(by_class, (own_cell[has_rival], labels[rival_row[has_rival]]), 1)
     near = node_sums(parent, node_cell, by_class)
     rival = np.where(near.sum(axis=1) > 0, near.argmax(axis=1), -1)
     names = prepared_columns(cfg)
@@ -236,11 +277,11 @@ def _branches(
     shares = np.empty((len(parent), len(columns)))
     for c, column in enumerate(columns):
         numeric = column in cfg.num_cols
-        values = column_values(points[:, owner == c], numeric)
-        ranges = node_ranges(values, cell, parent, node_cell, numeric)
-        shares[:, c] = cut_shares(ranges, rival, values, labels, numeric)
+        values = column_values(X[:, owner == c], numeric)
+        central = node_intervals(values, own_cell, parent, node_cell, numeric, tau)
+        shares[:, c] = cut_shares(central, rival, values, own_class, numeric)
     print(f"[quality_report] cuts on {len(columns)} columns measured", flush=True)
-    n_class = np.bincount(labels, minlength=len(classes))
+    n_class = np.bincount(own_class, minlength=len(classes))
     has_cut = rival >= 0
     least = np.full(len(parent), np.nan)
     least[has_cut] = shares[has_cut].min(axis=1)
@@ -271,24 +312,47 @@ def _branches(
     )
 
 
-def _counts(cell, m, weights, groups, invalid) -> dict[str, np.ndarray]:
-    """Return per cell its distinct and CSV rows, conflicting rows and null or invalid rows."""
-    conflicting = groups >= 0
+def _counts(cell, read, m, weights, groups, invalid) -> dict[str, np.ndarray]:
+    """Return per cell, of its rows read, the distinct and CSV rows, conflicting rows and null or invalid rows; and all its rows."""
+    of_read = cell[read]
+    conflicting = read[groups[read] >= 0]
     hit = np.unique(invalid["row"].to_numpy())
     counts = {
-        "n_rows": np.bincount(cell, minlength=m),
-        "n_read": np.bincount(cell, weights=weights, minlength=m),
+        "n_rows": np.bincount(of_read, minlength=m),
+        "n_read": np.bincount(of_read, weights=weights[read], minlength=m),
         "conflict_rows": np.bincount(cell[conflicting], minlength=m),
         "conflict_read": np.bincount(
             cell[conflicting], weights=weights[conflicting], minlength=m
         ),
         "missing_rows": np.bincount(cell[hit], minlength=m),
         "missing_read": np.bincount(cell[hit], weights=weights[hit], minlength=m),
+        "all_rows": np.bincount(cell, minlength=m),
+        "all_read": np.bincount(cell, weights=weights, minlength=m),
     }
     for kind in KINDS:
         rows = np.unique(invalid.filter(pl.col("kind") == kind)["row"].to_numpy())
         counts[f"{kind}_rows"] = np.bincount(cell[rows], minlength=m)
     return counts
+
+
+def _conflict_with(
+    cell: np.ndarray, read: np.ndarray, labels: np.ndarray, groups: np.ndarray
+) -> dict[int, set[int]]:
+    """Return, per cell, the other classes of the conflict groups of its rows read."""
+    members = np.flatnonzero(groups >= 0)
+    classes_of = (
+        pl.DataFrame({"group": groups[members], "cls": labels[members]})
+        .group_by("group")
+        .agg(pl.col("cls").unique())
+    )
+    of_group = dict(zip(classes_of["group"].to_list(), classes_of["cls"].to_list()))
+    out: dict[int, set[int]] = defaultdict(set)
+    for row in read[groups[read] >= 0].tolist():
+        own = int(labels[row])
+        out[int(cell[row])].update(
+            int(k) for k in of_group[int(groups[row])] if k != own
+        )
+    return out
 
 
 def _rival_row(rival, cell_class, classes) -> dict:
@@ -312,6 +376,8 @@ def _cell_row(c, cell_class, classes, counts, conflict_with, measured) -> dict:
         "n_rows": int(own["n_rows"]),
         "n_read": float(own["n_read"]),
         "n_duplicates": float(own["n_read"] - own["n_rows"]),
+        "all_rows": int(own["all_rows"]),
+        "all_read": float(own["all_read"]),
         "conflict_rows": int(own["conflict_rows"]),
         "conflict_read": float(own["conflict_read"]),
         "conflict_with": _names(conflict_with[c], classes),
@@ -332,36 +398,54 @@ def _provenance(
     cell: np.ndarray,
     labels: np.ndarray,
     weights: np.ndarray,
+    read: np.ndarray,
     rival_row: np.ndarray,
     own_row: np.ndarray,
-) -> tuple[pl.DataFrame, list[dict]]:
-    """Return the provenance of the CSV rows and, per cell, the provenance columns of its quality_cells row.
+) -> tuple[bool, list[dict]]:
+    """Return whether a provenance was read and, per cell, the provenance columns of its quality_cells row.
+
+    Only the CSV rows of the rows read and of their nearest rival and
+    own rows are read from provenance.parquet, in streaming.
 
     Args:
         cfg: The dataset config, with a provenance.
         cell: The cell of every row of the data file.
         labels: The class code of every row of the data file.
         weights: The copies of every row of the data file in the CSV.
-        rival_row: The nearest rival row of every row (-1 for none).
-        own_row: The nearest own row of every row (-1 for none).
+        read: The rows read.
+        rival_row: The nearest rival row of every row read (-1 for none).
+        own_row: The nearest own row of every row read (-1 for none).
 
     Returns:
-        provenance.parquet (paths.read_provenance), and one dict per
-        cell, in cell order: per key of provenance.KEYS in the file,
-        <key>_same, <key>_own, <key>_chance and <key>_n
-        (provenance.key_coincidence summed over the cell's rows known
-        for the row and both neighbours); with a time, time_near,
-        time_near_own and time_n (provenance.time_nearness, the same).
+        True, and one dict per cell, in cell order: per key of
+        provenance.KEYS in the file, <key>_same, <key>_own, <key>_chance
+        and <key>_n (provenance.key_coincidence summed over the cell's
+        rows read known for the row and both neighbours); with a time,
+        time_near, time_near_own and time_n (provenance.time_nearness,
+        the same).
 
     Raises:
         ValueError: When provenance.parquet is not of the rows of the
             data file ("run clean again").
     """
-    origin = read_provenance(cfg)
-    row = origin["row"].to_numpy()
-    m = int(cell.max()) + 1
-    if not np.array_equal(np.bincount(row, minlength=len(cell)), weights):
+    path = need(provenance_file(cfg), "clean")
+    of_csv = pl.read_parquet(path, columns=["row"])["row"].to_numpy()
+    n, m = len(cell), int(cell.max()) + 1
+    if not np.array_equal(np.bincount(of_csv, minlength=n), weights):
         raise ValueError("the provenance is of other rows: run clean again")
+    del of_csv
+    rival_of, own_of = np.full(n, -1), np.full(n, -1)
+    rival_of[read], own_of[read] = rival_row, own_row
+    measured = np.zeros(n, dtype=bool)
+    measured[read] = True
+    needed = np.unique(np.r_[read, rival_row[rival_row >= 0], own_row[own_row >= 0]])
+    wanted = pl.Series(needed.astype(np.int64)).implode()
+    origin = (
+        pl.scan_parquet(path)
+        .filter(pl.col("row").cast(pl.Int64).is_in(wanted))
+        .collect(engine="streaming")
+    )
+    row = origin["row"].to_numpy()
     sums: dict[str, np.ndarray] = {}
 
     def summed(name: str, known: np.ndarray, value: np.ndarray | None) -> None:
@@ -372,7 +456,7 @@ def _provenance(
         if key not in origin.columns:
             continue
         same, own, chance = key_coincidence(
-            row, origin[key], labels, rival_row, own_row
+            row, origin[key], labels, rival_of, own_of, measured
         )
         known = ~np.isnan(same) & ~np.isnan(own)
         summed(f"{key}_same", known, same)
@@ -381,8 +465,8 @@ def _provenance(
         summed(f"{key}_n", known, None)
     if TIME in origin.columns:
         times = origin[TIME].to_numpy()
-        near = time_nearness(row, times, labels, rival_row, own=False)
-        near_own = time_nearness(row, times, labels, own_row, own=True)
+        near = time_nearness(row, times, labels, rival_of, False, measured)
+        near_own = time_nearness(row, times, labels, own_of, True, measured)
         known = ~np.isnan(near) & ~np.isnan(near_own)
         summed("time_near", known, near)
         summed("time_near_own", known, near_own)
@@ -395,24 +479,28 @@ def _provenance(
         }
         for c in range(m)
     ]
-    return origin, per_cell
+    return True, per_cell
 
 
 def _hosts(
-    origin: pl.DataFrame, cell: np.ndarray, region: np.ndarray, regions: list[dict]
+    cfg: DatasetConfig, cell: np.ndarray, region: np.ndarray, regions: list[dict]
 ) -> list[dict]:
-    """Return the quality_regions rows with the concentration of each key's values over their CSV rows.
+    """Return the quality_regions rows with the concentration of each key's values over all their CSV rows.
 
-    Per key of provenance.KEYS in origin: <key>_n_values, <key>_top and
-    <key>_top_share (provenance.concentration).
+    Per key of provenance.KEYS in provenance.parquet, read one key at a
+    time: <key>_n_values, <key>_top and <key>_top_share
+    (provenance.concentration).
     """
+    path = provenance_file(cfg)
+    present = pl.read_parquet_schema(path).names()
     order = {r["region"]: i for i, r in enumerate(regions)}
     of_cell = np.array([order[int(r)] for r in region], dtype=np.int64)
-    group = of_cell[cell[origin["row"].to_numpy()]]
     out = [dict(r) for r in regions]
     for key in KEYS:
-        if key not in origin.columns:
+        if key not in present:
             continue
+        origin = pl.read_parquet(path, columns=["row", key])
+        group = of_cell[cell[origin["row"].to_numpy()]]
         found = concentration(group, origin[key], len(regions))
         for i, values in enumerate(found.iter_rows(named=True)):
             out[i].update({f"{key}_{name}": v for name, v in values.items()})

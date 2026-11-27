@@ -3,8 +3,9 @@
 A dataset may not fit in memory, so its rows are never held whole: a
 row is first known by its key (row_key), two 64-bit hashes of its
 columns, from which its copies are grouped (group_copies), the rare
-classes found (rare_classes) and the large ones sampled (cap_classes);
-only then are the rows kept read.
+classes found (rare_classes) and the rows equal on every feature under
+different labels (conflict_groups, on a second key without the label);
+only then are the rows kept read, one file at a time.
 """
 
 from __future__ import annotations
@@ -14,10 +15,11 @@ __all__ = [
     "KEY",
     "KINDS",
     "LABEL",
+    "CONFLICT_KEY",
     "UNPARSABLE",
     "Copies",
     "Features",
-    "cap_classes",
+    "conflict_groups",
     "constant_columns",
     "count_kinds",
     "csv_files",
@@ -40,8 +42,6 @@ from typing import TypeVar
 import numpy as np
 import polars as pl
 
-from src.graph import sample_rows
-
 Frame = TypeVar("Frame", pl.DataFrame, pl.LazyFrame)
 
 LABEL = "label"  # class code column of the data file
@@ -51,6 +51,7 @@ DUPLICATES = (
 UNPARSABLE = "__unparsable__"  # clean's mark of the numeric cells that were not numbers
 KINDS = ("empty", "unparsable", "nan", "inf")  # the null and invalid values, by kind
 KEY = ("__key_0__", "__key_1__")  # the two hashes of row_key
+CONFLICT_KEY = ("__conflict_0__", "__conflict_1__")  # row_key of the features alone
 
 
 @dataclass(frozen=True)
@@ -267,7 +268,7 @@ def count_kinds(
     }
 
 
-def row_key(columns: Sequence[str]) -> list[pl.Expr]:
+def row_key(columns: Sequence[str], names: Sequence[str] = KEY) -> list[pl.Expr]:
     """Return the key of a row: two 64-bit hashes of its columns.
 
     Two rows are copies when every column is equal; the key stands for
@@ -278,13 +279,15 @@ def row_key(columns: Sequence[str]) -> list[pl.Expr]:
 
     Args:
         columns: The columns compared, at least one (of the output of
-            read_numbers, so an unparsable cell differs from an empty one).
+            read_numbers, so an unparsable cell differs from an empty one
+            when UNPARSABLE is among them).
+        names: The names of the two hashes.
 
     Returns:
-        Two UInt64 expressions, named KEY.
+        Two UInt64 expressions, named names.
     """
     row = pl.struct(list(columns))
-    return [row.hash(seed).alias(name) for seed, name in enumerate(KEY)]
+    return [row.hash(seed).alias(name) for seed, name in enumerate(names)]
 
 
 @dataclass(frozen=True)
@@ -354,30 +357,47 @@ def rare_classes(labels: pl.Series, min_count: int) -> list[str]:
     return sorted(str(label) for label in rare.to_list())
 
 
-def cap_classes(labels: np.ndarray, cap: int | None, seed: int) -> np.ndarray:
-    """Sample every class down to cap rows.
+def conflict_groups(keys: np.ndarray, labels: np.ndarray) -> np.ndarray:
+    """Group the rows equal on every feature under different labels.
 
-    Each class over cap keeps a uniform sample of cap of its rows
-    (graph.sample_rows with seed); the others keep every row.
+    Two rows are equal when their keys are (row_key of the features
+    alone, without the label and UNPARSABLE: an unparsable cell equals an
+    empty one, null equals null). A group is a key that more than one
+    label holds; it joins every row with that key.
 
     Args:
-        labels: The class of every distinct row, shape (n,).
-        cap: The most rows a class keeps; None keeps every row.
-        seed: The seed of the draw, the same for every class.
+        keys: The key of every row, uint64, shape (n, 2).
+        labels: The class code of every row, shape (n,).
 
     Returns:
-        Per row, whether it is kept, bool, shape (n,).
+        The group of every row, shape (n,) int64: groups numbered from 0
+        in the order of their first row, -1 for a row that no row of
+        another label equals.
     """
+    keys = np.asarray(keys, dtype=np.uint64)
     labels = np.asarray(labels)
-    kept = np.ones(len(labels), dtype=bool)
-    if cap is None:
-        return kept
-    for label in np.unique(labels):
-        rows = np.flatnonzero(labels == label)
-        if len(rows) > cap:
-            kept[rows] = False
-            kept[rows[sample_rows(len(rows), cap, seed)]] = True
-    return kept
+    n = len(keys)
+    groups = np.full(n, -1, dtype=np.int64)
+    if n == 0:
+        return groups
+    order = np.lexsort(
+        (keys[:, 1], keys[:, 0])
+    )  # stable: a run starts at its first row
+    ordered = keys[order]
+    starts = np.ones(n, dtype=bool)
+    starts[1:] = (ordered[1:] != ordered[:-1]).any(axis=1)
+    run = np.cumsum(starts) - 1
+    of_run = labels[order]
+    first = np.flatnonzero(starts)
+    least = np.minimum.reduceat(of_run, first)
+    most = np.maximum.reduceat(of_run, first)
+    mixed = np.flatnonzero(least != most)  # the runs of more than one label
+    number = np.full(len(first), -1, dtype=np.int64)
+    number[mixed[np.argsort(order[first[mixed]], kind="stable")]] = np.arange(
+        len(mixed)
+    )
+    groups[order] = number[run]
+    return groups
 
 
 def constant_columns(rows: pl.DataFrame, columns: Sequence[str]) -> list[str]:

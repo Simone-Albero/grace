@@ -22,7 +22,6 @@ from typing import Any
 import yaml
 
 from src.data import DUPLICATES
-from src.prepare import MISSING
 from src.provenance import KEYS, TIME
 from src.quality import resolution_rows
 
@@ -36,11 +35,15 @@ class CellsConfig:
     """The cells every defect is measured on (`src.cells`).
 
     Attributes:
-        max_fit_samples: The most distinct rows of a class its Ward tree
-            is built on; every other row joins its nearest sampled row.
+        max_sample_rows: The most distinct rows of a class the method
+            reads, a uniform sample of them (graph.sample_rows): its Ward
+            tree is built on them and every share is read on them; every
+            other row is a candidate nearest row of the rows read, and
+            joins the cell of its nearest sampled row to be counted.
+            None reads every row: the exact method.
     """
 
-    max_fit_samples: int
+    max_sample_rows: int | None
 
 
 @dataclass(frozen=True)
@@ -143,9 +146,6 @@ class DatasetConfig:
         num_cols: The numeric columns.
         cat_cols: The categorical columns.
         min_class_count: Classes with fewer rows are dropped.
-        max_class_rows: The most distinct rows a class keeps, a uniform
-            sample of them past it (data.cap_classes); None keeps every
-            row.
         top_n: The most frequent values of a categorical column with
             their own one-hot slot; the others share one.
         significant_digits: The significant digits every number is
@@ -166,7 +166,6 @@ class DatasetConfig:
     num_cols: tuple[str, ...]
     cat_cols: tuple[str, ...]
     min_class_count: int
-    max_class_rows: int | None
     top_n: int
     significant_digits: int | None
     seed: int
@@ -206,11 +205,11 @@ def _check_keys(
 
 def _validate_method(method: MethodConfig) -> None:
     cells, quality = method.cells, method.quality
-    positive = {
-        "cells.max_fit_samples": cells.max_fit_samples,
-    }
-    for key, value in positive.items():
-        _check(value >= 1, f"{key} must be >= 1, got {value}")
+    rows = cells.max_sample_rows
+    _check(
+        rows is None or rows >= 1,
+        f"cells.max_sample_rows must be >= 1 or null, got {rows}",
+    )
     _check(
         0 < quality.tau <= 0.5, f"quality.tau must be in (0, 0.5], got {quality.tau}"
     )
@@ -289,20 +288,11 @@ def load_config(dataset: str, method: str = "default") -> DatasetConfig:
     raw = _yaml(path)
     _check_keys(raw, DatasetConfig, path)
     columns = [*(raw["num_cols"] or ()), *(raw["cat_cols"] or ()), raw["label_col"]]
-    for added, stage in ((DUPLICATES, "clean"), (MISSING, "prepare")):
-        _check(
-            added not in columns,
-            f"{added} is the column stage {stage} adds, not a configured one",
-        )
-    _check(raw["top_n"] >= 1, f"top_n must be >= 1, got {raw['top_n']}")
-    max_class_rows = raw.get("max_class_rows")
     _check(
-        max_class_rows is None
-        or (
-            isinstance(max_class_rows, int) and max_class_rows >= raw["min_class_count"]
-        ),
-        f"max_class_rows must be null or >= min_class_count, got {max_class_rows}",
+        DUPLICATES not in columns,
+        f"{DUPLICATES} is the column stage clean adds, not a configured one",
     )
+    _check(raw["top_n"] >= 1, f"top_n must be >= 1, got {raw['top_n']}")
     digits = raw.get("significant_digits")
     _check(
         digits is None or (isinstance(digits, int) and 1 <= digits <= 17),
@@ -321,7 +311,6 @@ def load_config(dataset: str, method: str = "default") -> DatasetConfig:
         num_cols=tuple(raw["num_cols"] or ()),
         cat_cols=tuple(raw["cat_cols"] or ()),
         min_class_count=raw["min_class_count"],
-        max_class_rows=max_class_rows,
         top_n=raw["top_n"],
         significant_digits=digits,
         seed=raw["seed"],

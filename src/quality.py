@@ -4,31 +4,36 @@
 cells of `src.cells` are the smallest groups a share is read on; every
 node of a class's cut holds the rows of the cells below it, and the
 report (src.report) judges every node and merges the cells up the cut
-into regions where no verdict changes. The defects (DEFECTS), in three
-families:
+into regions where no verdict changes. Every share is read on the rows
+read, a uniform sample of each class (stage cells); every property of
+a row read is searched among all the rows of the dataset. The defects
+(DEFECTS), in three families:
 - STRUCTURAL, facts of single rows, read as shares of a node's rows:
   invalid_values (a null or invalid value, invalid_values),
   duplicates (CSV rows that repeat a row: copies can fall on both
   sides of a train/test split) and label_conflict (a row equal on every
-  feature to a row of another class: no classifier tells them apart,
-  label_conflicts);
+  feature to a row of another class: no classifier tells them apart;
+  data.conflict_groups, in stage clean);
 - OVERLAP, against a rival class: a row is confused with a class when
   its nearest row in the dataset, itself left out, is of that class
-  (nearest_rivals, the leave-one-out 1-NN on every row, no sample and
-  no model; a local N3 of Ho & Basu, kDN of Smith et al. with one
+  (nearest_rivals, the leave-one-out 1-NN against every row, exact, no
+  model; a local N3 of Ho & Basu, kDN of Smith et al. with one
   neighbour). minority_overlap: at least one half of the node's rows
   are (rival_shares): its class is the minority where it lies, as rows
   under a wrong label, or a true minority, would be. majority_overlap:
   that share reaches tau, against a class it has no minority_overlap
   against;
-- GENERALIZATION: single_feature_cut, one column alone separates the
-  node from its rival class, the most frequent class of its rows'
-  nearest rival rows: under tau of that class's rows fall inside the
-  node's values on the column (cut_shares, a local F3); low_variability,
-  the node lies in a branch of its class's cut that holds at least tau
-  of the class's CSV rows and is no more spread than the median cell of
-  the dataset (branch_spread, low_variability_verdicts): many rows in
-  the room of a few, near copies of one flow.
+- GENERALIZATION: single_feature_cut, against the node's rival class
+  (the most frequent class of its rows' nearest rival rows), one column
+  alone separates the node from that class: under tau of that class's
+  rows fall inside the central values of the node on the column, those
+  of all its rows but tau (node_intervals, cut_shares: a local F3 with
+  an error of at most tau on either side); low_variability, the node
+  lies in a branch of its class's cut that holds at least tau of the
+  class's CSV rows and is no more spread than the typical cell, one
+  vote per class (branch_spread, low_variability_reference,
+  low_variability_verdicts): many rows in the room of a few, near
+  copies of one flow.
 
 Every share of a node's rows is read with an interval at a confidence
 (share_bounds), and judged against a threshold beyond the error of
@@ -53,14 +58,12 @@ __all__ = [
     "column_values",
     "cut_shares",
     "invalid_values",
-    "label_conflicts",
     "low_variability_reference",
     "low_variability_verdicts",
     "nearest_rivals",
-    "node_ranges",
+    "node_intervals",
     "node_sums",
     "node_verdicts",
-    "pair_conflicts",
     "resolution_rows",
     "rival_shares",
     "share_bounds",
@@ -68,12 +71,11 @@ __all__ = [
 ]
 
 import math
-from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from statistics import NormalDist
 
 import numpy as np
 import polars as pl
-from sklearn.neighbors import NearestNeighbors
 
 STRUCTURAL = ("invalid_values", "duplicates", "label_conflict")
 OVERLAP = ("minority_overlap", "majority_overlap")
@@ -81,155 +83,98 @@ GENERALIZATION = ("single_feature_cut", "low_variability")
 DEFECTS = STRUCTURAL + OVERLAP + GENERALIZATION
 
 
-def label_conflicts(features: pl.DataFrame, labels: np.ndarray) -> np.ndarray:
-    """Group the rows equal on every column under different labels.
-
-    Null equals null. On every column a group holds one row per label
-    (stage clean keeps one copy of the rows equal on every column and
-    the label); on fewer columns it may hold several rows of a label.
-
-    Args:
-        features: The columns compared, one row per row of the data.
-        labels: The class code of every row, shape (n,).
-
-    Returns:
-        The group of every row, shape (n,) int64: groups numbered from 0
-        in the order of their first row, -1 for a row that no row of
-        another label equals.
-    """
-    groups = np.full(features.height, -1, dtype=np.int64)
-    if features.height == 0 or features.width == 0:
-        return groups
-    row, label = "__quality_row__", "__quality_label__"
-    conflicting = (
-        features.with_columns(
-            pl.Series(label, labels), pl.int_range(features.height).alias(row)
-        )
-        .group_by(features.columns, maintain_order=True)
-        .agg(pl.col(row), pl.col(label).n_unique().alias(label))
-        .filter(pl.col(label) > 1)
-        .select(pl.col(row))
-        .with_row_index("group")
-        .explode(row)
-    )
-    groups[conflicting[row].to_numpy()] = conflicting["group"].to_numpy()
-    return groups
-
-
-def pair_conflicts(
-    groups: np.ndarray, labels: np.ndarray, cell: np.ndarray, weights: np.ndarray
-) -> dict[tuple[int, int], tuple[int, float]]:
-    """Count the conflicting rows that every pair of cells shares.
-
-    A group joins the cells of its rows; two cells of different classes
-    in a group share its rows that lie in either, counted once per
-    group. Two cells of one class share no conflict.
-
-    Args:
-        groups: The group of every row (label_conflicts), -1 for none.
-        labels: The class code of every row.
-        cell: The cell of every row.
-        weights: The copies of every row in the CSV.
-
-    Returns:
-        By pair (a, b) with a < b: the conflicting rows of the two
-        cells, summed over their groups, and their summed weights.
-    """
-    rows = np.flatnonzero(groups >= 0)
-    rows = rows[np.argsort(groups[rows], kind="stable")]
-    bounds = np.flatnonzero(np.diff(groups[rows])) + 1
-    counts: dict[tuple[int, int], tuple[int, float]] = {}
-    for members in np.split(rows, bounds) if len(rows) else []:
-        by_cell: dict[int, list[int]] = defaultdict(list)
-        for row in members.tolist():
-            by_cell[int(cell[row])].append(row)
-        cells = sorted(by_cell)
-        for i, a in enumerate(cells):
-            for b in cells[i + 1 :]:
-                if labels[by_cell[a][0]] == labels[by_cell[b][0]]:
-                    continue
-                shared = by_cell[a] + by_cell[b]
-                n, read = counts.get((a, b), (0, 0.0))
-                counts[(a, b)] = (n + len(shared), read + float(weights[shared].sum()))
-    return counts
-
-
 def nearest_rivals(
-    points: np.ndarray, labels: np.ndarray
+    points: np.ndarray, labels: np.ndarray, queries: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return, for every row, its nearest row of another class, whether it is confused with it, and its nearest own row.
+    """Return, for every row asked, its nearest row of another class, whether it is confused with it, and its nearest own row.
 
-    Euclidean and exact, on every row: per class a kd-tree on the rows
-    of the other classes gives the nearest rival row, and one on the
-    rows of the class the nearest row of its own, itself left out. A
-    row is confused with the class of its nearest rival row when that
-    row is nearer than its nearest own row (the leave-one-out 1-NN on
-    the whole dataset); at the same distance (relative tolerance 1e-9)
-    it counts one half. Of rows at the same distance, one, the same on
-    every run. The nearest own row is the control of the provenance
-    measures (src.provenance).
+    Euclidean and exact, against every row of the dataset, by brute
+    force: the rows are scanned class by class, _REFERENCE_ROWS at a
+    time, in double precision (the points are float32, read as float64),
+    the rows asked _QUERY_ROWS at a time on _WORKERS threads; the two
+    best candidates of each side are kept and their distances computed
+    again as sums of squared differences. A row is confused with the
+    class of its nearest rival row when that row is nearer than its
+    nearest own row, itself left out (the leave-one-out 1-NN on the
+    whole dataset); at the same distance (relative tolerance _TIE) it
+    counts one half. Of rows at the same distance, the first in the
+    scan. The nearest own row is the control of the provenance measures
+    (src.provenance).
 
     Args:
-        points: The rows, shape (n, d).
+        points: The points of every row, shape (n, d) (a float32
+            memmap: only _REFERENCE_ROWS rows are read at once).
         labels: The class code of every row, shape (n,).
+        queries: The rows asked, ascending, distinct.
 
     Returns:
-        The position of every row's nearest row of another class, shape
-        (n,) int64, -1 when the rows are of one class; how much each row
-        is confused with it, shape (n,) float: 1, 0.5 or 0 (1 for the
-        only row of its class, 0 without a rival row); and the position
-        of its nearest other row of its class, shape (n,) int64, -1 for
-        the only row of its class.
+        Per row asked, shape (q,): the position of its nearest row of
+        another class (int64, -1 when the rows are of one class); how
+        much it is confused with it (float: 1, 0.5 or 0; 1 for the only
+        row of its class, 0 without a rival row); and the position of
+        its nearest other row of its class (int64, -1 for the only row
+        of its class).
     """
-    points = np.asarray(points, dtype=np.float64)
     labels = np.asarray(labels)
-    n = len(labels)
-    rival_row = np.full(n, -1, dtype=np.int64)
-    own_row = np.full(n, -1, dtype=np.int64)
-    confused = np.zeros(n)
-    for k in np.unique(labels):
-        own = np.flatnonzero(labels == k)
-        others = np.flatnonzero(labels != k)
-        if len(others):
-            search = NearestNeighbors(n_neighbors=1, algorithm="kd_tree", n_jobs=-1)
-            rival, at = search.fit(points[others]).kneighbors(points[own])
-            rival_row[own] = others[at[:, 0]]
-        if len(own) == 1:  # no row of its own: its nearest row is a rival's
-            confused[own] = 1.0 if len(others) else 0.0
-            continue
-        search = NearestNeighbors(n_neighbors=2, algorithm="kd_tree", n_jobs=-1)
-        near, at = search.fit(points[own]).kneighbors(points[own])
-        # itself left out; a copy of it at distance 0 may come first
-        first = at[:, 0] == np.arange(len(own))
-        mine = np.where(first, near[:, 1], near[:, 0])
-        own_row[own] = own[np.where(first, at[:, 1], at[:, 0])]
-        if not len(others):
-            continue
-        rival = rival[:, 0]
-        tie = np.abs(rival - mine) <= _TIE * np.maximum(mine, 1.0)
-        confused[own] = np.where(tie, 0.5, (rival < mine).astype(np.float64))
+    queries = np.asarray(queries, dtype=np.int64)
+    q = len(queries)
+    Q = np.asarray(points[queries], dtype=np.float64)
+    mine = labels[queries]
+    best = {side: _Candidates(q) for side in ("own", "rival")}
+    blocks = [slice(b, min(b + _QUERY_ROWS, q)) for b in range(0, q, _QUERY_ROWS)]
+    with ThreadPoolExecutor(_WORKERS) as pool:
+        for k in np.unique(labels):
+            of_k = np.flatnonzero(labels == k)
+            asked_k = mine == k
+            for start in range(0, len(of_k), _REFERENCE_ROWS):
+                ref = of_k[start : start + _REFERENCE_ROWS]
+                R = np.asarray(points[ref], dtype=np.float64)
+                minus_two, norm = -2.0 * R.T, np.einsum("ij,ij->i", R, R)
+
+                def nearest(block: slice) -> tuple[slice, np.ndarray, np.ndarray]:
+                    G = Q[block] @ minus_two  # squared distance minus |q|²
+                    G += norm
+                    _leave_out(G, queries[block], asked_k[block], ref)
+                    at = G.argmin(axis=1)
+                    return block, G[np.arange(len(at)), at], at
+
+                for block, value, at in pool.map(nearest, blocks):
+                    own = asked_k[block]
+                    rows = np.arange(block.start, block.stop)
+                    best["own"].add(rows[own], value[own], ref[at[own]])
+                    best["rival"].add(rows[~own], value[~own], ref[at[~own]])
+    mine_d, own_row = best["own"].exact(points, Q)
+    rival_d, rival_row = best["rival"].exact(points, Q)
+    has_rival = rival_row >= 0
+    with np.errstate(invalid="ignore"):  # inf - inf where a side has no row
+        tie = np.abs(rival_d - mine_d) <= _TIE * np.maximum(mine_d, 1.0)
+    confused = np.where(tie, 0.5, (rival_d < mine_d).astype(np.float64))
+    confused[own_row < 0] = 1.0  # no row of its own: its nearest row is a rival's
+    confused[~has_rival] = 0.0
     return rival_row, confused, own_row
 
 
 def rival_shares(
     cell: np.ndarray,
+    rows: np.ndarray,
     rival_row: np.ndarray,
     confused: np.ndarray,
     cell_class: np.ndarray,
 ) -> list[tuple[int, int, list[int], float]]:
-    """Return, per cell and rival class, its rival cells and the share of its rows confused with that class.
+    """Return, per cell and rival class, its rival cells and the share of its rows read confused with that class.
 
-    The rival classes of a cell are the classes of its rows' nearest
-    rival rows (nearest_rivals), its rival cells of a class the cells
-    those rows lie in. The share is over all the cell's rows: the sum
-    of how much each row whose nearest rival row is of that class is
-    confused with it, over the cell's rows.
+    The rival classes of a cell are the classes of the nearest rival
+    rows of its rows read, its rival cells of a class the cells those
+    rows lie in. The share is over the cell's rows read: the sum of how
+    much each row whose nearest rival row is of that class is confused
+    with it, over the cell's rows read.
 
     Args:
-        cell: The cell of every row, shape (n,).
-        rival_row: The nearest row of another class of every row
-            (nearest_rivals), shape (n,), -1 for none.
-        confused: How much every row is confused with it, shape (n,).
+        cell: The cell of every row of the dataset, shape (n,).
+        rows: The rows read (nearest_rivals' queries), shape (q,).
+        rival_row: Their nearest rows of another class (nearest_rivals),
+            shape (q,), -1 for none.
+        confused: How much each is confused with it, shape (q,).
         cell_class: The class of every cell.
 
     Returns:
@@ -238,20 +183,69 @@ def rival_shares(
         rival row.
     """
     cell, rival_row = np.asarray(cell), np.asarray(rival_row)
+    own_cell = cell[np.asarray(rows, dtype=np.int64)]
     confused, cell_class = np.asarray(confused, dtype=np.float64), np.asarray(
         cell_class
     )
-    size = np.bincount(cell, minlength=len(cell_class))
+    size = np.bincount(own_cell, minlength=len(cell_class))
     found: dict[tuple[int, int], list] = {}
-    for row in np.flatnonzero(rival_row >= 0).tolist():
-        other = int(cell[rival_row[row]])
-        entry = found.setdefault((int(cell[row]), int(cell_class[other])), [set(), 0.0])
+    for i in np.flatnonzero(rival_row >= 0).tolist():
+        other = int(cell[rival_row[i]])
+        entry = found.setdefault(
+            (int(own_cell[i]), int(cell_class[other])), [set(), 0.0]
+        )
         entry[0].add(other)
-        entry[1] += float(confused[row])
+        entry[1] += float(confused[i])
     return [
         (c, k, sorted(cells), total / size[c])
         for (c, k), (cells, total) in sorted(found.items())
     ]
+
+
+class _Candidates:
+    """The two best rows found so far for every row asked, on one side (own or rival)."""
+
+    def __init__(self, q: int) -> None:
+        self.value = np.full((q, 2), np.inf)
+        self.row = np.full((q, 2), -1, dtype=np.int64)
+
+    def add(self, asked: np.ndarray, value: np.ndarray, row: np.ndarray) -> None:
+        """Offer one row to each row asked; a tie keeps the row found first."""
+        first = value < self.value[asked, 0]
+        second = ~first & (value < self.value[asked, 1])
+        a = asked[first]
+        self.value[a, 1], self.row[a, 1] = self.value[a, 0], self.row[a, 0]
+        self.value[a, 0], self.row[a, 0] = value[first], row[first]
+        b = asked[second]
+        self.value[b, 1], self.row[b, 1] = value[second], row[second]
+
+    def exact(self, points: np.ndarray, Q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Return the exact distance and the row of the nearer candidate (the first on a tie), inf and -1 for none."""
+        distance = np.full(self.row.shape, np.inf)
+        for c in range(2):
+            has = np.flatnonzero(self.row[:, c] >= 0)
+            found = np.asarray(points[self.row[has, c]], dtype=np.float64)
+            diff = Q[has] - found
+            distance[has, c] = np.sqrt(np.einsum("ij,ij->i", diff, diff))
+        pick = (distance[:, 1] < distance[:, 0]).astype(np.int64)
+        at = np.arange(len(pick))
+        return distance[at, pick], np.where(
+            np.isfinite(distance[at, pick]), self.row[at, pick], -1
+        )
+
+
+def _leave_out(
+    G: np.ndarray, asked: np.ndarray, own: np.ndarray, ref: np.ndarray
+) -> None:
+    """Set to inf the entry of every row asked against itself, when it is among the rows ref (ascending)."""
+    rows = np.flatnonzero(own)
+    if not len(rows):
+        return
+    at = np.searchsorted(ref, asked[rows])
+    inside = at < len(ref)
+    rows, at = rows[inside], at[inside]
+    hit = ref[at] == asked[rows]
+    G[rows[hit], at[hit]] = np.inf
 
 
 def invalid_values(features: pl.DataFrame, unparsable: pl.DataFrame) -> pl.DataFrame:
@@ -450,14 +444,22 @@ def node_sums(
     return out
 
 
-def node_ranges(
+def node_intervals(
     values: np.ndarray,
     cell: np.ndarray,
     parent: np.ndarray,
     node_cell: np.ndarray,
     numeric: bool,
+    tau: float,
 ) -> np.ndarray:
-    """Return, per node of a cut, the values its rows take on one column.
+    """Return, per node of a cut, the central values its rows take on one column: at least 1 - tau of its rows.
+
+    Numeric: the interval left once the floor(tau n / 2) least and as
+    many greatest values of its n rows are dropped. Categorical: its
+    most frequent slots, the most frequent first (ties to the lower
+    slot), until they hold all of its rows but at most floor(tau n). An
+    order statistic, not an extreme: a few far rows do not widen it,
+    and a sample reads it as every row would, within its error.
 
     Args:
         values: The column's value of every row, shape (n,)
@@ -467,39 +469,72 @@ def node_ranges(
         parent: The parent of every node, -1 for a root; a parent comes
             before its children.
         node_cell: The cell of every node, -1 for a node that is not a
-            cell.
+            cell; the cells are the leaves.
         numeric: Whether the column is numeric.
+        tau: The share of a node's rows left out, in (0, 0.5].
 
     Returns:
-        Numeric: shape (k, 2) float, the least and the most value of
-        each node's rows (NaN for a node without rows). Categorical:
-        shape (k, s + 1) bool, whether each slot is taken by a row of
-        the node, s the slots, the last for no slot (-1).
+        Numeric: shape (k, 2) float, the least and the most value kept
+        of each node's rows (NaN for a node without rows). Categorical:
+        shape (k, s + 1) bool, whether each slot is kept, s the slots,
+        the last for no slot (-1).
     """
     values, cell = np.asarray(values, dtype=np.float64), np.asarray(cell)
     parent, node_cell = np.asarray(parent), np.asarray(node_cell)
-    m = int(node_cell.max()) + 1
-    leaf = node_cell >= 0
-    if numeric:
-        least, most = np.full(m, np.inf), np.full(m, -np.inf)
-        np.minimum.at(least, cell, values)
-        np.maximum.at(most, cell, values)
-        out = np.full((len(parent), 2), np.nan)
-        out[leaf] = np.c_[least, most][node_cell[leaf]]
-        for v in range(len(parent) - 1, -1, -1):  # children after their parent
-            up = parent[v]
-            if up >= 0:
-                out[up, 0] = np.fmin(out[up, 0], out[v, 0])
-                out[up, 1] = np.fmax(out[up, 1], out[v, 1])
-        return out
-    slot = _slots(values)
-    taken = np.zeros((m, int(slot.max()) + 1 if len(slot) else 1), dtype=bool)
-    taken[cell, slot] = True
-    out = np.zeros((len(parent), taken.shape[1]), dtype=bool)
-    out[leaf] = taken[node_cell[leaf]]
-    for v in range(len(parent) - 1, -1, -1):
+    k = len(parent)
+    children: list[list[int]] = [[] for _ in range(k)]
+    for v in range(k):
         if parent[v] >= 0:
-            out[parent[v]] |= out[v]
+            children[parent[v]].append(v)
+    order, stack = [], [v for v in range(k - 1, -1, -1) if parent[v] < 0]
+    while stack:  # depth first: the leaves below a node come one after the other
+        v = stack.pop()
+        order.append(v)
+        stack.extend(reversed(children[v]))
+    leaves = [v for v in order if node_cell[v] >= 0]
+    rank = np.full(int(node_cell.max()) + 1, len(leaves), dtype=np.int64)
+    rank[node_cell[leaves]] = np.arange(len(leaves))
+    first, last = np.full(k, len(leaves), dtype=np.int64), np.full(
+        k, -1, dtype=np.int64
+    )
+    for v in reversed(order):  # children before their parent
+        if node_cell[v] >= 0:
+            first[v] = last[v] = rank[node_cell[v]]
+        if parent[v] >= 0:
+            first[parent[v]] = min(first[parent[v]], first[v])
+            last[parent[v]] = max(last[parent[v]], last[v])
+    of_row = rank[cell]
+    by = np.argsort(of_row, kind="stable")
+    start = np.searchsorted(of_row[by], np.arange(len(leaves) + 1))
+    span = [
+        (start[first[v]], start[last[v] + 1]) if last[v] >= 0 else (0, 0)
+        for v in range(k)
+    ]
+    if numeric:
+        ordered = values[by]
+        out = np.full((k, 2), np.nan)
+        for v, (a, b) in enumerate(span):
+            n = b - a
+            if n == 0:
+                continue
+            drop = int(tau * n / 2 + 1e-9)  # floor, but for rounding
+            kept = np.partition(ordered[a:b], (drop, n - 1 - drop))
+            out[v] = kept[drop], kept[n - 1 - drop]
+        return out
+    slots = _slots(values)
+    width = int(slots.max()) + 1 if len(slots) else 1
+    ordered = slots[by]
+    out = np.zeros((k, width), dtype=bool)
+    for v, (a, b) in enumerate(span):
+        n = b - a
+        if n == 0:
+            continue
+        counts = np.bincount(ordered[a:b], minlength=width)
+        top = np.argsort(
+            -counts, kind="stable"
+        )  # the most frequent first, ties to the lower slot
+        need = n - int(tau * n + 1e-9)
+        out[v, top[: int(np.searchsorted(np.cumsum(counts[top]), need)) + 1]] = True
     return out
 
 
@@ -510,17 +545,18 @@ def cut_shares(
     labels: np.ndarray,
     numeric: bool,
 ) -> np.ndarray:
-    """Return, per node, the share of its rival class's rows inside its values on one column.
+    """Return, per node, the share of its rival class's rows inside its central values on one column.
 
     A numeric column: the share of the distinct rows of the rival class
-    whose value lies in [min, max] of the node's rows. A categorical
-    one: of those whose slot is one the node's rows take. A low share
-    means the column alone separates the node from its rival class: a
-    local F3 of Ho & Basu, with its known limit (one extreme row widens
-    [min, max], so it reports less, never more).
+    whose value lies in the node's interval (node_intervals). A
+    categorical one: of those whose slot is one the node keeps. A low
+    share means the column alone separates the node from its rival
+    class, a one-column rule that leaves out at most tau of the node and
+    lets in that share of the rival: a local F3 of Ho & Basu on the
+    central values instead of [min, max], which one far row widens.
 
     Args:
-        ranges: Per node, what node_ranges returns for the column.
+        ranges: Per node, what node_intervals returns for the column.
         rival_class: The rival class of every node (the most frequent
             class of its rows' nearest rival rows, ties to the lower
             code), -1 for none.
@@ -556,26 +592,40 @@ def cut_shares(
     return shares
 
 
-def low_variability_reference(variance: np.ndarray, node_cell: np.ndarray) -> float:
-    """Return the reference of low_variability: the variance of the median cell of the dataset.
+def low_variability_reference(
+    variance: np.ndarray, node_cell: np.ndarray, node_class: np.ndarray
+) -> float:
+    """Return the reference of low_variability: the variance of the typical cell, one vote per class.
 
-    Every cell holds about as many distinct rows (one to two times
-    min_rows), so its variance is the room a typical group of
-    neighbouring rows of that size takes in the dataset. It depends on
-    tau, which sets the size of the cells, and on the classes of the
-    dataset, whose cells it is the median of.
+    Per class, the variance of its median cell; the reference is the
+    median of these over the classes. Every cell holds about as many
+    distinct rows (one to two times min_rows), so its variance is the
+    room a typical group of neighbouring rows of that size takes. One
+    vote per class keeps a class from weighing by its number of cells,
+    which its size and its sample set (the cells of a class read on a
+    sample are wider): the classes read whole keep their verdicts
+    whatever the sample of the others. It depends on tau, which sets the
+    size of the cells.
 
     Args:
         variance: The variance of every node of the cuts of every class
             (branch_spread).
         node_cell: The cell of every node, -1 for a node that is not a
             cell.
+        node_class: The class code of every node.
 
     Returns:
-        The median of the variances of the cells, >= 0.
+        The median over the classes of the variance of their median
+        cell, >= 0.
     """
     variance, node_cell = np.asarray(variance), np.asarray(node_cell)
-    return float(np.median(variance[node_cell >= 0]))
+    node_class = np.asarray(node_class)
+    leaf = node_cell >= 0
+    per_class = [
+        np.median(variance[leaf & (node_class == c)])
+        for c in np.unique(node_class[leaf])
+    ]
+    return float(np.median(per_class))
 
 
 def low_variability_verdicts(
@@ -600,7 +650,7 @@ def low_variability_verdicts(
         n_read: The CSV rows below every node.
         variance: The variance of every node's distinct rows
             (branch_spread).
-        reference: The variance of the median cell
+        reference: The variance of the typical cell
             (low_variability_reference).
         tau: The share of its class a branch must hold, in (0, 0.5].
 
@@ -632,6 +682,7 @@ def node_verdicts(
     missing_rows: float,
     conflict_rows: float,
     confused: dict[int, float],
+    cut_class: int | None,
     cut_share: float | None,
     n_cut_rows: int,
     low_variability: bool,
@@ -651,11 +702,12 @@ def node_verdicts(
     - against every other class k: the share of its rows confused with
       k (0 when none is), minority_overlap against one half,
       majority_overlap against tau;
-    - single_feature_cut, against no class (the rival class is its
-      description): True when the upper bound of the cut share, on the
-      rival class's distinct rows, lies under tau, False when its lower
-      bound reaches tau; the least share over the columns decides, the
-      bounds growing with the share;
+    - single_feature_cut, against its cut class (the node's rival
+      class): True when the upper bound of the cut share, on the cut
+      class's distinct rows, lies under tau, False when its lower bound
+      reaches tau; the least share over the columns decides, the bounds
+      growing with the share. Two nodes cut against two classes have two
+      entries, so a merge (src.cells.merge_nodes) keeps them apart;
     - low_variability, against no class: as low_variability_verdicts
       found it, never undecided.
 
@@ -669,6 +721,7 @@ def node_verdicts(
             class.
         confused: By rival class, its rows confused with it (the sum of
             how much each is, a tie one half).
+        cut_class: The class code of its rival class, None without one.
         cut_share: Its least cut share over the columns (cut_shares),
             None without a rival class.
         n_cut_rows: The distinct rows of its rival class.
@@ -696,14 +749,19 @@ def node_verdicts(
         bounds = share_bounds(confused.get(k, 0.0) / n_rows, n_rows, confidence)
         found[("minority_overlap", k)] = verdict(*bounds, 0.5)
         found[("majority_overlap", k)] = verdict(*bounds, tau)
-    if cut_share is not None:
+    if cut_class is not None and cut_share is not None:
         reached = judged(cut_share, n_cut_rows, tau)  # the share reaches tau: no cut
-        found[("single_feature_cut", None)] = None if reached is None else not reached
+        found[("single_feature_cut", cut_class)] = (
+            None if reached is None else not reached
+        )
     found[("low_variability", None)] = bool(low_variability)
     return found
 
 
 _TIE = 1e-9  # relative tolerance under which two distances tie
+_REFERENCE_ROWS = 16_384  # rows of the dataset nearest_rivals reads at once
+_QUERY_ROWS = 2_048  # rows asked nearest_rivals compares at once, on each thread
+_WORKERS = 4  # threads of nearest_rivals
 
 
 def column_values(Z: np.ndarray, numeric: bool) -> np.ndarray:

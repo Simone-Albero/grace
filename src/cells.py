@@ -8,13 +8,14 @@ granularity, large where a class is uniform, small where it is not.
 
 The rows of a class are its distinct rows, each counted once whatever
 its copies in the CSV: the copies are a defect of their own
-(duplicates), and no measure of a cell weighs them. The Ward tree is
-built on a uniform sample of the class, and every row joins its nearest
-sampled row, so each node of the tree
-holds the rows of the sampled rows below it. The tree is cut from the
-root: a node is split into its two children while it holds rows enough
-for two cells, until every node left is a cell; a branch with too few
-rows to be measured is left out, its rows joining the nearest cell.
+(duplicates), and no measure of a cell weighs them. A class is read on
+a uniform sample of its rows (graph.sample_rows, stage cells): the Ward
+tree is built on every sampled row, and the cut counts sampled rows.
+The tree is cut from the root: a node is split into its two children
+while it holds rows enough for two cells, until every node left is a
+cell; a branch with too few rows to be measured is left out, its rows
+joining the nearest cell. Every row that is not sampled joins the cell
+of its nearest sampled row (nearest_rows), to be counted only.
 
 The cut is the tree of the cells (CellTree): sibling cells are the most
 alike, so the report merges cells up this tree where no verdict they
@@ -28,6 +29,7 @@ __all__ = [
     "WardTree",
     "class_cells",
     "merge_nodes",
+    "nearest_rows",
     "ward_tree",
 ]
 
@@ -36,8 +38,6 @@ from dataclasses import dataclass
 
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
-
-from src.graph import sample_rows
 
 _NEAREST_ROWS = 100_000  # rows whose nearest sampled row is searched at once
 
@@ -148,46 +148,34 @@ def ward_tree(X: np.ndarray) -> WardTree:
     return WardTree(children, np.asarray(heights)[order])
 
 
-def class_cells(
-    X: np.ndarray,
-    min_rows: int,
-    max_fit_samples: int,
-    seed: int,
-) -> tuple[np.ndarray, CellTree]:
-    """Cut one class into cells of min_rows to 2 · min_rows - 1 distinct rows.
+def class_cells(X: np.ndarray, min_rows: int) -> tuple[np.ndarray, CellTree]:
+    """Cut the sampled rows of one class into cells of min_rows to 2 · min_rows - 1 rows.
 
-    A Ward tree (ward_tree) is built on a uniform sample of at
-    most max_fit_samples rows (graph.sample_rows); every row joins its
-    nearest sampled row (euclidean), so a node holds the rows of its
-    sampled rows. From the root, a node of at least 2 · min_rows rows is
-    split into its two children; a child of fewer than min_rows rows is
-    left out, its rows joining the cell of their nearest sampled row in
-    a cell, and the node goes on as its other child. Every node left is
-    a cell. A cell so holds fewer than 2 · min_rows rows, and the rows
-    of the small branches left out beside it; a class of fewer than
-    2 · min_rows rows is one cell. A node is never smaller than its
-    sampled rows: with more rows than max_fit_samples · 2 · min_rows a
-    class is cut at most into its sampled rows.
+    A Ward tree (ward_tree) is built on every row of X; each row joins
+    its nearest row of X (itself, or an equal row before it), so a node
+    holds the rows that join its leaves. From the root, a node of at
+    least 2 · min_rows rows is split into its two children; a child of
+    fewer than min_rows rows is left out, its rows joining the cell of
+    their nearest row in a cell, and the node goes on as its other
+    child. Every node left is a cell. A cell so holds fewer than
+    2 · min_rows rows, and the rows of the small branches left out
+    beside it; fewer than 2 · min_rows rows are one cell.
 
     Args:
-        X: The points of the class (its distinct rows), shape (n, d),
-            n >= 1.
-        min_rows: The fewest distinct rows of a cell, >= 1.
-        max_fit_samples: The most rows the tree is built on.
-        seed: The seed of the sample.
+        X: The points of the sampled rows of the class (distinct rows),
+            float64, shape (m, d), m >= 1.
+        min_rows: The fewest rows of a cell, >= 1.
 
     Returns:
-        The cell of every row, 0.. with no gap, numbered in the
+        The cell of every row of X, 0.. with no gap, numbered in the
         pre-order of the cut; and the cut.
     """
-    n = len(X)
-    sampled = sample_rows(n, max_fit_samples, seed)
-    m = len(sampled)
-    tree = ward_tree(X[sampled])
-    nearest = _nearest(X, X[sampled])
+    m = len(X)
+    tree = ward_tree(X)
+    nearest = nearest_rows(X, X)
     leaves, start, stop = _leaf_ranges(tree.children, m)
     held = np.r_[0, np.cumsum(np.bincount(nearest, minlength=m)[leaves])]
-    size = held[stop] - held[start]  # the rows of the class below each node
+    size = held[stop] - held[start]  # the rows below each node
     sample_cell = np.full(m, -1, dtype=np.int64)
     parent, cell = [], []
     stack = [(2 * m - 2, -1)]
@@ -215,7 +203,7 @@ def class_cells(
     left = np.flatnonzero(labels < 0)
     if len(left):
         kept = np.flatnonzero(sample_cell >= 0)
-        labels[left] = sample_cell[kept[_nearest(X[left], X[sampled[kept]])]]
+        labels[left] = sample_cell[kept[nearest_rows(X[left], X[kept])]]
     return labels, CellTree(
         np.asarray(parent, dtype=np.int64), np.asarray(cell, dtype=np.int64)
     )
@@ -296,8 +284,19 @@ def _squared_distances(X: np.ndarray, a: int) -> np.ndarray:
     return np.einsum("ij,ij->i", diff, diff)
 
 
-def _nearest(X: np.ndarray, Y: np.ndarray) -> np.ndarray:
-    """Return, for every row of X, the index of its nearest row of Y (euclidean)."""
+def nearest_rows(X: np.ndarray, Y: np.ndarray) -> np.ndarray:
+    """Return, for every row of X, the index of its nearest row of Y.
+
+    Euclidean, exact (scikit-learn's brute force), _NEAREST_ROWS rows of
+    X at a time; of rows of Y at the same distance, the first.
+
+    Args:
+        X: The rows, shape (n, d).
+        Y: The rows searched, shape (m, d), m >= 1.
+
+    Returns:
+        Shape (n,) int64, in [0, m).
+    """
     search = NearestNeighbors(n_neighbors=1, algorithm="brute", n_jobs=-1).fit(Y)
     return np.concatenate(
         [

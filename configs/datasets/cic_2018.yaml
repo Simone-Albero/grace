@@ -94,8 +94,6 @@ provenance:  # where each CSV row comes from: the source and the time are never 
 
 
 min_class_count: 50  # classes with fewer rows are dropped
-max_class_rows: 10000000  # Benign has 42.2M distinct rows (45.7M in all): a 16 GB machine holds a uniform sample of
-                          #   10M, the scale of cic_2018_broken; every attack class is under it and kept whole
 top_n: 32  # most frequent values of a categorical column with their own one-hot slot; the others share one
 seed: 42
 output_dir: resources/processed/cic_2018

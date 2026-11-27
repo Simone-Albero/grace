@@ -1,16 +1,21 @@
 """The verdicts of quality_report, at the dataset's tau.
 
-What quality_report measures does not depend on tau: per cell its rows,
-its CSV rows, its rows with a null or invalid value or in a label
-conflict, and the share of its rows confused with each rival class; per
-node of each class's cut, the variance of its rows and, on each column,
-the share of its rival class's rows inside its values. judge reads them
-at tau and the confidence, once, in the stage: it sums the measures of
-the cells up the cut, gives every node a verdict on every entry
+What quality_report measures depends on tau only through the cells,
+sized on it, and the central values of the cut: per cell its rows read
+(a uniform sample of its class) and their CSV rows, those with a null
+or invalid value or in a label conflict, the share of them confused
+with each rival class, and all its rows and their CSV rows; per node of
+each class's cut, the variance of its rows and, on each column, the
+share of its rival class's rows inside its central values (all its rows
+but tau). judge reads them at tau and the confidence, once, in the
+stage: it sums the measures of the cells up the cut, gives every node a
+verdict on every entry, a defect against a target
 (src.quality.node_verdicts), merges the cells into regions where no
 verdict a part decides changes (src.cells.merge_nodes), and writes the
 rows of the regions, of the classes and of the dataset. A region is a
-node of the cut, and its verdicts are read on its own rows.
+node of the cut, and its verdicts are read on its own rows read; the
+share of the CSV rows with a defect, per class and over the dataset,
+is of all the rows.
 """
 
 from __future__ import annotations
@@ -38,6 +43,10 @@ from src.quality import (
 
 COUNTS = ("n_rows", "n_read", "conflict_rows", "conflict_read", "missing_rows")
 COUNTS += ("missing_read",) + tuple(f"{kind}_rows" for kind in KINDS)
+COUNTS += ("all_rows", "all_read")
+# n_rows, n_read and the counts after them are of the rows read; all_rows
+# and all_read of every row of the cell, the rows read and those that
+# joined it (stage cells)
 
 
 @dataclass(frozen=True)
@@ -76,13 +85,15 @@ def judge(
     (COUNTS, the rows confused with each rival class as the sum of the
     rival share times the rows, the provenance sums) and those the
     stage measured on the node (variance, cut_*); then the verdict of
-    every entry (src.quality.node_verdicts, low_variability from
-    src.quality.low_variability_verdicts against the median cell);
+    every entry (src.quality.node_verdicts, single_feature_cut against
+    the node's cut class, low_variability from
+    src.quality.low_variability_verdicts against the typical cell, one
+    vote per class);
     then the regions (src.cells.merge_nodes on the raw verdicts). A
     region has a defect when an entry of it is True; majority_overlap
     only against a class it has no minority_overlap against. The share
-    of the CSV rows with a defect is that of the rows of the regions
-    with it, per class and over the dataset.
+    of the CSV rows with a defect is that of all the rows (all_read) of
+    the regions with it, per class and over the dataset.
 
     Args:
         cells: The tau-free quality_cells rows, sorted by cell, one per
@@ -113,7 +124,8 @@ def judge(
         cut_share/_low/_high and cut_columns, low_variability_branch,
         low_variability_share and low_variability_ratio, defects and
         undecided joined by ",", the provenance sums); classes (class,
-        n_rows, n_read, n_cells, n_regions, share_<defect>,
+        n_rows, n_read, all_rows, all_read, n_cells, n_regions,
+        share_<defect>,
         share_no_defect); stats.
     """
     code = {name: k for k, name in enumerate(classes)}
@@ -144,12 +156,13 @@ def judge(
     )
     n_rows, n_read = count["n_rows"], count["n_read"]
     variance = branches["variance"].to_numpy().astype(np.float64)
-    reference = low_variability_reference(variance, node_cell)
+    reference = low_variability_reference(variance, node_cell, node_class)
     compact, top = low_variability_verdicts(parent, n_read, variance, reference, tau)
     root = np.arange(k)
     for v in range(k):  # a parent before its children
         if parent[v] >= 0:
             root[v] = root[parent[v]]
+    cut_class = [None if k is None else code[k] for k in branches["cut_class"]]
     cut_share = branches["cut_share"].to_list()
     n_cut = branches["n_cut_rows"].to_list()
     entries = [
@@ -161,6 +174,7 @@ def judge(
             missing_rows=float(count["missing_rows"][v]),
             conflict_rows=float(count["conflict_rows"][v]),
             confused={j: float(x) for j, x in enumerate(confused[v]) if x > 0},
+            cut_class=cut_class[v],
             cut_share=cut_share[v],
             n_cut_rows=int(n_cut[v] or 0),
             low_variability=bool(compact[v]),
@@ -360,6 +374,8 @@ def _class_rows(
                 "class": name,
                 "n_rows": sum(r["n_rows"] for r in own),
                 "n_read": sum(r["n_read"] for r in own),
+                "all_rows": sum(r["all_rows"] for r in own),
+                "all_read": sum(r["all_read"] for r in own),
                 "n_cells": len(own),
                 "n_regions": len(mine),
                 **_shares(mine),
@@ -369,8 +385,8 @@ def _class_rows(
 
 
 def _shares(regions: list[dict]) -> dict[str, float]:
-    """Return share_<defect> and share_no_defect: the share of the CSV rows of these regions in regions with it, or with none."""
-    total = sum(r["n_read"] for r in regions)
+    """Return share_<defect> and share_no_defect: the share of all the CSV rows of these regions in regions with it, or with none."""
+    total = sum(r["all_read"] for r in regions)
 
     def share(rows: float) -> float:
         return rows / total if total else 0.0
@@ -378,11 +394,13 @@ def _shares(regions: list[dict]) -> dict[str, float]:
     return {
         **{
             f"share_{d}": share(
-                sum(r["n_read"] for r in regions if d in _listed(r["defects"]))
+                sum(r["all_read"] for r in regions if d in _listed(r["defects"]))
             )
             for d in DEFECTS
         },
-        "share_no_defect": share(sum(r["n_read"] for r in regions if not r["defects"])),
+        "share_no_defect": share(
+            sum(r["all_read"] for r in regions if not r["defects"])
+        ),
     }
 
 

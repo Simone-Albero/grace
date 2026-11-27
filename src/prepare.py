@@ -1,6 +1,8 @@
 """The features every distance of the method is measured on.
 
-Fitted on the cleaned rows by stage prepare. A number becomes
+Fitted on the cleaned rows by stage prepare, block by block (the rows
+are never held whole): the statistics of the fit are sums over the
+rows. A number becomes
 sign(x) · log1p(|x|), then is standardized (scikit-learn
 StandardScaler: minus its mean, divided by its standard deviation); a
 missing or non-finite number lands on the mean, 0, and MISSING counts
@@ -13,8 +15,9 @@ slots in the fitted rows (the chance two random rows differ on it): a
 mismatch costs 2 / g_c in squared distance, so on average, g_c times
 that, the column adds 2, as much as one standardized number adds. A
 rare slot is far from the others, as a rare value of a standardized
-number is. MISSING is left out of every distance (graph.space_points
-takes the numbers and the slots).
+number is. MISSING is a diagnostic, logged by stage prepare: no
+distance sees it. The points are the standardized numbers then the
+slots, in single precision (float32).
 """
 
 from __future__ import annotations
@@ -26,13 +29,14 @@ __all__ = [
     "Preparation",
     "TopNEncoder",
     "column_names",
+    "column_sources",
     "fit_preparation",
     "signed_log1p",
     "transform",
 ]
 
 import math
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -70,6 +74,8 @@ class TopNEncoder:
             fit.
         has_other_: Whether the fitted column held a value outside
             values_; set by fit.
+        slot_counts_: The fitted rows of each one-hot slot, in slot
+            order (slot_names); set by fit.
     """
 
     def __init__(self, column: str, top_n: int) -> None:
@@ -85,11 +91,27 @@ class TopNEncoder:
         Returns:
             self.
         """
-        counts = values.value_counts().sort(
-            ["count", values.name], descending=[True, False], nulls_last=True
+        return self.fit_counts(values.value_counts())
+
+    def fit_counts(self, counts: pl.DataFrame) -> TopNEncoder:
+        """Learn the top_n most frequent values from their counts.
+
+        Args:
+            counts: One row per distinct value of the column: the value
+                (null included), in the column named self.column, and
+                its rows, in "count" (value_counts, summed over blocks).
+
+        Returns:
+            self.
+        """
+        counts = counts.sort(
+            ["count", self.column], descending=[True, False], nulls_last=True
         )
-        self.values_ = tuple(counts[values.name].head(self.top_n).to_list())
+        self.values_ = tuple(counts[self.column].head(self.top_n).to_list())
         self.has_other_ = counts.height > self.top_n
+        rest = int(counts["count"].slice(self.top_n).sum() or 0)
+        top = [int(n) for n in counts["count"].head(self.top_n).to_list()]
+        self.slot_counts_ = tuple(top + [rest] * self.has_other_)
         return self
 
     def transform(self, values: pl.Series) -> np.ndarray:
@@ -144,16 +166,21 @@ class Preparation:
 
 
 def fit_preparation(
-    rows: pl.DataFrame,
+    blocks: Iterable[pl.DataFrame],
     num_cols: Sequence[str],
     cat_cols: Sequence[str],
     *,
     top_n: int,
 ) -> Preparation:
-    """Fit the preparation on the rows.
+    """Fit the preparation on the rows, read block by block.
+
+    The scaler is fitted with StandardScaler.partial_fit on each block
+    (the same mean and variance as one fit, up to rounding); the counts
+    of each categorical value are summed over the blocks.
 
     Args:
-        rows: The rows of the data file.
+        blocks: The rows of the data file, in blocks, each with num_cols
+            and cat_cols.
         num_cols: The numeric columns, at least one.
         cat_cols: The categorical columns, as text; may be empty.
         top_n: The values of a categorical column with their own code.
@@ -161,38 +188,64 @@ def fit_preparation(
     Returns:
         The fitted preparation.
     """
-    scaler = StandardScaler().fit(_signed_log(rows, num_cols))
-    encoders = tuple(TopNEncoder(name, top_n).fit(rows[name]) for name in cat_cols)
+    scaler = StandardScaler()
+    counts: dict[str, list[pl.DataFrame]] = {name: [] for name in cat_cols}
+    for block in blocks:
+        scaler.partial_fit(_signed_log(block, num_cols))
+        for name in cat_cols:
+            counts[name].append(block[name].value_counts())
+    encoders = []
+    for name in cat_cols:
+        summed = pl.concat(counts[name]).group_by(name).agg(pl.col("count").sum())
+        encoders.append(TopNEncoder(name, top_n).fit_counts(summed))
     weights = []
     for encoder in encoders:
-        slots = _slots(encoder, encoder.transform(rows[encoder.column]))
-        shares = np.bincount(slots, minlength=_n_slots(encoder)) / max(len(slots), 1)
+        shares = np.asarray(encoder.slot_counts_, dtype=np.float64)
+        shares /= max(shares.sum(), 1.0)
         differ = 1.0 - float(np.sum(shares**2))
         weights.append(math.sqrt(1.0 / differ) if differ > 1e-12 else 0.0)
     return Preparation(
         num_cols=tuple(num_cols),
         scaler=scaler,
-        encoders=encoders,
+        encoders=tuple(encoders),
         weights=tuple(weights),
     )
 
 
 def column_names(preparation: Preparation) -> list[str]:
-    """Return the names of the prepared columns.
+    """Return the names of the columns of the points.
 
     Args:
         preparation: The fitted preparation.
 
     Returns:
-        num_cols, then MISSING, then the slot_names of each encoder.
+        num_cols, then the slot_names of each encoder.
     """
-    names = [*preparation.num_cols, MISSING]
+    names = list(preparation.num_cols)
     for encoder in preparation.encoders:
         names += encoder.slot_names()
     return names
 
 
-def transform(preparation: Preparation, rows: pl.DataFrame) -> pl.DataFrame:
+def column_sources(preparation: Preparation) -> list[str]:
+    """Return the configured column behind every column of the points.
+
+    Args:
+        preparation: The fitted preparation.
+
+    Returns:
+        One name per column of column_names: a numeric column's own,
+        the categorical column of a one-hot slot.
+    """
+    sources = list(preparation.num_cols)
+    for encoder in preparation.encoders:
+        sources += [encoder.column] * _n_slots(encoder)
+    return sources
+
+
+def transform(
+    preparation: Preparation, rows: pl.DataFrame
+) -> tuple[np.ndarray, np.ndarray]:
     """Prepare rows.
 
     Args:
@@ -200,29 +253,27 @@ def transform(preparation: Preparation, rows: pl.DataFrame) -> pl.DataFrame:
         rows: Rows of the data file.
 
     Returns:
-        Float64 columns named by column_names, in row order: the
-        standardized numbers (0 when missing or non-finite), then
-        MISSING (how many of them were missing or non-finite, 0 when
-        none; present even when no row has one), then per
-        categorical column its slots, one of them set to the column's
-        preparation.weights and the others 0 (all 0 for a value outside
-        the top_n of a column fitted without an "other" slot, which
-        only rows the preparation was not fitted on can hold).
+        The points, float32, shape (n, columns of column_names), in row
+        order: the standardized numbers (0 when missing or
+        non-finite), then per categorical column its slots, one of them
+        set to the column's preparation.weights and the others 0 (all 0
+        for a value outside the top_n of a column fitted without an
+        "other" slot, which only rows the preparation was not fitted on
+        can hold); and MISSING of every row, shape (n,) int64: how many
+        of its numbers were missing or non-finite.
     """
     logged = _signed_log(rows, preparation.num_cols)
-    missing = np.isnan(logged).sum(axis=1, keepdims=True).astype(np.float64)
-    numbers = preparation.scaler.transform(logged)
-    blocks = [np.nan_to_num(numbers, nan=0.0), missing]
+    missing = np.isnan(logged).sum(axis=1).astype(np.int64)
+    numbers = np.nan_to_num(preparation.scaler.transform(logged), nan=0.0)
+    blocks = [numbers.astype(np.float32)]
     for encoder, weight in zip(preparation.encoders, preparation.weights):
         n_slots = _n_slots(encoder)
         slot = _slots(encoder, encoder.transform(rows[encoder.column]))
-        block = np.zeros((rows.height, n_slots))
+        block = np.zeros((rows.height, n_slots), dtype=np.float32)
         filled = slot < n_slots
         block[np.flatnonzero(filled), slot[filled]] = weight
         blocks.append(block)
-    return pl.DataFrame(
-        np.hstack(blocks), schema=column_names(preparation), orient="row"
-    )
+    return np.hstack(blocks), missing
 
 
 def _n_slots(encoder: TopNEncoder) -> int:

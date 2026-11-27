@@ -1,7 +1,7 @@
-# cic_2018_broken sampled into one CSV to compare grace and DataBadSmells (experiments/poc/generate.py, seed 42):
-# Benign 100k lines, every attack whole up to 10k but FTP-BruteForce and SlowHTTPTest whole (nearly all copies:
-# 10k lines would leave them under min_class_count distinct rows), raw lines byte for byte, one header, LF ends,
-# and the four columns only Thuesday-20-02 has dropped. Counts per class and per file of the source in its .manifest.json.
+# cic_2018_broken sampled into one CSV (experiments/poc, seed 42), the rule of both pocs: per class a uniform sample of
+# at most 100k distinct rows for Benign and 10k for every attack, with every copy of them in the CSV (a class with fewer,
+# as FTP-BruteForce and SlowHTTPTest, is whole), every field as in the source, one header, LF ends, and the four columns
+# only Thuesday-20-02 has dropped. Counts per class in its .manifest.json.
 name: cic_2018_broken_poc
 path: resources/raw_data/cic_2018_broken_poc/cic_2018_broken_poc.csv
 label_col: Label

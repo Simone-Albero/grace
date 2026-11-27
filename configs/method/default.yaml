@@ -1,7 +1,10 @@
 # Parameters of the method, shared by every dataset (src.config.MethodConfig).
 cells:                   # every class cut into compact cells of about the same size, the units every defect is measured on
-  max_fit_samples: 20000 # most distinct rows of a class its Ward tree is built on (quadratic time), a bound of
-                         #   computation: every other row joins its nearest sampled row
+  max_sample_rows: 20000 # most distinct rows of a class the method reads, a uniform sample: its Ward tree (quadratic
+                         #   time) is built on them and every share is read on them, a bound of computation; every
+                         #   other row is only searched as a nearest row, and joins the cell of its nearest sampled
+                         #   row to be counted. The sample is the first rows of one random order of the class, so a
+                         #   larger value reads the same rows and more; null reads every row (the exact method)
                          # The cells are as small as the measures allow: a node is split while both its children hold
                          #   min_rows rows, and min_rows is what tau and confidence ask for, not a key of its own
                          #   (quality.resolution_rows, the rows that decide a share tau away from tau or one half:

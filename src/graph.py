@@ -1,51 +1,29 @@
-"""The points of the space and uniform samples of rows.
-
-space_points turns the prepared rows into the points every distance,
-euclidean, is measured on. sample_rows draws a uniform sample of rows.
-"""
+"""Uniform samples of rows: sample_rows draws the rows a class is read on."""
 
 from __future__ import annotations
 
-__all__ = [
-    "sample_rows",
-    "space_points",
-]
+__all__ = ["sample_rows"]
 
 import numpy as np
 
 
-def space_points(numbers: np.ndarray, slots: np.ndarray) -> np.ndarray:
-    """Return the points every distance of the method is measured on.
-
-    The prepared numbers, then the categorical slots, as they are: the
-    distance of two rows is the euclidean one of their points.
-
-    Args:
-        numbers: The prepared numeric columns, shape (n, d_num).
-        slots: The prepared one-hot slots, shape (n, d_cat); may have
-            no column.
-
-    Returns:
-        Float64 points, shape (n, d_num + d_cat).
-    """
-    return np.hstack(
-        [np.asarray(numbers, dtype=np.float64), np.asarray(slots, dtype=np.float64)]
-    )
-
-
-def sample_rows(n: int, max_samples: int, seed: int) -> np.ndarray:
+def sample_rows(n: int, max_samples: int | None, seed: int) -> np.ndarray:
     """Return a uniform sample of range(n), ascending.
+
+    The sample is the first max_samples rows of one random order of
+    range(n), fixed by seed: a larger max_samples keeps the same rows
+    and more (nested samples).
 
     Args:
         n: The rows to sample from.
-        max_samples: The most rows kept; every row when n <=
-            max_samples.
-        seed: The seed of the draw (without replacement).
+        max_samples: The most rows kept; every row when None or when
+            n <= max_samples.
+        seed: The seed of the order.
 
     Returns:
         The kept positions, int64, ascending.
     """
-    if n <= max_samples:
+    if max_samples is None or n <= max_samples:
         return np.arange(n, dtype=np.int64)
-    rng = np.random.default_rng(seed)
-    return np.sort(rng.choice(n, size=max_samples, replace=False)).astype(np.int64)
+    order = np.random.default_rng(seed).permutation(n)
+    return np.sort(order[:max_samples]).astype(np.int64)

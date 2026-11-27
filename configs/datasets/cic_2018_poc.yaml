@@ -1,7 +1,7 @@
-# cic_2018 sampled into one CSV to compare grace and DataBadSmells (experiments/poc/generate.py, seed 42): BENIGN
-# 100k lines, every other class whole up to 10k but FTP-BruteForce - Attempted whole (nearly all copies), raw lines
-# byte for byte. Counts per class and per file of the source in its .manifest.json. Not features, as in cic_2018:
-# id, Flow ID, Src/Dst IP, Src Port, Timestamp, Attempted Category, ICMP Code/Type and the columns that repeat others.
+# cic_2018 sampled into one CSV (experiments/poc, seed 42), the rule of both pocs: per class a uniform sample of at most
+# 100k distinct rows for BENIGN and 10k for every other class, with every copy of them in the CSV (a class with fewer is
+# whole), every field as in the source, one header, LF ends. Counts per class in its .manifest.json. Not features, as in
+# cic_2018: id, Flow ID, Src/Dst IP, Src Port, Timestamp, Attempted Category, ICMP Code/Type and the columns that repeat others.
 name: cic_2018_poc
 path: resources/raw_data/cic_2018_poc/cic_2018_poc.csv
 label_col: Label

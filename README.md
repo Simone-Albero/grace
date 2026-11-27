@@ -45,7 +45,6 @@ label_col: Label
 num_cols: [Flow Duration, Total Fwd Packet]  # numeric features
 cat_cols: [Dst Port, Protocol]               # categorical features
 min_class_count: 50       # classes with fewer distinct rows are dropped
-max_class_rows: 10000000  # optional: larger classes are sampled down to this many distinct rows
 top_n: 32                 # categorical values with their own one-hot slot; the rest share one
 seed: 42
 output_dir: resources/processed/my_dataset
@@ -76,20 +75,26 @@ The yamls in `configs/datasets/` are further examples.
 |---|---|---|
 | `quality.tau` | 0.1 | the one threshold of the report (see the table below) |
 | `quality.confidence` | 0.95 | level of the Wilson interval every share of a cell is read with |
-| `cells.max_fit_samples` | 20000 | most rows of a class the Ward tree is built on (a bound of computation) |
+| `cells.max_sample_rows` | 20000 | most distinct rows of a class the method reads (a bound of computation); `null` reads every row |
 
 tau and the confidence also set the size of the cells, z² / (4 tau²) rows: 68 at the defaults. A smaller tau or a
 higher confidence asks for larger cells, so another tau means running `cells` and `quality_report` again. The
 dashboard shows the verdicts of the run, at its tau.
 
+The one approximation: each class is read on a uniform sample of at most `max_sample_rows` of its distinct rows, the
+first of one random order of the class (a larger value reads the same rows and more). The Ward tree is built on them
+and every share is read on them, with its interval; every property of a row read (its nearest row, the rows equal to
+it, its copies) is searched among all the rows. Every other row joins the cell of its nearest row read, to be counted
+in its region's rows.
+
 ## How it works
 
 | stage | what it does | writes |
 |---|---|---|
-| `clean` | reads the CSV, keeps one copy of each row and counts its copies, drops rare classes and constant columns, samples classes over `max_class_rows` | `data.parquet`, `provenance.parquet` |
-| `prepare` | numbers to sign(x)·log1p(\|x\|), then standardized; categoricals to weighted one-hot | `prepared.parquet` |
-| `cells` | a Ward tree per class, split while a node holds at least twice the cell size | `cells.parquet`, `assignments.parquet`, `cell_tree.parquet` |
-| `quality_report` | measures every cell and every branch of the trees, judges every branch at tau and merges the cells into regions | tables in the DB |
+| `clean` | reads the CSVs twice in streaming, keeps one copy of each row and counts its copies, finds the rows equal under two labels, drops rare classes and constant columns | `data.parquet`, `provenance.parquet`, `conflicts.parquet` |
+| `prepare` | numbers to sign(x)·log1p(\|x\|), then standardized; categoricals to weighted one-hot | `points.npy` (float32), `points.json` |
+| `cells` | samples each class, builds its Ward tree on the rows read, splits while a node holds at least twice the cell size | `cells.parquet`, `assignments.parquet`, `cell_tree.parquet` |
+| `quality_report` | finds the nearest rows of every row read among all the rows, measures every cell and every branch, judges every branch at tau and merges the cells into regions | `rivals.parquet`, tables in the DB |
 
 A row is confused with another class when its nearest row in the dataset belongs to that class. The `rival_share`
 of a group of rows against a class is the share of its rows confused with it. Every share is read with its interval
@@ -113,8 +118,8 @@ and the hosts of each region.
 | structural | `label_conflict` | at least tau of its rows equal a row of another class on every feature | no classifier can tell them apart |
 | overlap | `minority_overlap` | its `rival_share` against a class is at least one half | its class is the minority where it lies: wrong labels, or a true minority |
 | overlap | `majority_overlap` | its `rival_share` is at least tau, and it has no `minority_overlap` against that class | part of it is mixed with the other class |
-| generalization | `single_feature_cut` | under tau of its rival class's rows fall inside its values on one column | one column alone separates them: an artefact or a legitimate signal |
-| generalization | `low_variability` | it lies in a branch holding at least tau of its class's CSV rows, no more spread than the median cell | near copies of one flow: a model sees the same rows in training and test |
+| generalization | `single_feature_cut` | under tau of its rival class's rows fall inside its central values on one column (those of all its rows but tau) | one column alone separates them: an artefact or a legitimate signal |
+| generalization | `low_variability` | it lies in a branch holding at least tau of its class's CSV rows, no more spread than the typical cell (the median over the classes of each class's median cell) | near copies of one flow: a model sees the same rows in training and test |
 
 The names describe the geometry, not the cause: whether a `minority_overlap` is a wrong label or a true minority,
 whether a cut is an artefact, the provenance and the domain say.
@@ -139,7 +144,8 @@ dataset). Every table carries a `run_id`.
 
 - A measure: a function in `src/quality.py`, called in `stages/quality_report.py`. A measure of a cell that adds up
   goes in `quality_cells` (`src/report.judge` sums it up the tree); one that does not is measured on every branch, in
-  `quality_branches`. A measure must not depend on tau: tau is applied only in `src/report.judge`.
+  `quality_branches`. A measure must not depend on tau: tau is applied in `src/report.judge`, and enters the
+  measures only through the size of the cells and the central values of `single_feature_cut`.
 - A defect: its name in a family of `src/quality.py` (`DEFECTS`), its verdict in `node_verdicts`, its columns in the
   region rows of `src/report.judge`, and a line in the table above.
 
@@ -148,11 +154,13 @@ dataset). Every table carries a `run_id`.
 - A rerun overwrites the files of its stage, and nothing records which run wrote a stage's inputs.
 - Two method yamls on the same dataset share its `output_dir`.
 - A run killed by anything but Ctrl-C stays `running` in the DB.
-- The nearest-row searches use every core; a large class needs memory (cic_2018 samples Benign to 10M rows on 16 GB).
+- The nearest-row search is exact and brute force, on every core: its time grows with the rows read times all the
+  rows.
 - Every share treats a region's distinct rows as independent trials; rows that share their nearest rival row are
   not quite, so the intervals are a little narrower than true. The copies of a row count once.
-- `single_feature_cut` reads a column's [min, max]: one extreme row widens it, so it reports less, never more.
-- `low_variability` has no interval, and its reference, the median cell, depends on tau and on the classes of the
-  dataset. In a class of fewer than 1/tau cells one cell is a large branch.
+- `single_feature_cut` reads a region's central values on a column, all its rows but tau: the interval comes from
+  the rows read, and its error is not in the interval of the share.
+- `low_variability` has no interval, and its reference, the typical cell, depends on tau and, one vote each, on the
+  classes of the dataset. In a class of fewer than 1/tau cells one cell is a large branch.
 - `cic_2018_broken`: the IPs are in one file only, and the times are on 12 hours, read with `time_afternoon_before`
   (the rows at 20:xx local read as 08:xx).

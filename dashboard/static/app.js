@@ -259,20 +259,18 @@ function renderData(data) {
     tile("CSV rows read", num(s.n_raw)),
     tile("copies", num(s.n_duplicate), `${pct(s.n_duplicate / s.n_raw)} of the CSV rows`),
     tile("distinct rows kept", num(s.n_kept),
-      `${num(s.n_rare)} in rare classes` + (s.n_capped ? `, ${num(s.n_capped)} past max_class_rows` : "")),
+      `${num(s.n_rare)} in rare classes`),
     tile("classes", num(s.n_classes), `${data.dropped_classes.length} dropped`),
     features);
   const top = Math.max(...data.classes.map((c) => c.n_rows), 1);
-  const capped = data.classes.some((c) => (c.n_distinct ?? c.n_rows) > c.n_rows);
   fill("sp-classes", table(
-    ["class", "distinct rows", "share", "CSV rows", "copies", ...(capped ? ["sampled out"] : [])],
+    ["class", "distinct rows", "share", "CSV rows", "copies"],
     data.classes.map((c) => [
       c.label,
       h("span", {}, h("i", { class: "bar", style: `width:${Math.round((c.n_rows / top) * 60)}px` }), num(c.n_rows)),
       pct(c.n_rows / s.n_kept),
       num(c.n_read),
-      num(c.n_read - (c.n_distinct ?? c.n_rows)),
-      ...(capped ? [num((c.n_distinct ?? c.n_rows) - c.n_rows)] : []),
+      num(c.n_read - c.n_rows),
     ])));
   fill("sp-dropped", data.dropped_classes.map((c) => h("span", { class: "chip" }, `${c.label} (${num(c.n_rows)})`)));
   fill("sp-constant", data.dropped_columns.map((c) => h("span", { class: "chip" }, c)));
@@ -297,7 +295,7 @@ function renderCells(data) {
   last.cellInfo = new Map(data.cells.map((c) => [c.cell, c]));
   fill("rg-params", paramTable(data.params));
   const sizes = new Map();
-  for (const c of data.cells) sizes.set(c.class, [...(sizes.get(c.class) ?? []), c.n_rows]);
+  for (const c of data.cells) sizes.set(c.class, [...(sizes.get(c.class) ?? []), c.n_sampled]);
   const rows = data.classes.map((c) => {
     const v = (sizes.get(c.class) ?? []).sort((a, b) => a - b);
     return { ...c, median: v[Math.floor((v.length - 1) / 2)], min: v[0], max: v.at(-1) };
@@ -306,12 +304,15 @@ function renderCells(data) {
     { key: "class", label: "class", text: true },
     { key: "n_read", label: "CSV rows", format: (v, r) => h("span", { title: `${num(r.n_rows)} distinct rows` }, num(v)),
       help: HELP.read },
+    { key: "n_sampled", label: "rows read", format: num,
+      help: "the distinct rows the method reads, a uniform sample of at most max_sample_rows: the tree is built " +
+        "and every share is read on them; every other row joins the leaf of its nearest row read" },
     { key: "n_cells", label: "leaves", format: num },
-    { key: "median", label: "rows per leaf, median", format: num,
-      help: "the distinct rows of its leaves (lower median): from min_rows (the rows that decide a share τ away " +
+    { key: "median", label: "rows read per leaf, median", format: num,
+      help: "the rows read of its leaves (lower median): from min_rows (the rows that decide a share τ away " +
         "from τ or one half) to under twice it" },
     { key: "max", label: "least – most", format: (v, r) => `${num(r.min)} – ${num(v)}`,
-      help: "the fewest and the most distinct rows of one of its leaves" },
+      help: "the fewest and the most rows read of one of its leaves" },
   ], rows, { onClick: (r) => selectClass(r.class), selected: (r) => r.class === state.cls, by: "n_read" });
   const classes = data.classes.map((c) => c.class);
   if (!classes.includes(state.cls)) { state.cls = classes[0]; state.node = null; }
@@ -989,10 +990,11 @@ const DEFINITION = {
   majority_overlap: "against a rival class, its rival share is τ or more beyond the error of sampling, and it has no " +
     "minority_overlap against it: its class is the majority where it lies, but the rival is no stray",
   single_feature_cut: "one column alone separates it from its rival class (the most frequent class of its rows' " +
-    "nearest rival rows): under τ of that class's rows fall inside its values on the column, beyond the error of " +
-    "sampling",
+    "nearest rival rows): under τ of that class's rows fall inside its central values on the column (those of all " +
+    "its rows but τ), beyond the error of sampling",
   low_variability: "it lies in a branch of its class's tree that holds at least τ of the class's CSV rows and is no " +
-    "more spread than the median leaf of the dataset: many rows in the room of a few, near copies of one flow",
+    "more spread than the typical leaf (the median over the classes of each class's median leaf): many rows in " +
+    "the room of a few, near copies of one flow",
 };
 
 /** The other words of the quality tab, one line each. */
@@ -1052,9 +1054,9 @@ function pick(cls, filter) {
  */
 function drawMatrix() {
   const data = last.quality, s = data.stats, measured = measuredDefects();
-  const total = data.classes.reduce((a, c) => a + c.n_read, 0);
-  const lines = [...data.classes].sort((a, b) => b.n_read - a.n_read || a.class.localeCompare(b.class))
-    .map((c) => ({ cls: c.class, name: c.class, n_read: c.n_read, n_cells: c.n_regions, of: c }));
+  const total = data.classes.reduce((a, c) => a + c.all_read, 0);
+  const lines = [...data.classes].sort((a, b) => b.all_read - a.all_read || a.class.localeCompare(b.class))
+    .map((c) => ({ cls: c.class, name: c.class, n_read: c.all_read, n_cells: c.n_regions, of: c }));
   lines.push({ cls: null, name: "dataset", n_read: total, n_cells: s.n_regions, of: s });
   // every cell is listed when nothing is picked: no share stands for that
   const picked = (cls, f) => state.qclass === cls && state.qfilter === f && (cls != null || f != null);
@@ -1118,7 +1120,7 @@ function why(r, missingOf) {
     single_feature_cut: () => [colName(r.cut_columns[0]?.[0] ?? "?"),
       ` alone separates it from ${r.cut_class} (${pct(r.cut_share)} of its rows inside)`],
     low_variability: () => `in ${pct(r.low_variability_share)} of its class, spread ` +
-      `${dec(r.low_variability_ratio, 2)} times the median leaf`,
+      `${dec(r.low_variability_ratio, 2)} times the typical leaf`,
   };
   return h("div", { class: "why" }, r.defects.map((d) => h("div", {}, diagnosisChip(d), " ", found[d]())));
 }
@@ -1142,14 +1144,14 @@ function drawCellList() {
   sortable($("qr-cells"), [
     { key: "region", label: "cell" },
     { key: "class", label: "class", text: true },
-    { key: "n_read", label: "CSV rows", format: (v, r) => h("span", { title: `${num(r.n_rows)} distinct rows` }, num(v)),
+    { key: "all_read", label: "CSV rows", format: (v, r) => h("span", { title: `${num(r.all_rows)} distinct rows, ${num(r.n_rows)} read` }, num(v)),
       help: HELP.read },
     { key: "defects", label: "defects", format: (v, r) => why(r, missingOf), help: HELP.why, wrap: true },
   ], shown, {
     onClick: (r) => selectCell(r.region),
     selected: (r) => r.region === state.region,
     empty: "No cell.",
-    by: "n_read",
+    by: "all_read",
   });
   drawDetail();
 }
@@ -1210,7 +1212,7 @@ async function drawDetail() {
   close.onclick = () => selectCell(null);
   fill("qr-detail-title", `Cell ${row.region} · ${row.class}`, close);
   fill("qr-detail-head",
-    `${num(row.n_read)} CSV rows (${num(row.n_rows)} distinct) · `,
+    `${num(row.all_read)} CSV rows (${num(row.all_rows)} distinct, ${num(row.n_rows)} read) · `,
     flagged(`${pct(row.duplicates_share)} copies`, row.defects.includes("duplicates")), " · ",
     row.defects.length ? chips(row.defects) : "no defect");
   $("qr-all").open = false;
@@ -1287,7 +1289,8 @@ function featureDeltas(profile, rivals) {
 
 /**
  * The widest branch of its class the cell lies in that has low_variability: its share of the class's CSV rows, and its
- * variance over the reference, the variance of the median leaf of the dataset.
+ * variance over the reference, the variance of the typical leaf (the median over the classes of each class's median
+ * leaf).
  * @param {object} row its quality_regions row
  * @param {object} stats the quality_stats row
  * @param {number} tau
@@ -1309,7 +1312,8 @@ function cutTable(row, tau) {
   const lines = row.cut_columns.map(([column, share], i) => [colName(column), i === 0
     ? `${dec(share, 3)} (${dec(row.cut_low, 3)}–${dec(row.cut_high, 3)})` : dec(share, 3)]);
   return h("div", {},
-    h("p", { class: "note" }, `against ${row.cut_class}: the share of its rows inside this cell's values, under τ = ${tau}`),
+    h("p", { class: "note" }, `against ${row.cut_class}: the share of its rows inside this cell's central values ` +
+      `(all its rows but τ), under τ = ${tau}`),
     h("div", { class: "table-wrap" }, table(["column", `rows of ${row.cut_class} inside`], lines)));
 }
 

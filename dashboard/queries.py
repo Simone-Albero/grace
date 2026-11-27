@@ -47,10 +47,10 @@ from stages.paths import (
     assignments_file,
     data_file,
     need,
-    prepared_file,
+    points_columns_file,
+    points_file,
     provenance_file,
     read_classes,
-    read_points,
     read_weights,
 )
 
@@ -59,9 +59,9 @@ MAP_MAX_POINTS = 20000  # most rows of a map
 CONFLICT_GROUPS = 10  # most label conflict groups in a region's detail
 # the settings each stage's tab shows, by stage, as its run's config set them
 HYPERPARAMETERS = {
-    "clean": ("min_class_count", "max_class_rows", "significant_digits"),
+    "clean": ("min_class_count", "significant_digits"),
     "prepare": ("top_n",),
-    "cells": ("min_rows", "max_fit_samples", "seed"),
+    "cells": ("min_rows", "max_sample_rows", "seed"),
     "quality_report": (
         "tau",
         "confidence",
@@ -77,9 +77,8 @@ def clean(cfg: DatasetConfig) -> dict[str, Any]:
 
     Returns:
         run; params (_params); summary {n_raw, n_duplicate, n_rare,
-        n_capped, n_kept, n_classes, n_constant} (n_capped absent from a
-        run before max_class_rows); classes [{label, n_read, n_distinct,
-        n_rows}] sorted by label (n_distinct absent likewise);
+        n_kept, n_classes, n_constant}; classes [{label, n_read,
+        n_rows}] sorted by label;
         dropped_classes [{label, n_rows}]; dropped_columns [column];
         features {num: [...], cat: [...]}; provenance [{key, column,
         n_read, n_empty, n_unparsable, n_values}] (the provenance_columns
@@ -144,8 +143,9 @@ def cells(cfg: DatasetConfig) -> dict[str, Any]:
 
     Returns:
         run; params (_params); stats (the cell_stats row: n_cells,
-        min_rows, max_fit_samples); classes [{class, n_rows, n_read,
-        n_cells}]; cells [{cell, class, n_rows, n_read, region,
+        min_rows, max_sample_rows); classes [{class, n_rows, n_read,
+        n_sampled, n_cells}]; cells [{cell, class, n_rows, n_read,
+        n_sampled, region,
         defects}], region and defects (a list) those of the last
         quality_report run after this cells run (the defects of its
         region), null without one; tree [{node, class, parent, depth, cell, n_rows, n_read}] in
@@ -174,9 +174,8 @@ def cell_map(cfg: DatasetConfig, node: int) -> dict[str, Any]:
     cells run) are sampled at random (seed cfg.seed): at most per_cell
     = min(MAP_PER_CELL, max(1, MAP_MAX_POINTS // cells)) of each cell.
     A PCA fitted on the sample, in the space the cells were cut in
-    (graph.space_points of the prepared file), gives their first two
-    components. The
-    prepared points are cached per file and mtime.
+    (the points of stage prepare, read from disk), gives their first
+    two components.
 
     Args:
         cfg: The dataset.
@@ -359,7 +358,7 @@ def quality_profile(cfg: DatasetConfig, region: int) -> dict[str, Any]:
     run, assignments.parquet) and, per rival class, of
     the rival cells of that class of its cells (quality_rivals), each
     row weighted by its copies in the CSV: the mean of every numeric
-    column of the prepared file (logged and standardized: a difference
+    column of the points (logged and standardized: a difference
     of means is in standard deviations of the dataset, alike for every
     column), and the most frequent value of every categorical column of
     the data file (ties to the first in text order; null for a null).
@@ -390,11 +389,10 @@ def quality_profile(cfg: DatasetConfig, region: int) -> dict[str, Any]:
     groups += [sorted(by_class[k]) for k in names_of]
     rows = _rows_of_cells(cfg, groups)
     every = np.unique(np.concatenate(rows))
-    path = need(prepared_file(cfg), "prepare")
-    names = feature_cols(
-        pl.read_parquet_schema(path).names(), cfg.num_cols, cfg.cat_cols
-    ).num
-    numbers = _rows_at(path, every, names).to_numpy().reshape(len(every), len(names))
+    columns = json.loads(need(points_columns_file(cfg), "prepare").read_text())
+    names = [c for c in columns["columns"] if c in cfg.num_cols]
+    at_column = [columns["columns"].index(c) for c in names]
+    numbers = np.asarray(_space(cfg)[every][:, at_column], dtype=np.float64)
     data = need(data_file(cfg), "clean")
     cat = feature_cols(
         pl.read_parquet_schema(data).names(), cfg.num_cols, cfg.cat_cols
@@ -629,14 +627,14 @@ def _logged(
         )
         if not branches or "cut_share" not in branches[0]:
             raise LookupError("run quality_report again: it is of an older version")
+        cells = _rows(conn, "quality_report", "quality_cells", run)
+        if cells and "all_read" not in cells[0]:
+            raise LookupError("run quality_report again: it is of an older version")
         if len(_LOGGED) >= 8:
             _LOGGED.clear()
         _LOGGED[key] = Verdicts(
             rivals=_where(conn, "quality_rivals", run, "1"),
-            cells=sorted(
-                _rows(conn, "quality_report", "quality_cells", run),
-                key=lambda c: c["cell"],
-            ),
+            cells=sorted(cells, key=lambda c: c["cell"]),
             regions=sorted(
                 _rows(conn, "quality_report", "quality_regions", run),
                 key=lambda r: r["region"],
@@ -715,7 +713,7 @@ def _map_cells(cfg: DatasetConfig, shown: list[int]) -> dict[str, Any]:
             [rng.permutation(group)[:per_cell] for group in groups] or [rows]
         )
     )
-    points = _space(cfg)[take]
+    points = np.asarray(_space(cfg)[take], dtype=np.float64)
     plane = np.zeros((len(points), 2))
     shares = [0.0, 0.0]
     if len(points) >= 2:
@@ -845,16 +843,6 @@ def _classes(cfg: DatasetConfig) -> list[str]:
         raise LookupError(str(e)) from e
 
 
-_SPACE: dict[tuple, np.ndarray] = {}  # the points of the last prepared files read
-
-
 def _space(cfg: DatasetConfig) -> np.ndarray:
-    """Return paths.read_points, cached per file and mtime."""
-    path = need(prepared_file(cfg), "prepare")
-    key = (str(path), path.stat().st_mtime_ns)
-    if key not in _SPACE:
-        points, _ = read_points(cfg)
-        if len(_SPACE) >= 2:
-            _SPACE.clear()
-        _SPACE[key] = points
-    return _SPACE[key]
+    """Return the points of stage prepare, a read-only memmap: only the rows indexed are read."""
+    return np.load(need(points_file(cfg), "prepare"), mmap_mode="r")

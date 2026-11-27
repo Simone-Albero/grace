@@ -4,10 +4,11 @@ A dataset may name the columns of its rows' source and destination
 (address and port) and time (ProvenanceConfig). Stage clean reads them
 for every row of the CSV, copies included (the copies of a row may come
 from different hosts). Stage quality_report measures them between each
-distinct row and its nearest rival row (key_coincidence,
+distinct row read and its nearest rival row (key_coincidence,
 time_nearness), with its nearest row of its own class as the control,
-and describes the hosts of each region (concentration). They never
-decide a verdict: they support one.
+the chance read on the rows read of each class, and describes the hosts
+of each region over all its rows (concentration). They never decide a
+verdict: they support one.
 """
 
 from __future__ import annotations
@@ -111,6 +112,7 @@ def key_coincidence(
     labels: np.ndarray,
     rival_row: np.ndarray,
     own_row: np.ndarray,
+    measured: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return, per distinct row, how often it shares a key's value with its nearest rival and own rows.
 
@@ -119,8 +121,8 @@ def key_coincidence(
     of p_i · p_u, p the share of a row's CSV rows with the value (nulls
     left out), 1 or 0 for rows of one copy. Chance: the same between a
     row drawn at random from i's class and one from its rival's class,
-    the sum of q_a · q_k with q the mean of p over the distinct rows of
-    a class (with a known value), exact. The own row is the control:
+    the sum of q_a · q_k with q the mean of p over the measured distinct
+    rows of a class (with a known value). The own row is the control:
     neighbours in the features share values for reasons that are no
     labels' (the traffic of a day, a capture's artifacts, a key that is
     also a feature).
@@ -134,6 +136,8 @@ def key_coincidence(
         rival_row: The nearest row of another class of every row
             (quality.nearest_rivals), -1 for none.
         own_row: Its nearest other row of its class, -1 for none.
+        measured: Per row of the data file, whether it is read (the
+            rows the chance is the mean over), shape (n,) bool.
 
     Returns:
         Per row of the data file, shape (n,) float: the coincidence with
@@ -180,12 +184,14 @@ def key_coincidence(
         & has[np.maximum(rival_row, 0)]
         & has[np.maximum(own_row, 0)]
     )
+    measured = np.asarray(measured, dtype=bool)
+    read = p.filter(pl.Series(measured)[p["row"].to_numpy()])
     of_class = (
-        p.with_columns(cls=pl.Series(labels)[p["row"].to_numpy()].alias("cls"))
+        read.with_columns(cls=pl.Series(labels)[read["row"].to_numpy()].alias("cls"))
         .group_by("cls", "value")
         .agg(pl.col("p").sum())
     )
-    rows_of = np.bincount(labels[has], minlength=int(labels.max()) + 1)
+    rows_of = np.bincount(labels[has & measured], minlength=int(labels.max()) + 1)
     q = of_class.with_columns(
         q=pl.col("p") / pl.Series(rows_of)[of_class["cls"].to_numpy()]
     ).select("cls", "value", "q")
@@ -209,13 +215,15 @@ def time_nearness(
     labels: np.ndarray,
     neighbour: np.ndarray,
     own: bool,
+    measured: np.ndarray,
 ) -> np.ndarray:
     """Return, per distinct row, how near in time it lies to a neighbour, against chance.
 
     The copies of a row count as different times, and one is enough.
     For a row i and its neighbour u: g, the least distance between a
-    copy of i and a copy of u; s, the share of the CSV rows of u's
-    class (with a known time) inside the union of [t - g, t + g] around
+    copy of i and a copy of u; s, the share of the CSV rows of the
+    measured rows of u's class (with a known time) inside the union of
+    [t - g, t + g] around
     the copies of i, the bounds closed (a tie counts as near); m, the
     copies of u with a known time. The measure is 1 - (1 - s)^m: the
     chance that m copies drawn at random from u's class put one as
@@ -233,6 +241,9 @@ def time_nearness(
         neighbour: The neighbour of every row of the data file (its
             nearest rival or own row), -1 for none.
         own: Whether the neighbour is of the row's own class.
+        measured: Per row of the data file, whether it is read (the
+            rows whose CSV rows s is a share of), shape (n,) bool; a row
+            with a neighbour must be read.
 
     Returns:
         Per row of the data file, shape (n,) float in [0, 1]; NaN where
@@ -250,9 +261,10 @@ def time_nearness(
     start = np.searchsorted(at, np.arange(n), side="left")
     stop = np.searchsorted(at, np.arange(n), side="right")
     copies = stop - start
+    read = np.asarray(measured, dtype=bool)[at]
     of_class = {
-        k: np.sort(t[labels[at] == k]) for k in np.unique(labels[at])
-    }  # the known times of each class's CSV rows
+        k: np.sort(t[read & (labels[at] == k)]) for k in np.unique(labels[at])
+    }  # the known times of the CSV rows of each class's rows read
     out = np.full(n, np.nan)
     judged = np.flatnonzero((neighbour >= 0) & (copies > 0))
     judged = judged[copies[neighbour[judged]] > 0]

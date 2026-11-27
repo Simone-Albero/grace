@@ -11,31 +11,39 @@ __all__ = [
     "cell_tree_file",
     "cells_file",
     "classes_file",
+    "conflicts_file",
+    "data_blocks",
     "data_file",
     "need",
+    "points_columns_file",
+    "points_file",
     "prepared_columns",
-    "prepared_file",
     "provenance_file",
     "read_classes",
+    "read_conflicts",
     "read_data",
+    "read_labels",
     "read_points",
     "read_provenance",
+    "read_rows",
     "read_unparsable",
     "read_weights",
+    "rivals_file",
     "unparsable_file",
 ]
 
 import json
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import numpy as np
 import polars as pl
+import pyarrow.parquet as pq
 
 from src.config import DatasetConfig
-from src.data import DUPLICATES, LABEL, feature_cols
-from src.graph import space_points
-from src.prepare import MISSING
+from src.data import DUPLICATES, LABEL
+
+_BLOCK_ROWS = 500_000  # rows of the data file read at once by data_blocks
 
 
 def need(path: Path, stage: str) -> Path:
@@ -106,16 +114,43 @@ def provenance_file(cfg: DatasetConfig) -> Path:
     return cfg.output_dir / "provenance.parquet"
 
 
-def prepared_file(cfg: DatasetConfig) -> Path:
-    """Return the file of the prepared rows (stage prepare).
+def conflicts_file(cfg: DatasetConfig) -> Path:
+    """Return the file of the rows equal on every feature under different labels (stage clean).
 
     Args:
         cfg: The dataset config.
 
     Returns:
-        The parquet path.
+        The parquet path: columns row (of the data file) and group
+        (data.conflict_groups), one row per row in a group.
     """
-    return cfg.output_dir / "prepared.parquet"
+    return cfg.output_dir / "conflicts.parquet"
+
+
+def points_file(cfg: DatasetConfig) -> Path:
+    """Return the file of the points (stage prepare).
+
+    Args:
+        cfg: The dataset config.
+
+    Returns:
+        The .npy path: float32, shape (n, d), row i the point of row i
+        of the data file (prepare.transform).
+    """
+    return cfg.output_dir / "points.npy"
+
+
+def points_columns_file(cfg: DatasetConfig) -> Path:
+    """Return the file of the names of the columns of the points (stage prepare).
+
+    Args:
+        cfg: The dataset config.
+
+    Returns:
+        The JSON path: {"columns": prepare.column_names, "sources":
+        prepare.column_sources}.
+    """
+    return cfg.output_dir / "points.json"
 
 
 def cells_file(cfg: DatasetConfig) -> Path:
@@ -154,6 +189,22 @@ def assignments_file(cfg: DatasetConfig) -> Path:
     return cfg.output_dir / "assignments.parquet"
 
 
+def rivals_file(cfg: DatasetConfig) -> Path:
+    """Return the file of the nearest rows of every row read (stage quality_report).
+
+    Args:
+        cfg: The dataset config.
+
+    Returns:
+        The parquet path: columns row (of the data file, the rows read,
+        ascending), rival_row (its nearest row of another class, -1 for
+        none), confused (1, 0.5 or 0) and own_row (its nearest other
+        row of its class, -1 for none), as quality.nearest_rivals
+        returns them.
+    """
+    return cfg.output_dir / "rivals.parquet"
+
+
 def read_data(cfg: DatasetConfig) -> pl.DataFrame:
     """Return the cleaned rows.
 
@@ -170,30 +221,38 @@ def read_data(cfg: DatasetConfig) -> pl.DataFrame:
 
 
 def read_points(cfg: DatasetConfig) -> tuple[np.ndarray, np.ndarray]:
-    """Return the prepared rows as points of the space, and their classes.
-
-    The numeric columns of the prepared file (data.feature_cols) and its
-    one-hot slots (every other column but MISSING and LABEL) go through
-    graph.space_points. MISSING is a diagnostic: no distance sees it.
+    """Return the points of every row, on disk, and their classes.
 
     Args:
         cfg: The dataset config.
 
     Returns:
-        The Float64 points, shape (n, d_num + d_cat), and the class
-        codes, shape (n,). Row i is row i of the data file. Column j is
-        a column of prepared_columns(cfg)[j].
+        The points, a read-only float32 memmap of shape (n, d) (every
+        distance from stage cells on is euclidean on them), and the
+        class codes, shape (n,) int64. Row i is row i of the data file;
+        column j is column j of points_columns_file.
 
     Raises:
         FileNotFoundError: When stage prepare has not run.
     """
-    prepared = pl.read_parquet(need(prepared_file(cfg), "prepare"))
-    numeric, slots, _ = _space_columns(cfg, prepared.columns)
-    points = space_points(
-        prepared.select(numeric).to_numpy(),
-        prepared.select(slots).to_numpy(),
-    )
-    return points, prepared[LABEL].to_numpy()
+    points = np.load(need(points_file(cfg), "prepare"), mmap_mode="r")
+    return points, read_labels(cfg)
+
+
+def read_labels(cfg: DatasetConfig) -> np.ndarray:
+    """Return the class code of every row of the data file.
+
+    Args:
+        cfg: The dataset config.
+
+    Returns:
+        LABEL of the data file, shape (n,) int64.
+
+    Raises:
+        FileNotFoundError: When stage clean has not run.
+    """
+    rows = pl.read_parquet(need(data_file(cfg), "clean"), columns=[LABEL])
+    return rows[LABEL].cast(pl.Int64).to_numpy()
 
 
 def prepared_columns(cfg: DatasetConfig) -> list[str]:
@@ -209,30 +268,74 @@ def prepared_columns(cfg: DatasetConfig) -> list[str]:
     Raises:
         FileNotFoundError: When stage prepare has not run.
     """
-    names = pl.read_parquet_schema(need(prepared_file(cfg), "prepare")).names()
-    numeric, _, owners = _space_columns(cfg, names)
-    return [*numeric, *owners]
+    names = json.loads(need(points_columns_file(cfg), "prepare").read_text())
+    return list(names["sources"])
 
 
-def _space_columns(
-    cfg: DatasetConfig, columns: Sequence[str]
-) -> tuple[list[str], list[str], list[str]]:
-    """Return the numeric columns, the slots and the column of each slot.
+def read_rows(
+    cfg: DatasetConfig, rows: np.ndarray, columns: Sequence[str] | None = None
+) -> pl.DataFrame:
+    """Return some rows of the data file, read in streaming.
 
-    A slot f"{column}={value}" belongs to the longest categorical column
-    it starts with; MISSING and LABEL are neither.
+    Args:
+        cfg: The dataset config.
+        rows: Their positions in the data file, ascending, distinct.
+        columns: The columns read; None for all.
+
+    Returns:
+        The rows, in the order of rows.
+
+    Raises:
+        FileNotFoundError: When stage clean has not run.
     """
-    present = feature_cols(columns, cfg.num_cols, cfg.cat_cols).num
-    by_length = sorted(cfg.cat_cols, key=len, reverse=True)
-    numeric = list(present)
-    slots, owners = [], []
-    for name in columns:
-        if name in present or name in (MISSING, LABEL):
-            continue
-        owner = next(c for c in by_length if name.startswith(f"{c}="))
-        slots.append(name)
-        owners.append(owner)
-    return numeric, slots, owners
+    at = "__row__"
+    wanted = pl.Series(np.asarray(rows, dtype=np.int64)).implode()
+    scan = pl.scan_parquet(need(data_file(cfg), "clean")).with_row_index(at)
+    if columns is not None:
+        scan = scan.select(at, *columns)
+    found = scan.filter(pl.col(at).cast(pl.Int64).is_in(wanted))
+    return found.collect(engine="streaming").sort(at).drop(at)
+
+
+def data_blocks(
+    cfg: DatasetConfig, columns: Sequence[str] | None = None
+) -> Iterator[pl.DataFrame]:
+    """Yield the rows of the data file, in order, a block at a time.
+
+    Args:
+        cfg: The dataset config.
+        columns: The columns read; None for all.
+
+    Yields:
+        Consecutive blocks of at most _BLOCK_ROWS rows.
+
+    Raises:
+        FileNotFoundError: When stage clean has not run.
+    """
+    source = pq.ParquetFile(need(data_file(cfg), "clean"))
+    read = None if columns is None else list(columns)
+    for batch in source.iter_batches(batch_size=_BLOCK_ROWS, columns=read):
+        yield pl.from_arrow(batch)
+
+
+def read_conflicts(cfg: DatasetConfig, n: int) -> np.ndarray:
+    """Return the conflict group of every row of the data file.
+
+    Args:
+        cfg: The dataset config.
+        n: The rows of the data file.
+
+    Returns:
+        Shape (n,) int64: the group of conflicts_file, -1 for a row in
+        none.
+
+    Raises:
+        FileNotFoundError: When stage clean has not run.
+    """
+    found = pl.read_parquet(need(conflicts_file(cfg), "clean"))
+    groups = np.full(n, -1, dtype=np.int64)
+    groups[found["row"].to_numpy()] = found["group"].to_numpy()
+    return groups
 
 
 def read_unparsable(cfg: DatasetConfig) -> pl.DataFrame:
